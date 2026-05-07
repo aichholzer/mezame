@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>racp</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: #0f1115;
+        color: #d6d6d6;
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+        font-size: 14px;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid #222;
+        color: #888;
+        font-size: 12px;
+        display: flex;
+        justify-content: space-between;
+      }
+      #log {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0.75rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.45;
+      }
+      #log .user { color: #7fb4d6; }
+      #log .agent { color: #d7cf8a; }
+      #log .sys { color: #666; }
+      form {
+        display: flex;
+        gap: 0.5rem;
+        padding: 0.5rem;
+        border-top: 1px solid #222;
+        background: #0b0d11;
+      }
+      #i {
+        flex: 1;
+        background: #000;
+        color: #d6d6d6;
+        border: 1px solid #2a2a2a;
+        border-radius: 3px;
+        padding: 0.55rem 0.7rem;
+        font: inherit;
+        outline: none;
+      }
+      #i:focus { border-color: #3b5a7a; }
+      button {
+        background: #1e2633;
+        color: #d6d6d6;
+        border: 1px solid #2a3342;
+        border-radius: 3px;
+        padding: 0.55rem 1rem;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span>racp</span>
+      <span id="status">connecting...</span>
+    </header>
+    <div id="log"></div>
+    <form id="f">
+      <input id="i" type="text" placeholder="message..." autocomplete="off" autofocus />
+      <button id="b" type="submit">send</button>
+    </form>
+    <script>
+      // Terminal-style UI for racp.
+      //
+      // Wire protocol (JSON over the WebSocket at /ws):
+      //   client → server: { type: "prompt", text }
+      //   server → client:
+      //     { type: "append", role: "user"|"agent"|"sys", text }
+      //     { type: "prompt_done" }
+      //     { type: "error", message }
+      //
+      // Status transitions shown in the header:
+      //   connected → thinking... → responding → connected
+      // `awaitingFirstChunk` gates the thinking → responding flip on the
+      // first agent-role append after a prompt is sent.
+      const log = document.getElementById('log');
+      const form = document.getElementById('f');
+      const input = document.getElementById('i');
+      const button = document.getElementById('b');
+      const status = document.getElementById('status');
+
+      const append = (text, cls) => {
+        const s = document.createElement('span');
+        s.className = cls || 'agent';
+        s.textContent = text;
+        log.appendChild(s);
+        log.scrollTop = log.scrollHeight;
+      };
+
+      const setBusy = (busy) => {
+        input.disabled = busy;
+        button.disabled = busy;
+        if (!busy) {
+          input.focus();
+        }
+      };
+
+      let awaitingFirstChunk = false;
+
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+      ws.onopen = () => {
+        status.textContent = 'connected';
+      };
+
+      ws.onclose = () => {
+        status.textContent = 'disconnected';
+        append('\n[disconnected]\n', 'sys');
+        setBusy(true);
+      };
+
+      ws.onerror = () => {
+        status.textContent = 'error';
+      };
+
+      ws.onmessage = (e) => {
+        let msg;
+        try {
+          msg = JSON.parse(e.data);
+        } catch {
+          return;
+        }
+        switch (msg.type) {
+          case 'append':
+            if (awaitingFirstChunk && msg.role === 'agent') {
+              status.textContent = 'responding';
+              awaitingFirstChunk = false;
+            }
+            append(msg.text, msg.role || 'agent');
+            break;
+          case 'prompt_done':
+            status.textContent = 'connected';
+            awaitingFirstChunk = false;
+            setBusy(false);
+            break;
+          case 'error':
+            append(`\n[error: ${msg.message}]\n`, 'sys');
+            status.textContent = 'connected';
+            awaitingFirstChunk = false;
+            setBusy(false);
+            break;
+        }
+      };
+
+      form.onsubmit = (e) => {
+        e.preventDefault();
+        const text = input.value.trim();
+        if (!text || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        append(`> ${text}\n`, 'user');
+        ws.send(JSON.stringify({ type: 'prompt', text }));
+        input.value = '';
+        status.textContent = 'thinking...';
+        awaitingFirstChunk = true;
+        setBusy(true);
+      };
+    </script>
+  </body>
+</html>

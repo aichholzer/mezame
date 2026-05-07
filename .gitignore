@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target
+
+# macOS
+.DS_Store
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Kiro workspace state (sessions, local agents, settings)
+.kiro/
+
+# Claude Code local state
+.claude/
+
+# Cloudflared credentials if anyone ever generates them in-tree
+# (the convention is ~/.cloudflared/<uuid>.json, but cheap insurance)
+cloudflared/*.json
