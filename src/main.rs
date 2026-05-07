@@ -46,11 +46,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State
+        Query, State
     },
+    http::StatusCode,
     response::{Html, Response},
     routing::get,
-    Router
+    Json, Router
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,14 @@ struct TelegramConfig {
 fn config_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join(".racp/config.toml"))
+}
+
+/// Path to the persistent browser state (currently-open tabs, history list,
+/// active id, next numeric label). Server-side so any device hitting racp
+/// sees the same list.
+fn state_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join(".racp/state.json"))
 }
 
 fn load_config() -> Result<Config> {
@@ -219,6 +228,7 @@ async fn run_cloudflared(cfg: Config) -> Result<()> {
     let app = Router::new()
         .route("/", get(serve_ui))
         .route("/ws", get(ws_upgrade))
+        .route("/state", get(get_state).put(put_state))
         .with_state(shared);
 
     let listener = TcpListener::bind(&cfg.bind).await?;
@@ -231,9 +241,55 @@ async fn serve_ui() -> Html<&'static str> {
     Html(UI_HTML)
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(cfg): State<Arc<Config>>) -> Response {
+/// GET /state — returns the persisted browser state as JSON, or `{}` if the
+/// file does not exist yet. racp does not interpret the contents; it is
+/// purely a cross-device store for the UI.
+async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
+    let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            let v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+            Ok(Json(v))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Json(json!({}))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+    }
+}
+
+/// PUT /state — atomically replaces the stored state. Writes to a sibling
+/// `.tmp` then `rename` so readers never see a partial file.
+async fn put_state(Json(body): Json<Value>) -> Result<StatusCode, (StatusCode, String)> {
+    let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let data = serde_json::to_string_pretty(&body)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    std::fs::write(&tmp, data)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    Query(params): Query<HashMap<String, String>>,
+    State(cfg): State<Arc<Config>>
+) -> Response {
+    // `/ws?session=<acp-session-id>` asks racp to call `session/load` on the
+    // agent instead of `session/new`. Absent = always new session.
+    // `/ws?cwd=<path>` overrides the working directory for this session;
+    // absent or empty = racp's own process cwd.
+    let resume = params.get("session").cloned();
+    let cwd_override = params
+        .get("cwd")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws(socket, cfg).await {
+        if let Err(e) = handle_ws(socket, cfg, resume, cwd_override).await {
             eprintln!("ws session ended: {e:?}");
         }
     })
@@ -252,7 +308,12 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(cfg): State<Arc<Config>>) -> Res
 /// - Prompts are run in their own spawned tasks so a long-running
 ///   `session/prompt` does not block the select loop from draining
 ///   `session/update` notifications.
-async fn handle_ws(ws: WebSocket, cfg: Arc<Config>) -> Result<()> {
+async fn handle_ws(
+    ws: WebSocket,
+    cfg: Arc<Config>,
+    resume_session_id: Option<String>,
+    cwd_override: Option<String>
+) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
     let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
 
@@ -266,7 +327,9 @@ async fn handle_ws(ws: WebSocket, cfg: Arc<Config>) -> Result<()> {
         }
     });
 
-    send_sys(&to_ws_tx, "starting agent...\n")?;
+    // The browser's sticky status banner shows "connecting..." until the
+    // `ready` message arrives, so we no longer echo a startup line into
+    // the log. This keeps the log free of protocol chatter.
 
     // If spawn fails (bad agent_cmd, missing binary, ...) tell the browser
     // and close cleanly. Do NOT return an Err here: the writer task still
@@ -297,28 +360,76 @@ async fn handle_ws(ws: WebSocket, cfg: Arc<Config>) -> Result<()> {
         .await
         .context("initialize")?;
 
-    // `cwd` is racp's current working directory, which is what the agent
-    // will see as the project root. For a hosted deployment, consider
-    // making this configurable per session (e.g. a workspace parameter
-    // coming from the browser).
-    let cwd = std::env::current_dir()?;
-    let new_session = agent
-        .request(
-            "session/new",
-            json!({
-                "cwd": cwd.to_string_lossy(),
-                "mcpServers": []
-            })
-        )
-        .await
-        .context("session/new")?;
-    let session_id = new_session
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
-        .to_string();
+    // Session setup. If the browser supplied a resume id, try `session/load`
+    // first; on failure fall back to `session/new`. ACP's session/load
+    // replays past messages via session/update notifications on the same
+    // stream, which the select loop will forward to the browser as the
+    // history rehydrates.
+    //
+    // `cwd` comes from the browser's `?cwd=<path>` query param if provided;
+    // otherwise we use racp's own process cwd.
+    let cwd_str = match cwd_override {
+        Some(c) => c,
+        None => std::env::current_dir()?.to_string_lossy().to_string()
+    };
 
-    send_sys(&to_ws_tx, "ready.\n")?;
+    let (session_id, resumed) = match resume_session_id {
+        Some(sid) => {
+            let load_res = agent
+                .request(
+                    "session/load",
+                    json!({
+                        "sessionId": sid,
+                        "cwd": cwd_str,
+                        "mcpServers": []
+                    })
+                )
+                .await;
+            match load_res {
+                Ok(_) => (sid, true),
+                Err(e) => {
+                    eprintln!("session/load failed ({e}); falling back to session/new");
+                    let new_session = agent
+                        .request(
+                            "session/new",
+                            json!({ "cwd": cwd_str, "mcpServers": [] })
+                        )
+                        .await
+                        .context("session/new (fallback)")?;
+                    let sid = new_session
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
+                        .to_string();
+                    (sid, false)
+                }
+            }
+        }
+        None => {
+            let new_session = agent
+                .request(
+                    "session/new",
+                    json!({ "cwd": cwd_str, "mcpServers": [] })
+                )
+                .await
+                .context("session/new")?;
+            let sid = new_session
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
+                .to_string();
+            (sid, false)
+        }
+    };
+
+    // Tell the browser which session id it is bound to so it can persist it
+    // for reconnect, and whether this was a resume (so it can clear stale
+    // log before the replay lands).
+    let _ = to_ws_tx.send(text_msg(json!({
+        "type": "ready",
+        "sessionId": session_id,
+        "resumed": resumed
+    })));
 
     // Hand over the single updates receiver produced by `spawn_agent`. Only
     // one task may own it; we own it here, for the life of the session.
@@ -337,48 +448,106 @@ async fn handle_ws(ws: WebSocket, cfg: Arc<Config>) -> Result<()> {
                     Ok(v) => v,
                     Err(_) => continue
                 };
-                if v.get("type").and_then(Value::as_str) != Some("prompt") {
-                    continue;
-                }
-                let Some(user_text) = v.get("text").and_then(Value::as_str) else {
-                    continue;
-                };
 
-                // Run `session/prompt` in its own task so the select loop
-                // keeps pumping `session/update` notifications while the
-                // agent is working. When the request resolves we tell the
-                // browser the turn is over (or surface the error).
-                let agent = agent.clone();
-                let to_ws = to_ws_tx.clone();
-                let sid = session_id.clone();
-                let user_text = user_text.to_string();
-                tokio::spawn(async move {
-                    let res = agent
-                        .request(
-                            "session/prompt",
-                            json!({
-                                "sessionId": sid,
-                                "prompt": [{ "type": "text", "text": user_text }]
-                            })
-                        )
-                        .await;
-                    if let Err(e) = res {
-                        let _ = to_ws.send(text_msg(json!({ "type": "error", "message": format!("{e}") })));
+                match v.get("type").and_then(Value::as_str) {
+                    Some("prompt") => {
+                        let Some(user_text) = v.get("text").and_then(Value::as_str) else {
+                            continue;
+                        };
+
+                        // Run `session/prompt` in its own task so the select
+                        // loop keeps pumping `session/update` notifications
+                        // while the agent is working. When the request
+                        // resolves we tell the browser the turn is over (or
+                        // surface the error).
+                        let agent = agent.clone();
+                        let to_ws = to_ws_tx.clone();
+                        let sid = session_id.clone();
+                        let user_text = user_text.to_string();
+                        tokio::spawn(async move {
+                            let res = agent
+                                .request(
+                                    "session/prompt",
+                                    json!({
+                                        "sessionId": sid,
+                                        "prompt": [{ "type": "text", "text": user_text }]
+                                    })
+                                )
+                                .await;
+                            if let Err(e) = res {
+                                let _ = to_ws.send(text_msg(json!({ "type": "error", "message": format!("{e}") })));
+                            }
+                            let _ = to_ws.send(text_msg(json!({ "type": "prompt_done" })));
+                        });
                     }
-                    let _ = to_ws.send(text_msg(json!({ "type": "prompt_done" })));
-                });
+                    Some("permission_response") => {
+                        // Browser replied to a `session/request_permission`
+                        // we forwarded earlier. The `id` must match the one
+                        // we forwarded; we pass it straight back to the
+                        // agent so it can unblock.
+                        let Some(id) = v.get("id").cloned() else {
+                            continue;
+                        };
+                        let option_id = v
+                            .get("optionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let agent = agent.clone();
+                        let to_ws = to_ws_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = agent
+                                .respond(
+                                    id,
+                                    json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+                                )
+                                .await
+                            {
+                                let _ = to_ws.send(text_msg(json!({
+                                    "type": "error",
+                                    "message": format!("permission reply failed: {e}")
+                                })));
+                            }
+                        });
+                    }
+                    Some("cancel") => {
+                        // ACP `session/cancel` is a notification (no id, no
+                        // response expected). The agent is responsible for
+                        // stopping whatever tool or turn is in flight and
+                        // eventually resolving the outstanding
+                        // `session/prompt` request, which is what unblocks
+                        // the browser's "busy" state.
+                        let agent = agent.clone();
+                        let sid = session_id.clone();
+                        tokio::spawn(async move {
+                            let _ = agent
+                                .notify(
+                                    "session/cancel",
+                                    json!({ "sessionId": sid })
+                                )
+                                .await;
+                        });
+                    }
+                    _ => continue
+                }
             }
             // Agent → user: notifications and server-initiated requests.
             Some(agent_msg) = updates_rx.recv() => {
-                handle_agent_message(&to_ws_tx, &agent, agent_msg).await;
+                handle_agent_message(&to_ws_tx, agent_msg).await;
             }
             else => break
         }
     }
 
+    // Cooperative shutdown of the agent subprocess. Sends `session/cancel`,
+    // closes stdin, and waits briefly for exit so Kiro can release its
+    // session lock. `kill_on_drop` stays on as a safety net in case the
+    // agent doesn't honour EOF within the timeout.
+    agent.shutdown(Some(&session_id)).await;
+
     // Closing the outbound channel unblocks the writer task. The agent
     // child is killed on drop of the `Agent` (see `kill_on_drop(true)` in
-    // `spawn_agent`).
+    // `spawn_agent`) if shutdown timed out above.
     drop(to_ws_tx);
     let _ = writer.await;
     Ok(())
@@ -402,7 +571,7 @@ async fn handle_ws(ws: WebSocket, cfg: Arc<Config>) -> Result<()> {
 /// TODO(permission-ui): replace the auto-allow with a real prompt. The browser
 /// protocol needs a new message type carrying the toolCall summary and the
 /// option list, and a corresponding response type selecting an option.
-async fn handle_agent_message(tx: &mpsc::UnboundedSender<Message>, agent: &Agent, msg: Value) {
+async fn handle_agent_message(tx: &mpsc::UnboundedSender<Message>, msg: Value) {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
         "session/update" => {
@@ -412,6 +581,18 @@ async fn handle_agent_message(tx: &mpsc::UnboundedSender<Message>, agent: &Agent
                 "agent_message_chunk" => {
                     if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(Value::as_str) {
                         let _ = tx.send(text_msg(json!({ "type": "append", "role": "agent", "text": text })));
+                    }
+                }
+                "user_message_chunk" => {
+                    // Only emitted during `session/load` replay, so this
+                    // does not double-render live prompts (the browser
+                    // already echoes those locally).
+                    if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(Value::as_str) {
+                        let _ = tx.send(text_msg(json!({
+                            "type": "append",
+                            "role": "user",
+                            "text": format!("> {text}\n")
+                        })));
                     }
                 }
                 "agent_thought_chunk" => {
@@ -439,28 +620,25 @@ async fn handle_agent_message(tx: &mpsc::UnboundedSender<Message>, agent: &Agent
             }
         }
         "session/request_permission" => {
-            // Auto-allow for the sketch. We pick the first offered option,
-            // which for most agents is some form of "allow once". If the
-            // agent offers only a denial option first, this will deny —
-            // that is also a reason to build a real permission UI.
-            if let Some(id) = msg.get("id").cloned() {
-                let option_id = msg
-                    .get("params")
-                    .and_then(|p| p.get("options"))
-                    .and_then(Value::as_array)
-                    .and_then(|opts| opts.first())
-                    .and_then(|o| o.get("optionId"))
+            // Forward to the browser. The reply comes back as a
+            // `permission_response` browser message, handled in the WS
+            // select loop (see `handle_ws`). JSON-RPC id is passed through
+            // unchanged so we can respond to the agent with it.
+            if let Some(params) = msg.get("params") {
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let title = params
+                    .get("toolCall")
+                    .and_then(|tc| tc.get("title").or_else(|| tc.get("name")))
                     .and_then(Value::as_str)
-                    .unwrap_or("allow_once")
+                    .unwrap_or("tool")
                     .to_string();
-                if let Err(e) = agent
-                    .respond(id, json!({ "outcome": { "outcome": "selected", "optionId": option_id } }))
-                    .await
-                {
-                    let _ = tx.send(text_msg(json!({ "type": "error", "message": format!("permission reply failed: {e}") })));
-                } else {
-                    let _ = tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": "[permission auto-allowed]\n" })));
-                }
+                let options = params.get("options").cloned().unwrap_or(Value::Array(vec![]));
+                let _ = tx.send(text_msg(json!({
+                    "type": "permission_request",
+                    "id": id,
+                    "title": title,
+                    "options": options
+                })));
             }
         }
         _ => {
@@ -476,14 +654,6 @@ async fn handle_agent_message(tx: &mpsc::UnboundedSender<Message>, agent: &Agent
 /// `handle_agent_message` free of `Message::Text(...)` noise.
 fn text_msg(value: Value) -> Message {
     Message::Text(value.to_string())
-}
-
-/// Send a `sys`-role line to the browser. Used for the short status messages
-/// racp itself emits (startup, errors, permission auto-allow).
-fn send_sys(tx: &mpsc::UnboundedSender<Message>, text: &str) -> Result<()> {
-    tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": text })))
-        .map_err(|_| anyhow!("ws channel closed"))?;
-    Ok(())
 }
 
 // ---------- telegram transport (stub) ----------
@@ -528,8 +698,10 @@ struct Agent {
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     /// Updates receiver, handed out exactly once via `take_updates`.
     updates_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
-    /// Owned child so drop kills it (see `kill_on_drop(true)`).
-    _child: Mutex<Child>
+    /// Owned child. SIGKILL on drop (kill_on_drop) remains as a safety net,
+    /// but `shutdown` tries a clean EOF+wait first so Kiro can release its
+    /// per-session lockfile.
+    child: Mutex<Child>
 }
 
 impl Agent {
@@ -575,6 +747,40 @@ impl Agent {
         stdin.write_all(line.as_bytes()).await?;
         stdin.flush().await?;
         Ok(())
+    }
+
+    /// Send a JSON-RPC notification (no id, no response expected). Used for
+    /// one-way signals like `session/cancel`.
+    async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        let line = format!("{}\n", json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Cooperative shutdown:
+    ///   1. Best-effort `session/cancel` so any in-flight tool or turn stops.
+    ///   2. Close stdin so the agent sees EOF and exits cleanly. Kiro uses
+    ///      this signal to release its per-session PID lockfile; without it
+    ///      you get "Session is active in another process (PID ...)" errors
+    ///      on the next `session/load`.
+    ///   3. Wait up to 500ms for the child to exit.
+    ///   4. If the timeout expires, fall through — `kill_on_drop` will still
+    ///      SIGKILL the child when the Agent is dropped shortly after.
+    async fn shutdown(&self, session_id: Option<&str>) {
+        if let Some(sid) = session_id {
+            let _ = self.notify("session/cancel", json!({ "sessionId": sid })).await;
+        }
+        {
+            let mut stdin = self.stdin.lock().await;
+            let _ = stdin.shutdown().await;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            let mut child = self.child.lock().await;
+            let _ = child.wait().await;
+        })
+        .await;
     }
 }
 
@@ -650,6 +856,6 @@ async fn spawn_agent(cfg: &Config) -> Result<Agent> {
         next_id: AtomicI64::new(1),
         pending,
         updates_rx: Mutex::new(Some(updates_rx)),
-        _child: Mutex::new(child)
+        child: Mutex::new(child)
     })
 }

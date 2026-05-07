@@ -145,18 +145,47 @@ All frames are JSON text.
 
 ```json
 { "type": "prompt", "text": "hello" }
+{ "type": "permission_response", "id": <original id>, "optionId": "allow_once" }
+{ "type": "cancel" }
 ```
 
 **racp → browser:**
 
 ```json
+{ "type": "ready", "sessionId": "sess_...", "resumed": true | false }
 { "type": "append", "role": "user" | "agent" | "sys", "text": "..." }
 { "type": "prompt_done" }
+{ "type": "permission_request", "id": <original id>, "title": "...", "options": [...] }
 { "type": "error", "message": "..." }
 ```
 
 The browser appends `{role}`-classed text into the scrollback; roles drive
 colour. `prompt_done` re-enables the input after a turn completes.
+`permission_request` renders an inline card with one button per option; the
+user's click sends back a `permission_response` with the matching
+`optionId`, which racp forwards to the agent. `cancel` triggers
+`session/cancel` on the agent. `ready` fires once per (re)connect and carries
+the ACP `sessionId`; the browser persists it so reconnects and reloads pass
+`?session=<id>` and the server can `session/load` to resume history.
+
+The WS upgrade URL also accepts `?cwd=<absolute-path>` to scope the session
+to a different working directory than `racp`'s own process cwd. When the
+browser prompts on `+`, it passes the result here; absent or empty means
+fall back to `racp`'s cwd.
+
+### Cross-device UI state
+
+The browser persists the open-tabs list, history, and numeric counter via
+two endpoints:
+
+- `GET /state` — returns the current state JSON, or `{}` if nothing stored.
+- `PUT /state` — atomically replaces the state (writes to `.tmp` + rename).
+
+Backing file: `~/.racp/state.json`. Any browser hitting this racp sees the
+same tabs and history — useful when you move between laptop and phone
+through the same tunnel. Actual conversation content stays with the agent
+(Kiro at `~/.kiro/sessions/cli/`); racp only stores labels, cwds, and
+ACP session ids.
 
 ### racp ↔ agent (over stdio, ACP JSON-RPC 2.0)
 
@@ -166,8 +195,9 @@ Methods currently exercised:
 - `session/new` — creates one session per browser connection. `cwd` is
   `racp`'s current working directory.
 - `session/prompt` — forwards each user message.
-- `session/request_permission` — handled by auto-allowing the first offered
-  option. See *Known gaps*.
+- `session/request_permission` — forwarded to the browser as a
+  `permission_request` event; racp waits for the user's click and replies to
+  the agent with the selected `optionId`.
 
 Notifications handled (`session/update` with `sessionUpdate` variants):
 
@@ -203,27 +233,20 @@ KIRO_LOG_LEVEL=debug ./target/release/racp
 
 All marked with `TODO:` in the source.
 
-1. **Permission UI.** `session/request_permission` currently auto-allows the
-   first offered option. The browser needs a button row and `racp` needs to
-   forward options to it and wait for the response. See
-   `handle_agent_message` in `src/main.rs`.
-2. **Auth enforcement.** `racp` trusts everything that reaches the WebSocket
+1. **Auth enforcement.** `racp` trusts everything that reaches the WebSocket
    upgrade. When fronted by Cloudflare Access, validate the
    `Cf-Access-Jwt-Assertion` header (JWKS at
    `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`). See
    `ws_upgrade` in `src/main.rs`.
-3. **Telegram transport.** `run_telegram` is a stub. Planned shape: long-poll
+2. **Telegram transport.** `run_telegram` is a stub. Planned shape: long-poll
    `getUpdates`, one ACP agent per Telegram chat, stream chunks as
    `editMessageText` throttled to ~1/s, inline keyboard for permission
    prompts. Per-user-token model (BotFather) keeps `racp` out of the data
    path.
-4. **Kiro extensions (`_kiro.dev/*`).** Not forwarded. Useful candidates:
+3. **Kiro extensions (`_kiro.dev/*`).** Not forwarded. Useful candidates:
    slash-command availability (could become a UI affordance), MCP OAuth URL
    (needs user redirect), compaction status (status-bar hint).
-5. **Session reuse.** Each browser reload kills its agent and spawns a fresh
-   one. Reusing sessions via `session/load` would keep history across
-   reconnects. Kiro persists sessions at `~/.kiro/sessions/cli/`.
-6. **Streamable HTTP remote transport.** ACP's draft RFD defines an HTTP/WS
+4. **Streamable HTTP remote transport.** ACP's draft RFD defines an HTTP/WS
    remote transport with `Acp-Connection-Id` and `Acp-Session-Id` headers;
    today `racp` is purely a local stdio client. Once the RFD stabilises and
    agents support it, `racp` can become a thin remote adapter too.
