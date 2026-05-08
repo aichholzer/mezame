@@ -134,8 +134,8 @@ export const TabBar = ({
   };
 
   return (
-    <header className="border-b bg-background">
-      <div className="flex w-full items-center gap-2 px-2 py-2.5">
+    <header className="mx-3 mt-3 h-16 rounded-xl border border-[color:var(--primary)]/60 bg-background/70 shadow-lg shadow-black/30 backdrop-blur-md">
+      <div className="flex h-full w-full items-center gap-2 px-3">
         <DropdownMenu>
         <Tooltip>
           <TooltipTrigger asChild>
