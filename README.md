@@ -16,6 +16,8 @@ The name is Japanese for "wake up" (起きろ), which is what you do to your age
 
 `Okiro` is an **ACP client**. It spawns your configured agent binary as a child process, speaks JSON-RPC 2.0 with it over stdio, and bridges the conversation to a browser over WebSockets. The agent keeps its own credentials and model choice; `Okiro` carries none.
 
+> **Tested with Kiro CLI.** The protocol surface is standard ACP, so any stdio-speaking agent should work for the core loop (prompt, stream, cancel, permissions, modes, models). A few features lean on Kiro-specific extensions and disk layout: chat history rehydration reads `~/.kiro/sessions/cli/<id>.jsonl`, slash-command autocomplete consumes the `_kiro.dev/commands/available` notification, and stale-lock recovery targets Kiro's lockfile convention. Claude Agent CLI, Gemini CLI, Codex, and others should connect, but are currently untested; expect missing command autocomplete and no history replay on resume. Bug reports welcome.
+
 ## Features
 
 ### Sessions
@@ -48,7 +50,7 @@ The name is Japanese for "wake up" (起きろ), which is what you do to your age
 - Self-contained release binary. React + Tailwind UI baked in via `rust-embed`; no static file hosting required.
 - Loopback-only bind (`127.0.0.1`). Designed to sit behind a named Cloudflare Tunnel with Cloudflare Access for authentication.
 - Interactive first-run setup (`okiro init`) writes `~/.okiro/config.toml`.
-- Agent-agnostic. Works with any stdio-speaking ACP agent: Kiro, Claude Agent CLI, Gemini CLI, Codex, or anything else that implements the protocol.
+- Agent-agnostic on the core loop. Tested with Kiro CLI; Claude Agent CLI, Gemini CLI, Codex, and other stdio-speaking ACP agents should connect, with some Kiro-specific niceties (command autocomplete, history replay) unavailable.
 
 ## Architecture
 
