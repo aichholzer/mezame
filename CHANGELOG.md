@@ -4,13 +4,81 @@ All notable user-visible changes to Okiro!. Format follows
 [Keep a Changelog](https://keepachangelog.com) loosely; versions are
 [SemVer](https://semver.org).
 
-The version is tracked in two places and must match:
+The version is tracked in three places and must match:
 
 - `Cargo.toml` → `package.version`
 - `ui/package.json` → `version`
+- the heading of the top-most release section below
 
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
+
+## [0.7.1] — 2026-05-08
+
+### Added
+
+- **Attachments in prompts.** Paste an image, drop a file on the
+  composer, or click the paperclip to open a file picker. The server
+  forwards the agent's `promptCapabilities` from `initialize` in the
+  `ready` event, and the composer gates which file types it accepts
+  (images only when the agent advertises `image`, resources only when
+  it advertises `embeddedContext`). Per-attachment cap 5 MB, total 20
+  MB, max 10 per message.
+- **Tool-call cards.** Tool calls now render as a collapsible row in
+  the chat: summary shows title and a status pill, expanding reveals
+  arguments (JSON), output (markdown or JSON), and the file locations
+  touched. Updates with the same `toolCallId` merge in place.
+- **Favicon attention badge.** Background-tab attention (permission
+  request, turn complete, error) paints a red numeric pill onto the
+  favicon and prefixes `document.title` with `(N) `. Attention now
+  also raises for the active in-app session when the whole Okiro
+  browser tab is hidden, so you see a badge when a turn finishes
+  while you're reading elsewhere. `visibilitychange` clears it on
+  return.
+- **Cwd chip in the composer.** Shows the working directory the
+  session was started with, with the server-reported resolved path
+  (not just the user-supplied override). Double-click to open a
+  sibling tab at a different path.
+- **Bind-address menu in `okiro init`.** Three options: loopback
+  (default), `0.0.0.0` for trusted-LAN setups where cloudflared runs
+  elsewhere, or a custom address. The LAN option prints an explicit
+  warning that Okiro has no auth of its own today.
+
+### Changed
+
+- **UI deps refreshed.** TypeScript 5.7 to 6.0, Vite 6 to 8 with
+  `@vitejs/plugin-react` 4 to 6, react-markdown 9 to 10, lucide-react
+  0.475 to 1.14, `@types/node` 22 to 25; all other deps bumped to the
+  current latest. TypeScript 6 required dropping `baseUrl` from the
+  tsconfigs (moduleResolution "bundler" resolves `paths` relative to
+  the tsconfig itself) and adding an ambient `declare module '*.css'`
+  for side-effect CSS imports.
+- **Header restyle.** Tab bar now renders as a floating card with
+  rounded corners and the same primary-blue border as the composer at
+  the bottom.
+- **Telegram option removed from `okiro init`.** Picking it prints an
+  informative "not yet implemented" message and re-prompts. The enum,
+  config field, and stub remain for forward compatibility.
+- **Prose sweep.** User-facing stderr lines, anyhow contexts, error
+  messages to the browser, and init prompts rewritten as sentence case
+  with em dashes replaced by colons. Init prompt accepts transport
+  identifiers case-insensitively. New logos, new favicon, and a new
+  "Why Okiro" section in the README positioning the tool against
+  direct-to-provider gateways.
+
+### Fixed
+
+- `cargo build` on a clean checkout no longer requires the
+  `cloudflared/` folder to exist; the example config is inlined in
+  the README instead, and `ui/dist/` is gitignored as expected.
+- Rebased a `build.rs` docstring typo and cleaned up stale comment
+  blocks in `src/main.rs`.
+
+### Known gaps
+
+- Attachments in historical turns are not rehydrated on resume. The
+  `/history` parser only handles text today; inspecting what Kiro
+  records for image and resource blocks in its JSONL is a follow-up.
 
 ## [0.6.0] — 2026-05-07
 
