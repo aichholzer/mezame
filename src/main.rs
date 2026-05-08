@@ -1,41 +1,10 @@
-//! okiro — bridge an ACP-compliant local agent to a remote UI.
+//! Okiro: an ACP client that bridges a local agent to a browser UI.
 //!
-//! # Overview
+//! One WebSocket connection = one agent subprocess = one ACP session.
+//! The agent is killed when the browser disconnects (`kill_on_drop(true)`).
 //!
-//! okiro is an **ACP client**. For each incoming browser WebSocket it spawns a
-//! fresh agent subprocess (configured via `agent_cmd` + `agent_args`), sends
-//! `initialize` followed by `session/new`, then forwards each user message as
-//! `session/prompt` and streams `session/update` notifications back to the
-//! browser as terminal-style text.
-//!
-//! One WebSocket connection = one agent subprocess = one ACP session. When the
-//! browser disconnects the agent is killed (via `kill_on_drop(true)`).
-//!
-//! # Transports
-//!
-//! - `cloudflared`: HTTP + WebSocket on `127.0.0.1:<bind>` fronted by an
-//!   existing Cloudflare Tunnel. The React UI under `ui/` is built by
-//!   `build.rs` and embedded via `rust-embed`, so the binary is
-//!   self-contained.
-//! - `telegram`: stub. See [`run_telegram`]; schema is stable so implementing
-//!   it later does not break existing configs.
-//!
-//! # Wire shapes
-//!
-//! Browser ↔ okiro (JSON over WS):
-//!   { type: "prompt", text: string }                           // client→server
-//!   { type: "append", role: "user"|"agent"|"sys", text: str }  // server→client
-//!   { type: "prompt_done" }                                    // server→client
-//!   { type: "error", message: string }                         // server→client
-//!
-//! okiro ↔ agent (JSON-RPC 2.0 over stdio): standard ACP. See the README for
-//! the list of methods and `session/update` variants we actually handle, and
-//! which ones Kiro emits vs ignores.
-//!
-//! # Known gaps
-//!
-//! Search for `TODO:` to find the extension points. The README has the same
-//! list with more context for new contributors.
+//! See the README for architecture, wire protocol, transports, and
+//! extension points. In-code extension points are marked with `TODO:`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -112,7 +81,7 @@ fn config_path() -> Result<PathBuf> {
 }
 
 /// Path to the persistent browser state (currently-open tabs, history list,
-/// active id, next numeric label). Server-side so any device hitting okiro
+/// active id, next numeric label). Server-side so any device hitting Okiro
 /// sees the same list.
 fn state_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
@@ -248,7 +217,7 @@ async fn run_cloudflared(cfg: Config) -> Result<()> {
         .with_state(shared);
 
     let listener = TcpListener::bind(&cfg.bind).await?;
-    eprintln!("okiro listening on http://{} (front with your Cloudflare Tunnel)", cfg.bind);
+    eprintln!("Okiro listening on http://{} (front with your Cloudflare Tunnel)", cfg.bind);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -319,7 +288,7 @@ fn mime_for(path: &str) -> &'static str {
 }
 
 /// GET /state — returns the persisted browser state as JSON, or `{}` if the
-/// file does not exist yet. okiro does not interpret the contents; it is
+/// file does not exist yet. Okiro does not interpret the contents; it is
 /// purely a cross-device store for the UI.
 async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
     let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -488,10 +457,10 @@ async fn ws_upgrade(
     Query(params): Query<HashMap<String, String>>,
     State(cfg): State<Arc<Config>>
 ) -> Response {
-    // `/ws?session=<acp-session-id>` asks okiro to call `session/load` on the
+    // `/ws?session=<acp-session-id>` asks Okiro to call `session/load` on the
     // agent instead of `session/new`. Absent = always new session.
     // `/ws?cwd=<path>` overrides the working directory for this session;
-    // absent or empty = okiro's own process cwd.
+    // absent or empty = Okiro's own process cwd.
     let resume = params.get("session").cloned();
     let cwd_override = params
         .get("cwd")
@@ -554,7 +523,7 @@ async fn handle_ws(
     };
 
     // ACP handshake. `initialize` advertises no filesystem capabilities
-    // because okiro does not back `fs/read_text_file` etc. today — the agent
+    // because Okiro does not back `fs/read_text_file` etc. today; the agent
     // is expected to use its own tools for file I/O.
     agent
         .request(
@@ -576,7 +545,7 @@ async fn handle_ws(
     // history rehydrates.
     //
     // `cwd` comes from the browser's `?cwd=<path>` query param if provided;
-    // otherwise we use okiro's own process cwd.
+    // otherwise we use Okiro's own process cwd.
     let cwd_str = match cwd_override {
         Some(c) => c,
         None => std::env::current_dir()?.to_string_lossy().to_string()
@@ -984,7 +953,7 @@ fn extract_session_info(result: &Value) -> Option<Value> {
 // an ACP process is attached to that session. Two ways this gets in our
 // way:
 //
-// 1. Dead-PID stale lock. A previous okiro (or Kiro child) was SIGKILLed
+// 1. Dead-PID stale lock. A previous Okiro (or Kiro child) was SIGKILLed
 //    before its cooperative shutdown could run. The lockfile persists
 //    pointing at a PID that no longer exists.
 // 2. Live-PID transient contention. Browser reload causes the old WS
@@ -1141,7 +1110,7 @@ fn short_reason(msg: &str) -> String {
 //   - Stream `agent_message_chunk` output as a single `sendMessage` followed
 //     by `editMessageText` calls throttled to ~1/s (Telegram per-chat limit).
 //   - Inline keyboard for `session/request_permission` replies.
-//   - Per-user bot tokens (created via @BotFather) keep okiro out of the
+//   - Per-user bot tokens (created via @BotFather) keep Okiro out of the
 //     shared infrastructure path; long polling requires exactly one process
 //     per token.
 
@@ -1301,7 +1270,7 @@ async fn spawn_agent(cfg: &Config) -> Result<Agent> {
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
 
     // Optional ACP tracing. Set `OKIRO_DEBUG_ACP=1` to dump every inbound
-    // line from the agent to okiro's stderr. Helpful when wiring new
+    // line from the agent to Okiro's stderr. Helpful when wiring new
     // Kiro extensions (`_kiro.dev/*`) or debugging wire-shape mismatches.
     let debug_acp = std::env::var_os("OKIRO_DEBUG_ACP").is_some();
 
