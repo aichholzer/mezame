@@ -1,8 +1,8 @@
-//! racp — bridge an ACP-compliant local agent to a remote UI.
+//! okiro — bridge an ACP-compliant local agent to a remote UI.
 //!
 //! # Overview
 //!
-//! racp is an **ACP client**. For each incoming browser WebSocket it spawns a
+//! okiro is an **ACP client**. For each incoming browser WebSocket it spawns a
 //! fresh agent subprocess (configured via `agent_cmd` + `agent_args`), sends
 //! `initialize` followed by `session/new`, then forwards each user message as
 //! `session/prompt` and streams `session/update` notifications back to the
@@ -14,20 +14,21 @@
 //! # Transports
 //!
 //! - `cloudflared`: HTTP + WebSocket on `127.0.0.1:<bind>` fronted by an
-//!   existing Cloudflare Tunnel. The terminal-style UI is embedded via
-//!   `include_str!("ui.html")` so the binary is self-contained.
+//!   existing Cloudflare Tunnel. The React UI under `ui/` is built by
+//!   `build.rs` and embedded via `rust-embed`, so the binary is
+//!   self-contained.
 //! - `telegram`: stub. See [`run_telegram`]; schema is stable so implementing
 //!   it later does not break existing configs.
 //!
 //! # Wire shapes
 //!
-//! Browser ↔ racp (JSON over WS):
+//! Browser ↔ okiro (JSON over WS):
 //!   { type: "prompt", text: string }                           // client→server
 //!   { type: "append", role: "user"|"agent"|"sys", text: str }  // server→client
 //!   { type: "prompt_done" }                                    // server→client
 //!   { type: "error", message: string }                         // server→client
 //!
-//! racp ↔ agent (JSON-RPC 2.0 over stdio): standard ACP. See the README for
+//! okiro ↔ agent (JSON-RPC 2.0 over stdio): standard ACP. See the README for
 //! the list of methods and `session/update` variants we actually handle, and
 //! which ones Kiro emits vs ignores.
 //!
@@ -44,16 +45,18 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State
     },
-    http::StatusCode,
-    response::{Html, Response},
+    http::{header, HeaderValue, StatusCode, Uri},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router
 };
 use futures_util::{SinkExt, StreamExt};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -62,11 +65,20 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 const PROTOCOL_VERSION: u32 = 1;
-const UI_HTML: &str = include_str!("ui.html");
+
+/// React UI bundle baked into the binary by `build.rs` + `rust-embed`.
+///
+/// In `--release` the files are compiled in and the binary is truly
+/// self-contained. In debug builds (with the `debug-embed` feature) files
+/// are read from disk at runtime, so a `npm run build` in `ui/` is enough
+/// to refresh the bundle without touching cargo.
+#[derive(RustEmbed)]
+#[folder = "ui/dist/"]
+struct UiAssets;
 
 // ---------- config ----------
 //
-// On-disk config lives at `~/.racp/config.toml`. Schema changes are breaking
+// On-disk config lives at `~/.okiro/config.toml`. Schema changes are breaking
 // for existing users, so add fields with `#[serde(default)]` rather than
 // reshuffling. The `Transport` enum gates which `run_*` function main() calls.
 
@@ -96,15 +108,15 @@ struct TelegramConfig {
 
 fn config_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".racp/config.toml"))
+    Ok(PathBuf::from(home).join(".okiro/config.toml"))
 }
 
 /// Path to the persistent browser state (currently-open tabs, history list,
-/// active id, next numeric label). Server-side so any device hitting racp
+/// active id, next numeric label). Server-side so any device hitting okiro
 /// sees the same list.
 fn state_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".racp/state.json"))
+    Ok(PathBuf::from(home).join(".okiro/state.json"))
 }
 
 fn load_config() -> Result<Config> {
@@ -226,23 +238,88 @@ fn main() -> Result<()> {
 async fn run_cloudflared(cfg: Config) -> Result<()> {
     let shared = Arc::new(cfg.clone());
     let app = Router::new()
-        .route("/", get(serve_ui))
         .route("/ws", get(ws_upgrade))
         .route("/state", get(get_state).put(put_state))
+        .route("/history", get(get_history))
+        // SPA fallback: /, /assets/*, and any unknown path resolve against
+        // the embedded UI bundle, with index.html as the fallback for
+        // client-side routes.
+        .fallback(get(serve_ui_asset))
         .with_state(shared);
 
     let listener = TcpListener::bind(&cfg.bind).await?;
-    eprintln!("racp listening on http://{} (front with your Cloudflare Tunnel)", cfg.bind);
+    eprintln!("okiro listening on http://{} (front with your Cloudflare Tunnel)", cfg.bind);
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn serve_ui() -> Html<&'static str> {
-    Html(UI_HTML)
+/// Serve a single file from the embedded UI bundle.
+///
+/// Strips the leading `/`, falls back to `index.html` for empty paths and
+/// for any unknown path (so the SPA handles its own routing). Sets a
+/// reasonable Cache-Control: long-lived for hashed `/assets/*` filenames
+/// Vite emits, no-cache for `index.html`.
+async fn serve_ui_asset(uri: Uri) -> Response {
+    let raw_path = uri.path().trim_start_matches('/');
+    // Resolve to an actual asset. `/` and unknown routes both fall back to
+    // `index.html` so the SPA can handle its own routing.
+    let (asset, resolved_path) = match UiAssets::get(raw_path) {
+        Some(a) => (a, raw_path),
+        None => match UiAssets::get("index.html") {
+            Some(a) => (a, "index.html"),
+            None => {
+                return (StatusCode::NOT_FOUND, "UI bundle missing").into_response();
+            }
+        }
+    };
+    let is_index = resolved_path == "index.html";
+
+    let mime = mime_for(resolved_path);
+    let cache_control = if is_index {
+        "no-cache, no-store, must-revalidate"
+    } else if resolved_path.starts_with("assets/") {
+        // Vite emits content-hashed filenames under /assets, so we can
+        // cache them for a year without risking stale content.
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
+        .header(header::CACHE_CONTROL, HeaderValue::from_static(cache_control))
+        .body(Body::from(asset.data.into_owned()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response build failed").into_response())
+}
+
+/// Tiny mime-type lookup for the handful of extensions Vite emits. Keeps us
+/// off a `mime_guess` dependency.
+fn mime_for(path: &str) -> &'static str {
+    let lower = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match lower.as_str() {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream"
+    }
 }
 
 /// GET /state — returns the persisted browser state as JSON, or `{}` if the
-/// file does not exist yet. racp does not interpret the contents; it is
+/// file does not exist yet. okiro does not interpret the contents; it is
 /// purely a cross-device store for the UI.
 async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
     let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
@@ -274,15 +351,147 @@ async fn put_state(Json(body): Json<Value>) -> Result<StatusCode, (StatusCode, S
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// GET /history?session=<id> — returns a compact history reconstructed from
+/// Kiro's own `~/.kiro/sessions/cli/<id>.jsonl` event log.
+///
+/// Kiro records a `meta.timestamp` (Unix seconds) only on `Prompt` entries.
+/// Subsequent `AssistantMessage` / `ToolResults` inherit the timestamp of
+/// the most recent preceding `Prompt`, which is the right grouping: a
+/// turn and its reply share a single user-facing time.
+///
+/// Returned JSON:
+///   { "entries": [{ "role": "user"|"agent"|"sys", "text": "...",
+///                   "timestamp": <ms since epoch> }, ...] }
+///
+/// Missing session file → `{ "entries": [] }`, not an error. Reading a
+/// file Kiro currently has open for append is safe; we only read.
+async fn get_history(
+    Query(params): Query<HashMap<String, String>>
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let Some(sid) = params.get("session") else {
+        return Err((StatusCode::BAD_REQUEST, "missing ?session=<id>".into()));
+    };
+    // Block path traversal defensively: Kiro session ids are UUIDs, and
+    // we only ever want a single file next to the others.
+    if sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "invalid session id".into()));
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "HOME not set".into()));
+    };
+    let path = PathBuf::from(home).join(format!(".kiro/sessions/cli/{sid}.jsonl"));
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Json(json!({ "entries": [] })));
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+    };
+
+    let entries = parse_kiro_history(&raw);
+    Ok(Json(json!({ "entries": entries })))
+}
+
+/// Parse Kiro's session JSONL into compact browser-facing entries.
+///
+/// Shape we consume (all other variants ignored):
+///   { "kind": "Prompt", "data": {
+///       "content": [{ "kind": "text", "data": "..." }, ...],
+///       "meta": { "timestamp": <unix seconds> } } }
+///   { "kind": "AssistantMessage", "data": {
+///       "content": [{ "kind": "text", "data": "..." }, ...] } }
+///
+/// Any `content` block whose `kind` is not `"text"` is dropped here; we
+/// don't try to reconstruct thinking blocks, tool calls, or tool results
+/// in the history view. If Kiro ever starts emitting verbose tool panels
+/// in the UI, those should come through as structured events separately.
+fn parse_kiro_history(raw: &str) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    // Timestamp of the most recent Prompt. Persisted in ms for the
+    // browser's `Date` math; Kiro stores seconds.
+    let mut current_ts_ms: Option<i64> = None;
+
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
+        let data = entry.get("data").cloned().unwrap_or(Value::Null);
+
+        match kind {
+            "Prompt" => {
+                let ts_sec = data
+                    .get("meta")
+                    .and_then(|m| m.get("timestamp"))
+                    .and_then(Value::as_i64);
+                if let Some(secs) = ts_sec {
+                    current_ts_ms = Some(secs.saturating_mul(1000));
+                }
+                if let Some(text) = extract_text_blocks(&data) {
+                    out.push(json!({
+                        "role": "user",
+                        "text": text,
+                        "timestamp": current_ts_ms
+                    }));
+                }
+            }
+            "AssistantMessage" => {
+                if let Some(text) = extract_text_blocks(&data) {
+                    out.push(json!({
+                        "role": "agent",
+                        "text": text,
+                        "timestamp": current_ts_ms
+                    }));
+                }
+            }
+            _ => {
+                // Ignore ToolResults, thinking-only messages, any other
+                // variants. The live view will render those for new
+                // turns; replayed history stays lean.
+            }
+        }
+    }
+
+    out
+}
+
+/// Concatenate all `content[].data` strings where `content[].kind == "text"`,
+/// with newlines between blocks. Returns `None` when there's nothing useful
+/// (e.g. an assistant turn that was only a tool call).
+fn extract_text_blocks(data: &Value) -> Option<String> {
+    let content = data.get("content")?.as_array()?;
+    let mut buf = String::new();
+    for block in content {
+        if block.get("kind").and_then(Value::as_str) == Some("text") {
+            if let Some(s) = block.get("data").and_then(Value::as_str) {
+                if !s.is_empty() {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(s);
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     Query(params): Query<HashMap<String, String>>,
     State(cfg): State<Arc<Config>>
 ) -> Response {
-    // `/ws?session=<acp-session-id>` asks racp to call `session/load` on the
+    // `/ws?session=<acp-session-id>` asks okiro to call `session/load` on the
     // agent instead of `session/new`. Absent = always new session.
     // `/ws?cwd=<path>` overrides the working directory for this session;
-    // absent or empty = racp's own process cwd.
+    // absent or empty = okiro's own process cwd.
     let resume = params.get("session").cloned();
     let cwd_override = params
         .get("cwd")
@@ -345,7 +554,7 @@ async fn handle_ws(
     };
 
     // ACP handshake. `initialize` advertises no filesystem capabilities
-    // because racp does not back `fs/read_text_file` etc. today — the agent
+    // because okiro does not back `fs/read_text_file` etc. today — the agent
     // is expected to use its own tools for file I/O.
     agent
         .request(
@@ -367,44 +576,41 @@ async fn handle_ws(
     // history rehydrates.
     //
     // `cwd` comes from the browser's `?cwd=<path>` query param if provided;
-    // otherwise we use racp's own process cwd.
+    // otherwise we use okiro's own process cwd.
     let cwd_str = match cwd_override {
         Some(c) => c,
         None => std::env::current_dir()?.to_string_lossy().to_string()
     };
 
-    let (session_id, resumed) = match resume_session_id {
-        Some(sid) => {
-            let load_res = agent
-                .request(
-                    "session/load",
-                    json!({
-                        "sessionId": sid,
-                        "cwd": cwd_str,
-                        "mcpServers": []
-                    })
-                )
-                .await;
-            match load_res {
-                Ok(_) => (sid, true),
-                Err(e) => {
-                    eprintln!("session/load failed ({e}); falling back to session/new");
-                    let new_session = agent
-                        .request(
-                            "session/new",
-                            json!({ "cwd": cwd_str, "mcpServers": [] })
-                        )
-                        .await
-                        .context("session/new (fallback)")?;
-                    let sid = new_session
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
-                        .to_string();
-                    (sid, false)
-                }
+    let (session_id, resumed, session_info) = match resume_session_id {
+        Some(sid) => match try_load_session(&agent, &sid, &cwd_str).await {
+            Ok(value) => (sid, true, extract_session_info(&value)),
+            Err(err_str) => {
+                eprintln!("session/load failed ({err_str}); falling back to session/new");
+                let _ = to_ws_tx.send(text_msg(json!({
+                    "type": "append",
+                    "role": "sys",
+                    "text": format!(
+                        "\n[previous session {} could not be resumed ({}). Starting a new one.]\n",
+                        short_id(&sid),
+                        short_reason(&err_str)
+                    )
+                })));
+                let new_session = agent
+                    .request(
+                        "session/new",
+                        json!({ "cwd": cwd_str, "mcpServers": [] })
+                    )
+                    .await
+                    .context("session/new (fallback)")?;
+                let sid = new_session
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
+                    .to_string();
+                (sid, false, extract_session_info(&new_session))
             }
-        }
+        },
         None => {
             let new_session = agent
                 .request(
@@ -418,7 +624,7 @@ async fn handle_ws(
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
                 .to_string();
-            (sid, false)
+            (sid, false, extract_session_info(&new_session))
         }
     };
 
@@ -430,6 +636,24 @@ async fn handle_ws(
         "sessionId": session_id,
         "resumed": resumed
     })));
+
+    // Send the `modes` and `models` payload (if present in either
+    // session/new or session/load result) so the UI can render its
+    // mode/model selectors and the current selections.
+    if let Some(info) = session_info {
+        let _ = to_ws_tx.send(text_msg(json!({
+            "type": "session_info",
+            "info": info
+        })));
+    }
+
+    // After a successful `session/load`, Kiro replays past messages via
+    // `session/update` notifications. The browser instead fetches the
+    // history via `/history` (with real per-turn timestamps from the
+    // on-disk `.jsonl`), so forwarding Kiro's replay would produce
+    // duplicates. Drop `session/update` events until the first user-sent
+    // prompt after resume; permission/tool requests still flow through.
+    let mut suppress_session_updates = resumed;
 
     // Hand over the single updates receiver produced by `spawn_agent`. Only
     // one task may own it; we own it here, for the life of the session.
@@ -454,6 +678,11 @@ async fn handle_ws(
                         let Some(user_text) = v.get("text").and_then(Value::as_str) else {
                             continue;
                         };
+
+                        // First live prompt after resume: stop hiding
+                        // `session/update` events. From here on everything
+                        // the agent emits is genuinely new.
+                        suppress_session_updates = false;
 
                         // Run `session/prompt` in its own task so the select
                         // loop keeps pumping `session/update` notifications
@@ -528,12 +757,61 @@ async fn handle_ws(
                                 .await;
                         });
                     }
+                    Some("set_mode") => {
+                        // Kiro calls them "modes" but the available ids are
+                        // agent configs (`kiro_default`, `kiro_planner`,
+                        // `kiro_guide`). Forward as `session/set_mode`.
+                        let Some(mode_id) = v.get("modeId").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let mode_id = mode_id.to_string();
+                        let agent = agent.clone();
+                        let sid = session_id.clone();
+                        let to_ws = to_ws_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = agent
+                                .request(
+                                    "session/set_mode",
+                                    json!({ "sessionId": sid, "modeId": mode_id })
+                                )
+                                .await
+                            {
+                                let _ = to_ws.send(text_msg(json!({
+                                    "type": "error",
+                                    "message": format!("set_mode failed: {e}")
+                                })));
+                            }
+                        });
+                    }
+                    Some("set_model") => {
+                        let Some(model_id) = v.get("modelId").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let model_id = model_id.to_string();
+                        let agent = agent.clone();
+                        let sid = session_id.clone();
+                        let to_ws = to_ws_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = agent
+                                .request(
+                                    "session/set_model",
+                                    json!({ "sessionId": sid, "modelId": model_id })
+                                )
+                                .await
+                            {
+                                let _ = to_ws.send(text_msg(json!({
+                                    "type": "error",
+                                    "message": format!("set_model failed: {e}")
+                                })));
+                            }
+                        });
+                    }
                     _ => continue
                 }
             }
             // Agent → user: notifications and server-initiated requests.
             Some(agent_msg) = updates_rx.recv() => {
-                handle_agent_message(&to_ws_tx, agent_msg).await;
+                handle_agent_message(&to_ws_tx, agent_msg, suppress_session_updates).await;
             }
             else => break
         }
@@ -555,26 +833,51 @@ async fn handle_ws(
 
 /// Translate an agent-originated message into browser-facing events.
 ///
+/// `suppress_session_updates` is set by the WS handler during a resume
+/// window: the browser seeds its log from `/history` instead of the ACP
+/// replay, so forwarding `session/update` events would duplicate every
+/// replayed chunk. Server-initiated requests (permission prompts) are
+/// still forwarded — they only occur for live tool calls, not replay.
+///
 /// Currently understood:
 ///
 /// - `session/update`:
 ///     - `agent_message_chunk`   → append as `agent` text
 ///     - `agent_thought_chunk`   → append as `sys` with a `(thinking)` prefix
 ///     - `tool_call` / `tool_call_update` → append `[title — status]`
-/// - `session/request_permission` → auto-allow the first offered option
+/// - `session/request_permission` → forwarded to the browser as a
+///   `permission_request` event.
+/// - `_kiro.dev/commands/available` → trimmed and forwarded as a
+///   `commands` event (just the `commands` + `prompts` arrays; the big
+///   `tools` catalogue is dropped to keep the WS frame small).
 ///
-/// Everything else is silently dropped, including Kiro's `_kiro.dev/*`
-/// extension notifications (slash-command catalogue, MCP OAuth URLs, etc.).
-/// Wire those up here if you want them surfaced — each has its own
-/// `method` name and params shape; see the Kiro CLI ACP docs.
-///
-/// TODO(permission-ui): replace the auto-allow with a real prompt. The browser
-/// protocol needs a new message type carrying the toolCall summary and the
-/// option list, and a corresponding response type selecting an option.
-async fn handle_agent_message(tx: &mpsc::UnboundedSender<Message>, msg: Value) {
+/// Everything else is silently dropped, including Kiro's other
+/// `_kiro.dev/*` extension notifications.
+async fn handle_agent_message(
+    tx: &mpsc::UnboundedSender<Message>,
+    msg: Value,
+    suppress_session_updates: bool
+) {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
+        "_kiro.dev/commands/available" => {
+            // Kiro re-emits this notification as its catalogue warms up
+            // (MCP servers load, etc.). We treat each emission as the
+            // full current catalogue; last-wins semantics on the browser.
+            if let Some(params) = msg.get("params") {
+                let commands = params.get("commands").cloned().unwrap_or(Value::Array(vec![]));
+                let prompts = params.get("prompts").cloned().unwrap_or(Value::Array(vec![]));
+                let _ = tx.send(text_msg(json!({
+                    "type": "commands",
+                    "commands": commands,
+                    "prompts": prompts
+                })));
+            }
+        }
         "session/update" => {
+            if suppress_session_updates {
+                return;
+            }
             let update = msg.get("params").and_then(|p| p.get("update")).cloned().unwrap_or(Value::Null);
             let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
             match kind {
@@ -656,6 +959,179 @@ fn text_msg(value: Value) -> Message {
     Message::Text(value.to_string())
 }
 
+/// Pull the `modes` and `models` blocks out of a `session/new` or
+/// `session/load` result. Returns `None` when neither is present so the
+/// WS handler can skip emitting the `session_info` event entirely.
+///
+/// The shape passed through is exactly what Kiro sends, so the browser
+/// can key off `currentModeId` / `availableModes` / `currentModelId` /
+/// `availableModels` without any translation.
+fn extract_session_info(result: &Value) -> Option<Value> {
+    let modes = result.get("modes").cloned();
+    let models = result.get("models").cloned();
+    if modes.is_none() && models.is_none() {
+        return None;
+    }
+    Some(json!({
+        "modes": modes,
+        "models": models
+    }))
+}
+
+// ---------- stale-lock recovery ----------
+//
+// Kiro writes a `<session-id>.lock` file into `~/.kiro/sessions/cli/` while
+// an ACP process is attached to that session. Two ways this gets in our
+// way:
+//
+// 1. Dead-PID stale lock. A previous okiro (or Kiro child) was SIGKILLed
+//    before its cooperative shutdown could run. The lockfile persists
+//    pointing at a PID that no longer exists.
+// 2. Live-PID transient contention. Browser reload causes the old WS
+//    handler to begin shutting down Kiro while the new WS handler is
+//    already trying to `session/load`. For a few hundred ms the old Kiro
+//    really is alive and really does own the session.
+//
+// `try_load_session` below handles both: it retries `session/load` with a
+// short back-off while the error is "Session is active in another
+// process", stealing the lockfile whenever the named PID is dead.
+
+/// Attempt to resume an existing ACP session, recovering from the stale
+/// lock / shutdown-race conditions described above.
+///
+/// On success returns the full `session/load` result so the caller can
+/// forward modes/models to the browser just like on `session/new`. On a
+/// non-recoverable error, or if retries are exhausted, returns
+/// `Err(last_error_message)`.
+async fn try_load_session(agent: &Agent, sid: &str, cwd: &str) -> std::result::Result<Value, String> {
+    // ~1.25s total budget: 5 attempts at 250ms spacing. Empirically covers
+    // the cooperative shutdown path (500ms) plus a little headroom for
+    // Kiro to actually release the lockfile after its child exits.
+    const ATTEMPTS: u32 = 6;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let mut last_err = String::new();
+    for attempt in 0..ATTEMPTS {
+        let res = agent
+            .request(
+                "session/load",
+                json!({
+                    "sessionId": sid,
+                    "cwd": cwd,
+                    "mcpServers": []
+                })
+            )
+            .await;
+        match res {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                last_err = format!("{e}");
+                if !is_stale_lock_error(&last_err) {
+                    // Any other error (session truly missing, schema
+                    // mismatch, etc.) is not going to fix itself with
+                    // retries. Give up immediately.
+                    break;
+                }
+                // Steal the lock if its PID is dead; this always makes
+                // the next attempt succeed if the problem was purely a
+                // stale lockfile. If the PID is alive we leave the lock
+                // alone and let the shutdown-race back-off do its job.
+                let stole = steal_stale_session_lock(sid);
+                if stole {
+                    eprintln!("session/load {sid}: stale lock stolen on attempt {}", attempt + 1);
+                    // Don't burn a backoff sleep if we just cleared the
+                    // blocker ourselves.
+                    continue;
+                }
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(BACKOFF).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// True if the agent's error message is the stale-PID lock case.
+fn is_stale_lock_error(msg: &str) -> bool {
+    msg.contains("Session is active in another process")
+}
+
+/// If the lockfile for `session_id` points at a dead PID, remove it and
+/// return true. Any uncertainty (lockfile missing, unreadable, malformed,
+/// PID still alive) returns false so we fall through to `session/new`.
+fn steal_stale_session_lock(session_id: &str) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let path = std::path::PathBuf::from(home).join(format!(".kiro/sessions/cli/{session_id}.lock"));
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    // Lockfile shape: {"pid":12345,"started_at":"..."}. Keep the parse
+    // narrow; we don't care about the timestamp.
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let Some(pid) = parsed.get("pid").and_then(Value::as_i64) else {
+        return false;
+    };
+    if pid_is_alive(pid as i32) {
+        return false;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            eprintln!("stole stale Kiro session lock (pid {pid}): {}", path.display());
+            true
+        }
+        Err(_) => false
+    }
+}
+
+/// Unix PID liveness check. `kill(pid, 0)` returns 0 if the process exists
+/// and we can signal it, `-1` otherwise. On ESRCH (no such process) the
+/// PID is definitely dead; on EPERM the process exists but we can't
+/// signal it, which for our case means we should NOT steal the lock.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    // SAFETY: `kill` with signal 0 does not send a signal, it only
+    // queries existence. No state is mutated.
+    unsafe { libc_kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: i32) -> bool {
+    // Non-unix: don't risk stealing a lock we can't verify.
+    true
+}
+
+// Minimal FFI binding to avoid pulling in `libc` for one call.
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+/// First eight hex chars of a UUID-shaped session id, for user-facing log.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Best-effort one-liner summary of an agent error string for the log.
+fn short_reason(msg: &str) -> String {
+    // Strip our wrapper and the JSON framing Kiro returns. The interesting
+    // bits live in the `data` field of the JSON-RPC error.
+    if let Some(start) = msg.find("\"data\":\"") {
+        let rest = &msg[start + 8..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_string();
+        }
+    }
+    // Fallback: trim the generic prefixes so the user sees something
+    // useful rather than three nested quote levels.
+    msg.trim_start_matches("agent error: ").trim().to_string()
+}
+
 // ---------- telegram transport (stub) ----------
 //
 // TODO(telegram): implement. Planned shape:
@@ -665,12 +1141,12 @@ fn text_msg(value: Value) -> Message {
 //   - Stream `agent_message_chunk` output as a single `sendMessage` followed
 //     by `editMessageText` calls throttled to ~1/s (Telegram per-chat limit).
 //   - Inline keyboard for `session/request_permission` replies.
-//   - Per-user bot tokens (created via @BotFather) keep racp out of the
+//   - Per-user bot tokens (created via @BotFather) keep okiro out of the
 //     shared infrastructure path; long polling requires exactly one process
 //     per token.
 
 async fn run_telegram(_cfg: Config) -> Result<()> {
-    bail!("telegram transport is not yet implemented; re-run `racp init` and pick cloudflared");
+    bail!("telegram transport is not yet implemented; re-run `okiro init` and pick cloudflared");
 }
 
 // ---------- ACP agent subprocess ----------
@@ -824,6 +1300,11 @@ async fn spawn_agent(cfg: &Config) -> Result<Agent> {
     let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
 
+    // Optional ACP tracing. Set `OKIRO_DEBUG_ACP=1` to dump every inbound
+    // line from the agent to okiro's stderr. Helpful when wiring new
+    // Kiro extensions (`_kiro.dev/*`) or debugging wire-shape mismatches.
+    let debug_acp = std::env::var_os("OKIRO_DEBUG_ACP").is_some();
+
     // Stdout reader: route responses vs notifications.
     //
     // A response is any message carrying `result` or `error` whose `id`
@@ -834,6 +1315,9 @@ async fn spawn_agent(cfg: &Config) -> Result<Agent> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
+            if debug_acp {
+                eprintln!("[acp<-] {line}");
+            }
             let msg: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
                 Err(_) => continue // malformed line; skip silently

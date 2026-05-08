@@ -27,3 +27,8 @@
 # Cloudflared credentials if anyone ever generates them in-tree
 # (the convention is ~/.cloudflared/<uuid>.json, but cheap insurance)
 cloudflared/*.json
+
+# React UI (ui/)
+ui/node_modules/
+ui/dist/
+ui/*.tsbuildinfo

@@ -1,10 +1,10 @@
-# Named Cloudflare Tunnel config for the RACP agent.
+# Named Cloudflare Tunnel config for Okiro!.
 # WebSocket upgrade is forwarded by default; no extra flags needed.
 
 tunnel: REPLACE_WITH_TUNNEL_UUID
 credentials-file: /Users/stefan/.cloudflared/REPLACE_WITH_TUNNEL_UUID.json
 
 ingress:
-  - hostname: racp.example.com
+  - hostname: okiro.example.com
     service: http://localhost:7842
   - service: http_status:404
