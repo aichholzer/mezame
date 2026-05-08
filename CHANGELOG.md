@@ -13,6 +13,54 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.0] — 2026-05-08
+
+### Breaking
+
+- **Config format switched from TOML to JSON.** Config path moved from
+  `~/.okiro/config.toml` to `~/.okiro/config.json`. Existing users are
+  dropped into `okiro init` on next launch; the new config is written
+  after interactive setup.
+- **Transports are now a list.** The top-level `transport` enum and
+  `bind` string are gone. Replaced by `transports: [{ "kind":
+  "cloudflared", "bind": "..." }]`. Only one entry is accepted at
+  runtime today; the list shape is forward-compatible with a future
+  Telegram transport without another break.
+- **Default port changed from 7842 to 9510.** Existing tunnels and LAN
+  bookmarks need to be updated accordingly, or set a custom `bind` in
+  the new config.
+
+### Added
+
+- **`cargo install okiro` support.** Crate now carries the metadata
+  crates.io requires (`description`, `license`, `keywords`,
+  `categories`, `repository`, `readme`, `exclude`). `build.rs`
+  compiles the UI inside `$OUT_DIR` instead of the source tree so
+  `cargo publish` verify passes.
+- **Interactive init with arrow keys.** `okiro init` now uses
+  `dialoguer` for the bind-address and agent menus. `init` also probes
+  `$PATH` for known ACP CLIs (Kiro CLI, Claude Agent CLI, Gemini CLI,
+  Codex) and offers them as a pick list; "Other" drops to a free-form
+  prompt. Kiro CLI pre-fills `acp` as the subcommand.
+- **Graceful shutdown on SIGTERM / SIGINT.** Okiro now stops accepting
+  new connections and exits promptly when `systemctl stop` or
+  `launchctl bootout` asks. Pairs with the new
+  [service guide](./docs/service.md) covering systemd user and system
+  units and a macOS LaunchAgent.
+
+### Changed
+
+- **Source layout.** `src/main.rs` split into six modules (`config`,
+  `agent`, `session`, `http`, `ws`, plus a thin `main`). Behavioural
+  change: none. Easier to navigate.
+- **Dependency trim.** `toml` removed (6 transitive crates gone). axum
+  dropped to `default-features = false` with only the features we
+  actually use. `rust-embed`'s `debug-embed` swapped for
+  `interpolate-folder-path`.
+- **Docs split.** Architecture, wire protocol, Cloudflare setup,
+  development, and the service guide all moved to `docs/`. README down
+  from ~260 lines to ~130.
+
 ## [0.7.1] — 2026-05-08
 
 ### Added
