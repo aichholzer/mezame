@@ -3,12 +3,31 @@ name = "okiro"
 version = "0.7.1"
 edition = "2021"
 build = "build.rs"
+description = "An ACP client that bridges a local agent (Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, ...) to a browser UI over WebSockets."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/aichholzer/okiro"
+keywords = ["acp", "agent", "cli", "kiro", "websocket"]
+categories = ["command-line-utilities", "web-programming::websocket"]
+# `ui/node_modules/` is populated by `build.rs` inside `$OUT_DIR` and
+# never reaches the source tree during a clean build. We also ignore it
+# via `.gitignore`. Excluded explicitly here for belt-and-braces. Assets
+# and the changelog are not needed at build time; the README links to
+# raw.githubusercontent.com for the banner image.
+exclude = [
+    "ui/node_modules/**",
+    "ui/dist/**",
+    "assets/**",
+    "CHANGELOG.md",
+    "todo.md"
+]
 
 [dependencies]
 anyhow = "1.0.95"
 axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
+dialoguer = { version = "0.12.0", default-features = false }
 futures-util = "0.3.31"
-rust-embed = { version = "8.5.0", features = ["debug-embed"] }
+rust-embed = { version = "8.5.0", features = ["interpolate-folder-path"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "sync"] }

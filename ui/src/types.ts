@@ -1,5 +1,5 @@
 // Wire-protocol types between the browser and okiro. These mirror the
-// shapes produced by handle_agent_message in src/main.rs.
+// shapes produced by handle_agent_message in src/ws.rs.
 
 export type Role = 'user' | 'agent' | 'sys';
 
@@ -7,12 +7,12 @@ export type Attention = 'done' | 'permission' | 'error' | null;
 
 export type ServerMessage =
   | {
-      type: 'ready';
-      sessionId: string;
-      resumed: boolean;
-      cwd?: string;
-      promptCapabilities?: PromptCapabilities;
-    }
+    type: 'ready';
+    sessionId: string;
+    resumed: boolean;
+    cwd?: string;
+    promptCapabilities?: PromptCapabilities;
+  }
   | { type: 'session_info'; info: SessionInfo }
   | { type: 'commands'; commands: SlashCommand[]; prompts: SlashPrompt[] }
   | { type: 'append'; role: Role; text: string }
@@ -44,11 +44,11 @@ export type PromptBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; mimeType: string; data: string }
   | {
-      type: 'resource';
-      resource:
-        | { uri: string; mimeType?: string; text: string }
-        | { uri: string; mimeType?: string; blob: string };
-    };
+    type: 'resource';
+    resource:
+    | { uri: string; mimeType?: string; text: string }
+    | { uri: string; mimeType?: string; blob: string };
+  };
 
 export type SessionInfo = {
   modes?: {
@@ -116,28 +116,28 @@ export type ToolCallStatus = 'pending' | 'in_progress' | 'completed' | 'failed' 
 export type LogEntry =
   | { kind: 'text'; id: string; role: Role; text: string; timestamp: number }
   | {
-      kind: 'permission';
-      id: string;
-      requestId: number | string;
-      title: string;
-      options: PermissionOption[];
-      timestamp: number;
-      /** Set once the user picks an option. Presence disables buttons. */
-      resolution?: string;
-    }
+    kind: 'permission';
+    id: string;
+    requestId: number | string;
+    title: string;
+    options: PermissionOption[];
+    timestamp: number;
+    /** Set once the user picks an option. Presence disables buttons. */
+    resolution?: string;
+  }
   | {
-      kind: 'tool_call';
-      id: string;
-      /** ACP tool-call id; keyed for in-place updates. */
-      toolCallId: string;
-      title: string;
-      status: ToolCallStatus | null;
-      toolKind: string | null;
-      rawInput: unknown;
-      content: unknown;
-      locations: ToolCallLocation[];
-      timestamp: number;
-    };
+    kind: 'tool_call';
+    id: string;
+    /** ACP tool-call id; keyed for in-place updates. */
+    toolCallId: string;
+    title: string;
+    status: ToolCallStatus | null;
+    toolKind: string | null;
+    rawInput: unknown;
+    content: unknown;
+    locations: ToolCallLocation[];
+    timestamp: number;
+  };
 
 export type Status = 'connecting' | 'connected' | 'reconnecting' | 'error';
 

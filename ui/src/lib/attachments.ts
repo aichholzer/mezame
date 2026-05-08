@@ -9,7 +9,7 @@ import type { PromptBlock, PromptCapabilities } from '@/types';
 // Attachments sent in a prompt are not rehydrated when the browser
 // reconnects and issues `session/load`. Reasoning: Okiro's `/history`
 // endpoint parses Kiro's on-disk JSONL, which today we only read for
-// text turns (see `parse_kiro_history` in `src/main.rs`). Kiro's JSONL
+// text turns (see `parse_kiro_history` in `src/http.rs`). Kiro's JSONL
 // almost certainly records the full ACP prompt payload, but we have
 // not inspected what shape it uses for image / resource blocks, and
 // the parser would need corresponding work. Until then, expect to see
