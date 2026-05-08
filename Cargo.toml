@@ -6,13 +6,12 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.95"
-axum = { version = "0.7.9", features = ["ws"] }
+axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 futures-util = "0.3.31"
 rust-embed = { version = "8.5.0", features = ["debug-embed"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "sync"] }
-toml = "0.8.19"
 
 [profile.release]
 lto = true

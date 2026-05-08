@@ -5,7 +5,7 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
 // Dev: Vite runs on :5173 with HMR and proxies /ws and /state to the Rust
-// binary on :7842. Release builds emit to ui/dist and get baked into the
+// binary on :9510. Release builds emit to ui/dist and get baked into the
 // binary via rust-embed.
 
 // Surface the version string in `ui/package.json` to the UI at build
@@ -28,12 +28,12 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/ws': {
-        target: 'ws://127.0.0.1:7842',
+        target: 'ws://127.0.0.1:9510',
         ws: true,
         changeOrigin: true
       },
-      '/state': 'http://127.0.0.1:7842',
-      '/legacy': 'http://127.0.0.1:7842'
+      '/state': 'http://127.0.0.1:9510',
+      '/legacy': 'http://127.0.0.1:9510'
     }
   },
   build: {

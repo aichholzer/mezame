@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Okiro_lg.png" alt="Okiro!" width="100%">
+  <img src="assets/Okiro.png" alt="Okiro!" width="100%">
 </p>
 
 # Okiro!
@@ -10,7 +10,7 @@ A small Rust bridge that puts a browser-based chat UI in front of a locally runn
 
 [acp]: https://agentclientprotocol.com
 
-The name is Japanese for "wake up" (起きろ), which is what you do to your agent when you page it from across town. It also happens to contain "kiro", which has a nice ring to it.
+The name is Japanese for "wake up" (**起きろ**), which is what you do to your agent when you page it from across town.
 
 ## What it does
 
@@ -41,8 +41,8 @@ There are plenty of tools that let you drive an LLM from the couch. Most of them
 - Session persistence across browser reloads and server restarts. Tab list and ACP session ids live in `~/.okiro/state.json` on the server.
 - Cross-device state sync. Any browser hitting the same `Okiro` instance sees the same tabs and recently-closed history.
 - Recently-closed history (up to 20 entries) with one-click restore. Forget entries you no longer need.
-- Session resumption with automatic recovery from stale lockfiles (steals the lock when the holding PID is dead).
-- Per-session working directory override (`?cwd=<abs-path>`), so different tabs can target different repositories.
+- Session resumption with automatic recovery from stale lockfiles.
+- Per-session working directory override (`?cwd=<abs-path>`), so different tabs can target different directories.
 - Cooperative cancel of the active turn.
 - Auto-reconnect with exponential back-off on WebSocket drops.
 
@@ -66,7 +66,7 @@ There are plenty of tools that let you drive an LLM from the couch. Most of them
 
 - Self-contained release binary. React + Tailwind UI baked in via `rust-embed`; no static file hosting required.
 - Loopback bind by default (`127.0.0.1`); `okiro init` also offers `0.0.0.0` for trusted LAN setups. Designed to sit behind a named Cloudflare Tunnel with Cloudflare Access for authentication.
-- Interactive first-run setup (`okiro init`) writes `~/.okiro/config.toml`.
+- Interactive first-run setup (`okiro init`) writes `~/.okiro/config.json`.
 - Agent-agnostic on the core loop. Tested with Kiro CLI; Claude Agent CLI, Gemini CLI, Codex, and other stdio-speaking ACP agents should connect, with some Kiro-specific niceties (command autocomplete, history replay) unavailable.
 
 ## Architecture
@@ -74,17 +74,17 @@ There are plenty of tools that let you drive an LLM from the couch. Most of them
 ```mermaid
 flowchart LR
   browser[Browser]
-  okiro["Okiro<br/>(this crate)"]
+  okiro["Okiro"]
   agent["Agent<br/>(kiro-cli acp,<br/>claude, gemini,<br/>codex, ...)"]
-  transport["Transport layer<br/>(cloudflared today,<br/>telegram TODO)"]
+  transport["Transport layer"]
 
   browser <-- WS --> okiro
-  okiro <-- "stdio JSON-RPC" --> agent
+  okiro <-- "STDIO JSON-RPC" --> agent
   okiro --- transport
 ```
 
 - One browser WebSocket connection = one `Okiro` session = one freshly spawned agent subprocess = one ACP session.
-- `Okiro` listens only on `127.0.0.1`. Public reachability is delegated to an existing Cloudflare Tunnel on your network.
+- `Okiro` binds loopback by default; `okiro init` also offers `0.0.0.0` for trusted-LAN setups. Public reachability is delegated to an existing Cloudflare Tunnel on your network.
 - The web UI is a React + Tailwind v4 + shadcn app under `ui/`. A `build.rs` step runs the Vite build; the compiled bundle is baked into the binary via `rust-embed` so the release binary stays self-contained.
 
 ## File layout
@@ -96,6 +96,7 @@ Okiro/
 ├── CHANGELOG.md
 ├── LICENSE
 ├── build.rs                    # runs `npm ci` + `npm run build` in ui/
+├── assets/                     # logo (Okiro.png) and source artwork (Okiro.af), README-only
 ├── src/
 │   └── main.rs                 # config, ACP bridge, transports, HTTP
 ├── ui/                         # React UI (Vite, TS, Tailwind v4, shadcn)
@@ -119,7 +120,7 @@ Okiro/
 
 - Rust toolchain (`cargo`, edition 2021 or newer).
 - Node.js 24 or newer with `npm` on `PATH`. The build script invokes `npm ci` and `npm run build` under `ui/` to produce the bundle that gets embedded into the binary. If `node` or `npm` are missing, the Rust build fails fast with an actionable error. `brew install node` on macOS, or use [nvm][nvm] / your distro's package manager.
-- An ACP-capable agent binary somewhere on `PATH` (Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, etc.). You configure which one at first launch.
+- An ACP-capable agent binary somewhere on `PATH` (Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, etc.).
 
 [nvm]: https://github.com/nvm-sh/nvm
 
@@ -132,40 +133,35 @@ cargo build --release
 
 `cargo build` invokes the UI build as part of `build.rs`. First build seeds `ui/node_modules` via `npm ci`; subsequent builds are cache hits and mostly free. Set `OKIRO_SKIP_UI_BUILD=1` to skip the UI build when iterating on Rust only; you are then responsible for keeping `ui/dist/` populated.
 
-First launch without config drops into an interactive setup and writes `~/.okiro/config.toml`. Re-run setup any time:
+First launch without config drops into an interactive setup and writes `~/.okiro/config.json`. Re-run setup any time:
 
 ```sh
 ./target/release/okiro init
 ```
 
-Then point a browser at `http://127.0.0.1:7842` to smoke-test locally, or at your public hostname once the tunnel is wired.
+`init` asks for the agent command and its args separately. The args matter: most agent CLIs need a subcommand to enter ACP mode on stdio. For Kiro CLI that's `acp`. Without the subcommand, the agent starts in its normal interactive mode and Okiro's first JSON-RPC message goes nowhere. Check the [agent command examples](#agent-command-examples) below if you're using something other than Kiro.
+
+Then point a browser at `http://127.0.0.1:9510` to smoke-test locally, or at your public hostname once the tunnel is wired.
 
 
 ## Configuration reference
 
-`~/.okiro/config.toml`:
+`~/.okiro/config.json`:
 
-```toml
-# Transport picks how clients reach Okiro.
-#   "cloudflared" — serves HTTP + WebSocket on `bind`, for an external tunnel.
-#   "telegram"    — stub; long-polls a Telegram bot. Not yet implemented; `okiro init`
-#                   does not offer it as a choice, but the field still parses.
-transport = "cloudflared"
-
-# Local bind address. Default is loopback; `okiro init` offers `0.0.0.0:7842`
-# if you want LAN reach. Okiro has no auth of its own today, so anything
-# non-loopback relies on Cloudflare Access (or your LAN being trusted).
-bind = "127.0.0.1:7842"
-
-# Command to launch the ACP agent. Either a bare name (resolved via $PATH) or
-# an absolute path. For Kiro: `kiro-cli` with args ["acp"].
-agent_cmd = "kiro-cli"
-agent_args = ["acp"]
-
-[telegram]
-# Only used when transport = "telegram". Create with @BotFather.
-token = ""
+```json
+{
+  "transports": [
+    { "kind": "cloudflared", "bind": "127.0.0.1:9510" }
+  ],
+  "agent_cmd": "kiro-cli",
+  "agent_args": ["acp"]
+}
 ```
+
+- `transports`: list of transport entries. Each entry is internally tagged by `kind`. Only `"cloudflared"` is implemented today; running more than one entry at once is not yet supported, so keep the list at a single element. The list shape is future-proofing for adding Telegram and others later (see Roadmap).
+- `transports[].kind = "cloudflared"`: serves HTTP + WebSocket on `bind`, for an external tunnel.
+- `transports[].bind` (cloudflared only): local bind address. Default is loopback; `okiro init` offers `0.0.0.0:9510` if you want LAN reach. Okiro has no auth of its own today, so anything non-loopback relies on Cloudflare Access, or your LAN being trusted.
+- `agent_cmd`: command to launch the ACP agent. Either a bare name, resolved via `$PATH`, or an absolute path. For Kiro use `kiro-cli` with args `["acp"]`.
 
 ### Agent command examples
 
@@ -204,7 +200,7 @@ A named Cloudflare Tunnel can route a public hostname at your local `Okiro`. The
 
    ingress:
      - hostname: okiro.example.com
-       service: http://localhost:7842
+       service: http://localhost:9510
      - service: http_status:404
    ```
 
@@ -232,7 +228,7 @@ If you already have `cloudflared` running (Proxmox LXC, Docker, systemd unit, wh
 ingress:
   # ... your existing rules above ...
   - hostname: okiro.example.com
-    service: http://<host-running-okiro>:7842
+    service: http://<host-running-okiro>:9510
   # keep the catch-all last
   - service: http_status:404
 ```
@@ -352,12 +348,17 @@ Stderr carries `Okiro`'s own logs and, prefixed with `[agent]`, the agent's stde
 ## Known gaps (pick up here)
 
 1. **Auth enforcement.** `Okiro` trusts everything that reaches the WebSocket upgrade. When fronted by Cloudflare Access, validate the `Cf-Access-Jwt-Assertion` header (JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`). See `ws_upgrade` in `src/main.rs` and the backlog in `todo.md`.
-2. **Telegram transport.** `run_telegram` is a stub. Planned shape: long-poll `getUpdates`, one ACP agent per Telegram chat, stream chunks as `editMessageText` throttled to ~1/s, inline keyboard for permission prompts. Per-user-token model (BotFather) keeps `Okiro` out of the data path.
-3. **Remaining Kiro extensions.** MCP OAuth URL (needs user redirect) and compaction / clear status notifications are still dropped. Slash commands and the commands catalogue are surfaced.
-4. **Attachment rehydration on resume.** Prompts with images or embedded resources are sent correctly on the live path, but when the browser reconnects and Okiro replays history via Kiro's on-disk JSONL, only text turns are rendered. The parser in `parse_kiro_history` (`src/main.rs`) only knows about user/agent text today. Extending it requires knowing the shape Kiro uses for non-text prompt blocks in its JSONL, which has not been inspected yet. Until then, attachments in historical turns will appear as plain text (or be missing entirely) after a resume.
-5. **Streamable HTTP remote transport.** ACP's draft RFD defines an HTTP/WS remote transport with `Acp-Connection-Id` and `Acp-Session-Id` headers; today `Okiro` is purely a local stdio client. Once the RFD stabilises and agents support it, `Okiro` can become a thin remote adapter too.
+2. **Remaining Kiro extensions.** MCP OAuth URL (needs user redirect) and compaction / clear status notifications are still dropped. Slash commands and the commands catalogue are surfaced.
+3. **Attachment rehydration on resume.** Prompts with images or embedded resources are sent correctly on the live path, but when the browser reconnects and Okiro replays history via Kiro's on-disk JSONL, only text turns are rendered. The parser in `parse_kiro_history` (`src/main.rs`) only knows about user/agent text today. Extending it requires knowing the shape Kiro uses for non-text prompt blocks in its JSONL, which has not been inspected yet. Until then, attachments in historical turns will appear as plain text (or be missing entirely) after a resume.
 
 Everything else proposed (markdown polish, exports, keyboard shortcuts, mobile layout, per-tool allow/deny, etc.) lives in `todo.md`.
+
+## Roadmap
+
+Planned additions. None of these ship today, and none block the core loop.
+
+1. **Telegram transport.** `run_telegram` is a stub and the option is hidden from `okiro init`. Planned shape: long-poll `getUpdates`, one ACP agent per Telegram chat, stream chunks as `editMessageText` throttled to ~1/s, inline keyboard for permission prompts. Per-user-token model (BotFather) keeps `Okiro` out of the data path.
+2. **Streamable HTTP remote transport.** ACP's draft RFD defines an HTTP/WS remote transport with `Acp-Connection-Id` and `Acp-Session-Id` headers; today `Okiro` is purely a local stdio client. Once the RFD stabilises and agents support it, `Okiro` can become a thin remote adapter too.
 
 ## Development guide
 
@@ -387,7 +388,7 @@ npm run build   # emits ui/dist/
 Two terminals:
 
 ```sh
-# terminal 1: Rust on :7842
+# terminal 1: Rust on :9510
 cargo run --release
 
 # terminal 2: Vite with HMR on :5173, proxies /ws, /state, /history
@@ -412,7 +413,7 @@ Browse `http://127.0.0.1:5173`. The embedded bundle is only relevant when you ru
 
 There are no tests yet. Practical coverage to add:
 
-- **Config round-trip.** Property test that `Config` survives `toml::to_string_pretty` to `toml::from_str`.
+- **Config round-trip.** Property test that `Config` survives `serde_json::to_string_pretty` to `serde_json::from_str`.
 - **JSON-RPC routing.** Unit test the reader task: feed it a mix of responses (by id), notifications, and malformed lines, assert the right routing.
 - **End-to-end smoke.** Spawn `Okiro` with `agent_cmd = "bash"` and `agent_args = ["-c", "<echo canned JSON-RPC>"]` as a fake agent.
 - **History parser.** Feed `parse_kiro_history` a representative `.jsonl` fragment; assert timestamps propagate from `Prompt` to the subsequent `AssistantMessage` entries.
@@ -427,7 +428,7 @@ There are no tests yet. Practical coverage to add:
 ## Troubleshooting
 
 **`failed to spawn kiro-cli`**
- `agent_cmd` not on `$PATH`. Use `which kiro-cli` and put the absolute path in `~/.okiro/config.toml`.
+ `agent_cmd` not on `$PATH`. Use `which kiro-cli` and put the absolute path in `~/.okiro/config.json`.
 
 **`cargo build` fails with "npm not found"**
  `build.rs` requires `node` and `npm`. Install Node.js, or set `OKIRO_SKIP_UI_BUILD=1` and produce `ui/dist/` yourself.
@@ -439,7 +440,7 @@ There are no tests yet. Practical coverage to add:
  The browser tried to resume via `session/load` and Kiro refused. Either the session file is gone from `~/.kiro/sessions/cli/`, or a live process still holds the lock. `Okiro` retries with exponential back-off (~1.25 s budget) and steals stale-PID locks automatically. If you see this message persistently, there is a genuine conflict: check `ps` for another Kiro process holding that session, or delete the `.lock` file manually.
 
 **Cloudflare hostname returns 502**
- The `cloudflared` machine cannot reach the `Okiro` machine. Check `service: http://<host>:7842` in the ingress rule resolves and the port is open on the `Okiro` host.
+ The `cloudflared` machine cannot reach the `Okiro` machine. Check `service: http://<host>:9510` in the ingress rule resolves and the port is open on the `Okiro` host.
 
 **WebSocket closes immediately**
  Cloudflare Access policy is rejecting the upgrade. Hit the hostname in a browser first to satisfy Access, then retry.

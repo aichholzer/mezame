@@ -159,11 +159,11 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
 
 Okiro has no auth of its own. The intended production posture is:
 
-- `bind = "127.0.0.1:7842"` on the host running Okiro.
-- `cloudflared` on the same host (or another container on a trusted LAN), ingress pointing at `http://localhost:7842` or `http://<okiro-host>:7842`.
+- `bind = "127.0.0.1:9510"` on the host running Okiro.
+- `cloudflared` on the same host (or another container on a trusted LAN), ingress pointing at `http://localhost:9510` or `http://<okiro-host>:9510`.
 - Cloudflare Access on the public hostname, gating with an identity provider.
 
-`okiro init` offers `0.0.0.0:7842` as an option for trusted-LAN setups where `cloudflared` runs on a different container and needs to reach Okiro across the LAN. Picking that option opts into "my LAN is my trust boundary", which is on the user, not the tool. Default stays loopback.
+`okiro init` offers `0.0.0.0:9510` as an option for trusted-LAN setups where `cloudflared` runs on a different container and needs to reach Okiro across the LAN. Picking that option opts into "my LAN is my trust boundary", which is on the user, not the tool. Default stays loopback.
 
 Open work in this area:
 
@@ -172,7 +172,7 @@ Open work in this area:
 - **Size:** half a day including JWKS caching.
 - **Where:** `ws_upgrade` (and any other public route) in `src/main.rs`.
 - **What:** validate `Cf-Access-Jwt-Assertion` before allowing the WS upgrade. JWKS lives at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. Verify the signature, `aud`, `iss`, `exp`. Cache the JWKS with a reasonable TTL (15 min) and refresh on signature miss.
-- **Config:** add `access.team_domain` and `access.aud` to `~/.okiro/config.toml`. Optional; when unset, skip validation (local-only mode).
+- **Config:** add `access.team_domain` and `access.aud` to `~/.okiro/config.json`. Optional; when unset, skip validation (local-only mode).
 - **Gotchas:**
   - Bypass the check when the request is from `127.0.0.1` so local smoke tests still work.
   - Add the crates we need: `jsonwebtoken`, `reqwest` (or reuse something we already have to avoid bloat; check tls features carefully).
@@ -205,31 +205,38 @@ Open work in this area:
 
 ### 19. Multi-transport: run more than one channel at once
 
-- **Size:** day (the wiring), plus whatever individual transports still need (telegram is todo #N inside `run_telegram`).
-- **Where:** `Config`, `Transport`, and the `match cfg.transport` block in `main`. Today `transport` is a single enum variant; everything downstream assumes one channel per process.
+- **Size:** half a day (runtime only), plus whatever individual transports still need (telegram, item #20).
+- **Status:** config shape shipped. `Config.transports: Vec<TransportConfig>` is live and `okiro init` writes a single-entry list. The runtime still only supports one entry and bails on multi-entry configs; that's what this item covers.
+- **Where:** the `match cfg.transports.as_slice()` block in `main`.
 - **What:** let a user configure and run multiple transports from one Okiro process. Use cases today: cloudflared-fronted web UI for desktop, Telegram for phone, both pointing at the same agent pool. In the future: Matrix, Discord, iMessage.
-- **Config shape sketch:**
+- **Current config shape (already live):**
 
-  ```toml
-  # Old single-transport config still parses and runs the one channel.
-  transport = "cloudflared"
+  ```json
+  {
+    "transports": [
+      { "kind": "cloudflared", "bind": "127.0.0.1:9510" }
+    ],
+    "agent_cmd": "kiro-cli",
+    "agent_args": ["acp"]
+  }
+  ```
 
-  # New: list of transports, each with its own section. `transport` field
-  # is dropped in favour of presence of `[[transports]]` entries.
-  [[transports]]
-  kind = "cloudflared"
-  bind = "127.0.0.1:7842"
+  With Telegram (once the variant is restored):
 
-  [[transports]]
-  kind = "telegram"
-  token = "..."
+  ```json
+  {
+    "transports": [
+      { "kind": "cloudflared", "bind": "127.0.0.1:9510" },
+      { "kind": "telegram", "token": "..." }
+    ],
+    "agent_cmd": "kiro-cli",
+    "agent_args": ["acp"]
+  }
   ```
 
 - **Runtime:** each configured transport spawns its own tokio task with its own ACP session pool. `cloudflared` task owns the WS server; `telegram` task owns a `getUpdates` long-poll loop. They are independent, so one failing does not take the other down.
-- **Migration:** on startup, if only legacy `transport = "x"` is present, synthesise a single-entry `[[transports]]` list so existing configs still work. Remove the legacy field after a deprecation window, or leave it indefinitely for simple setups.
+- **Init rewrite:** when the second transport is added, the commented-out transport prompt in `init_config` gets rewritten, not uncommented: ask for the first transport, offer to add another, loop until the user says no. The single-choice block currently commented out in the source is not reusable as-is.
 - **Gotchas:**
-  - `TelegramConfig` already has a `token` field at the top level; it moves into the per-transport table.
-  - Per-transport `bind` is required for cloudflared (different tabs want different local ports if the user runs two). The top-level `bind` field goes away alongside `transport`.
   - Error aggregation: `main` needs to wait for all transport tasks and surface the first non-graceful exit, while still honouring Ctrl+C.
   - Session state (tabs, closed history) in `~/.okiro/state.json` is currently shared across the process. That is fine; transports are channels into the same agent pool, not isolated instances.
 

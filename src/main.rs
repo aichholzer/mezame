@@ -34,6 +34,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 const PROTOCOL_VERSION: u32 = 1;
+const DEFAULT_PORT: u16 = 9510;
 
 /// React UI bundle baked into the binary by `build.rs` + `rust-embed`.
 ///
@@ -47,37 +48,34 @@ struct UiAssets;
 
 // ---------- config ----------
 //
-// On-disk config lives at `~/.okiro/config.toml`. Schema changes are breaking
+// On-disk config lives at `~/.okiro/config.json`. Schema changes are breaking
 // for existing users, so add fields with `#[serde(default)]` rather than
 // reshuffling. The `Transport` enum gates which `run_*` function main() calls.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
-    transport: Transport,
-    bind: String,
+    transports: Vec<TransportConfig>,
     agent_cmd: String,
     #[serde(default)]
-    agent_args: Vec<String>,
-    #[serde(default)]
-    telegram: TelegramConfig
+    agent_args: Vec<String>
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Transport {
-    Cloudflared,
-    Telegram
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct TelegramConfig {
-    #[serde(default)]
-    token: String
+/// Transport entries are internally tagged by `kind`, so each variant can
+/// carry its own config without a separate top-level section. Adding a new
+/// transport is: add a variant here, add an arm in `main`, implement its
+/// `run_*` entry point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum TransportConfig {
+    Cloudflared { bind: String },
+    // Telegram { token: String } — commented out until `run_telegram`
+    // ships. Leaving the variant here would require it to round-trip, and
+    // we do not want to pretend it works.
 }
 
 fn config_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".okiro/config.toml"))
+    Ok(PathBuf::from(home).join(".okiro/config.json"))
 }
 
 /// Path to the persistent browser state (currently-open tabs, history list,
@@ -91,7 +89,7 @@ fn state_path() -> Result<PathBuf> {
 fn load_config() -> Result<Config> {
     let path = config_path()?;
     let raw = std::fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;
-    let cfg: Config = toml::from_str(&raw).context("Parsing config.toml")?;
+    let cfg: Config = serde_json::from_str(&raw).context("Parsing config.json")?;
     Ok(cfg)
 }
 
@@ -105,36 +103,46 @@ fn prompt_line(msg: &str) -> Result<String> {
 }
 
 fn init_config() -> Result<Config> {
-    println!();
-    println!("Which transport?");
-    println!("  1) cloudflared  (serve a terminal-like web UI; front with your tunnel)");
-    println!("  2) telegram     (long-poll a Telegram bot)  [not yet implemented]");
-    let transport = loop {
-        match prompt_line("> ")?.to_ascii_lowercase().as_str() {
-            "1" | "cloudflared" => break Transport::Cloudflared,
-            "2" | "telegram" => {
-                println!("Telegram transport is not yet implemented. Pick cloudflared for now.");
-                continue;
-            }
-            _ => println!("Pick 1")
-        }
-    };
+    // Transport prompt commented out while Cloudflared is the only
+    // implemented option. When Telegram ships, rewrite this to build up the
+    // `transports` list interactively (ask for Cloudflared, offer to add
+    // another, loop) rather than resurrecting the single-choice block
+    // below verbatim.
+    //
+    // println!();
+    // println!("Which transport?");
+    // println!("  1) Cloudflared  (serve a terminal-like web UI; front with your tunnel)");
+    // println!("  2) Telegram     (long-poll a Telegram bot)  [not yet implemented]");
+    // let transport = loop {
+    //     match prompt_line("> ")?.to_ascii_lowercase().as_str() {
+    //         "1" | "cloudflared" => break Transport::Cloudflared,
+    //         "2" | "telegram" => {
+    //             println!("Telegram transport is not yet implemented. Pick Cloudflared for now.");
+    //             continue;
+    //         }
+    //         _ => println!("Pick 1")
+    //     }
+    // };
 
     println!();
-    println!("Bind address. Picks which network interface Okiro listens on.");
-    println!("  1) 127.0.0.1:7842  (loopback only; intended path, front with Cloudflare Tunnel + Access)");
-    println!("  2) 0.0.0.0:7842    (all IPv4 interfaces; reachable from your LAN)");
-    println!("  3) custom          (type an address:port)");
+    println!("Bind address. Select on which network interface Okiro listens on.");
+    println!("  1) 127.0.0.1:{}  — Loopback only. Default.", DEFAULT_PORT);
+    println!("  2) 0.0.0.0:{}    — All IPv4 interfaces; reachable from your LAN.", DEFAULT_PORT);
+    println!("  3) Custom        — Type an address:port");
     println!();
-    println!("Option 2 exposes Okiro to anyone on the LAN. There is no auth inside");
-    println!("Okiro today. Only pick 2 if the LAN is trusted and you know what you");
-    println!("are doing.");
+    println!("Option 2 exposes Okiro to anyone on the LAN. Okiro does not handle authentication yet.");
+    println!("Pick 2 if the LAN is trusted and you know what you are doing.");
     let bind = loop {
-        match prompt_line("> ")?.to_ascii_lowercase().as_str() {
-            "" | "1" | "127.0.0.1:7842" | "loopback" => break "127.0.0.1:7842".to_string(),
-            "2" | "0.0.0.0:7842" | "all" => break "0.0.0.0:7842".to_string(),
+        let loopback = format!("127.0.0.1:{DEFAULT_PORT}");
+        let all = format!("0.0.0.0:{DEFAULT_PORT}");
+        let choice = prompt_line("> ")?.to_ascii_lowercase();
+        match choice.as_str() {
+            "" | "1" | "loopback" => break loopback,
+            "2" | "all" => break all,
+            s if s == loopback => break loopback,
+            s if s == all => break all,
             "3" | "custom" => {
-                let s = prompt_line("bind address: ")?;
+                let s = prompt_line("Bind address: ")?;
                 if s.is_empty() {
                     println!("Bind address is required for the custom option.");
                     continue;
@@ -153,28 +161,20 @@ fn init_config() -> Result<Config> {
         s
     };
 
-    let args_raw = prompt_line("agent args (space-separated) []: ")?;
+    let args_raw = prompt_line("Agent args (space-separated, e.g. `acp` for Kiro CLI) []: ")?;
     let agent_args: Vec<String> = args_raw.split_whitespace().map(str::to_string).collect();
 
-    // TelegramConfig stays on the struct for forward-compatibility with
-    // existing `~/.okiro/config.toml` files that already specified it,
-    // and for when the transport is actually implemented. We never
-    // prompt for it here because init only offers cloudflared.
-    let telegram = TelegramConfig::default();
-
     let cfg = Config {
-        transport,
-        bind,
+        transports: vec![TransportConfig::Cloudflared { bind }],
         agent_cmd,
-        agent_args,
-        telegram
+        agent_args
     };
 
     let path = config_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
+    std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
     println!("Wrote {}", path.display());
     println!();
     Ok(cfg)
@@ -205,9 +205,18 @@ fn main() -> Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        match cfg.transport {
-            Transport::Cloudflared => run_cloudflared(cfg).await,
-            Transport::Telegram => run_telegram(cfg).await
+        // Single-transport runtime for now: pick the first entry, bail on
+        // empty or multi-entry configs. When multi-transport lands
+        // (todo #19), iterate the list and spawn one task per entry.
+        match cfg.transports.as_slice() {
+            [] => bail!("No transports configured. Re-run `okiro init`."),
+            [one] => match one.clone() {
+                TransportConfig::Cloudflared { bind } => run_cloudflared(cfg, bind).await
+            },
+            _ => bail!(
+                "Running more than one transport at once is not yet supported. \
+                 Leave a single entry in `transports` until multi-transport ships."
+            )
         }
     })
 }
@@ -222,8 +231,8 @@ fn main() -> Result<()> {
 // signing keys are at
 //   https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
 
-async fn run_cloudflared(cfg: Config) -> Result<()> {
-    let shared = Arc::new(cfg.clone());
+async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
+    let shared = Arc::new(cfg);
     let app = Router::new()
         .route("/ws", get(ws_upgrade))
         .route("/state", get(get_state).put(put_state))
@@ -234,8 +243,8 @@ async fn run_cloudflared(cfg: Config) -> Result<()> {
         .fallback(get(serve_ui_asset))
         .with_state(shared);
 
-    let listener = TcpListener::bind(&cfg.bind).await?;
-    eprintln!("Okiro listening on http://{} (front with your Cloudflare Tunnel)", cfg.bind);
+    let listener = TcpListener::bind(&bind).await?;
+    eprintln!("Okiro listening on http://{bind} (front with your Cloudflare Tunnel)");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1172,7 +1181,8 @@ fn short_reason(msg: &str) -> String {
 
 // ---------- telegram transport (stub) ----------
 //
-// TODO(telegram): implement. Planned shape:
+// Commented out alongside the `TransportConfig::Telegram` variant until the
+// implementation lands. Restore both together. Planned shape:
 //   - Long-poll https://api.telegram.org/bot<token>/getUpdates.
 //   - One ACP agent per Telegram chat, spawned on first message, torn down
 //     on idle timeout.
@@ -1182,10 +1192,10 @@ fn short_reason(msg: &str) -> String {
 //   - Per-user bot tokens (created via @BotFather) keep Okiro out of the
 //     shared infrastructure path; long polling requires exactly one process
 //     per token.
-
-async fn run_telegram(_cfg: Config) -> Result<()> {
-    bail!("Telegram transport is not yet implemented. Re-run `okiro init` and pick Cloudflared.");
-}
+//
+// async fn run_telegram(cfg: Config, token: String) -> Result<()> {
+//     bail!("Telegram transport is not yet implemented.")
+// }
 
 // ---------- ACP agent subprocess ----------
 //
