@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/aichholzer/okiro/main/assets/Okiro.png" alt="Okiro!" width="100%">
+  <img src="assets/Okiro.png" alt="Okiro!" width="100%">
 </div>
 
 # Okiro!
