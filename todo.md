@@ -31,6 +31,7 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
 
 ### 3. Expandable tool calls
 
+- **Status:** done (2026-05-08). Server forwards the full ACP `tool_call` / `tool_call_update` payload as a structured `tool_call` WS event keyed by `toolCallId`. Browser merges updates into the existing log entry in place. `ToolCallCard` renders a collapsible row: summary shows title and a status pill; expanded reveals arguments (JSON), content (markdown), and file locations, each with a copy button where useful. Rows with no expandable detail collapse to the summary only.
 - **Size:** afternoon-to-day.
 - **Where:** `handle_agent_message` in `src/main.rs` for the `tool_call` / `tool_call_update` variants, and the `sys`-line rendering in `src/ui.html`.
 - **What:** today the `[title — status]` line is plain text. Keep it as a summary row, but forward the full payload (arguments, locations, content, raw output) to the browser as structured JSON. The row becomes clickable; expanded state shows arguments, output preview, locations touched, and elapsed time.
@@ -61,6 +62,7 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
 
 ### 6. Favicon badge for total attention count
 
+- **Status:** done (2026-05-08). `useAttentionBadge` hook subscribes to the session store, counts background sessions with attention, paints a red numeric pill onto the favicon and prefixes `document.title` with `(N)`. Base favicon lives at `ui/public/favicon.png`. Attention now also raises for the active in-app session when the whole Okiro browser tab is hidden (was: only raised for background in-app tabs), so you see a badge when a turn completes while you're reading elsewhere. Visibility change on the Okiro tab clears the active session's attention.
 - **Size:** half an afternoon.
 - **Where:** `src/ui.html`. Purely client-side.
 - **What:** compute the sum of tabs with attention dots. If > 0, paint a small badge into a canvas, draw the base favicon underneath, set `link[rel=icon].href` to the canvas data URL. If 0, restore the base favicon.
@@ -194,6 +196,5 @@ Top picks from what's left:
 2. Command palette (#8)
 3. MCP OAuth URL handling (#13)
 4. Cloudflare Access JWT validation (#16)
-5. Favicon badge for total attention count (#6)
 
-Completed: #1, #2, #4, #11, #12.
+Completed: #1, #2, #3, #4, #6, #11, #12.

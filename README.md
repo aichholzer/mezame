@@ -4,7 +4,7 @@
 
 # Okiro!
 
-*Wake your Kiro up from anywhere*
+*Wake your agent up from anywhere. Anytime.*
 
 A small Rust bridge that puts a browser-based chat UI in front of a locally running ACP agent (Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, or anything else that speaks the [Agent Client Protocol][acp] over stdio).
 
@@ -56,8 +56,9 @@ There are plenty of tools that let you drive an LLM from the couch. Most of them
 - Agent-side mode and model pickers in the composer, driven by ACP `session/set_mode` and `session/set_model`.
 - Inline permission prompts with one button per option; the user's choice is forwarded straight to the agent.
 - Agent thought/reasoning chunks rendered as muted sys lines.
-- Tool-call status lines inline with the conversation.
+- Tool-call rows inline with the conversation. Summary shows title and status pill; expanding reveals arguments, output, and file locations touched.
 - Attention badges on tabs when a background session needs input (permission requested, turn finished, error raised).
+- Favicon badge and document title counter so background-tab attention is visible from the browser's own tab strip, not just within the app.
 - Chat history rehydration from Kiro's on-disk JSONL event log with real per-turn timestamps.
 
 ### Deployment
@@ -276,11 +277,13 @@ Access injects a signed `Cf-Access-Jwt-Assertion` header on every request. Valid
 ### Okiro to browser
 
 ```json
-{ "type": "ready", "sessionId": "<uuid>", "resumed": true | false }
+{ "type": "ready", "sessionId": "<uuid>", "resumed": true | false, "cwd": "<path>" }
 { "type": "session_info", "info": { "modes": { "currentModeId", "availableModes": [...] },
                                     "models": { "currentModelId", "availableModels": [...] } } }
 { "type": "commands", "commands": [...], "prompts": [...] }
 { "type": "append", "role": "user" | "agent" | "sys", "text": "..." }
+{ "type": "tool_call", "toolCallId": "...", "title": "...", "status": "in_progress" | "completed" | "failed" | ...,
+                       "kind": "...", "rawInput": {...}, "content": [...], "locations": [...] }
 { "type": "prompt_done" }
 { "type": "permission_request", "id": <original id>, "title": "...", "options": [...] }
 { "type": "error", "message": "..." }
@@ -292,6 +295,7 @@ Details:
 - `session_info` arrives immediately after `ready` whenever Kiro reported `modes` / `models` on `session/new` or `session/load`. Drives the mode and model selectors in the header.
 - `commands` forwards Kiro's `_kiro.dev/commands/available` catalogue (commands + prompts only; the massive tool catalogue is stripped on the server to keep WS frames light). Drives the `/` autocomplete.
 - `append` is the ACP streaming path for a live turn. During a resume window the server suppresses these so the browser's `/history`-seeded log doesn't get duplicated.
+- `tool_call` carries the full ACP tool-call payload (arguments, content, file locations). Updates for the same `toolCallId` merge into the existing UI row in place rather than appending.
 - `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which `Okiro` forwards to the agent to unblock it.
 - `cancel` triggers `session/cancel` on the agent.
 
@@ -316,7 +320,7 @@ Notifications `Okiro` handles:
   - `agent_message_chunk` to `append` with `role: "agent"`. Rendered as markdown in the chat pane.
   - `user_message_chunk` to `append` with `role: "user"` during `session/load` replay (suppressed when we're seeding from `/history`, see above).
   - `agent_thought_chunk` to `append` with `role: "sys"` and a `(thinking)` prefix. Kiro itself does not emit these today; reasoning-model agents do.
-  - `tool_call` / `tool_call_update` to sys line `[title, status]`.
+  - `tool_call` / `tool_call_update` forwarded as a structured `tool_call` event keyed by `toolCallId`. Updates mutate the existing entry in place on the browser, so one tool call equals one collapsible row regardless of how many update notifications it emits.
 - `session/request_permission` to `permission_request` event for the browser.
 - `_kiro.dev/commands/available` to `commands` event (trimmed to `commands` + `prompts`).
 

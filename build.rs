@@ -1,4 +1,4 @@
-//! Build script for okiro.
+//! Build script for Okiro.
 //!
 //! Runs the React/Vite UI build under `ui/` so that `ui/dist/` is present
 //! when `rust-embed` picks it up to bake into the binary. The UI tree is
