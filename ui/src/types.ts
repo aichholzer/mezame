@@ -6,7 +6,13 @@ export type Role = 'user' | 'agent' | 'sys';
 export type Attention = 'done' | 'permission' | 'error' | null;
 
 export type ServerMessage =
-  | { type: 'ready'; sessionId: string; resumed: boolean; cwd?: string }
+  | {
+      type: 'ready';
+      sessionId: string;
+      resumed: boolean;
+      cwd?: string;
+      promptCapabilities?: PromptCapabilities;
+    }
   | { type: 'session_info'; info: SessionInfo }
   | { type: 'commands'; commands: SlashCommand[]; prompts: SlashPrompt[] }
   | { type: 'append'; role: Role; text: string }
@@ -16,11 +22,33 @@ export type ServerMessage =
   | { type: 'error'; message: string };
 
 export type ClientMessage =
-  | { type: 'prompt'; text: string }
+  | { type: 'prompt'; text?: string; blocks?: PromptBlock[] }
   | { type: 'permission_response'; id: number | string; optionId: string }
   | { type: 'set_mode'; modeId: string }
   | { type: 'set_model'; modelId: string }
   | { type: 'cancel' };
+
+/** Prompt capabilities advertised by the agent at initialize time.
+ * Missing fields default to false; the agent advertises what it will
+ * accept as prompt content. */
+export type PromptCapabilities = {
+  image?: boolean;
+  audio?: boolean;
+  embeddedContext?: boolean;
+};
+
+/** Subset of ACP ContentBlock types we build on the client side. The
+ * server accepts any ACP-shaped block and forwards it without
+ * validation, so this union can grow without a server change. */
+export type PromptBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; mimeType: string; data: string }
+  | {
+      type: 'resource';
+      resource:
+        | { uri: string; mimeType?: string; text: string }
+        | { uri: string; mimeType?: string; blob: string };
+    };
 
 export type SessionInfo = {
   modes?: {
@@ -126,6 +154,9 @@ export type Session = {
    * server on `ready`. Equals `cwd` when the user supplied an override,
    * otherwise the server's own process cwd. Display-only. */
   effectiveCwd: string | null;
+  /** Prompt capabilities advertised by the agent at initialize time.
+   * Drives which attachment affordances the composer exposes. */
+  promptCapabilities: PromptCapabilities;
   /** True once the user has sent at least one prompt. Kiro only persists
    * a session to disk on first turn; unused sessions cannot be resumed. */
   used: boolean;

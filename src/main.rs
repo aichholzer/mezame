@@ -112,17 +112,36 @@ fn init_config() -> Result<Config> {
     let transport = loop {
         match prompt_line("> ")?.to_ascii_lowercase().as_str() {
             "1" | "cloudflared" => break Transport::Cloudflared,
-            "2" | "telegram" => break Transport::Telegram,
-            _ => println!("Pick 1 or 2")
+            "2" | "telegram" => {
+                println!("Telegram transport is not yet implemented. Pick cloudflared for now.");
+                continue;
+            }
+            _ => println!("Pick 1")
         }
     };
 
-    let bind = {
-        let s = prompt_line("bind address [127.0.0.1:7842]: ")?;
-        if s.is_empty() {
-            "127.0.0.1:7842".to_string()
-        } else {
-            s
+    println!();
+    println!("Bind address. Picks which network interface Okiro listens on.");
+    println!("  1) 127.0.0.1:7842  (loopback only; intended path, front with Cloudflare Tunnel + Access)");
+    println!("  2) 0.0.0.0:7842    (all IPv4 interfaces; reachable from your LAN)");
+    println!("  3) custom          (type an address:port)");
+    println!();
+    println!("Option 2 exposes Okiro to anyone on the LAN. There is no auth inside");
+    println!("Okiro today. Only pick 2 if the LAN is trusted and you know what you");
+    println!("are doing.");
+    let bind = loop {
+        match prompt_line("> ")?.to_ascii_lowercase().as_str() {
+            "" | "1" | "127.0.0.1:7842" | "loopback" => break "127.0.0.1:7842".to_string(),
+            "2" | "0.0.0.0:7842" | "all" => break "0.0.0.0:7842".to_string(),
+            "3" | "custom" => {
+                let s = prompt_line("bind address: ")?;
+                if s.is_empty() {
+                    println!("Bind address is required for the custom option.");
+                    continue;
+                }
+                break s;
+            }
+            _ => println!("Pick 1, 2, or 3")
         }
     };
 
@@ -137,12 +156,11 @@ fn init_config() -> Result<Config> {
     let args_raw = prompt_line("agent args (space-separated) []: ")?;
     let agent_args: Vec<String> = args_raw.split_whitespace().map(str::to_string).collect();
 
-    let telegram = if transport == Transport::Telegram {
-        let token = prompt_line("telegram bot token: ")?;
-        TelegramConfig { token }
-    } else {
-        TelegramConfig::default()
-    };
+    // TelegramConfig stays on the struct for forward-compatibility with
+    // existing `~/.okiro/config.toml` files that already specified it,
+    // and for when the transport is actually implemented. We never
+    // prompt for it here because init only offers cloudflared.
+    let telegram = TelegramConfig::default();
 
     let cfg = Config {
         transport,
@@ -525,7 +543,12 @@ async fn handle_ws(
     // ACP handshake. `initialize` advertises no filesystem capabilities
     // because Okiro does not back `fs/read_text_file` etc. today; the agent
     // is expected to use its own tools for file I/O.
-    agent
+    //
+    // The agent responds with its own `agentCapabilities`, including
+    // `promptCapabilities` (image, audio, embeddedContext). We capture
+    // the prompt capabilities to forward to the UI so it can decide
+    // whether to surface image paste/drop and file upload.
+    let initialize_result = agent
         .request(
             "initialize",
             json!({
@@ -537,6 +560,11 @@ async fn handle_ws(
         )
         .await
         .context("Failed to initialize agent")?;
+    let prompt_capabilities = initialize_result
+        .get("agentCapabilities")
+        .and_then(|c| c.get("promptCapabilities"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     // Session setup. If the browser supplied a resume id, try `session/load`
     // first; on failure fall back to `session/new`. ACP's session/load
@@ -605,7 +633,8 @@ async fn handle_ws(
         "type": "ready",
         "sessionId": session_id,
         "resumed": resumed,
-        "cwd": cwd_str
+        "cwd": cwd_str,
+        "promptCapabilities": prompt_capabilities
     })));
 
     // Send the `modes` and `models` payload (if present in either
@@ -646,9 +675,23 @@ async fn handle_ws(
 
                 match v.get("type").and_then(Value::as_str) {
                     Some("prompt") => {
-                        let Some(user_text) = v.get("text").and_then(Value::as_str) else {
+                        // Browser sends a prompt as either a plain `text`
+                        // string (legacy path) or a full ACP-shaped
+                        // `blocks` array. The blocks path is how we carry
+                        // attachments (image, audio, resource) alongside
+                        // the user's text. The server does no validation
+                        // beyond "must be an array"; the agent will reject
+                        // block types it did not advertise support for.
+                        let prompt_blocks: Vec<Value> = if let Some(blocks) = v.get("blocks").and_then(Value::as_array) {
+                            blocks.clone()
+                        } else if let Some(user_text) = v.get("text").and_then(Value::as_str) {
+                            vec![json!({ "type": "text", "text": user_text })]
+                        } else {
                             continue;
                         };
+                        if prompt_blocks.is_empty() {
+                            continue;
+                        }
 
                         // First live prompt after resume: stop hiding
                         // `session/update` events. From here on everything
@@ -663,14 +706,13 @@ async fn handle_ws(
                         let agent = agent.clone();
                         let to_ws = to_ws_tx.clone();
                         let sid = session_id.clone();
-                        let user_text = user_text.to_string();
                         tokio::spawn(async move {
                             let res = agent
                                 .request(
                                     "session/prompt",
                                     json!({
                                         "sessionId": sid,
-                                        "prompt": [{ "type": "text", "text": user_text }]
+                                        "prompt": prompt_blocks
                                     })
                                 )
                                 .await;

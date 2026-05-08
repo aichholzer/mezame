@@ -5,6 +5,7 @@ import type {
   LogEntry,
   PermissionOption,
   PersistedState,
+  PromptBlock,
   Role,
   ServerMessage,
   Session,
@@ -229,6 +230,7 @@ const makeSession = (
   acpSessionId,
   cwd,
   effectiveCwd: cwd,
+  promptCapabilities: {},
   used: acpSessionId !== null,
   log: [],
   status: 'connecting',
@@ -306,6 +308,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
         s.pinnedToBottom = true;
         s.acpSessionId = msg.sessionId;
         s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
+        s.promptCapabilities = msg.promptCapabilities ?? {};
         setStatus(s, 'connected');
         // Seed from /history for real per-turn timestamps. The server
         // suppresses the ACP replay stream during the resume window, so
@@ -314,6 +317,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
       } else {
         s.acpSessionId = msg.sessionId;
         s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
+        s.promptCapabilities = msg.promptCapabilities ?? {};
         setStatus(s, 'connected');
       }
       scheduleSync();
@@ -544,14 +548,32 @@ const forgetHistory = (acpSessionId: string) => {
   scheduleSync();
 };
 
-const sendPrompt = (text: string) => {
+const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   const s = currentSession();
   if (!s || !s.ws || s.ws.readyState !== WebSocket.OPEN) {
     return;
   }
   ensureTrailingNewline(s);
-  appendLog(s, { kind: 'text', id: newLogId(), role: 'user', text: `> ${text}\n`, timestamp: Date.now() });
-  s.ws.send(JSON.stringify({ type: 'prompt', text }));
+
+  // Local echo in the log: text on its own line, attachments as a
+  // compact "[attached: N item(s)]" suffix. The agent will see the
+  // full blocks; we avoid spamming the chat with base64.
+  const echo = attachments.length > 0
+    ? `> ${text}\n  [attached: ${attachments.length} item${attachments.length === 1 ? '' : 's'}]\n`
+    : `> ${text}\n`;
+  appendLog(s, { kind: 'text', id: newLogId(), role: 'user', text: echo, timestamp: Date.now() });
+
+  // Build the ACP-shaped prompt. Text always comes first when present.
+  // Attachments preserve the order the user added them.
+  const blocks: PromptBlock[] = [];
+  if (text.length > 0) {
+    blocks.push({ type: 'text', text });
+  }
+  for (const a of attachments) {
+    blocks.push(a);
+  }
+  s.ws.send(JSON.stringify({ type: 'prompt', blocks }));
+
   s.thinking = true;
   setBusy(s, true);
   if (!s.used) {

@@ -134,6 +134,7 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
 
 ### 14. Paste and drop images
 
+- **Status:** done (2026-05-08). Composer now stages attachments from paste (clipboard image), drag-drop onto the composer card, and an explicit paperclip button that opens a file picker. `fileToAttachment` classifies each file into `image`, `text-resource`, or `binary-resource` gated on the agent's `promptCapabilities`, which the server forwards in the `ready` event from the ACP `initialize` response. On submit, each attachment is read and emitted as an ACP `ContentBlock` alongside the text. Attachment chips render above the textarea with a thumbnail for images and an icon otherwise; rejected files surface a transient notice at the top of the card. Per-attachment cap 5 MB, total cap 20 MB, max 10 attachments. Known gap: attachments in historical turns are not rehydrated on session resume (see README "Known gaps" #4).
 - **Size:** day.
 - **Where:** `src/ui.html` for paste/drop handling; `src/main.rs` to forward as ACP image blocks in `session/prompt`.
 - **What:** accept clipboard paste (`paste` event, look for image/*) and drag-drop onto the input area. Show a thumbnail chip above the input with a remove button. On submit, send the image as an ACP prompt content block (`{ type: "image", mimeType, data }`).
@@ -153,6 +154,18 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
   - Cap result count; 50 is plenty.
 
 ## Security and hardening
+
+### Bind defaults and auth
+
+Okiro has no auth of its own. The intended production posture is:
+
+- `bind = "127.0.0.1:7842"` on the host running Okiro.
+- `cloudflared` on the same host (or another container on a trusted LAN), ingress pointing at `http://localhost:7842` or `http://<okiro-host>:7842`.
+- Cloudflare Access on the public hostname, gating with an identity provider.
+
+`okiro init` offers `0.0.0.0:7842` as an option for trusted-LAN setups where `cloudflared` runs on a different container and needs to reach Okiro across the LAN. Picking that option opts into "my LAN is my trust boundary", which is on the user, not the tool. Default stays loopback.
+
+Open work in this area:
 
 ### 16. Cloudflare Access JWT validation
 
@@ -188,6 +201,38 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
   - History and settings menus collapse into a drawer.
 - **Gotchas:** iOS Safari viewport quirks are legendary; test on a real device, not just dev tools. Watch for double-tap zoom on buttons.
 
+## Transports
+
+### 19. Multi-transport: run more than one channel at once
+
+- **Size:** day (the wiring), plus whatever individual transports still need (telegram is todo #N inside `run_telegram`).
+- **Where:** `Config`, `Transport`, and the `match cfg.transport` block in `main`. Today `transport` is a single enum variant; everything downstream assumes one channel per process.
+- **What:** let a user configure and run multiple transports from one Okiro process. Use cases today: cloudflared-fronted web UI for desktop, Telegram for phone, both pointing at the same agent pool. In the future: Matrix, Discord, iMessage.
+- **Config shape sketch:**
+
+  ```toml
+  # Old single-transport config still parses and runs the one channel.
+  transport = "cloudflared"
+
+  # New: list of transports, each with its own section. `transport` field
+  # is dropped in favour of presence of `[[transports]]` entries.
+  [[transports]]
+  kind = "cloudflared"
+  bind = "127.0.0.1:7842"
+
+  [[transports]]
+  kind = "telegram"
+  token = "..."
+  ```
+
+- **Runtime:** each configured transport spawns its own tokio task with its own ACP session pool. `cloudflared` task owns the WS server; `telegram` task owns a `getUpdates` long-poll loop. They are independent, so one failing does not take the other down.
+- **Migration:** on startup, if only legacy `transport = "x"` is present, synthesise a single-entry `[[transports]]` list so existing configs still work. Remove the legacy field after a deprecation window, or leave it indefinitely for simple setups.
+- **Gotchas:**
+  - `TelegramConfig` already has a `token` field at the top level; it moves into the per-transport table.
+  - Per-transport `bind` is required for cloudflared (different tabs want different local ports if the user runs two). The top-level `bind` field goes away alongside `transport`.
+  - Error aggregation: `main` needs to wait for all transport tasks and surface the first non-graceful exit, while still honouring Ctrl+C.
+  - Session state (tabs, closed history) in `~/.okiro/state.json` is currently shared across the process. That is fine; transports are channels into the same agent pool, not isolated instances.
+
 ## Priority shortlist (value per hour for a daily user)
 
 Top picks from what's left:
@@ -197,4 +242,4 @@ Top picks from what's left:
 3. MCP OAuth URL handling (#13)
 4. Cloudflare Access JWT validation (#16)
 
-Completed: #1, #2, #3, #4, #6, #11, #12.
+Completed: #1, #2, #3, #4, #6, #11, #12, #14.

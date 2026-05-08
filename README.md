@@ -55,6 +55,7 @@ There are plenty of tools that let you drive an LLM from the couch. Most of them
 - Slash-command autocomplete populated from Kiro's `_kiro.dev/commands/available` catalogue, including MCP prompt arguments.
 - Agent-side mode and model pickers in the composer, driven by ACP `session/set_mode` and `session/set_model`.
 - Inline permission prompts with one button per option; the user's choice is forwarded straight to the agent.
+- Attach images and files to prompts: paste from the clipboard, drag-drop onto the composer, or click the paperclip. Gated per-session on the agent's advertised `promptCapabilities` (image, embeddedContext). Per-attachment cap 5 MB, total cap 20 MB per message.
 - Agent thought/reasoning chunks rendered as muted sys lines.
 - Tool-call rows inline with the conversation. Summary shows title and status pill; expanding reveals arguments, output, and file locations touched.
 - Attention badges on tabs when a background session needs input (permission requested, turn finished, error raised).
@@ -64,7 +65,7 @@ There are plenty of tools that let you drive an LLM from the couch. Most of them
 ### Deployment
 
 - Self-contained release binary. React + Tailwind UI baked in via `rust-embed`; no static file hosting required.
-- Loopback-only bind (`127.0.0.1`). Designed to sit behind a named Cloudflare Tunnel with Cloudflare Access for authentication.
+- Loopback bind by default (`127.0.0.1`); `okiro init` also offers `0.0.0.0` for trusted LAN setups. Designed to sit behind a named Cloudflare Tunnel with Cloudflare Access for authentication.
 - Interactive first-run setup (`okiro init`) writes `~/.okiro/config.toml`.
 - Agent-agnostic on the core loop. Tested with Kiro CLI; Claude Agent CLI, Gemini CLI, Codex, and other stdio-speaking ACP agents should connect, with some Kiro-specific niceties (command autocomplete, history replay) unavailable.
 
@@ -147,10 +148,13 @@ Then point a browser at `http://127.0.0.1:7842` to smoke-test locally, or at you
 ```toml
 # Transport picks how clients reach Okiro.
 #   "cloudflared" — serves HTTP + WebSocket on `bind`, for an external tunnel.
-#   "telegram"    — stub; long-polls a Telegram bot. Not yet implemented.
+#   "telegram"    — stub; long-polls a Telegram bot. Not yet implemented; `okiro init`
+#                   does not offer it as a choice, but the field still parses.
 transport = "cloudflared"
 
-# Local bind address. Keep it on loopback; public exposure is the tunnel's job.
+# Local bind address. Default is loopback; `okiro init` offers `0.0.0.0:7842`
+# if you want LAN reach. Okiro has no auth of its own today, so anything
+# non-loopback relies on Cloudflare Access (or your LAN being trusted).
 bind = "127.0.0.1:7842"
 
 # Command to launch the ACP agent. Either a bare name (resolved via $PATH) or
@@ -268,16 +272,21 @@ Access injects a signed `Cf-Access-Jwt-Assertion` header on every request. Valid
 
 ```json
 { "type": "prompt", "text": "hello" }
+{ "type": "prompt", "blocks": [{ "type": "text", "text": "look at this" },
+                               { "type": "image", "mimeType": "image/png", "data": "iVBOR..." }] }
 { "type": "cancel" }
 { "type": "permission_response", "id": <original id>, "optionId": "allow_once" }
 { "type": "set_mode", "modeId": "kiro_planner" }
 { "type": "set_model", "modelId": "claude-sonnet-4.5" }
 ```
 
+`prompt` accepts either a legacy `text` string (wrapped into a single text block on the server) or a full ACP `blocks` array. The server forwards blocks unchanged, so the agent is the one that validates types against its own capabilities.
+
 ### Okiro to browser
 
 ```json
-{ "type": "ready", "sessionId": "<uuid>", "resumed": true | false, "cwd": "<path>" }
+{ "type": "ready", "sessionId": "<uuid>", "resumed": true | false, "cwd": "<path>",
+   "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true } }
 { "type": "session_info", "info": { "modes": { "currentModeId", "availableModes": [...] },
                                     "models": { "currentModelId", "availableModels": [...] } } }
 { "type": "commands", "commands": [...], "prompts": [...] }
@@ -291,7 +300,7 @@ Access injects a signed `Cf-Access-Jwt-Assertion` header on every request. Valid
 
 Details:
 
-- `ready` fires once per (re)connect. `resumed: true` means the browser should clear the active log and seed from `/history`. The browser persists the `sessionId` so the next reconnect can pass `?session=<id>`.
+- `ready` fires once per (re)connect. `resumed: true` means the browser should clear the active log and seed from `/history`. The browser persists the `sessionId` so the next reconnect can pass `?session=<id>`. `promptCapabilities` is the agent's `initialize`-time advertisement (see [ACP protocol](https://agentclientprotocol.com/protocol/content)); the composer uses it to gate paste/drop/upload affordances.
 - `session_info` arrives immediately after `ready` whenever Kiro reported `modes` / `models` on `session/new` or `session/load`. Drives the mode and model selectors in the header.
 - `commands` forwards Kiro's `_kiro.dev/commands/available` catalogue (commands + prompts only; the massive tool catalogue is stripped on the server to keep WS frames light). Drives the `/` autocomplete.
 - `append` is the ACP streaming path for a live turn. During a resume window the server suppresses these so the browser's `/history`-seeded log doesn't get duplicated.
@@ -345,7 +354,8 @@ Stderr carries `Okiro`'s own logs and, prefixed with `[agent]`, the agent's stde
 1. **Auth enforcement.** `Okiro` trusts everything that reaches the WebSocket upgrade. When fronted by Cloudflare Access, validate the `Cf-Access-Jwt-Assertion` header (JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`). See `ws_upgrade` in `src/main.rs` and the backlog in `todo.md`.
 2. **Telegram transport.** `run_telegram` is a stub. Planned shape: long-poll `getUpdates`, one ACP agent per Telegram chat, stream chunks as `editMessageText` throttled to ~1/s, inline keyboard for permission prompts. Per-user-token model (BotFather) keeps `Okiro` out of the data path.
 3. **Remaining Kiro extensions.** MCP OAuth URL (needs user redirect) and compaction / clear status notifications are still dropped. Slash commands and the commands catalogue are surfaced.
-4. **Streamable HTTP remote transport.** ACP's draft RFD defines an HTTP/WS remote transport with `Acp-Connection-Id` and `Acp-Session-Id` headers; today `Okiro` is purely a local stdio client. Once the RFD stabilises and agents support it, `Okiro` can become a thin remote adapter too.
+4. **Attachment rehydration on resume.** Prompts with images or embedded resources are sent correctly on the live path, but when the browser reconnects and Okiro replays history via Kiro's on-disk JSONL, only text turns are rendered. The parser in `parse_kiro_history` (`src/main.rs`) only knows about user/agent text today. Extending it requires knowing the shape Kiro uses for non-text prompt blocks in its JSONL, which has not been inspected yet. Until then, attachments in historical turns will appear as plain text (or be missing entirely) after a resume.
+5. **Streamable HTTP remote transport.** ACP's draft RFD defines an HTTP/WS remote transport with `Acp-Connection-Id` and `Acp-Session-Id` headers; today `Okiro` is purely a local stdio client. Once the RFD stabilises and agents support it, `Okiro` can become a thin remote adapter too.
 
 Everything else proposed (markdown polish, exports, keyboard shortcuts, mobile layout, per-tool allow/deny, etc.) lives in `todo.md`.
 
