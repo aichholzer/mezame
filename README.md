@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo_sm.png" alt="Okiro!" width="480">
+  <img src="assets/logo_lg.png" alt="Okiro!" width="100%">
 </p>
 
 # Okiro!
