@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { CwdChip } from '@/features/CwdChip';
 import { ModeModelSelectors } from '@/features/ModeModelSelectors';
 import { SlashAutocomplete, type SlashAutocompleteHandle } from '@/features/SlashAutocomplete';
 import { cn } from '@/lib/utils';
@@ -16,13 +17,11 @@ import type { Session } from '@/types';
 // Layout:
 //   [  textarea                                         [  send ] ]
 //   [                                                             ]
-//   [                                            [ Agent picker ] ]
-//   [                                            [ Model picker ] ]
+//   [ [cwd chip]                       [ Agent ] [ Model picker ] ]
 //
-// Send and the stacked selectors are absolutely positioned inside the
-// card, with generous right padding on the textarea so typed text
-// never slides under them. There is no in-UI cancel right now; the
-// textarea disables itself while the agent is working.
+// Send sits top-right. The bottom row has the cwd chip on the left and
+// the Agent / Model pickers on the right, so the composer is disabled
+// while the agent is working; there is no in-UI cancel.
 
 type Props = {
   session: Session | null;
@@ -152,8 +151,9 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           </Tooltip>
         </div>
 
-        {/* Bottom-right: inline Agent / Model selectors. */}
-        <div className="absolute bottom-2 right-2">
+        {/* Bottom row: cwd chip (left) and inline Agent / Model selectors (right). */}
+        <div className="absolute inset-x-2 bottom-2 flex items-center justify-between gap-2">
+          <CwdChip session={session} />
           <ModeModelSelectors session={session} layout="row" />
         </div>
       </div>
