@@ -28,3 +28,10 @@
 ui/node_modules/
 ui/dist/
 ui/*.tsbuildinfo
+
+# Security scanner outputs
+.ash/
+.checkov/
+.grype/
+.semgrep/
+.syft/
