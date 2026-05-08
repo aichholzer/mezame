@@ -56,18 +56,19 @@ Then point a browser at `http://127.0.0.1:9510` (or whatever IP and port you set
 
 ### Prerequisites
 
-- **Rust** toolchain, stable. [rustup][rustup] or your distro's package manager. `cargo` has to be on `PATH`.
-- **Node.js** 24 or newer with `npm` on `PATH`. Installing Okiro builds the embedded React UI as part of `build.rs`; the install fails fast if `node`/`npm` are missing. `brew install node` on macOS, or use [nvm][nvm].
+- **Rust** toolchain, stable. [rustup][rustup] or your distro's package manager.
+- **Node.js** 22 or newer with `npm` on `PATH`. Installing Okiro builds the embedded React UI as part of `build.rs`; the install fails fast if `node`/`npm` are missing.
 - **An ACP-capable agent** on `PATH`: Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, etc. `okiro init` probes for known CLIs and offers them in a menu.
 
 [rustup]: https://rustup.rs
 [nvm]: https://github.com/nvm-sh/nvm
 
-`cargo install` downloads the source, runs `build.rs` (which compiles the UI), then installs the binary to `~/.cargo/bin/okiro`. The UI bundle is baked into the binary via `rust-embed`, so the installed `okiro` is fully self-contained and does not need Node.js at runtime.
+`cargo install` will install the binary to `~/.cargo/bin/okiro`. The UI bundle is baked into the binary. No need for Node.js at runtime.
 
 ## Docs
 
 - [Architecture and layout](./docs/architecture.md): diagram, file layout, config reference.
+- [Running as a service](./docs/service.md): systemd (Linux) and launchd (macOS) units so Okiro starts at boot.
 - [Cloudflare Tunnel and Access](./docs/cloudflare.md): step-by-step for exposing Okiro publicly and gating it with an identity provider.
 - [Wire protocol](./docs/wire-protocol.md): browser to Okiro and Okiro to agent message catalogue.
 - [Development](./docs/development.md): build, dev loop, where to add things, debugging.

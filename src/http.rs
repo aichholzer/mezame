@@ -57,8 +57,46 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
 
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("Okiro is listening on: http://{bind}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolve when the process receives SIGINT (Ctrl+C) or SIGTERM (systemd
+/// / launchd `stop`). `with_graceful_shutdown` stops accepting new
+/// connections on the returned future, so Okiro exits promptly when its
+/// service manager asks it to.
+///
+/// Live WebSocket sessions are dropped on shutdown; the agent subprocess
+/// is killed (`kill_on_drop`), which may leave a Kiro session lockfile
+/// behind. The next start self-heals via `steal_stale_session_lock`.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                eprintln!("Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => eprintln!("\nReceived SIGINT, shutting down."),
+        _ = terminate => eprintln!("Received SIGTERM, shutting down."),
+    }
 }
 
 /// Serve a single file from the embedded UI bundle.
