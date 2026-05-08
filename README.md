@@ -18,6 +18,21 @@ The name is Japanese for "wake up" (起きろ), which is what you do to your age
 
 > **Tested with Kiro CLI.** The protocol surface is standard ACP, so any stdio-speaking agent should work for the core loop (prompt, stream, cancel, permissions, modes, models). A few features lean on Kiro-specific extensions and disk layout: chat history rehydration reads `~/.kiro/sessions/cli/<id>.jsonl`, slash-command autocomplete consumes the `_kiro.dev/commands/available` notification, and stale-lock recovery targets Kiro's lockfile convention. Claude Agent CLI, Gemini CLI, Codex, and others should connect, but are currently untested; expect missing command autocomplete and no history replay on resume. Bug reports welcome.
 
+## Why Okiro
+
+There are plenty of tools that let you drive an LLM from the couch. Most of them fall into one of two shapes:
+
+1. **Direct-to-provider gateways.** They talk to Bedrock, Anthropic, OpenAI, or Google themselves. You hand them API keys, provision users, manage roles and quotas, and store credentials somewhere they can reach. The tool becomes another auth surface you have to look after.
+2. **Remote UIs for a local agent CLI.** These front a locally-running agent process, which is closer to what I wanted. Some of them still ask you to generate access tokens, configure users, or wire up a separate auth flow between the browser and the bridge itself.
+
+`Okiro` deliberately does less than either. It is an **ACP pipe**, nothing more:
+
+- Your local agent (Kiro, Claude, Gemini, Codex, whatever...) already handles its own login, its own model choice, its own credentials, and its own session storage. That solved problem stays solved.
+- `Okiro` never sees an API key. It does not know what the agent authenticates to, and does not want to.
+- Access control for the browser is pushed to the edge: bind to loopback, put Cloudflare Tunnel in front, let Cloudflare Access gate the hostname with your existing identity provider. You already trust that stack with the rest of your self-hosted tools.
+
+**The net effect:** if your agent is signed in locally, you can talk to it from anywhere your tunnel reaches. If it is not, `Okiro` has nothing useful to offer. That is the whole trade.
+
 ## Features
 
 ### Sessions
