@@ -240,6 +240,25 @@ Open work in this area:
   - Error aggregation: `main` needs to wait for all transport tasks and surface the first non-graceful exit, while still honouring Ctrl+C.
   - Session state (tabs, closed history) in `~/.okiro/state.json` is currently shared across the process. That is fine; transports are channels into the same agent pool, not isolated instances.
 
+## Bugs
+
+### 20. PDF upload surfaces a misleading "Unrecognised file type" error
+
+- **Size:** afternoon.
+- **Where:** `ui/src/lib/attachments.ts` (`fileToAttachment`, `describeRejection`, `RejectReason`), and the file picker `accept` attribute in `ui/src/features/InputRow.tsx`.
+- **Symptom:** uploading a PDF (or any non-image binary that isn't in the short textish mime list) through the composer shows "Unrecognised file type." when the agent has not advertised `embeddedContext`. The mime is fine; the agent just does not accept embedded content.
+- **Root cause:** three branches in `fileToAttachment` decide routing: image, textish, or binary-resource. The binary-resource branch gates on `caps.embeddedContext`; when false, the code falls through to `return { kind: 'unknown-type' }` instead of using the existing `embed-not-supported` reason.
+- **Before coding, confirm:** run with `OKIRO_DEBUG_ACP=1`, open a session, check the `initialize` response line. If Kiro advertises `promptCapabilities.embeddedContext: true` we have a real client-side bug (the PDF should be going through as a binary-resource). If it advertises false or omits the field, this is strictly a messaging fix.
+- **Fix:**
+  - Collapse the trailing `unknown-type` branch into the existing `embed-not-supported` path. Every non-image should route as a binary-resource when the agent allows it, same rejection otherwise.
+  - Update `describeRejection` for `embed-not-supported` to read well for both text and binary cases: "This agent does not accept embedded files." or similar.
+  - Remove the `unknown-type` variant from `RejectReason`, plus any `case 'unknown-type'` branches (at least in `describeRejection`).
+  - Tighten the file picker's `accept` attribute to reflect the agent's advertised capabilities: images-only when `caps.image && !caps.embeddedContext`, images+binaries when both, text-only when just `caps.embeddedContext`. Avoids the dead-end drop-to-reject flow.
+- **Acceptance:**
+  - Dropping a PDF when the agent supports embedded content sends the file through as a binary-resource (no error).
+  - Dropping a PDF when the agent does not support embedded content surfaces an accurate message naming the capability gap, not a format complaint.
+  - The file picker's dialogue only offers file types the agent can actually take.
+
 ## Priority shortlist (value per hour for a daily user)
 
 Top picks from what's left:
