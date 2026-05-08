@@ -28,7 +28,7 @@ type Props = {
   onSubmit: (text: string) => void;
 };
 
-const MIN_ROWS = 2;
+const MIN_ROWS = 3;
 const MAX_ROWS = 8;
 
 export const InputRow = ({ session, onSubmit }: Props) => {

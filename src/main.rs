@@ -878,17 +878,42 @@ async fn handle_agent_message(
                     }
                 }
                 "tool_call" | "tool_call_update" => {
-                    // Single-line "[title — status]" gives users visibility
-                    // into long tool runs. Extend this to render structured
-                    // tool IO if you want richer UI.
-                    let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
-                    let status = update.get("status").and_then(Value::as_str).unwrap_or("");
-                    let line = if status.is_empty() {
-                        format!("\n[{title}]\n")
-                    } else {
-                        format!("\n[{title}: {status}]\n")
-                    };
-                    let _ = tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": line })));
+                    // Forward the full structured payload to the browser.
+                    // Both `tool_call` and `tool_call_update` emit the
+                    // same WS event type; the UI dedupes by `toolCallId`
+                    // and mutates the existing row in place on updates.
+                    //
+                    // Fields are passed through as-is so the UI can
+                    // render whatever the agent supplied (title, status,
+                    // kind, input args, output content blocks, and file
+                    // locations touched).
+                    let tool_call_id = update
+                        .get("toolCallId")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if tool_call_id.is_null() {
+                        // Nothing to key on; fall back to a sys line so
+                        // the user at least knows something happened.
+                        let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
+                        let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+                        let line = if status.is_empty() {
+                            format!("\n[{title}]\n")
+                        } else {
+                            format!("\n[{title}: {status}]\n")
+                        };
+                        let _ = tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": line })));
+                        return;
+                    }
+                    let _ = tx.send(text_msg(json!({
+                        "type": "tool_call",
+                        "toolCallId": tool_call_id,
+                        "title": update.get("title").cloned().unwrap_or(Value::Null),
+                        "status": update.get("status").cloned().unwrap_or(Value::Null),
+                        "kind": update.get("kind").cloned().unwrap_or(Value::Null),
+                        "rawInput": update.get("rawInput").cloned().unwrap_or(Value::Null),
+                        "content": update.get("content").cloned().unwrap_or(Value::Null),
+                        "locations": update.get("locations").cloned().unwrap_or(Value::Null)
+                    })));
                 }
                 _ => {}
             }

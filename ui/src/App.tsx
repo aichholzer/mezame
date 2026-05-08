@@ -3,11 +3,14 @@ import { InputRow } from '@/features/InputRow';
 import { LogPane } from '@/features/LogPane';
 import { NewSessionDialog } from '@/features/NewSessionDialog';
 import { TabBar } from '@/features/TabBar';
+import { useAttentionBadge } from '@/hooks/useAttentionBadge';
 import { okiroActions, useOkiro } from '@/hooks/useOkiro';
 
 export const App = () => {
   const { sessions, closed, activeId, activeSession } = useOkiro();
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+
+  useAttentionBadge();
 
   useEffect(() => {
     void okiroActions.init();

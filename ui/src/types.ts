@@ -10,6 +10,7 @@ export type ServerMessage =
   | { type: 'session_info'; info: SessionInfo }
   | { type: 'commands'; commands: SlashCommand[]; prompts: SlashPrompt[] }
   | { type: 'append'; role: Role; text: string }
+  | { type: 'tool_call'; toolCallId: string; title?: string | null; status?: string | null; kind?: string | null; rawInput?: unknown; content?: unknown; locations?: unknown }
   | { type: 'permission_request'; id: number | string; title: string; options: PermissionOption[] }
   | { type: 'prompt_done' }
   | { type: 'error'; message: string };
@@ -70,9 +71,19 @@ export type PermissionOption = {
   kind?: string;
 };
 
+export type ToolCallLocation = {
+  path?: string;
+  line?: number;
+};
+
+/** Known status values from ACP. Anything else is displayed verbatim. */
+export type ToolCallStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | (string & {});
+
 /** A log entry in a tab. `text` segments are rendered as pre-wrap spans,
- * permissions render an inline card with buttons. The log is flat and
- * append-only; updates (permission resolution) mutate the item in place.
+ * permissions render an inline card with buttons, and tool calls render
+ * a collapsible summary row with arguments, content, and locations.
+ * The log is flat and append-only; updates (permission resolution,
+ * tool-call progress) mutate the item in place.
  */
 export type LogEntry =
   | { kind: 'text'; id: string; role: Role; text: string; timestamp: number }
@@ -85,6 +96,19 @@ export type LogEntry =
       timestamp: number;
       /** Set once the user picks an option. Presence disables buttons. */
       resolution?: string;
+    }
+  | {
+      kind: 'tool_call';
+      id: string;
+      /** ACP tool-call id; keyed for in-place updates. */
+      toolCallId: string;
+      title: string;
+      status: ToolCallStatus | null;
+      toolKind: string | null;
+      rawInput: unknown;
+      content: unknown;
+      locations: ToolCallLocation[];
+      timestamp: number;
     };
 
 export type Status = 'connecting' | 'connected' | 'reconnecting' | 'error';

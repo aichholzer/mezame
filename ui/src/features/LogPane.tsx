@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
+import { ToolCallCard } from '@/features/ToolCallCard';
 import { okiroActions } from '@/hooks/useOkiro';
 import { useTick } from '@/hooks/useTick';
 import { formatAbsolute, timeAgo } from '@/lib/time';
@@ -84,7 +85,7 @@ const TextEntry = ({ entry, now }: { entry: Extract<LogEntry, { kind: 'text' }>;
     if (!trimmed) {
       return null;
     }
-    const isError = trimmed.startsWith('[error');
+    const isError = trimmed.startsWith('[Error');
     return (
       <div className="my-2 flex justify-center">
         <div
@@ -190,6 +191,9 @@ export const LogPane = ({ session, isActive }: Props) => {
       {session.log.map((entry) => {
         if (entry.kind === 'text') {
           return <TextEntry key={entry.id} entry={entry} now={now} />;
+        }
+        if (entry.kind === 'tool_call') {
+          return <ToolCallCard key={entry.id} entry={entry} />;
         }
         return (
           <PermissionCard key={entry.id} session={session} entry={entry} options={entry.options} />

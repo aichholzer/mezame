@@ -8,7 +8,8 @@ import type {
   Role,
   ServerMessage,
   Session,
-  Status
+  Status,
+  ToolCallLocation
 } from '@/types';
 
 // Multi-session ACP store.
@@ -101,7 +102,16 @@ const setBusy = (s: Session, busy: boolean) => {
 };
 
 const raiseAttention = (s: Session, level: NonNullable<Attention>) => {
-  if (s.id === activeId) {
+  // Skip raising attention when the user is already looking at this
+  // session: the Okiro tab is visible AND the session is the active
+  // in-app tab. Any other combination (different in-app tab, or the
+  // whole Okiro browser tab hidden) still raises attention so the
+  // favicon badge and document title light up.
+  const looking =
+    s.id === activeId &&
+    typeof document !== 'undefined' &&
+    document.visibilityState === 'visible';
+  if (looking) {
     return;
   }
   const rank: Record<NonNullable<Attention>, number> = { done: 1, permission: 2, error: 3 };
@@ -327,6 +337,53 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
         timestamp: Date.now()
       });
       break;
+    case 'tool_call': {
+      // Merge with an existing tool-call entry if we have seen this id
+      // before (ACP `tool_call_update`); otherwise push a new row.
+      const existing = s.log.find(
+        (e) => e.kind === 'tool_call' && e.toolCallId === msg.toolCallId
+      );
+      const nextTitle = typeof msg.title === 'string' && msg.title.length > 0 ? msg.title : null;
+      const nextStatus = typeof msg.status === 'string' && msg.status.length > 0 ? msg.status : null;
+      const nextKind = typeof msg.kind === 'string' && msg.kind.length > 0 ? msg.kind : null;
+      const nextLocations = Array.isArray(msg.locations) ? (msg.locations as ToolCallLocation[]) : null;
+      if (existing && existing.kind === 'tool_call') {
+        // ACP updates carry only the fields that changed. Fall back to
+        // the prior value when a field is absent or null.
+        if (nextTitle !== null) {
+          existing.title = nextTitle;
+        }
+        if (nextStatus !== null) {
+          existing.status = nextStatus;
+        }
+        if (nextKind !== null) {
+          existing.toolKind = nextKind;
+        }
+        if (msg.rawInput !== undefined && msg.rawInput !== null) {
+          existing.rawInput = msg.rawInput;
+        }
+        if (msg.content !== undefined && msg.content !== null) {
+          existing.content = msg.content;
+        }
+        if (nextLocations !== null) {
+          existing.locations = nextLocations;
+        }
+      } else {
+        s.log.push({
+          kind: 'tool_call',
+          id: newLogId(),
+          toolCallId: msg.toolCallId,
+          title: nextTitle ?? 'tool',
+          status: nextStatus,
+          toolKind: nextKind,
+          rawInput: msg.rawInput ?? null,
+          content: msg.content ?? null,
+          locations: nextLocations ?? [],
+          timestamp: Date.now()
+        });
+      }
+      break;
+    }
     case 'prompt_done':
       s.thinking = false;
       ensureTrailingNewline(s);
@@ -367,6 +424,25 @@ const activate = (id: string) => {
   notify();
   scheduleSync();
 };
+
+/** Clears attention on the active session when the Okiro browser tab
+ * becomes visible again. Covers the case where an event raised
+ * attention on the already-active in-app tab while the browser tab
+ * was hidden. */
+const clearActiveAttentionOnVisible = () => {
+  if (typeof document === 'undefined' || document.visibilityState !== 'visible') {
+    return;
+  }
+  const s = activeId ? findSession(activeId) : undefined;
+  if (s && s.attention !== null) {
+    s.attention = null;
+    notify();
+  }
+};
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', clearActiveAttentionOnVisible);
+}
 
 const newSession = (cwd: string | null = null, name: string | null = null) => {
   const id = newId();
@@ -505,6 +581,12 @@ const resolvePermission = (sessionId: string, logEntryId: string, option: Permis
     return;
   }
   entry.resolution = option.name || option.optionId || 'option';
+  // User answered the prompt: drop any lingering permission attention
+  // so the favicon/title badge de-escalates immediately rather than
+  // waiting for a turn end or tab switch.
+  if (s.attention === 'permission') {
+    s.attention = null;
+  }
   s.ws?.send(
     JSON.stringify({
       type: 'permission_response',
