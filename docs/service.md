@@ -12,7 +12,7 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
 
    ```ini
    [Unit]
-   Description=Okiro ACP bridge
+   Description=Okiro
    After=network-online.target
    Wants=network-online.target
 
@@ -54,7 +54,7 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
 
    ```ini
    [Unit]
-   Description=Okiro ACP bridge
+   Description=Okiro
    After=network-online.target
    Wants=network-online.target
 
@@ -161,4 +161,4 @@ Both systemd `stop` and launchd `bootout` send SIGTERM. Okiro catches it, stops 
 
 ## A note on `--background`
 
-Okiro does not have a `--background` flag and intentionally will not. Daemonising your own process conflicts with how modern init systems track child processes, rotate logs, and decide when to restart. The pattern above is the one every other well-behaved foreground tool (including `cloudflared` when you use `cloudflared service install`) uses, and it gives you better observability for free.
+Okiro does not have a `--background` flag and intentionally will not. Daemonising your own process conflicts with how modern init systems track child processes, rotate logs, and decide when to restart. The pattern above is the one every other well-behaved foreground tool uses, and it gives you better observability for free.

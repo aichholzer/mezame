@@ -18,6 +18,7 @@ exclude = [
     "ui/node_modules/**",
     "ui/dist/**",
     "assets/**",
+    "docs/**",
     "CHANGELOG.md",
     "todo.md"
 ]
