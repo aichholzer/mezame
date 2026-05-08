@@ -68,8 +68,6 @@ Okiro/
 │       ├── features/           # TabBar, LogPane, InputRow, ...
 │       ├── components/         # CopyButton + shadcn primitives
 │       └── lib/                # utils, time helpers
-└── cloudflared/
-    └── config.yml              # example named-tunnel config
 ```
 
 ## Quick start
@@ -141,9 +139,9 @@ prints nothing to stdout until it receives a JSON-RPC message on stdin.
 
 ## Expose via Cloudflare Tunnel
 
-`cloudflared/config.yml` is a ready-to-edit starting point for a named
-tunnel that routes a public hostname at your local `okiro`. Adapt it to
-your setup depending on whether you already run `cloudflared`.
+A named Cloudflare Tunnel can route a public hostname at your local
+`okiro`. The setup differs slightly depending on whether you already run
+`cloudflared`.
 
 ### Starting from scratch
 
@@ -160,27 +158,32 @@ your setup depending on whether you already run `cloudflared`.
    cloudflared tunnel create okiro
    ```
 
-3. Copy the example config into place:
+3. Create `~/.cloudflared/config.yml` with the following contents,
+   replacing `REPLACE_WITH_TUNNEL_UUID` with the UUID from step 2 and
+   `okiro.example.com` with your hostname. WebSocket upgrades are
+   forwarded by default; no extra flags needed.
 
-   ```sh
-   mkdir -p ~/.cloudflared
-   cp cloudflared/config.yml ~/.cloudflared/config.yml
+   ```yaml
+   tunnel: REPLACE_WITH_TUNNEL_UUID
+   credentials-file: ~/.cloudflared/REPLACE_WITH_TUNNEL_UUID.json
+
+   ingress:
+     - hostname: okiro.example.com
+       service: http://localhost:7842
+     - service: http_status:404
    ```
 
-4. Edit `~/.cloudflared/config.yml` and replace the
-   `REPLACE_WITH_TUNNEL_UUID` placeholders with the tunnel name (or its
-   UUID) from step 2, and swap `okiro.example.com` for your hostname.
    The `tunnel:` value must match the tunnel you created; if it does
    not, `cloudflared` refuses to start.
 
-5. Route the hostname to the tunnel from the machine that owns the
+4. Route the hostname to the tunnel from the machine that owns the
    credentials:
 
    ```sh
    cloudflared tunnel route dns okiro okiro.example.com
    ```
 
-6. Run it:
+5. Run it:
 
    ```sh
    cloudflared tunnel run okiro
