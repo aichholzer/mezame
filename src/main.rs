@@ -90,8 +90,8 @@ fn state_path() -> Result<PathBuf> {
 
 fn load_config() -> Result<Config> {
     let path = config_path()?;
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: Config = toml::from_str(&raw).context("parsing config.toml")?;
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;
+    let cfg: Config = toml::from_str(&raw).context("Parsing config.toml")?;
     Ok(cfg)
 }
 
@@ -110,10 +110,10 @@ fn init_config() -> Result<Config> {
     println!("  1) cloudflared  (serve a terminal-like web UI; front with your tunnel)");
     println!("  2) telegram     (long-poll a Telegram bot)  [not yet implemented]");
     let transport = loop {
-        match prompt_line("> ")?.as_str() {
+        match prompt_line("> ")?.to_ascii_lowercase().as_str() {
             "1" | "cloudflared" => break Transport::Cloudflared,
             "2" | "telegram" => break Transport::Telegram,
-            _ => println!("pick 1 or 2")
+            _ => println!("Pick 1 or 2")
         }
     };
 
@@ -129,7 +129,7 @@ fn init_config() -> Result<Config> {
     let agent_cmd = {
         let s = prompt_line("ACP agent command (e.g. kiro-cli, claude, gemini, codex): ")?;
         if s.is_empty() {
-            bail!("agent command is required");
+            bail!("Agent command is required");
         }
         s
     };
@@ -157,7 +157,7 @@ fn init_config() -> Result<Config> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, toml::to_string_pretty(&cfg)?)?;
-    println!("wrote {}", path.display());
+    println!("Wrote {}", path.display());
     println!();
     Ok(cfg)
 }
@@ -180,8 +180,8 @@ fn main() -> Result<()> {
     let cfg = if config_path()?.exists() {
         load_config()?
     } else {
-        eprintln!("no config at {}", config_path()?.display());
-        eprintln!("let's set one up:");
+        eprintln!("No config at {}", config_path()?.display());
+        eprintln!("Let's set one up:");
         init_config()?
     };
 
@@ -468,7 +468,7 @@ async fn ws_upgrade(
         .filter(|s| !s.is_empty());
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle_ws(socket, cfg, resume, cwd_override).await {
-            eprintln!("ws session ended: {e:?}");
+            eprintln!("WebSocket session ended: {e:?}");
         }
     })
 }
@@ -536,7 +536,7 @@ async fn handle_ws(
             })
         )
         .await
-        .context("initialize")?;
+        .context("Failed to initialize agent")?;
 
     // Session setup. If the browser supplied a resume id, try `session/load`
     // first; on failure fall back to `session/new`. ACP's session/load
@@ -555,13 +555,12 @@ async fn handle_ws(
         Some(sid) => match try_load_session(&agent, &sid, &cwd_str).await {
             Ok(value) => (sid, true, extract_session_info(&value)),
             Err(err_str) => {
-                eprintln!("session/load failed ({err_str}); falling back to session/new");
+                eprintln!("Session load failed: {err_str}. Falling back to a new session.");
                 let _ = to_ws_tx.send(text_msg(json!({
                     "type": "append",
                     "role": "sys",
                     "text": format!(
-                        "\n[previous session {} could not be resumed ({}). Starting a new one.]\n",
-                        short_id(&sid),
+                        "\n[{} — Starting a new one.]\n",
                         short_reason(&err_str)
                     )
                 })));
@@ -571,11 +570,11 @@ async fn handle_ws(
                         json!({ "cwd": cwd_str, "mcpServers": [] })
                     )
                     .await
-                    .context("session/new (fallback)")?;
+                    .context("Failed to start fallback session")?;
                 let sid = new_session
                     .get("sessionId")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
+                    .ok_or_else(|| anyhow!("Session creation returned no session id"))?
                     .to_string();
                 (sid, false, extract_session_info(&new_session))
             }
@@ -587,11 +586,11 @@ async fn handle_ws(
                     json!({ "cwd": cwd_str, "mcpServers": [] })
                 )
                 .await
-                .context("session/new")?;
+                .context("Failed to start new session")?;
             let sid = new_session
                 .get("sessionId")
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("session/new returned no sessionId"))?
+                .ok_or_else(|| anyhow!("Session creation returned no session id"))?
                 .to_string();
             (sid, false, extract_session_info(&new_session))
         }
@@ -599,11 +598,14 @@ async fn handle_ws(
 
     // Tell the browser which session id it is bound to so it can persist it
     // for reconnect, and whether this was a resume (so it can clear stale
-    // log before the replay lands).
+    // log before the replay lands). The `cwd` is the actual path the agent
+    // session was opened with, so the UI can display it even when no
+    // `?cwd=` override was supplied.
     let _ = to_ws_tx.send(text_msg(json!({
         "type": "ready",
         "sessionId": session_id,
-        "resumed": resumed
+        "resumed": resumed,
+        "cwd": cwd_str
     })));
 
     // Send the `modes` and `models` payload (if present in either
@@ -703,7 +705,7 @@ async fn handle_ws(
                             {
                                 let _ = to_ws.send(text_msg(json!({
                                     "type": "error",
-                                    "message": format!("permission reply failed: {e}")
+                                    "message": format!("Permission reply failed: {e}")
                                 })));
                             }
                         });
@@ -747,7 +749,7 @@ async fn handle_ws(
                             {
                                 let _ = to_ws.send(text_msg(json!({
                                     "type": "error",
-                                    "message": format!("set_mode failed: {e}")
+                                    "message": format!("Failed to change agent mode: {e}")
                                 })));
                             }
                         });
@@ -770,7 +772,7 @@ async fn handle_ws(
                             {
                                 let _ = to_ws.send(text_msg(json!({
                                     "type": "error",
-                                    "message": format!("set_model failed: {e}")
+                                    "message": format!("Failed to change model: {e}")
                                 })));
                             }
                         });
@@ -884,7 +886,7 @@ async fn handle_agent_message(
                     let line = if status.is_empty() {
                         format!("\n[{title}]\n")
                     } else {
-                        format!("\n[{title} — {status}]\n")
+                        format!("\n[{title}: {status}]\n")
                     };
                     let _ = tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": line })));
                 }
@@ -1007,7 +1009,7 @@ async fn try_load_session(agent: &Agent, sid: &str, cwd: &str) -> std::result::R
                 // alone and let the shutdown-race back-off do its job.
                 let stole = steal_stale_session_lock(sid);
                 if stole {
-                    eprintln!("session/load {sid}: stale lock stolen on attempt {}", attempt + 1);
+                    eprintln!("Session {sid}: stale lock stolen on attempt {}.", attempt + 1);
                     // Don't burn a backoff sleep if we just cleared the
                     // blocker ourselves.
                     continue;
@@ -1050,7 +1052,7 @@ fn steal_stale_session_lock(session_id: &str) -> bool {
     }
     match std::fs::remove_file(&path) {
         Ok(()) => {
-            eprintln!("stole stale Kiro session lock (pid {pid}): {}", path.display());
+            eprintln!("Stole stale Kiro session lock (pid {pid}): {}", path.display());
             true
         }
         Err(_) => false
@@ -1081,10 +1083,10 @@ extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
-/// First eight hex chars of a UUID-shaped session id, for user-facing log.
-fn short_id(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
-}
+// First eight hex chars of a UUID-shaped session id, for user-facing log.
+// fn short_id(id: &str) -> &str {
+//    id.get(..8).unwrap_or(id)
+// }
 
 /// Best-effort one-liner summary of an agent error string for the log.
 fn short_reason(msg: &str) -> String {
@@ -1115,7 +1117,7 @@ fn short_reason(msg: &str) -> String {
 //     per token.
 
 async fn run_telegram(_cfg: Config) -> Result<()> {
-    bail!("telegram transport is not yet implemented; re-run `okiro init` and pick cloudflared");
+    bail!("Telegram transport is not yet implemented. Re-run `okiro init` and pick Cloudflared.");
 }
 
 // ---------- ACP agent subprocess ----------
@@ -1178,9 +1180,9 @@ impl Agent {
             stdin.flush().await?;
         }
 
-        let resp = rx.await.context("agent closed before replying")?;
+        let resp = rx.await.context("Agent closed before replying")?;
         if let Some(err) = resp.get("error") {
-            bail!("agent error: {err}");
+            bail!("Agent error: {err}");
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -1252,7 +1254,7 @@ async fn spawn_agent(cfg: &Config) -> Result<Agent> {
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to spawn `{}`", cfg.agent_cmd))?;
+        .with_context(|| format!("Failed to spawn `{}`", cfg.agent_cmd))?;
 
     let stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");

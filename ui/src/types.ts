@@ -6,7 +6,7 @@ export type Role = 'user' | 'agent' | 'sys';
 export type Attention = 'done' | 'permission' | 'error' | null;
 
 export type ServerMessage =
-  | { type: 'ready'; sessionId: string; resumed: boolean }
+  | { type: 'ready'; sessionId: string; resumed: boolean; cwd?: string }
   | { type: 'session_info'; info: SessionInfo }
   | { type: 'commands'; commands: SlashCommand[]; prompts: SlashPrompt[] }
   | { type: 'append'; role: Role; text: string }
@@ -98,6 +98,10 @@ export type Session = {
   acpSessionId: string | null;
   /** Optional working directory override passed via `?cwd=`. */
   cwd: string | null;
+  /** Actual cwd the agent session was opened with, reported by the
+   * server on `ready`. Equals `cwd` when the user supplied an override,
+   * otherwise the server's own process cwd. Display-only. */
+  effectiveCwd: string | null;
   /** True once the user has sent at least one prompt. Kiro only persists
    * a session to disk on first turn; unused sessions cannot be resumed. */
   used: boolean;

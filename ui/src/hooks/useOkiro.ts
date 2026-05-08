@@ -218,6 +218,7 @@ const makeSession = (
   label,
   acpSessionId,
   cwd,
+  effectiveCwd: cwd,
   used: acpSessionId !== null,
   log: [],
   status: 'connecting',
@@ -294,6 +295,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
         s.log = [];
         s.pinnedToBottom = true;
         s.acpSessionId = msg.sessionId;
+        s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
         setStatus(s, 'connected');
         // Seed from /history for real per-turn timestamps. The server
         // suppresses the ACP replay stream during the resume window, so
@@ -301,6 +303,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
         void loadHistory(s);
       } else {
         s.acpSessionId = msg.sessionId;
+        s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
         setStatus(s, 'connected');
       }
       scheduleSync();
@@ -334,7 +337,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
       raiseAttention(s, 'done');
       break;
     case 'error':
-      appendLog(s, { kind: 'text', id: newLogId(), role: 'sys', text: `\n[error: ${msg.message}]\n`, timestamp: Date.now() });
+      appendLog(s, { kind: 'text', id: newLogId(), role: 'sys', text: `\n[Error: ${msg.message}]\n`, timestamp: Date.now() });
       s.thinking = false;
       setBusy(s, false);
       raiseAttention(s, 'error');
@@ -488,7 +491,7 @@ const sendCancel = () => {
     return;
   }
   s.ws.send(JSON.stringify({ type: 'cancel' }));
-  appendLog(s, { kind: 'text', id: newLogId(), role: 'sys', text: '\n[cancel requested]\n', timestamp: Date.now() });
+  appendLog(s, { kind: 'text', id: newLogId(), role: 'sys', text: '\n[Cancel requested]\n', timestamp: Date.now() });
   notify();
 };
 

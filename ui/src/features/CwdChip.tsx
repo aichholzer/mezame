@@ -56,7 +56,10 @@ export const CwdChip = ({ session }: Props) => {
     return null;
   }
 
-  const cwd = session.cwd ?? '';
+  // Prefer the server-reported cwd (actual path the agent session opened
+  // at). Fall back to the user-supplied override, and finally to empty
+  // while the session is still connecting.
+  const cwd = session.effectiveCwd ?? session.cwd ?? '';
   const display = cwd.length > 0 ? truncateMiddle(cwd, 48) : SERVER_DEFAULT;
 
   const startEdit = () => {
@@ -80,7 +83,6 @@ export const CwdChip = ({ session }: Props) => {
     okiroActions.newSession(next);
     cancel();
   };
-
   if (editing) {
     return (
       <Input
