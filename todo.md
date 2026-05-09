@@ -240,9 +240,48 @@ Open work in this area:
   - Error aggregation: `main` needs to wait for all transport tasks and surface the first non-graceful exit, while still honouring Ctrl+C.
   - Session state (tabs, closed history) in `~/.okiro/state.json` is currently shared across the process. That is fine; transports are channels into the same agent pool, not isolated instances.
 
+## Service integration
+
+### 20. `okiro service install` subcommand (install as systemd / launchd service)
+
+- **Size:** weekend. ~250-300 lines of Rust plus docs.
+- **Status:** today we document the install in `docs/service.md`. This item replaces the copy-paste story with `okiro service {install|start|stop|restart|status|uninstall}`, matching what `cloudflared service install` and `zeroclaw service install` do.
+- **Where:** new `src/service.rs`, new `Service` enum in `main.rs`'s CLI arg parsing, route to `service::handle_command` before the transport dispatch.
+- **Scope (picking battles):** macOS LaunchAgent + Linux systemd user service only, as a v1. No OpenRC, no Windows, no system service with a dedicated user, no `logs` subcommand (`journalctl --user -u okiro` and `tail ~/Library/Logs/okiro.log` are fine and already documented). Keep it to what a single-user self-hosted setup needs.
+- **Prior art:** zeroclaw-labs/zeroclaw has this working in `crates/zeroclaw-runtime/src/service/mod.rs`. Copy the shape, don't reinvent. In particular:
+  - **Platform dispatch via `cfg!(target_os = ...)`** in each public fn, no Rust service-management crate (`service-manager` etc.). Shell out to `launchctl` / `systemctl` directly.
+  - **`std::env::current_exe()`** resolved at install time and baked into the unit/plist. No PATH guessing at service-start time. Works cleanly with `cargo install okiro` → `~/.cargo/bin/okiro`.
+  - **Plist and unit file bodies as `format!` string literals.** No templating crate. Zeroclaw ships a 5-line `xml_escape` helper for plist XML; reuse that verbatim.
+  - **Enum dispatch pattern** (`ServiceCommands::Install | Start | ...`) with a thin `handle_command` that pattern-matches to fn calls. Keeps the public surface obvious.
+- **What we want to improve on zeroclaw's version:**
+  - **Use `launchctl bootstrap gui/$(id -u) <plist>` and `bootout`, not `load -w` / `unload`.** Apple's docs flag the old verbs as legacy; our `docs/service.md` already uses the new ones. Zeroclaw uses the legacy verbs; we should ship the current ones from day one.
+  - **No Homebrew-prefix detection.** Zeroclaw does an involved dance to detect `/opt/homebrew/Cellar/...` and route runtime state into `<prefix>/var/zeroclaw/`. We don't need it: Okiro is distributed via `cargo install`, so the binary lives under `~/.cargo/bin/` and config under `~/.okiro/`. Skip the whole `detect_homebrew_var_dir` function.
+- **Plist template shape (copy from `docs/service.md`'s existing example):**
+  - `Label` = `dev.okiro`
+  - `ProgramArguments` = `[<current_exe>]` (no args; the binary serves by default)
+  - `RunAtLoad` = true
+  - `KeepAlive` = `{ SuccessfulExit: false }` (restart on crash, not on clean exit — matches systemd's `Restart=on-failure`)
+  - `StandardOutPath` / `StandardErrorPath` = `$HOME/Library/Logs/okiro.log`
+  - `EnvironmentVariables.HOME` and `.PATH` set explicitly (launchd's default PATH does not include Homebrew)
+- **Unit template shape (copy from `docs/service.md`):**
+  - `[Unit]` `After=network-online.target`, `Wants=network-online.target`
+  - `[Service]` `Type=simple`, `ExecStart=<current_exe>`, `Restart=on-failure`, `RestartSec=5`
+  - `[Install]` `WantedBy=default.target` (user service, not `multi-user.target`)
+- **Install flow per platform:**
+  - macOS: write `~/Library/LaunchAgents/dev.okiro.plist`, print "Start with: `okiro service start`". `start` runs `launchctl bootstrap gui/$(id -u) <plist>` then `launchctl kickstart -k gui/$(id -u)/dev.okiro`.
+  - Linux systemd user: write `~/.config/systemd/user/okiro.service`, run `systemctl --user daemon-reload && systemctl --user enable okiro.service`, print the `loginctl enable-linger` suggestion (do not run it ourselves; it needs root).
+- **Uninstall flow:** stop first, then remove the unit/plist. Mirror zeroclaw's "stop is best-effort, don't bail on failure" pattern so an unloaded unit doesn't make uninstall explode.
+- **Graceful shutdown:** already implemented in `src/http.rs::shutdown_signal`. `systemctl --user stop okiro` and `launchctl bootout` both send SIGTERM, which the handler catches. No code changes there.
+- **Docs:** once shipped, `docs/service.md` shrinks to "run `okiro service install`; here's how to inspect logs" plus the manual-install recipes for anyone who prefers to edit a unit file by hand.
+- **Acceptance:**
+  - `cargo install okiro && okiro service install && okiro service start` produces a running service on macOS and Debian/Ubuntu without further manual editing.
+  - The service survives logout on both platforms (with `loginctl enable-linger` noted for systemd users on headless machines).
+  - `okiro service stop` exits cleanly, no Kiro session lockfile panic on next start.
+  - `okiro service uninstall` leaves no unit/plist/log-dir debris.
+
 ## Bugs
 
-### 20. PDF upload surfaces a misleading "Unrecognised file type" error
+### 21. PDF upload surfaces a misleading "Unrecognised file type" error
 
 - **Size:** afternoon.
 - **Where:** `ui/src/lib/attachments.ts` (`fileToAttachment`, `describeRejection`, `RejectReason`), and the file picker `accept` attribute in `ui/src/features/InputRow.tsx`.
