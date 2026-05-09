@@ -7,7 +7,7 @@ import type { PromptBlock, PromptCapabilities } from '@/types';
 // ## History replay caveat
 //
 // Attachments sent in a prompt are not rehydrated when the browser
-// reconnects and issues `session/load`. Reasoning: Okiro's `/history`
+// reconnects and issues `session/load`. Reasoning: Mezame's `/history`
 // endpoint parses Kiro's on-disk JSONL, which today we only read for
 // text turns (see `parse_kiro_history` in `src/http.rs`). Kiro's JSONL
 // almost certainly records the full ACP prompt payload, but we have

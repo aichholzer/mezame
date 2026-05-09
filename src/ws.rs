@@ -38,10 +38,10 @@ pub(crate) async fn ws_upgrade(
     Query(params): Query<HashMap<String, String>>,
     State(cfg): State<Arc<Config>>
 ) -> Response {
-    // `/ws?session=<acp-session-id>` asks Okiro to call `session/load` on the
+    // `/ws?session=<acp-session-id>` asks Mezame to call `session/load` on the
     // agent instead of `session/new`. Absent = always new session.
     // `/ws?cwd=<path>` overrides the working directory for this session;
-    // absent or empty = Okiro's own process cwd.
+    // absent or empty = Mezame's own process cwd.
     let resume = params.get("session").cloned();
     let cwd_override = params
         .get("cwd")
@@ -97,7 +97,7 @@ async fn handle_ws(
     };
 
     // ACP handshake. `initialize` advertises no filesystem capabilities
-    // because Okiro does not back `fs/read_text_file` etc. today; the agent
+    // because Mezame does not back `fs/read_text_file` etc. today; the agent
     // is expected to use its own tools for file I/O.
     //
     // The agent responds with its own `agentCapabilities`, including
@@ -129,7 +129,7 @@ async fn handle_ws(
     // history rehydrates.
     //
     // `cwd` comes from the browser's `?cwd=<path>` query param if provided;
-    // otherwise we use Okiro's own process cwd.
+    // otherwise we use Mezame's own process cwd.
     let cwd_str = match cwd_override {
         Some(c) => c,
         None => std::env::current_dir()?.to_string_lossy().to_string()

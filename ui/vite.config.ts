@@ -16,7 +16,7 @@ const pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'ut
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   define: {
-    __OKIRO_VERSION__: JSON.stringify(pkg.version)
+    __MEZAME_VERSION__: JSON.stringify(pkg.version)
   },
   resolve: {
     alias: {

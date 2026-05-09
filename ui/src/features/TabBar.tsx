@@ -15,7 +15,7 @@ import type { Attention, ClosedEntry, Session } from '@/types';
 
 // Vite injects the version string from `ui/package.json` at build time.
 // See `vite.config.ts`.
-declare const __OKIRO_VERSION__: string;
+declare const __MEZAME_VERSION__: string;
 
 type Props = {
   sessions: Session[];
@@ -77,7 +77,7 @@ const tabVisualClass: Record<TabVisualState, string> = {
 };
 
 const tabVisualStyle: Partial<Record<TabVisualState, React.CSSProperties>> = {
-  connecting: { animation: 'okiro-pulse-orange 1.4s ease-in-out infinite' }
+  connecting: { animation: 'mezame-pulse-orange 1.4s ease-in-out infinite' }
 };
 
 const tabTooltipStatus = (state: TabVisualState): string => {
@@ -275,8 +275,8 @@ export const TabBar = ({
       </div>
 
       <div className="flex items-center gap-1.5 select-none">
-        <span className="text-sm font-bold tracking-wider text-foreground">Okiro!</span>
-        <span className="text-[10px] text-muted-foreground/70 font-mono">{__OKIRO_VERSION__}</span>
+        <span className="text-sm font-bold tracking-wider text-foreground">Mezame!</span>
+        <span className="text-[10px] text-muted-foreground/70 font-mono">{__MEZAME_VERSION__}</span>
       </div>
       </div>
     </header>

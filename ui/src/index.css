@@ -3,7 +3,7 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* okiro design tokens.
+/* mezame design tokens.
  *
  * Dark-only today. Zinc base, cool blue accent, monospace throughout. Role
  * and attention hues deliberately match the legacy src/ui.html palette so
@@ -96,7 +96,7 @@
  * indirection, no color-mix, no @layer) so nothing in Tailwind's
  * pipeline can flatten them. Applied via inline style from TabBar.tsx
  * so they win any cascade fight with hover utilities. */
-@keyframes okiro-pulse-orange {
+@keyframes mezame-pulse-orange {
   0%, 100% {
     background-color: rgba(217, 163, 63, 0.25);
   }
@@ -118,7 +118,7 @@
   inherits: false;
 }
 
-@keyframes okiro-border-spin {
+@keyframes mezame-border-spin {
   to {
     --busy-border-angle: 360deg;
   }
@@ -147,7 +147,7 @@
       rgba(110, 196, 140, 0.95) 325deg,
       transparent 360deg
     ) border-box;
-  animation: okiro-border-spin 2s linear infinite;
+  animation: mezame-border-spin 2s linear infinite;
 }
 .tab-busy-border:hover {
   background:

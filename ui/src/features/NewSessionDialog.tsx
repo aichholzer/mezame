@@ -65,7 +65,7 @@ export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
               value={cwd}
               onChange={(e) => setCwd(e.target.value)}
               autoComplete="off"
-              placeholder="leave blank for okiro's directory"
+              placeholder="leave blank for mezame's directory"
             />
           </div>
           <DialogFooter>

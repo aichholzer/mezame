@@ -1,4 +1,4 @@
-// Wire-protocol types between the browser and okiro. These mirror the
+// Wire-protocol types between the browser and mezame. These mirror the
 // shapes produced by handle_agent_message in src/ws.rs.
 
 export type Role = 'user' | 'agent' | 'sys';

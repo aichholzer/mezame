@@ -1,8 +1,8 @@
-//! Cloudflared transport: the HTTP/WS server that fronts Okiro.
+//! Cloudflared transport: the HTTP/WS server that fronts Mezame.
 //!
 //! axum serves the embedded UI at `/` and accepts WS upgrades at `/ws`.
 //! Public reachability is delegated to an external Cloudflare Tunnel;
-//! Okiro binds loopback by default.
+//! Mezame binds loopback by default.
 //!
 //! Also home to the plain HTTP endpoints: `/state` (cross-device browser
 //! state), `/history` (Kiro JSONL replay), and the embedded-asset fallback.
@@ -56,7 +56,7 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
         .with_state(shared);
 
     let listener = TcpListener::bind(&bind).await?;
-    eprintln!("Okiro is listening on: http://{bind}");
+    eprintln!("Mezame is listening on: http://{bind}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -65,7 +65,7 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
 
 /// Resolve when the process receives SIGINT (Ctrl+C) or SIGTERM (systemd
 /// / launchd `stop`). `with_graceful_shutdown` stops accepting new
-/// connections on the returned future, so Okiro exits promptly when its
+/// connections on the returned future, so Mezame exits promptly when its
 /// service manager asks it to.
 ///
 /// Live WebSocket sessions are dropped on shutdown; the agent subprocess
@@ -165,7 +165,7 @@ fn mime_for(path: &str) -> &'static str {
 }
 
 /// GET /state — returns the persisted browser state as JSON, or `{}` if the
-/// file does not exist yet. Okiro does not interpret the contents; it is
+/// file does not exist yet. Mezame does not interpret the contents; it is
 /// purely a cross-device store for the UI.
 async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
     let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;

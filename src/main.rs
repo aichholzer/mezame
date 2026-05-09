@@ -1,4 +1,4 @@
-//! Okiro: an ACP client that bridges a local agent to a browser UI.
+//! Mezame: an ACP client that bridges a local agent to a browser UI.
 //!
 //! One WebSocket connection = one agent subprocess = one ACP session.
 //! The agent is killed when the browser disconnects (`kill_on_drop(true)`).
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
         // empty or multi-entry configs. When multi-transport lands
         // (todo #19), iterate the list and spawn one task per entry.
         match cfg.transports.as_slice() {
-            [] => bail!("No transports configured. Re-run `okiro init`."),
+            [] => bail!("No transports configured. Re-run `mezame init`."),
             [one] => match one.clone() {
                 TransportConfig::Cloudflared { bind } => run_cloudflared(cfg, bind).await
             },

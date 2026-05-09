@@ -104,9 +104,9 @@ const setBusy = (s: Session, busy: boolean) => {
 
 const raiseAttention = (s: Session, level: NonNullable<Attention>) => {
   // Skip raising attention when the user is already looking at this
-  // session: the Okiro tab is visible AND the session is the active
+  // session: the Mezame tab is visible AND the session is the active
   // in-app tab. Any other combination (different in-app tab, or the
-  // whole Okiro browser tab hidden) still raises attention so the
+  // whole Mezame browser tab hidden) still raises attention so the
   // favicon badge and document title light up.
   const looking =
     s.id === activeId &&
@@ -155,7 +155,7 @@ const doSync = async () => {
       body: JSON.stringify(body)
     });
   } catch {
-    // Unreachable server: state stays local. WS failures imply okiro is
+    // Unreachable server: state stays local. WS failures imply mezame is
     // down; nothing works anyway.
   }
 };
@@ -174,7 +174,7 @@ const fetchState = async (): Promise<Partial<PersistedState> | null> => {
 
 // ---------- history rehydration ----------
 //
-// On resume, okiro suppresses the ACP replay stream and the browser seeds
+// On resume, mezame suppresses the ACP replay stream and the browser seeds
 // its log from `/history?session=<id>`. The server reads Kiro's own JSONL
 // event log and returns compact entries with real per-turn timestamps.
 
@@ -429,7 +429,7 @@ const activate = (id: string) => {
   scheduleSync();
 };
 
-/** Clears attention on the active session when the Okiro browser tab
+/** Clears attention on the active session when the Mezame browser tab
  * becomes visible again. Covers the case where an event raised
  * attention on the already-active in-app tab while the browser tab
  * was hidden. */
@@ -680,7 +680,7 @@ const init = async () => {
 
 // ---------- public hook ----------
 
-export const useOkiro = () => {
+export const useMezame = () => {
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   return {
     sessions: state.sessions,
@@ -690,7 +690,7 @@ export const useOkiro = () => {
   };
 };
 
-export const okiroActions = {
+export const mezameActions = {
   init,
   activate,
   newSession,

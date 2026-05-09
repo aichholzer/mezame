@@ -1,12 +1,12 @@
 [package]
-name = "okiro"
+name = "mezame"
 version = "0.8.0"
 edition = "2021"
 build = "build.rs"
 description = "An ACP client that bridges a local agent (Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, ...) to a browser UI over WebSockets."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/aichholzer/okiro"
+repository = "https://github.com/aichholzer/mezame"
 keywords = ["acp", "agent", "cli", "kiro", "websocket"]
 categories = ["command-line-utilities", "web-programming::websocket"]
 # `ui/node_modules/` is populated by `build.rs` inside `$OUT_DIR` and

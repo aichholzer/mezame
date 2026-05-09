@@ -161,10 +161,10 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
     let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
 
-    // Optional ACP tracing. Set `OKIRO_DEBUG_ACP=1` to dump every inbound
-    // line from the agent to Okiro's stderr. Helpful when wiring new
+    // Optional ACP tracing. Set `MEZAME_DEBUG_ACP=1` to dump every inbound
+    // line from the agent to Mezame's stderr. Helpful when wiring new
     // Kiro extensions (`_kiro.dev/*`) or debugging wire-shape mismatches.
-    let debug_acp = std::env::var_os("OKIRO_DEBUG_ACP").is_some();
+    let debug_acp = std::env::var_os("MEZAME_DEBUG_ACP").is_some();
 
     // Stdout reader: route responses vs notifications.
     //

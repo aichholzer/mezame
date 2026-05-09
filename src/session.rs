@@ -4,7 +4,7 @@
 //! while an ACP process is attached to that session. Two ways this gets
 //! in our way:
 //!
-//! 1. Dead-PID stale lock. A previous Okiro (or Kiro child) was SIGKILLed
+//! 1. Dead-PID stale lock. A previous Mezame (or Kiro child) was SIGKILLed
 //!    before its cooperative shutdown could run. The lockfile persists
 //!    pointing at a PID that no longer exists.
 //! 2. Live-PID transient contention. Browser reload causes the old WS

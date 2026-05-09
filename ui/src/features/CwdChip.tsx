@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { okiroActions } from '@/hooks/useOkiro';
+import { mezameActions } from '@/hooks/useMezame';
 import { cn } from '@/lib/utils';
 import type { Session } from '@/types';
 
@@ -16,7 +16,7 @@ import type { Session } from '@/types';
 //
 // Double-click (or Enter on focus) swaps the chip for an inline input
 // preseeded with the current cwd. Commit spawns a new tab via
-// okiroActions.newSession(cwd). Escape cancels.
+// mezameActions.newSession(cwd). Escape cancels.
 
 type Props = {
   session: Session | null;
@@ -25,7 +25,7 @@ type Props = {
 const SERVER_DEFAULT = 'server default';
 
 // Middle-ellipsis for long paths so both the parent and leaf stay
-// visible: `/Users/stefan/.../repos/okiro`.
+// visible: `/Users/stefan/.../repos/mezame`.
 const truncateMiddle = (value: string, max: number) => {
   if (value.length <= max) {
     return value;
@@ -80,7 +80,7 @@ export const CwdChip = ({ session }: Props) => {
     }
     // Spawn a sibling tab. The store places new tabs leftmost and
     // activates them automatically.
-    okiroActions.newSession(next);
+    mezameActions.newSession(next);
     cancel();
   };
   if (editing) {

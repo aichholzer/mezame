@@ -10,7 +10,7 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { okiroActions } from '@/hooks/useOkiro';
+import { mezameActions } from '@/hooks/useMezame';
 import { cn } from '@/lib/utils';
 import type { Session } from '@/types';
 
@@ -129,7 +129,7 @@ export const ModeModelSelectors = ({ session, layout = 'row' }: Props) => {
         label="Agent"
         options={modeOptions}
         currentId={session.currentModeId}
-        onPick={okiroActions.setMode}
+        onPick={mezameActions.setMode}
         disabled={busy}
         emptyLabel="none"
         triggerLabel={currentMode?.name || currentMode?.id || '—'}
@@ -138,7 +138,7 @@ export const ModeModelSelectors = ({ session, layout = 'row' }: Props) => {
         label="Model"
         options={modelOptions}
         currentId={session.currentModelId}
-        onPick={okiroActions.setModel}
+        onPick={mezameActions.setModel}
         disabled={busy}
         emptyLabel="none"
         triggerLabel={currentModel?.name || currentModel?.modelId || '—'}

@@ -1,4 +1,4 @@
-//! Build script for Okiro.
+//! Build script for Mezame.
 //!
 //! Runs the React/Vite UI build under `$OUT_DIR/ui/` (copied from the
 //! crate's `ui/` sources) so that `$OUT_DIR/ui/dist/` is present when
@@ -12,7 +12,7 @@
 //! The UI tree is declared in `rerun-if-changed` so a plain `cargo build`
 //! with no UI changes is a cache hit after the first `npm ci`.
 //!
-//! The build is skipped entirely when `OKIRO_SKIP_UI_BUILD=1`, which is
+//! The build is skipped entirely when `MEZAME_SKIP_UI_BUILD=1`, which is
 //! useful in local Rust-only iteration where you're running `vite dev` in
 //! a separate terminal.
 //!
@@ -41,9 +41,9 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/src");
     println!("cargo:rerun-if-changed=ui/public");
     println!("cargo:rerun-if-changed=ui/components.json");
-    println!("cargo:rerun-if-env-changed=OKIRO_SKIP_UI_BUILD");
+    println!("cargo:rerun-if-env-changed=MEZAME_SKIP_UI_BUILD");
 
-    if std::env::var_os("OKIRO_SKIP_UI_BUILD").is_some() {
+    if std::env::var_os("MEZAME_SKIP_UI_BUILD").is_some() {
         // Leave an empty dist/ directory so rust-embed doesn't fail to
         // resolve the `$OUT_DIR/ui/dist/` folder. The binary will be
         // missing the UI; that's on the developer who set the flag.
@@ -57,10 +57,10 @@ fn main() {
     // because cargo squashes most of build.rs output unless there's an
     // error.
     if which("npm").is_none() {
-        panic!("`npm` not found on PATH. Install Node.js (includes npm) and retry `cargo build` or `cargo install okiro`.");
+        panic!("`npm` not found on PATH. Install Node.js (includes npm) and retry `cargo build` or `cargo install mezame`.");
     }
     if which("node").is_none() {
-        panic!("`node` not found on PATH. Install Node.js and retry `cargo build` or `cargo install okiro`.");
+        panic!("`node` not found on PATH. Install Node.js and retry `cargo build` or `cargo install mezame`.");
     }
 
     // Mirror the source tree into OUT_DIR. Only the UI inputs, never

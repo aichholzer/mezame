@@ -1,4 +1,4 @@
-# Okiro! backlog
+# Mezame! backlog
 
 Feature backlog, grouped by theme. Sizes are rough: *afternoon* / *day* / *weekend*.
 
@@ -62,7 +62,7 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
 
 ### 6. Favicon badge for total attention count
 
-- **Status:** done (2026-05-08). `useAttentionBadge` hook subscribes to the session store, counts background sessions with attention, paints a red numeric pill onto the favicon and prefixes `document.title` with `(N)`. Base favicon lives at `ui/public/favicon.png`. Attention now also raises for the active in-app session when the whole Okiro browser tab is hidden (was: only raised for background in-app tabs), so you see a badge when a turn completes while you're reading elsewhere. Visibility change on the Okiro tab clears the active session's attention.
+- **Status:** done (2026-05-08). `useAttentionBadge` hook subscribes to the session store, counts background sessions with attention, paints a red numeric pill onto the favicon and prefixes `document.title` with `(N)`. Base favicon lives at `ui/public/favicon.png`. Attention now also raises for the active in-app session when the whole Mezame browser tab is hidden (was: only raised for background in-app tabs), so you see a badge when a turn completes while you're reading elsewhere. Visibility change on the Mezame tab clears the active session's attention.
 - **Size:** half an afternoon.
 - **Where:** `src/ui.html`. Purely client-side.
 - **What:** compute the sum of tabs with attention dots. If > 0, paint a small badge into a canvas, draw the base favicon underneath, set `link[rel=icon].href` to the canvas data URL. If 0, restore the base favicon.
@@ -117,7 +117,7 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
 
 ### 12. Agent mode and model switch per tab
 
-- **Status:** done (2026-05-07). `session/new` and `session/load` results carry `modes` and `models`, and `okiro` forwards them as a `session_info` WS event right after `ready`. Browser sends `set_mode`/`set_model` back, which okiro translates into ACP `session/set_mode`/`session/set_model`. UI lives in `ui/src/features/ModeModelSelectors.tsx` and renders as two dropdowns in a secondary header row below the tab bar. Disabled while the session is busy.
+- **Status:** done (2026-05-07). `session/new` and `session/load` results carry `modes` and `models`, and `mezame` forwards them as a `session_info` WS event right after `ready`. Browser sends `set_mode`/`set_model` back, which mezame translates into ACP `session/set_mode`/`session/set_model`. UI lives in `ui/src/features/ModeModelSelectors.tsx` and renders as two dropdowns in a secondary header row below the tab bar. Disabled while the session is busy.
 - **Size:** day.
 - **Where:** `src/main.rs` to send `session/set_mode` / `session/set_model` and to forward the current mode/model and available options to the browser. `src/ui.html` for the selector UI.
 - **What:** small selector in the tab header or status bar. Shows current mode (e.g. autopilot / supervised) and current model. Clicking opens a dropdown of allowed values reported by the agent.
@@ -157,13 +157,13 @@ All UI-only items live in `src/ui.html`. Server-touching items note the function
 
 ### Bind defaults and auth
 
-Okiro has no auth of its own. The intended production posture is:
+Mezame has no auth of its own. The intended production posture is:
 
-- `bind = "127.0.0.1:9510"` on the host running Okiro.
-- `cloudflared` on the same host (or another container on a trusted LAN), ingress pointing at `http://localhost:9510` or `http://<okiro-host>:9510`.
+- `bind = "127.0.0.1:9510"` on the host running Mezame.
+- `cloudflared` on the same host (or another container on a trusted LAN), ingress pointing at `http://localhost:9510` or `http://<mezame-host>:9510`.
 - Cloudflare Access on the public hostname, gating with an identity provider.
 
-`okiro init` offers `0.0.0.0:9510` as an option for trusted-LAN setups where `cloudflared` runs on a different container and needs to reach Okiro across the LAN. Picking that option opts into "my LAN is my trust boundary", which is on the user, not the tool. Default stays loopback.
+`mezame init` offers `0.0.0.0:9510` as an option for trusted-LAN setups where `cloudflared` runs on a different container and needs to reach Mezame across the LAN. Picking that option opts into "my LAN is my trust boundary", which is on the user, not the tool. Default stays loopback.
 
 Open work in this area:
 
@@ -172,7 +172,7 @@ Open work in this area:
 - **Size:** half a day including JWKS caching.
 - **Where:** `ws_upgrade` (and any other public route) in `src/main.rs`.
 - **What:** validate `Cf-Access-Jwt-Assertion` before allowing the WS upgrade. JWKS lives at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`. Verify the signature, `aud`, `iss`, `exp`. Cache the JWKS with a reasonable TTL (15 min) and refresh on signature miss.
-- **Config:** add `access.team_domain` and `access.aud` to `~/.okiro/config.json`. Optional; when unset, skip validation (local-only mode).
+- **Config:** add `access.team_domain` and `access.aud` to `~/.mezame/config.json`. Optional; when unset, skip validation (local-only mode).
 - **Gotchas:**
   - Bypass the check when the request is from `127.0.0.1` so local smoke tests still work.
   - Add the crates we need: `jsonwebtoken`, `reqwest` (or reuse something we already have to avoid bloat; check tls features carefully).
@@ -206,9 +206,9 @@ Open work in this area:
 ### 19. Multi-transport: run more than one channel at once
 
 - **Size:** half a day (runtime only), plus whatever individual transports still need (telegram, item #20).
-- **Status:** config shape shipped. `Config.transports: Vec<TransportConfig>` is live and `okiro init` writes a single-entry list. The runtime still only supports one entry and bails on multi-entry configs; that's what this item covers.
+- **Status:** config shape shipped. `Config.transports: Vec<TransportConfig>` is live and `mezame init` writes a single-entry list. The runtime still only supports one entry and bails on multi-entry configs; that's what this item covers.
 - **Where:** the `match cfg.transports.as_slice()` block in `main`.
-- **What:** let a user configure and run multiple transports from one Okiro process. Use cases today: cloudflared-fronted web UI for desktop, Telegram for phone, both pointing at the same agent pool. In the future: Matrix, Discord, iMessage.
+- **What:** let a user configure and run multiple transports from one Mezame process. Use cases today: cloudflared-fronted web UI for desktop, Telegram for phone, both pointing at the same agent pool. In the future: Matrix, Discord, iMessage.
 - **Current config shape (already live):**
 
   ```json
@@ -238,46 +238,46 @@ Open work in this area:
 - **Init rewrite:** when the second transport is added, the commented-out transport prompt in `init_config` gets rewritten, not uncommented: ask for the first transport, offer to add another, loop until the user says no. The single-choice block currently commented out in the source is not reusable as-is.
 - **Gotchas:**
   - Error aggregation: `main` needs to wait for all transport tasks and surface the first non-graceful exit, while still honouring Ctrl+C.
-  - Session state (tabs, closed history) in `~/.okiro/state.json` is currently shared across the process. That is fine; transports are channels into the same agent pool, not isolated instances.
+  - Session state (tabs, closed history) in `~/.mezame/state.json` is currently shared across the process. That is fine; transports are channels into the same agent pool, not isolated instances.
 
 ## Service integration
 
-### 20. `okiro service install` subcommand (install as systemd / launchd service)
+### 20. `mezame service install` subcommand (install as systemd / launchd service)
 
 - **Size:** weekend. ~250-300 lines of Rust plus docs.
-- **Status:** today we document the install in `docs/service.md`. This item replaces the copy-paste story with `okiro service {install|start|stop|restart|status|uninstall}`, matching what `cloudflared service install` and `zeroclaw service install` do.
+- **Status:** today we document the install in `docs/service.md`. This item replaces the copy-paste story with `mezame service {install|start|stop|restart|status|uninstall}`, matching what `cloudflared service install` and `zeroclaw service install` do.
 - **Where:** new `src/service.rs`, new `Service` enum in `main.rs`'s CLI arg parsing, route to `service::handle_command` before the transport dispatch.
-- **Scope (picking battles):** macOS LaunchAgent + Linux systemd user service only, as a v1. No OpenRC, no Windows, no system service with a dedicated user, no `logs` subcommand (`journalctl --user -u okiro` and `tail ~/Library/Logs/okiro.log` are fine and already documented). Keep it to what a single-user self-hosted setup needs.
+- **Scope (picking battles):** macOS LaunchAgent + Linux systemd user service only, as a v1. No OpenRC, no Windows, no system service with a dedicated user, no `logs` subcommand (`journalctl --user -u mezame` and `tail ~/Library/Logs/mezame.log` are fine and already documented). Keep it to what a single-user self-hosted setup needs.
 - **Prior art:** zeroclaw-labs/zeroclaw has this working in `crates/zeroclaw-runtime/src/service/mod.rs`. Copy the shape, don't reinvent. In particular:
   - **Platform dispatch via `cfg!(target_os = ...)`** in each public fn, no Rust service-management crate (`service-manager` etc.). Shell out to `launchctl` / `systemctl` directly.
-  - **`std::env::current_exe()`** resolved at install time and baked into the unit/plist. No PATH guessing at service-start time. Works cleanly with `cargo install okiro` → `~/.cargo/bin/okiro`.
+  - **`std::env::current_exe()`** resolved at install time and baked into the unit/plist. No PATH guessing at service-start time. Works cleanly with `cargo install mezame` → `~/.cargo/bin/mezame`.
   - **Plist and unit file bodies as `format!` string literals.** No templating crate. Zeroclaw ships a 5-line `xml_escape` helper for plist XML; reuse that verbatim.
   - **Enum dispatch pattern** (`ServiceCommands::Install | Start | ...`) with a thin `handle_command` that pattern-matches to fn calls. Keeps the public surface obvious.
 - **What we want to improve on zeroclaw's version:**
   - **Use `launchctl bootstrap gui/$(id -u) <plist>` and `bootout`, not `load -w` / `unload`.** Apple's docs flag the old verbs as legacy; our `docs/service.md` already uses the new ones. Zeroclaw uses the legacy verbs; we should ship the current ones from day one.
-  - **No Homebrew-prefix detection.** Zeroclaw does an involved dance to detect `/opt/homebrew/Cellar/...` and route runtime state into `<prefix>/var/zeroclaw/`. We don't need it: Okiro is distributed via `cargo install`, so the binary lives under `~/.cargo/bin/` and config under `~/.okiro/`. Skip the whole `detect_homebrew_var_dir` function.
+  - **No Homebrew-prefix detection.** Zeroclaw does an involved dance to detect `/opt/homebrew/Cellar/...` and route runtime state into `<prefix>/var/zeroclaw/`. We don't need it: Mezame is distributed via `cargo install`, so the binary lives under `~/.cargo/bin/` and config under `~/.mezame/`. Skip the whole `detect_homebrew_var_dir` function.
 - **Plist template shape (copy from `docs/service.md`'s existing example):**
-  - `Label` = `dev.okiro`
+  - `Label` = `dev.mezame`
   - `ProgramArguments` = `[<current_exe>]` (no args; the binary serves by default)
   - `RunAtLoad` = true
   - `KeepAlive` = `{ SuccessfulExit: false }` (restart on crash, not on clean exit — matches systemd's `Restart=on-failure`)
-  - `StandardOutPath` / `StandardErrorPath` = `$HOME/Library/Logs/okiro.log`
+  - `StandardOutPath` / `StandardErrorPath` = `$HOME/Library/Logs/mezame.log`
   - `EnvironmentVariables.HOME` and `.PATH` set explicitly (launchd's default PATH does not include Homebrew)
 - **Unit template shape (copy from `docs/service.md`):**
   - `[Unit]` `After=network-online.target`, `Wants=network-online.target`
   - `[Service]` `Type=simple`, `ExecStart=<current_exe>`, `Restart=on-failure`, `RestartSec=5`
   - `[Install]` `WantedBy=default.target` (user service, not `multi-user.target`)
 - **Install flow per platform:**
-  - macOS: write `~/Library/LaunchAgents/dev.okiro.plist`, print "Start with: `okiro service start`". `start` runs `launchctl bootstrap gui/$(id -u) <plist>` then `launchctl kickstart -k gui/$(id -u)/dev.okiro`.
-  - Linux systemd user: write `~/.config/systemd/user/okiro.service`, run `systemctl --user daemon-reload && systemctl --user enable okiro.service`, print the `loginctl enable-linger` suggestion (do not run it ourselves; it needs root).
+  - macOS: write `~/Library/LaunchAgents/dev.mezame.plist`, print "Start with: `mezame service start`". `start` runs `launchctl bootstrap gui/$(id -u) <plist>` then `launchctl kickstart -k gui/$(id -u)/dev.mezame`.
+  - Linux systemd user: write `~/.config/systemd/user/mezame.service`, run `systemctl --user daemon-reload && systemctl --user enable mezame.service`, print the `loginctl enable-linger` suggestion (do not run it ourselves; it needs root).
 - **Uninstall flow:** stop first, then remove the unit/plist. Mirror zeroclaw's "stop is best-effort, don't bail on failure" pattern so an unloaded unit doesn't make uninstall explode.
-- **Graceful shutdown:** already implemented in `src/http.rs::shutdown_signal`. `systemctl --user stop okiro` and `launchctl bootout` both send SIGTERM, which the handler catches. No code changes there.
-- **Docs:** once shipped, `docs/service.md` shrinks to "run `okiro service install`; here's how to inspect logs" plus the manual-install recipes for anyone who prefers to edit a unit file by hand.
+- **Graceful shutdown:** already implemented in `src/http.rs::shutdown_signal`. `systemctl --user stop mezame` and `launchctl bootout` both send SIGTERM, which the handler catches. No code changes there.
+- **Docs:** once shipped, `docs/service.md` shrinks to "run `mezame service install`; here's how to inspect logs" plus the manual-install recipes for anyone who prefers to edit a unit file by hand.
 - **Acceptance:**
-  - `cargo install okiro && okiro service install && okiro service start` produces a running service on macOS and Debian/Ubuntu without further manual editing.
+  - `cargo install mezame && mezame service install && mezame service start` produces a running service on macOS and Debian/Ubuntu without further manual editing.
   - The service survives logout on both platforms (with `loginctl enable-linger` noted for systemd users on headless machines).
-  - `okiro service stop` exits cleanly, no Kiro session lockfile panic on next start.
-  - `okiro service uninstall` leaves no unit/plist/log-dir debris.
+  - `mezame service stop` exits cleanly, no Kiro session lockfile panic on next start.
+  - `mezame service uninstall` leaves no unit/plist/log-dir debris.
 
 ## Bugs
 
@@ -287,7 +287,7 @@ Open work in this area:
 - **Where:** `ui/src/lib/attachments.ts` (`fileToAttachment`, `describeRejection`, `RejectReason`), and the file picker `accept` attribute in `ui/src/features/InputRow.tsx`.
 - **Symptom:** uploading a PDF (or any non-image binary that isn't in the short textish mime list) through the composer shows "Unrecognised file type." when the agent has not advertised `embeddedContext`. The mime is fine; the agent just does not accept embedded content.
 - **Root cause:** three branches in `fileToAttachment` decide routing: image, textish, or binary-resource. The binary-resource branch gates on `caps.embeddedContext`; when false, the code falls through to `return { kind: 'unknown-type' }` instead of using the existing `embed-not-supported` reason.
-- **Before coding, confirm:** run with `OKIRO_DEBUG_ACP=1`, open a session, check the `initialize` response line. If Kiro advertises `promptCapabilities.embeddedContext: true` we have a real client-side bug (the PDF should be going through as a binary-resource). If it advertises false or omits the field, this is strictly a messaging fix.
+- **Before coding, confirm:** run with `MEZAME_DEBUG_ACP=1`, open a session, check the `initialize` response line. If Kiro advertises `promptCapabilities.embeddedContext: true` we have a real client-side bug (the PDF should be going through as a binary-resource). If it advertises false or omits the field, this is strictly a messaging fix.
 - **Fix:**
   - Collapse the trailing `unknown-type` branch into the existing `embed-not-supported` path. Every non-image should route as a binary-resource when the agent allows it, same rejection otherwise.
   - Update `describeRejection` for `embed-not-supported` to read well for both text and binary cases: "This agent does not accept embedded files." or similar.

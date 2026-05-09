@@ -1,8 +1,8 @@
 # Wire protocol
 
-Okiro speaks two protocols: JSON text frames to the browser over `/ws`, and ACP (JSON-RPC 2.0) to the agent over stdio. This document is for contributors or anyone plumbing a new client. The main README covers the higher-level architecture.
+Mezame speaks two protocols: JSON text frames to the browser over `/ws`, and ACP (JSON-RPC 2.0) to the agent over stdio. This document is for contributors or anyone plumbing a new client. The main README covers the higher-level architecture.
 
-## Browser to Okiro (JSON text frames over `/ws`)
+## Browser to Mezame (JSON text frames over `/ws`)
 
 ```json
 { "type": "prompt", "text": "hello" }
@@ -16,7 +16,7 @@ Okiro speaks two protocols: JSON text frames to the browser over `/ws`, and ACP 
 
 `prompt` accepts either a legacy `text` string (wrapped into a single text block on the server) or a full ACP `blocks` array. The server forwards blocks unchanged, so the agent is the one that validates types against its own capabilities.
 
-## Okiro to browser
+## Mezame to browser
 
 ```json
 { "type": "ready", "sessionId": "<uuid>", "resumed": true | false, "cwd": "<path>",
@@ -39,16 +39,16 @@ Details:
 - `commands` forwards Kiro's `_kiro.dev/commands/available` catalogue (commands + prompts only; the massive tool catalogue is stripped on the server to keep WS frames light). Drives the `/` autocomplete.
 - `append` is the ACP streaming path for a live turn. During a resume window the server suppresses these so the browser's `/history`-seeded log doesn't get duplicated.
 - `tool_call` carries the full ACP tool-call payload (arguments, content, file locations). Updates for the same `toolCallId` merge into the existing UI row in place rather than appending.
-- `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which Okiro forwards to the agent to unblock it.
+- `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which Mezame forwards to the agent to unblock it.
 - `cancel` triggers `session/cancel` on the agent.
 
 ## Cross-device UI state
 
-`GET` / `PUT /state` persists the open-tabs list, recently-closed history, active tab, and numeric label counter. Backing file is `~/.okiro/state.json`. Any browser hitting this Okiro sees the same list, useful when moving between devices behind the same tunnel. Actual conversation content stays with the agent (Kiro at `~/.kiro/sessions/cli/`); Okiro only stores labels, cwds, and ACP session ids.
+`GET` / `PUT /state` persists the open-tabs list, recently-closed history, active tab, and numeric label counter. Backing file is `~/.mezame/state.json`. Any browser hitting this Mezame sees the same list, useful when moving between devices behind the same tunnel. Actual conversation content stays with the agent (Kiro at `~/.kiro/sessions/cli/`); Mezame only stores labels, cwds, and ACP session ids.
 
-## Okiro to agent (stdio, ACP JSON-RPC 2.0)
+## Mezame to agent (stdio, ACP JSON-RPC 2.0)
 
-Requests Okiro sends:
+Requests Mezame sends:
 
 - `initialize` on spawn.
 - `session/new` when the browser opens a fresh tab.
@@ -57,7 +57,7 @@ Requests Okiro sends:
 - `session/cancel` (notification) for explicit cancel and during cooperative shutdown.
 - `session/set_mode`, `session/set_model` when the user picks a new value in the header.
 
-Notifications Okiro handles:
+Notifications Mezame handles:
 
 - `session/update`:
   - `agent_message_chunk` to `append` with `role: "agent"`. Rendered as markdown in the chat pane.

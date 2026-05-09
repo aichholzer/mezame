@@ -1,6 +1,6 @@
 # Changelog
 
-All notable user-visible changes to Okiro!. Format follows
+All notable user-visible changes to Mezame!. Format follows
 [Keep a Changelog](https://keepachangelog.com) loosely; versions are
 [SemVer](https://semver.org).
 
@@ -13,13 +13,36 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [Unreleased]
+
+### Breaking
+
+- **Project renamed from `okiro` to `mezame`** to avoid confusion with
+  the AWS product of the same stem. User-facing wordmark now reads
+  "Mezame!"; Japanese for "awakening" (目覚め). Knock-on renames:
+  - Crate and binary: `okiro` to `mezame`. Reinstall via
+    `cargo install mezame`.
+  - Config and state directories: `~/.okiro/` to `~/.mezame/`. Existing
+    users need to move `config.json` and `state.json` manually or run
+    `mezame init`.
+  - Environment variables: `OKIRO_DEBUG_ACP` to `MEZAME_DEBUG_ACP`,
+    `OKIRO_SKIP_UI_BUILD` to `MEZAME_SKIP_UI_BUILD`. `KIRO_LOG_LEVEL`
+    is unchanged (it belongs to the spawned Kiro CLI, not to us).
+  - Build-time define (`__OKIRO_VERSION__` to `__MEZAME_VERSION__`),
+    UI store hook (`useOkiro` / `okiroActions` to `useMezame` /
+    `mezameActions`), UI package (`okiro-ui` to `mezame-ui`), and CSS
+    keyframes (`okiro-pulse-orange` / `okiro-border-spin` to
+    `mezame-pulse-orange` / `mezame-border-spin`) all renamed.
+- README now carries an explicit disclaimer that the project is not
+  affiliated with AWS or the Kiro product.
+
 ## [0.8.0] — 2026-05-08
 
 ### Breaking
 
 - **Config format switched from TOML to JSON.** Config path moved from
-  `~/.okiro/config.toml` to `~/.okiro/config.json`. Existing users are
-  dropped into `okiro init` on next launch; the new config is written
+  `~/.mezame/config.toml` to `~/.mezame/config.json`. Existing users are
+  dropped into `mezame init` on next launch; the new config is written
   after interactive setup.
 - **Transports are now a list.** The top-level `transport` enum and
   `bind` string are gone. Replaced by `transports: [{ "kind":
@@ -32,17 +55,17 @@ build-time Vite define.
 
 ### Added
 
-- **`cargo install okiro` support.** Crate now carries the metadata
+- **`cargo install mezame` support.** Crate now carries the metadata
   crates.io requires (`description`, `license`, `keywords`,
   `categories`, `repository`, `readme`, `exclude`). `build.rs`
   compiles the UI inside `$OUT_DIR` instead of the source tree so
   `cargo publish` verify passes.
-- **Interactive init with arrow keys.** `okiro init` now uses
+- **Interactive init with arrow keys.** `mezame init` now uses
   `dialoguer` for the bind-address and agent menus. `init` also probes
   `$PATH` for known ACP CLIs (Kiro CLI, Claude Agent CLI, Gemini CLI,
   Codex) and offers them as a pick list; "Other" drops to a free-form
   prompt. Kiro CLI pre-fills `acp` as the subcommand.
-- **Graceful shutdown on SIGTERM / SIGINT.** Okiro now stops accepting
+- **Graceful shutdown on SIGTERM / SIGINT.** Mezame now stops accepting
   new connections and exits promptly when `systemctl stop` or
   `launchctl bootout` asks. Pairs with the new
   [service guide](./docs/service.md) covering systemd user and system
@@ -79,7 +102,7 @@ build-time Vite define.
 - **Favicon attention badge.** Background-tab attention (permission
   request, turn complete, error) paints a red numeric pill onto the
   favicon and prefixes `document.title` with `(N) `. Attention now
-  also raises for the active in-app session when the whole Okiro
+  also raises for the active in-app session when the whole Mezame
   browser tab is hidden, so you see a badge when a turn finishes
   while you're reading elsewhere. `visibilitychange` clears it on
   return.
@@ -87,10 +110,10 @@ build-time Vite define.
   session was started with, with the server-reported resolved path
   (not just the user-supplied override). Double-click to open a
   sibling tab at a different path.
-- **Bind-address menu in `okiro init`.** Three options: loopback
+- **Bind-address menu in `mezame init`.** Three options: loopback
   (default), `0.0.0.0` for trusted-LAN setups where cloudflared runs
   elsewhere, or a custom address. The LAN option prints an explicit
-  warning that Okiro has no auth of its own today.
+  warning that Mezame has no auth of its own today.
 
 ### Changed
 
@@ -104,14 +127,14 @@ build-time Vite define.
 - **Header restyle.** Tab bar now renders as a floating card with
   rounded corners and the same primary-blue border as the composer at
   the bottom.
-- **Telegram option removed from `okiro init`.** Picking it prints an
+- **Telegram option removed from `mezame init`.** Picking it prints an
   informative "not yet implemented" message and re-prompts. The enum,
   config field, and stub remain for forward compatibility.
 - **Prose sweep.** User-facing stderr lines, anyhow contexts, error
   messages to the browser, and init prompts rewritten as sentence case
   with em dashes replaced by colons. Init prompt accepts transport
   identifiers case-insensitively. New logos, new favicon, and a new
-  "Why Okiro" section in the README positioning the tool against
+  "Why Mezame" section in the README positioning the tool against
   direct-to-provider gateways.
 
 ### Fixed
@@ -131,13 +154,13 @@ build-time Vite define.
 ## [0.6.0] — 2026-05-07
 
 ### Changed
-- Project renamed from `racp` to `okiro`. User-facing wordmark reads
+- Project renamed from `racp` to `okiro`. User-facing wordmark read
   "Okiro!" in the UI header and the window title. Japanese for "wake
   up!" (起きろ), which is what you do to a Kiro that is asleep
   somewhere else.
 - Config and state directories moved from `~/.racp/` to `~/.okiro/`.
-- Environment variables renamed: `RACP_DEBUG_ACP` is now
-  `OKIRO_DEBUG_ACP`, `RACP_SKIP_UI_BUILD` is now `OKIRO_SKIP_UI_BUILD`.
+- Environment variables renamed: `RACP_DEBUG_ACP` became
+  `OKIRO_DEBUG_ACP`, `RACP_SKIP_UI_BUILD` became `OKIRO_SKIP_UI_BUILD`.
 - CSS keyframes (`racp-pulse-orange`, `racp-border-spin`), build-time
   define (`__RACP_VERSION__`), UI store hook (`useRacp` /
   `racpActions`), and UI package name (`racp-ui`) all renamed to their
@@ -279,7 +302,7 @@ build-time Vite define.
 ### Fixed
 - Tab pulse, for real this time. Dropped the `color-mix` + custom-
   property + Tailwind-utility-class indirection and just hardcoded
-  two plain keyframes (`okiro-pulse-orange`, `okiro-pulse-green`), then
+  two plain keyframes (`mezame-pulse-orange`, `mezame-pulse-green`), then
   attached them to the tab via an inline `style={{ animation: ... }}`
   so nothing in the cascade can flatten them. Connecting/Reconnecting
   now pulse orange; busy-in-background pulses green.
@@ -339,13 +362,13 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
 ### Core
 - Rust bridge from a browser WebSocket to a locally spawned ACP agent
   (Kiro CLI or any stdio-ACP agent) over JSON-RPC 2.0.
-- Config at `~/.okiro/config.toml`, interactive `init` subcommand.
+- Config at `~/.mezame/config.toml`, interactive `init` subcommand.
 - Cloudflared transport, axum HTTP + WebSocket on `127.0.0.1:7842`.
 - Telegram transport stubbed.
 
 ### UI (React + Vite + Tailwind v4 + shadcn)
 - Multi-tab chat. One tab = one WS = one Kiro subprocess = one ACP session.
-- Cross-device state persisted via `GET/PUT /state` (`~/.okiro/state.json`).
+- Cross-device state persisted via `GET/PUT /state` (`~/.mezame/state.json`).
 - Session resume on reconnect via `?session=<id>` and `session/load`.
 - Per-tab `cwd` override via `?cwd=...`.
 - Permission prompts rendered as inline cards, reply carries selected `optionId`.
@@ -366,7 +389,7 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
   width below, system lines centred, permissions left-aligned.
 - Per-message copy button (user and agent) and hoverable absolute
   timestamp (tooltip carries the exact time).
-- History rehydration on resume: okiro reads Kiro's `<id>.jsonl` event
+- History rehydration on resume: mezame reads Kiro's `<id>.jsonl` event
   log and serves it at `GET /history?session=<id>` with real per-turn
   timestamps. Server-side suppression of Kiro's live replay during the
   resume window to avoid double rendering.
@@ -381,12 +404,12 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
 
 ### Layout niceties
 - Header: History and New-session buttons on the far left; new tabs
-  appear leftmost. `Okiro!` wordmark + version string on the far right.
+  appear leftmost. `Mezame!` wordmark + version string on the far right.
 - Mode and model selectors in a secondary row below the tab bar, shown
   only when the active session has populated them.
 
 ### Developer ergonomics
-- `OKIRO_DEBUG_ACP=1` dumps every inbound ACP line to stderr prefixed
+- `MEZAME_DEBUG_ACP=1` dumps every inbound ACP line to stderr prefixed
   with `[acp<-]`, useful when wiring new Kiro extensions.
-- `OKIRO_SKIP_UI_BUILD=1` skips the Vite build in `build.rs` for
+- `MEZAME_SKIP_UI_BUILD=1` skips the Vite build in `build.rs` for
   Rust-only iterations (developer owns refreshing `ui/dist`).

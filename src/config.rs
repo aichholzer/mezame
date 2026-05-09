@@ -1,6 +1,6 @@
 //! On-disk configuration and interactive setup.
 //!
-//! Config lives at `~/.okiro/config.json`. Schema changes are breaking for
+//! Config lives at `~/.mezame/config.json`. Schema changes are breaking for
 //! existing users, so add fields with `#[serde(default)]` rather than
 //! reshuffling. Transports live in a list (`TransportConfig`) internally
 //! tagged on `kind`; see the README Configuration reference and todo #19.
@@ -11,14 +11,14 @@ use anyhow::{bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use serde::{Deserialize, Serialize};
 
-const OKIRO_ART: &str = r#"
-  ██████╗ ██╗  ██╗██╗██████╗  ██████╗ ██╗
- ██╔═══██╗██║ ██╔╝██║██╔══██╗██╔═══██╗██║
- ██║   ██║█████╔╝ ██║██████╔╝██║   ██║██║
- ██║   ██║██╔═██╗ ██║██╔══██╗██║   ██║╚═╝
- ╚██████╔╝██║  ██╗██║██║  ██║╚██████╔╝██╗
-  ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝
- 起きろ!
+const MEZAME_ART: &str = r#"
+ ██╗   ███╗███████╗███████╗ █████╗ ███╗   ███╗███████╗
+ ████╗ ████║██╔════╝╚══███╔╝██╔══██╗████╗ ████║██╔════╝
+ ██╔████╔██║█████╗    ███╔╝ ███████║██╔████╔██║█████╗  
+ ██║╚██╔╝██║██╔══╝   ███╔╝  ██╔══██║██║╚██╔╝██║██╔══╝  
+ ██║ ╚═╝ ██║███████╗███████╗██║  ██║██║ ╚═╝ ██║███████╗
+ ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝
+ 目覚め!
 "#;
 
 pub(crate) const DEFAULT_PORT: u16 = 9510;
@@ -46,15 +46,15 @@ pub(crate) enum TransportConfig {
 
 pub(crate) fn config_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".okiro/config.json"))
+    Ok(PathBuf::from(home).join(".mezame/config.json"))
 }
 
 /// Path to the persistent browser state (currently-open tabs, history list,
-/// active id, next numeric label). Server-side so any device hitting Okiro
+/// active id, next numeric label). Server-side so any device hitting Mezame
 /// sees the same list.
 pub(crate) fn state_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".okiro/state.json"))
+    Ok(PathBuf::from(home).join(".mezame/state.json"))
 }
 
 pub(crate) fn load_config() -> Result<Config> {
@@ -89,7 +89,7 @@ pub(crate) fn init_config() -> Result<Config> {
         "Custom          (type an address:port)".to_string()
     ];
 
-    println!("{}", OKIRO_ART);
+    println!("{}", MEZAME_ART);
     let bind_idx = Select::with_theme(&theme)
         .with_prompt("Bind address")
         .items(&bind_options)
@@ -157,7 +157,7 @@ pub(crate) fn init_config() -> Result<Config> {
 }
 
 /// Known ACP agent CLI we probe for on `$PATH`. Entries here show up as a
-/// selectable menu in `okiro init` when the binary is present. Extending
+/// selectable menu in `mezame init` when the binary is present. Extending
 /// the list is a two-line change.
 struct KnownAgent {
     /// Human-readable label shown in the init menu.

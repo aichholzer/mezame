@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useOkiro } from '@/hooks/useOkiro';
+import { useMezame } from '@/hooks/useMezame';
 
 // Paints a numeric badge onto the favicon and prefixes the document
 // title with `(N)` when one or more background sessions have attention.
@@ -91,7 +91,7 @@ const paintBadge = async (count: number) => {
   }
 };
 
-const BASE_TITLE = 'Okiro!';
+const BASE_TITLE = 'Mezame!';
 
 const paintTitle = (count: number) => {
   document.title = count > 0 ? `(${count}) ${BASE_TITLE}` : BASE_TITLE;
@@ -103,7 +103,7 @@ const paintTitle = (count: number) => {
  * the number of background sessions needing attention.
  */
 export const useAttentionBadge = () => {
-  const { sessions } = useOkiro();
+  const { sessions } = useMezame();
   const count = sessions.filter((s) => s.attention !== null).length;
 
   useEffect(() => {

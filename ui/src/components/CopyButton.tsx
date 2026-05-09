@@ -10,7 +10,7 @@ type Props = {
 
 // Small copy-to-clipboard button. Falls back to a hidden textarea +
 // execCommand for insecure-context environments (local http over
-// non-localhost), though okiro is loopback-only so navigator.clipboard
+// non-localhost), though mezame is loopback-only so navigator.clipboard
 // should always work in practice.
 
 export const CopyButton = ({ text, className, title = 'Copy' }: Props) => {

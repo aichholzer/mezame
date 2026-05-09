@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
 import { ToolCallCard } from '@/features/ToolCallCard';
-import { okiroActions } from '@/hooks/useOkiro';
+import { mezameActions } from '@/hooks/useMezame';
 import { useTick } from '@/hooks/useTick';
 import { formatAbsolute, timeAgo } from '@/lib/time';
 import { cn } from '@/lib/utils';
@@ -58,7 +58,7 @@ const PermissionCard = ({
             <button
               key={opt.optionId}
               type="button"
-              onClick={() => okiroActions.resolvePermission(session.id, entry.id, opt)}
+              onClick={() => mezameActions.resolvePermission(session.id, entry.id, opt)}
               className={cn(
                 'cursor-pointer rounded-sm border bg-card px-2.5 py-1 text-xs transition-colors',
                 optionTone(opt)
@@ -161,7 +161,7 @@ export const LogPane = ({ session, isActive }: Props) => {
     }
     const onScroll = () => {
       const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
-      okiroActions.setPinnedToBottom(session.id, pinned);
+      mezameActions.setPinnedToBottom(session.id, pinned);
     };
     el.addEventListener('scroll', onScroll);
     return () => el.removeEventListener('scroll', onScroll);

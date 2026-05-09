@@ -4,16 +4,16 @@ import { LogPane } from '@/features/LogPane';
 import { NewSessionDialog } from '@/features/NewSessionDialog';
 import { TabBar } from '@/features/TabBar';
 import { useAttentionBadge } from '@/hooks/useAttentionBadge';
-import { okiroActions, useOkiro } from '@/hooks/useOkiro';
+import { mezameActions, useMezame } from '@/hooks/useMezame';
 
 export const App = () => {
-  const { sessions, closed, activeId, activeSession } = useOkiro();
+  const { sessions, closed, activeId, activeSession } = useMezame();
   const [newSessionOpen, setNewSessionOpen] = useState(false);
 
   useAttentionBadge();
 
   useEffect(() => {
-    void okiroActions.init();
+    void mezameActions.init();
   }, []);
 
   return (
@@ -27,11 +27,11 @@ export const App = () => {
           sessions={sessions}
           activeId={activeId}
           closed={closed}
-          onActivate={okiroActions.activate}
-          onClose={okiroActions.closeSession}
-          onRename={okiroActions.renameSession}
-          onRestore={okiroActions.restoreFromHistory}
-          onForget={okiroActions.forgetHistory}
+          onActivate={mezameActions.activate}
+          onClose={mezameActions.closeSession}
+          onRename={mezameActions.renameSession}
+          onRestore={mezameActions.restoreFromHistory}
+          onForget={mezameActions.forgetHistory}
           onNewTab={() => setNewSessionOpen(true)}
         />
 
@@ -42,14 +42,14 @@ export const App = () => {
             <LogPane key={s.id} session={s} isActive={s.id === activeId} />
           ))}
 
-          <InputRow session={activeSession} onSubmit={okiroActions.sendPrompt} />
+          <InputRow session={activeSession} onSubmit={mezameActions.sendPrompt} />
         </main>
       </div>
 
       <NewSessionDialog
         open={newSessionOpen}
         onOpenChange={setNewSessionOpen}
-        onCreate={(cwd, name) => okiroActions.newSession(cwd, name)}
+        onCreate={(cwd, name) => mezameActions.newSession(cwd, name)}
       />
     </div>
   );
