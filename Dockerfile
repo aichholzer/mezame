@@ -6,7 +6,7 @@
 #  - Rust stable (to compile mezame from crates.io)
 #  - Node.js and npm (mezame's build.rs builds the embedded UI)
 #  - Kiro CLI, musl variant, with its bundled glibc-linked Bun 
-     swapped for a musl Bun (the fix for `os error 2` on Alpine)
+#    swapped for a musl Bun (the fix for `os error 2` on Alpine)
 #  - Mezame, installed from crates.io
 #
 # First run, one-off setup:
@@ -28,10 +28,10 @@
 #    mezame
 #
 # Caveat: If Kiro CLI ever self-updates and replaces its 
-          bundled Bun, the glibc-linked binary will come
-          back and the TUI / ACP child will fail with
-          `os error 2`. Re-apply the Bun swap from this 
-          file`s RUN step, or rebuild the image.
+#         bundled Bun, the glibc-linked binary will come
+#         back and the TUI / ACP child will fail with
+#         `os error 2`. Re-apply the Bun swap from this 
+#         file`s RUN step, or rebuild the image.
 
 FROM alpine:latest
 
@@ -88,8 +88,7 @@ RUN set -eux; \
     cp /root/.bun/bin/bun /root/.local/share/kiro-cli/bun; \
     chmod +x /root/.local/share/kiro-cli/bun
 
-# Install mezame from crates.io. build.rs needs node and npm (installed
-# above) to build the embedded UI bundle.
+# Install mezame from crates.io.
 RUN cargo install mezame
 
 EXPOSE 9510
@@ -99,7 +98,8 @@ EXPOSE 9510
 # start. Users can mount named volumes over these paths.
 VOLUME ["/root/.local/share/kiro-cli", "/root/.kiro", "/root/.mezame"]
 
-# Default to an interactive shell so first-run setup (`kiro-cli login`,
-# `mezame init`) is obvious. Override with `mezame` to start the bridge
-# directly once setup has been done once against a persistent volume.
-CMD ["bash"]
+# Default to running the bridge. Compose's `setup` service overrides
+# this with `bash` for the one-off `kiro-cli login` / `mezame init`
+# flow. `docker run mezame` on its own will start the bridge directly,
+# assuming volumes with prior setup are mounted.
+CMD ["mezame"]
