@@ -112,6 +112,28 @@ cargo build --release
 
 `cargo build` invokes the UI build as part of `build.rs`. The UI is compiled inside `$OUT_DIR` (cargo's per-crate build directory) so the source tree stays clean. First build seeds `node_modules` via `npm ci` and is the slow one; subsequent builds are cache hits and mostly free. Set `MEZAME_SKIP_UI_BUILD=1` to skip the UI build when iterating on Rust only; the binary will ship without a UI.
 
+## Run with Docker
+
+A lightweight Alpine-based [`Dockerfile`](./Dockerfile) and [`compose.yaml`](./compose.yaml) are included if you'd rather not install Rust, Node, and Kiro CLI on the host. The image bundles Rust, Node.js, Kiro CLI, and Mezame.
+
+First-run setup, one-off:
+
+```sh
+docker compose run --rm setup
+# inside the container:
+kiro-cli login --use-device-flow
+mezame init
+exit
+```
+
+Then:
+
+```sh
+docker compose up -d
+```
+
+Kiro credentials, session history, and Mezame config are persisted in named volumes, so you only authenticate once. See the comments in `compose.yaml` for the full flow.
+
 Stderr carries Mezame's own logs and, prefixed with `[agent]`, the agent's stderr. Useful env vars:
 
 - `KIRO_LOG_LEVEL=debug`, passed through to the spawned `kiro-cli acp` child for Kiro-side tracing.
