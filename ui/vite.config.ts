@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
@@ -13,10 +13,21 @@ import tailwindcss from '@tailwindcss/vite';
 // until we decide on a script.
 const pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'utf8')) as { version: string };
 
+// Build id: written by `build.rs` so the Rust binary and the JS bundle
+// share the exact same token. In dev mode (no `build.rs` run) we fall
+// back to a timestamp so the comparison is effectively skipped (the
+// server will have a different value, but in dev you have Vite HMR
+// anyway so the reload gate is irrelevant).
+const buildIdFile = path.resolve(__dirname, '.build-id');
+const buildId = existsSync(buildIdFile)
+  ? readFileSync(buildIdFile, 'utf8').trim()
+  : Date.now().toString(36);
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   define: {
-    __MEZAME_VERSION__: JSON.stringify(pkg.version)
+    __MEZAME_VERSION__: JSON.stringify(pkg.version),
+    __MEZAME_BUILD_ID__: JSON.stringify(buildId)
   },
   resolve: {
     alias: {

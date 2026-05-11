@@ -295,7 +295,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         className={cn(
           // The card itself: takes pointer events, floats, and blurs
           // whatever log content slides under it. Border tint matches
-          // the send button's primary blue so the card reads as a
+          // the send button's primary accent so the card reads as a
           // first-class control, not a stray panel.
           'pointer-events-auto relative rounded-xl border border-[color:var(--primary)]/60 bg-background/70 shadow-lg shadow-black/30 backdrop-blur-md',
           dragOver && 'ring-2 ring-[color:var(--primary)]/70'
@@ -376,7 +376,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
                       type="button"
                       variant="ghost"
                       size="icon"
-                      className="size-7 touch:size-11 touch-manipulation"
+                      className="size-7 touch:size-11 text-[color:var(--primary)] touch-manipulation"
                       disabled={disabled}
                       onClick={() => fileInputRef.current?.click()}
                       aria-label="Attach file"

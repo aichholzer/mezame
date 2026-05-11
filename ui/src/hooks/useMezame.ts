@@ -1,4 +1,13 @@
 import { useSyncExternalStore } from 'react';
+
+// Vite injects the version string from `ui/package.json` at build time.
+// See `vite.config.ts`.
+declare const __MEZAME_VERSION__: string;
+
+// Unique-per-build token (base-36 epoch ms). Compared against the
+// server's `buildId` in the `ready` message to detect stale bundles.
+declare const __MEZAME_BUILD_ID__: string;
+
 import type {
   Attention,
   ClosedEntry,
@@ -301,6 +310,14 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
   }
   switch (msg.type) {
     case 'ready':
+      // Build-id gate: if the server reports a different build id than
+      // the one baked into this UI bundle, the binary was rebuilt and
+      // the browser is serving a stale bundle. Force a full reload so
+      // the user always sees the latest UI without manual intervention.
+      if (msg.buildId && msg.buildId !== __MEZAME_BUILD_ID__) {
+        window.location.reload();
+        return;
+      }
       // A resume replays history via session/update — clear stale log so
       // the replay lands in a fresh pane.
       if (msg.resumed) {

@@ -184,13 +184,15 @@ async fn handle_ws(
     // for reconnect, and whether this was a resume (so it can clear stale
     // log before the replay lands). The `cwd` is the actual path the agent
     // session was opened with, so the UI can display it even when no
-    // `?cwd=` override was supplied.
+    // `?cwd=` override was supplied. `buildId` is a unique-per-build token
+    // so the UI can detect a stale bundle and force a reload.
     let _ = to_ws_tx.send(text_msg(json!({
         "type": "ready",
         "sessionId": session_id,
         "resumed": resumed,
         "cwd": cwd_str,
-        "promptCapabilities": prompt_capabilities
+        "promptCapabilities": prompt_capabilities,
+        "buildId": env!("MEZAME_BUILD_ID")
     })));
 
     // Send the `modes` and `models` payload (if present in either

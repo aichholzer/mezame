@@ -43,6 +43,27 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/components.json");
     println!("cargo:rerun-if-env-changed=MEZAME_SKIP_UI_BUILD");
 
+    // Expose a unique build id to the binary so the WS `ready` message
+    // can tell the browser whether its cached bundle is stale. Using
+    // epoch seconds means every `cargo build` that re-runs this script
+    // produces a new value, regardless of semver bumps.
+    //
+    // The same value is written to `$OUT_DIR/ui/.build-id` so the Vite
+    // build (which runs later in this script) can read it and inject the
+    // identical token into the JS bundle. Both sides must agree.
+    let build_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=MEZAME_BUILD_ID={build_id}");
+
+    // Also write it into the source ui/ directory so `vite.config.ts`
+    // can read it during the Vite build step below.
+    let build_id_file = ui_src.join(".build-id");
+    std::fs::write(&build_id_file, &build_id).unwrap_or_else(|e| {
+        panic!("failed to write {}: {e}", build_id_file.display())
+    });
+
     if std::env::var_os("MEZAME_SKIP_UI_BUILD").is_some() {
         // Leave an empty dist/ directory so rust-embed doesn't fail to
         // resolve the `$OUT_DIR/ui/dist/` folder. The binary will be

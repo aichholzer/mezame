@@ -13,9 +13,23 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { cn } from '@/lib/utils';
 import type { Attention, ClosedEntry, Session } from '@/types';
 
-// Vite injects the version string from `ui/package.json` at build time.
-// See `vite.config.ts`.
-declare const __MEZAME_VERSION__: string;
+// Fixed sidebar on desktop, slide-in drawer on mobile.
+//
+// Layout (top to bottom):
+//   - Brand label (目覚め).
+//   - Action row: History dropdown, New session button.
+//   - Divider.
+//   - Scrollable list of session rows, one tab per row, full width.
+//
+// On mobile the sidebar is hidden by default. `isOpen` is driven by the
+// parent: the burger button in the chat pane flips it, and tapping any
+// session row triggers `onRequestClose` so the drawer hides as the tab
+// takes over the viewport.
+//
+// Active-state indicator is a 3 px accent bar on the row's left edge
+// (replaces the chip-style ring used by the old horizontal bar). The
+// status-driven fills (connected/connecting/error/busy-background) are
+// unchanged.
 
 type Props = {
   sessions: Session[];
@@ -27,11 +41,17 @@ type Props = {
   onNewTab: () => void;
   onRestore: (acpSessionId: string) => void;
   onForget: (acpSessionId: string) => void;
+  /** Drawer visibility on mobile. Ignored at desktop widths where the
+   * sidebar is always rendered. */
+  isOpen: boolean;
+  /** Invoked when the drawer should close (tab activated, backdrop
+   * tapped, close button pressed). No-op on desktop. */
+  onRequestClose: () => void;
 };
 
 // Attention dot: fill carries the semantic (done/permission/error), a
-// white outline plus drop shadow keeps it legible on top of any tab
-// background colour (including the matching "Connected" green).
+// white outline plus drop shadow keeps it legible on top of any row
+// background colour.
 const attentionClass: Record<NonNullable<Attention>, string> = {
   done: 'bg-[color:var(--attn-done)]',
   permission: 'bg-[color:var(--attn-permission)]',
@@ -39,11 +59,11 @@ const attentionClass: Record<NonNullable<Attention>, string> = {
 };
 
 const attentionDotBase =
-  'size-2 mr-1 rounded-full ring-2 ring-background shadow-[0_0_0_1px_rgba(0,0,0,0.35)]';
+  'size-2 rounded-full ring-2 ring-background shadow-[0_0_0_1px_rgba(0,0,0,0.35)]';
 
-// Per-status tab backgrounds. Kept subtle (~18% of the accent colour)
-// so many tabs remain readable side-by-side; the active tab still gets
-// its usual accent highlight on top.
+// Per-status row backgrounds. Kept subtle (~18% of the accent colour)
+// so many rows remain readable stacked; the active row still gets its
+// left accent bar on top.
 //
 // The extra `busy-background` state pulses green for a tab that is
 // still running a turn while the user has moved to another tab, so
@@ -111,7 +131,7 @@ const timeAgo = (ts: number): string => {
   return `${d} d ago`;
 };
 
-export const TabBar = ({
+export const SideBar = ({
   sessions,
   activeId,
   closed,
@@ -120,24 +140,22 @@ export const TabBar = ({
   onRename,
   onNewTab,
   onRestore,
-  onForget
+  onForget,
+  isOpen,
+  onRequestClose
 }: Props) => {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
 
-  // Keep the active tab visible when activation changes programmatically
-  // (new session, restore from history, keyboard switch). `scrollIntoView`
-  // with `inline: 'center'` pulls the chip to the middle of the strip,
-  // which is the most useful resting spot when many tabs are open. No-op
-  // when the chip is already fully in view or when nothing matches the
-  // selector (e.g., just-closed session).
+  // Keep the active row visible when activation changes programmatically
+  // (new session, restore from history, keyboard switch).
   useEffect(() => {
     if (!activeId) {
       return;
     }
-    const chip = document.querySelector(`[data-tab-id="${CSS.escape(activeId)}"]`);
-    if (chip instanceof HTMLElement) {
-      chip.scrollIntoView({ block: 'nearest', inline: 'center' });
+    const row = document.querySelector(`[data-tab-id="${CSS.escape(activeId)}"]`);
+    if (row instanceof HTMLElement) {
+      row.scrollIntoView({ block: 'nearest' });
     }
   }, [activeId]);
 
@@ -149,18 +167,66 @@ export const TabBar = ({
     setRenameValue('');
   };
 
+  const handleActivate = (id: string) => {
+    onActivate(id);
+    // Drawer hides itself on mobile so the selected tab takes over the
+    // viewport. No-op at desktop widths.
+    onRequestClose();
+  };
+
   return (
-    <header className="mx-3 mt-3 h-14 md:h-16 rounded-xl border border-[color:var(--primary)]/60 bg-background/70 shadow-lg shadow-black/30 backdrop-blur-md">
-      <div className="flex h-full w-full items-center gap-2 px-3">
-        {/* Fixed-position cluster: history + new-tab buttons. Pinned on
-         * the left so the scrolling tab strip to their right cannot
-         * push them off-screen on narrow viewports. */}
-        <div className="flex shrink-0 items-center gap-2">
+    <>
+      {/* Backdrop: mobile-only, dims the chat while the drawer is
+       * open so the modal affordance is unambiguous. Tapping it
+       * closes the drawer. Hidden on desktop where the sidebar is
+       * static. */}
+      <div
+        onClick={onRequestClose}
+        className={cn(
+          'fixed inset-0 z-30 bg-background/60 backdrop-blur-xs md:hidden',
+          isOpen ? 'opacity-100' : 'pointer-events-none opacity-0',
+          'transition-opacity duration-200'
+        )}
+        aria-hidden="true"
+      />
+
+      <aside
+        className={cn(
+          // Base layout: fixed on the left, full height, scrolls its
+          // own session list. Desktop always renders at translate-x-0;
+          // mobile slides in from the left. Widths: 14 rem on desktop
+          // (comfortable for a 20-character label with some room),
+          // 16 rem on mobile drawer (touch targets are larger so the
+          // extra width keeps labels legible).
+          'fixed inset-y-0 left-0 z-40 flex w-72 flex-col',
+          'border-r border-border/40 bg-background/95 backdrop-blur-md',
+          'md:static md:w-64 md:bg-background/70',
+          'transition-transform duration-200 ease-out',
+          isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
+        )}
+        style={{
+          paddingTop: 'var(--mz-safe-top)',
+          paddingBottom: 'var(--mz-safe-bottom)',
+          paddingLeft: 'var(--mz-safe-left)'
+        }}
+      >
+        <div className="flex items-center justify-center px-3 pt-6 pb-5">
+          <span className="text-[1.5rem] font-bold tracking-wider text-[color:var(--primary)] select-none">
+            目覚め
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2 px-3 pb-2">
           <DropdownMenu>
             <Tooltip>
               <TooltipTrigger asChild>
                 <DropdownMenuTrigger asChild>
-                  <Button size="icon" variant="outline" className="size-8" aria-label="History">
+                  <Button
+                    size="icon"
+                    variant="outline"
+                    className="size-8 text-[color:var(--primary)]"
+                    aria-label="History"
+                  >
                     <HistoryIcon className="size-4" />
                   </Button>
                 </DropdownMenuTrigger>
@@ -171,7 +237,7 @@ export const TabBar = ({
               <DropdownMenuLabel>Recently closed</DropdownMenuLabel>
               <DropdownMenuSeparator />
               {closed.length === 0 ? (
-                <div className="px-2 py-1.5 text-xs text-muted-foreground">no recently closed sessions</div>
+                <div className="px-2 py-1.5 text-xs text-muted-foreground">No recently closed sessions</div>
               ) : (
                 closed.map((entry) => (
                   <DropdownMenuItem
@@ -206,15 +272,35 @@ export const TabBar = ({
 
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button size="icon" variant="outline" className="size-8" onClick={onNewTab} aria-label="New session">
+              <Button
+                size="icon"
+                variant="outline"
+                className="size-8 text-[color:var(--primary)]"
+                onClick={onNewTab}
+                aria-label="New session"
+              >
                 <PlusIcon className="size-4" />
               </Button>
             </TooltipTrigger>
             <TooltipContent side="bottom">New session</TooltipContent>
           </Tooltip>
+
+          {/* Mobile-only close button so the drawer can be dismissed
+           * without tapping the backdrop. */}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-8 ml-auto md:hidden"
+            onClick={onRequestClose}
+            aria-label="Close sidebar"
+          >
+            <XIcon className="size-4" />
+          </Button>
         </div>
 
-        <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto scrollbar-thin">
+        <div className="mx-3 border-t border-[color:var(--primary)]/30" />
+
+        <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto scrollbar-thin px-3 py-2">
           {sessions.map((s) => {
             const isActive = s.id === activeId;
             const isRenaming = renamingId === s.id;
@@ -222,10 +308,10 @@ export const TabBar = ({
             const visualClass = tabVisualClass[visual];
             // Attention dots signal "something finished in a tab you are
             // not looking at" (done) or "the agent is waiting on you"
-            // (permission). Shown on Connected tabs and on Busy-in-
-            // background tabs (so a pending permission prompt remains
+            // (permission). Shown on Connected rows and on Busy-in-
+            // background rows (so a pending permission prompt remains
             // visible on top of the green pulse). Suppressed on the
-            // active tab (the user is already looking) and when the tab
+            // active row (the user is already looking) and when the row
             // carries its own strong colour (error / connecting).
             const showAttentionDot =
               !isActive &&
@@ -237,25 +323,31 @@ export const TabBar = ({
                   <div
                     data-tab-id={s.id}
                     className={cn(
-                      // h-11 (44 px) on touch, h-8 (32 px) on mouse.
-                      // Larger text on touch so the label is not
-                      // swallowed by the taller chip.
-                      // `touch-manipulation` disables the iOS
-                      // double-tap-to-zoom delay on tab chips; tabs
-                      // are tapped frequently and the 300 ms delay
-                      // is noticeable.
-                      'group inline-flex h-8 touch:h-11 cursor-pointer items-center gap-1.5 rounded-sm border px-2.5 text-xs touch:text-[13px] select-none touch-manipulation',
-                      visualClass,
-                      isActive && 'ring-1 ring-ring/50'
+                      // Full-width row. h-9 (36 px) on desktop, h-11
+                      // (44 px) on touch for thumb-friendly targets.
+                      // Left padding reserves space for the active
+                      // accent bar so content doesn't shift between
+                      // states.
+                      'group relative flex h-9 touch:h-11 w-full cursor-pointer items-center gap-2 rounded-sm border pl-3 pr-2 text-xs touch:text-[13px] select-none touch-manipulation',
+                      visualClass
                     )}
                     style={tabVisualStyle[visual]}
-                    onClick={() => !isRenaming && onActivate(s.id)}
+                    onClick={() => !isRenaming && handleActivate(s.id)}
                     onDoubleClick={(ev) => {
                       ev.stopPropagation();
                       setRenamingId(s.id);
                       setRenameValue(s.label);
                     }}
                   >
+                    {/* Active-row accent bar: sits inside the row's
+                     * left padding so it never pushes content. */}
+                    {isActive && (
+                      <span
+                        aria-hidden="true"
+                        className="absolute inset-y-1 left-0.5 w-[3px] rounded-full bg-[color:var(--primary)]"
+                      />
+                    )}
+
                     {showAttentionDot && s.attention && (
                       <span className={cn(attentionDotBase, attentionClass[s.attention])} />
                     )}
@@ -266,6 +358,7 @@ export const TabBar = ({
                         value={renameValue}
                         onChange={(e) => setRenameValue(e.target.value)}
                         onBlur={commitRename}
+                        onClick={(e) => e.stopPropagation()}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') {
                             commitRename();
@@ -274,15 +367,15 @@ export const TabBar = ({
                             setRenameValue('');
                           }
                         }}
-                        className="h-6 w-28 rounded-sm bg-background px-1 text-base md:text-xs outline-hidden focus:ring-1 focus:ring-ring"
+                        className="h-6 flex-1 rounded-sm bg-transparent px-1 text-base md:text-xs outline-hidden"
                       />
                     ) : (
-                      <span>{s.label}</span>
+                      <span className="min-w-0 flex-1 truncate">{s.label}</span>
                     )}
 
                     <button
                       type="button"
-                      className="cursor-pointer rounded-sm px-0.5 touch:p-1.5 text-muted-foreground/60 hover:text-[color:var(--attn-error)]"
+                      className="cursor-pointer rounded-sm p-0.5 touch:p-1.5 text-muted-foreground/60 hover:text-[color:var(--attn-error)]"
                       aria-label="Close session"
                       onClick={(ev) => {
                         ev.stopPropagation();
@@ -293,7 +386,7 @@ export const TabBar = ({
                     </button>
                   </div>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">
+                <TooltipContent side="right">
                   <div>{s.cwd ? `${s.label} · ${s.cwd}` : s.label}</div>
                   <div className="text-muted-foreground mt-2">{tabTooltipStatus(visual)}</div>
                   <div className="text-muted-foreground">Double-click to rename.</div>
@@ -302,7 +395,7 @@ export const TabBar = ({
             );
           })}
         </div>
-      </div>
-    </header>
+      </aside>
+    </>
   );
 };

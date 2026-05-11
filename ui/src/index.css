@@ -7,30 +7,32 @@
 
 /* mezame design tokens.
  *
- * Dark-only today. Zinc base, cool blue accent, monospace throughout. Role
- * and attention hues deliberately match the legacy src/ui.html palette so
- * visual calibration stays consistent while we migrate. */
+ * Dark-only today. Zinc base, green primary (matching the "connected"
+ * and "thinking" states so UI chrome and live status share a family),
+ * monospace throughout. User-message bubble stays blue so user turns
+ * read distinctly from the green ambient UI, and agent output stays
+ * amber for the same reason. */
 
 :root {
-  --background: oklch(0.145 0 0);
+  --background: oklch(0.19 0.04 255);
   --foreground: oklch(0.922 0 0);
-  --card: oklch(0.17 0 0);
+  --card: oklch(0.22 0.04 255);
   --card-foreground: oklch(0.922 0 0);
-  --popover: oklch(0.17 0 0);
+  --popover: oklch(0.22 0.04 255);
   --popover-foreground: oklch(0.922 0 0);
-  --primary: oklch(0.6 0.12 240);
+  --primary: oklch(0.65 0.13 155);
   --primary-foreground: oklch(0.145 0 0);
-  --secondary: oklch(0.22 0 0);
+  --secondary: oklch(0.26 0.035 255);
   --secondary-foreground: oklch(0.922 0 0);
-  --muted: oklch(0.22 0 0);
-  --muted-foreground: oklch(0.65 0 0);
-  --accent: oklch(0.26 0 0);
+  --muted: oklch(0.26 0.035 255);
+  --muted-foreground: oklch(0.7 0.02 255);
+  --accent: oklch(0.3 0.04 255);
   --accent-foreground: oklch(0.922 0 0);
   --destructive: oklch(0.62 0.19 25);
   --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(0.26 0 0);
-  --input: oklch(0.22 0 0);
-  --ring: oklch(0.55 0.1 240);
+  --border: oklch(0.32 0.04 255);
+  --input: oklch(0.26 0.035 255);
+  --ring: oklch(0.6 0.11 155);
   --radius: 0.375rem;
 
   --user: oklch(0.72 0.09 240);
@@ -40,9 +42,9 @@
   --attn-permission: oklch(0.78 0.12 75);
   --attn-error: oklch(0.7 0.14 25);
 
-  /* User message bubble. Friendlier than the raw primary: a lighter, more
-   * saturated azure that sits forward on the dark background without
-   * feeling like a button. */
+  /* User message bubble. Kept in the blue family so user turns read
+   * distinctly from the green UI chrome (primary/ring) and the amber
+   * agent output: three different hues for three different roles. */
   --user-bubble: oklch(0.72 0.11 235);
 
   /* Virtual-keyboard inset, populated by useKeyboardInset() at runtime.
@@ -112,6 +114,22 @@
   }
 }
 
+/* Tooltip content: shown only for fine pointers (mouse, trackpad).
+ * Suppressed on coarse pointers (touch) where a tap would leave the
+ * tooltip lingering with no dismiss affordance. Written directly in
+ * CSS rather than as a Tailwind `mouse:` variant because the Tailwind
+ * JIT resolves variants at build time, and a stale compiled bundle in
+ * `ui/dist/` would silently hide all tooltips in production. */
+.tt-fine-only {
+  display: none;
+}
+
+@media (pointer: fine) {
+  .tt-fine-only {
+    display: block;
+  }
+}
+
 /* Tab pulse keyframes. Hardcoded RGB values (no custom-property
  * indirection, no color-mix, no @layer) so nothing in Tailwind's
  * pipeline can flatten them. Applied via inline style from TabBar.tsx
@@ -162,7 +180,7 @@
    * transparent with a narrow bright arc, so only a travelling glow
    * moves around the outline, not a rotating half-disc. */
   background:
-    linear-gradient(#1a2a20, #1a2a20) padding-box,
+    linear-gradient(#18243a, #18243a) padding-box,
     conic-gradient(from var(--busy-border-angle),
       transparent 0deg,
       transparent 280deg,
@@ -173,7 +191,7 @@
 
 .tab-busy-border:hover {
   background:
-    linear-gradient(#203428, #203428) padding-box,
+    linear-gradient(#1f2e47, #1f2e47) padding-box,
     conic-gradient(from var(--busy-border-angle),
       transparent 0deg,
       transparent 280deg,

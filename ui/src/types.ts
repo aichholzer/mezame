@@ -12,6 +12,7 @@ export type ServerMessage =
     resumed: boolean;
     cwd?: string;
     promptCapabilities?: PromptCapabilities;
+    buildId?: string;
   }
   | { type: 'session_info'; info: SessionInfo }
   | { type: 'commands'; commands: SlashCommand[]; prompts: SlashPrompt[] }

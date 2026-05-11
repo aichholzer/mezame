@@ -125,7 +125,7 @@ export const CwdChip = ({ session }: Props) => {
           className={cn(triggerClass, 'max-w-[60vw]')}
           aria-label="Working directory (double-click to open a new session elsewhere)"
         >
-          <FolderIcon className="size-3 shrink-0 opacity-70" />
+          <FolderIcon className="size-3 shrink-0 text-[color:var(--primary)]" />
           <span className="truncate">{display}</span>
         </Button>
       </TooltipTrigger>

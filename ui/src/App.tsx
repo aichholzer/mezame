@@ -1,8 +1,10 @@
+import { MenuIcon } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { Button } from '@/components/ui/button';
 import { InputRow } from '@/features/InputRow';
 import { LogPane } from '@/features/LogPane';
 import { NewSessionDialog } from '@/features/NewSessionDialog';
-import { TabBar } from '@/features/TabBar';
+import { SideBar } from '@/features/SideBar';
 import { useAttentionBadge } from '@/hooks/useAttentionBadge';
 import { useKeyboardInset } from '@/hooks/useKeyboardInset';
 import { mezameActions, useMezame } from '@/hooks/useMezame';
@@ -10,6 +12,10 @@ import { mezameActions, useMezame } from '@/hooks/useMezame';
 export const App = () => {
   const { sessions, closed, activeId, activeSession } = useMezame();
   const [newSessionOpen, setNewSessionOpen] = useState(false);
+  // Mobile-only: drawer state for the sidebar. Desktop ignores it
+  // (the sidebar is always rendered and the transform-based hiding
+  // is overridden at `md:`).
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useAttentionBadge();
   useKeyboardInset();
@@ -33,45 +39,64 @@ export const App = () => {
 
   return (
     <div
-      className="flex h-full h-[100dvh] min-h-0 flex-col"
+      className="flex h-full h-[100dvh] min-h-0"
       style={{
-        // Top/left/right safe-area padding so the header and side
-        // gutters clear the notch and rounded-screen insets on
-        // iOS. Bottom inset is handled inside the floating composer,
-        // not here: the scrollable log wants the full height and
-        // applies its own padding around the composer footprint.
-        paddingTop: 'var(--mz-safe-top)',
-        paddingLeft: 'var(--mz-safe-left)',
+        // Top/left/right safe-area padding on the shell is handled
+        // per-region now: the sidebar owns its own top/bottom/left
+        // safe area, and the main column owns top/right. Bottom inset
+        // for the composer is handled inside the floating composer
+        // itself.
         paddingRight: 'var(--mz-safe-right)'
       }}
     >
-      {/* Single centred content column. Both the header (tab bar) and
-       * the chat pane live inside it, so they share the same width
-       * cap and can fill it freely without each needing their own
-       * max-width. */}
-      <div className="mx-auto flex w-full min-h-0 flex-1 flex-col max-w-[1600px]">
-        <TabBar
-          sessions={sessions}
-          activeId={activeId}
-          closed={closed}
-          onActivate={mezameActions.activate}
-          onClose={mezameActions.closeSession}
-          onRename={mezameActions.renameSession}
-          onRestore={mezameActions.restoreFromHistory}
-          onForget={mezameActions.forgetHistory}
-          onNewTab={() => setNewSessionOpen(true)}
-        />
+      <SideBar
+        sessions={sessions}
+        activeId={activeId}
+        closed={closed}
+        onActivate={mezameActions.activate}
+        onClose={mezameActions.closeSession}
+        onRename={mezameActions.renameSession}
+        onRestore={mezameActions.restoreFromHistory}
+        onForget={mezameActions.forgetHistory}
+        onNewTab={() => setNewSessionOpen(true)}
+        isOpen={sidebarOpen}
+        onRequestClose={() => setSidebarOpen(false)}
+      />
 
-        {/* Relative so the floating composer inside can anchor to the
-         * chat area rather than the whole viewport. */}
-        <main className="relative flex min-h-0 flex-1 flex-col">
+      {/* Main column: the chat pane. Centred and width-capped so long
+       * lines stay readable on ultra-wide monitors. Relative so the
+       * floating composer inside can anchor to it. */}
+      <main
+        className="relative flex min-h-0 flex-1 flex-col"
+        style={{ paddingTop: 'var(--mz-safe-top)' }}
+      >
+        {/* Mobile burger: pinned top-left of the main column, hidden on
+         * desktop where the sidebar is always visible. The sidebar has
+         * its own safe-area padding, so this button sits above the
+         * notch by matching it. */}
+        <div
+          className="absolute left-3 top-3 z-20 md:hidden"
+          style={{ top: 'calc(0.75rem + var(--mz-safe-top))' }}
+        >
+          <Button
+            size="icon"
+            variant="outline"
+            className="size-10 text-[color:var(--primary)]"
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Open sidebar"
+          >
+            <MenuIcon className="size-5" />
+          </Button>
+        </div>
+
+        <div className="mx-auto flex w-full min-h-0 flex-1 flex-col">
           {sessions.map((s) => (
             <LogPane key={s.id} session={s} isActive={s.id === activeId} />
           ))}
 
           <InputRow session={activeSession} onSubmit={mezameActions.sendPrompt} />
-        </main>
-      </div>
+        </div>
+      </main>
 
       <NewSessionDialog
         open={newSessionOpen}

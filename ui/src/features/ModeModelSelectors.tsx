@@ -57,7 +57,7 @@ const Picker = <T extends { id: string; label: string; description?: string }>({
       <TooltipTrigger asChild>
         <DropdownMenuTrigger asChild disabled={disabled || options.length === 0}>
           <Button variant="ghost" size="sm" className={triggerClass}>
-            <span className="text-muted-foreground">{label}:</span>
+            <span className="text-[color:var(--primary)]">{label}:</span>
             <span className="max-w-[10rem] truncate">
               {options.length === 0 ? emptyLabel : triggerLabel}
             </span>
