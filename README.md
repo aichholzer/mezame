@@ -27,6 +27,7 @@ Clarity matters here, because "AI-adjacent tool" covers a lot of ground.
 - **Mezame does not talk to an LLM.** It has no model, no inference code, no prompt engineering. It carries bytes between a browser and a subprocess; that is the entire job.
 - **Mezame has no credentials of its own.** It does not hold API keys, OAuth tokens, or AWS credentials. It never authenticates to any provider.
 - **Mezame is useless on its own.** It requires an ACP-speaking agent (e.g. Kiro CLI) to be installed, authenticated, and working locally. All intelligence, access, billing, and policy live with that agent. Mezame only exposes a conversation surface to a browser you control.
+- **Mezame does not modify your agent's files.** It reads `~/.kiro/sessions/cli/<id>.jsonl` to replay history on resume, and it declares `fs.readTextFile: false` and `fs.writeTextFile: false` at ACP `initialize`, so the agent cannot ask Mezame to touch the filesystem either. The sole exception is stale-lockfile cleanup under `~/.kiro/sessions/cli/`: if a `.lock` points at a dead PID, Mezame removes it so the next `session/load` succeeds. Mezame's own config and state live in `~/.mezame/`.
 
 **Put plainly:** if you uninstall the agent, Mezame has nothing to show you.
 
