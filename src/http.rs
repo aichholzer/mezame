@@ -121,7 +121,12 @@ async fn serve_ui_asset(uri: Uri) -> Response {
     let is_index = resolved_path == "index.html";
 
     let mime = mime_for(resolved_path);
-    let cache_control = if is_index {
+    let cache_control = if is_index || resolved_path == "sw.js" {
+        // Both `index.html` and the service-worker script must not be
+        // cached aggressively: `index.html` is the SPA entry point and
+        // `sw.js` is how we update the SW itself (browsers already
+        // bypass HTTP cache for SW updates in most cases, but the
+        // explicit no-cache keeps any intermediary from stashing it).
         "no-cache, no-store, must-revalidate"
     } else if resolved_path.starts_with("assets/") {
         // Vite emits content-hashed filenames under /assets, so we can
