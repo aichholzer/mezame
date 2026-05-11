@@ -31,16 +31,44 @@ const DialogOverlay = ({ className, ...props }: ComponentProps<typeof DialogPrim
   />
 );
 
-const DialogContent = ({ className, children, ...props }: ComponentProps<typeof DialogPrimitive.Content>) => (
+const DialogContent = ({
+  className,
+  variant = 'modal',
+  children,
+  ...props
+}: ComponentProps<typeof DialogPrimitive.Content> & { variant?: 'modal' | 'sheet' }) => (
   <DialogPortal>
     <DialogOverlay />
     <DialogPrimitive.Content
       data-slot="dialog-content"
       className={cn(
-        'fixed top-1/2 left-1/2 z-50 grid w-full max-w-[min(90vw,380px)] -translate-x-1/2 -translate-y-1/2 gap-3 border bg-card p-4 shadow-lg duration-200 rounded-md',
+        // Desktop: centred modal. On mobile the `sheet` variant slides
+        // up from the bottom and fills the viewport width; the `modal`
+        // variant keeps the centred behaviour everywhere.
+        'fixed z-50 grid gap-3 border bg-card p-4 shadow-lg duration-200',
+        variant === 'sheet'
+          ? cn(
+            // Mobile: full-width bottom sheet. Round only the top
+            // corners so the card visually merges with the bottom
+            // edge. Safe-area bottom padding keeps content above
+            // the iOS home indicator.
+            'bottom-0 left-0 right-0 w-full max-w-full rounded-t-md rounded-b-none',
+            // Desktop: revert to centred modal.
+            'md:top-1/2 md:left-1/2 md:bottom-auto md:right-auto md:-translate-x-1/2 md:-translate-y-1/2',
+            'md:w-auto md:max-w-[min(90vw,380px)] md:rounded-md'
+          )
+          : cn(
+            'top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 rounded-md',
+            'w-full max-w-[min(90vw,380px)]'
+          ),
         'data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0 data-[state=open]:zoom-in-95 data-[state=closed]:zoom-out-95',
         className
       )}
+      style={
+        variant === 'sheet'
+          ? { paddingBottom: 'calc(1rem + var(--mz-safe-bottom))' }
+          : undefined
+      }
       {...props}
     >
       {children}

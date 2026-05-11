@@ -81,6 +81,17 @@ const components: Components = {
       />
     );
   },
+  table({ className, ...rest }) {
+    // Wrap tables so wide content scrolls horizontally within the
+    // wrapper instead of expanding the page. Without this, a table
+    // with long cells would push the body viewport wider than the
+    // window on narrow screens.
+    return (
+      <div className="my-2 w-full overflow-x-auto scrollbar-thin">
+        <table className={cn('border-collapse', className)} {...rest} />
+      </div>
+    );
+  },
   a({ className, children, href, ...rest }) {
     return (
       <a

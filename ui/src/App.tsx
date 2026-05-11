@@ -4,6 +4,7 @@ import { LogPane } from '@/features/LogPane';
 import { NewSessionDialog } from '@/features/NewSessionDialog';
 import { TabBar } from '@/features/TabBar';
 import { useAttentionBadge } from '@/hooks/useAttentionBadge';
+import { useKeyboardInset } from '@/hooks/useKeyboardInset';
 import { mezameActions, useMezame } from '@/hooks/useMezame';
 
 export const App = () => {
@@ -11,13 +12,39 @@ export const App = () => {
   const [newSessionOpen, setNewSessionOpen] = useState(false);
 
   useAttentionBadge();
+  useKeyboardInset();
+
+  // Mirror the browser tab's visibility onto
+  // `<html data-visibility="visible|hidden">` so CSS can pause
+  // animations when the user has switched away. See
+  // `.tab-busy-border` in index.css.
+  useEffect(() => {
+    const onVisibility = () => {
+      document.documentElement.dataset.visibility = document.visibilityState;
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    onVisibility();
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, []);
 
   useEffect(() => {
     void mezameActions.init();
   }, []);
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div
+      className="flex h-full h-[100dvh] min-h-0 flex-col"
+      style={{
+        // Top/left/right safe-area padding so the header and side
+        // gutters clear the notch and rounded-screen insets on
+        // iOS. Bottom inset is handled inside the floating composer,
+        // not here: the scrollable log wants the full height and
+        // applies its own padding around the composer footprint.
+        paddingTop: 'var(--mz-safe-top)',
+        paddingLeft: 'var(--mz-safe-left)',
+        paddingRight: 'var(--mz-safe-right)'
+      }}
+    >
       {/* Single centred content column. Both the header (tab bar) and
        * the chat pane live inside it, so they share the same width
        * cap and can fill it freely without each needing their own

@@ -1,5 +1,5 @@
 import { HistoryIcon, PlusIcon, XIcon } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -125,6 +125,22 @@ export const TabBar = ({
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
 
+  // Keep the active tab visible when activation changes programmatically
+  // (new session, restore from history, keyboard switch). `scrollIntoView`
+  // with `inline: 'center'` pulls the chip to the middle of the strip,
+  // which is the most useful resting spot when many tabs are open. No-op
+  // when the chip is already fully in view or when nothing matches the
+  // selector (e.g., just-closed session).
+  useEffect(() => {
+    if (!activeId) {
+      return;
+    }
+    const chip = document.querySelector(`[data-tab-id="${CSS.escape(activeId)}"]`);
+    if (chip instanceof HTMLElement) {
+      chip.scrollIntoView({ block: 'nearest', inline: 'center' });
+    }
+  }, [activeId]);
+
   const commitRename = () => {
     if (renamingId && renameValue.trim()) {
       onRename(renamingId, renameValue.trim());
@@ -134,150 +150,158 @@ export const TabBar = ({
   };
 
   return (
-    <header className="mx-3 mt-3 h-16 rounded-xl border border-[color:var(--primary)]/60 bg-background/70 shadow-lg shadow-black/30 backdrop-blur-md">
+    <header className="mx-3 mt-3 h-14 md:h-16 rounded-xl border border-[color:var(--primary)]/60 bg-background/70 shadow-lg shadow-black/30 backdrop-blur-md">
       <div className="flex h-full w-full items-center gap-2 px-3">
-        <DropdownMenu>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <DropdownMenuTrigger asChild>
-              <Button size="icon" variant="outline" className="size-8" aria-label="History">
-                <HistoryIcon className="size-4" />
-              </Button>
-            </DropdownMenuTrigger>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">Recently closed</TooltipContent>
-        </Tooltip>
-        <DropdownMenuContent align="start">
-          <DropdownMenuLabel>Recently closed</DropdownMenuLabel>
-          <DropdownMenuSeparator />
-          {closed.length === 0 ? (
-            <div className="px-2 py-1.5 text-xs text-muted-foreground">no recently closed sessions</div>
-          ) : (
-            closed.map((entry) => (
-              <DropdownMenuItem
-                key={entry.acpSessionId}
-                onSelect={() => onRestore(entry.acpSessionId)}
-                className="flex-col items-stretch gap-0.5"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm text-foreground">{entry.label}</span>
-                  <button
-                    type="button"
-                    className="rounded-sm px-1 text-muted-foreground/60 hover:text-[color:var(--attn-error)]"
-                    onClick={(ev) => {
-                      ev.stopPropagation();
-                      ev.preventDefault();
-                      onForget(entry.acpSessionId);
-                    }}
-                    aria-label="Forget"
-                  >
-                    <XIcon className="size-3" />
-                  </button>
-                </div>
-                <div className="truncate text-[11px] text-muted-foreground">
-                  {entry.cwd ? `${entry.cwd} · ` : ''}
-                  {timeAgo(entry.closedAt)}
-                </div>
-              </DropdownMenuItem>
-            ))
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
-
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button size="icon" variant="outline" className="size-8" onClick={onNewTab} aria-label="New session">
-            <PlusIcon className="size-4" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">New session</TooltipContent>
-      </Tooltip>
-
-      <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto scrollbar-thin">
-        {sessions.map((s) => {
-          const isActive = s.id === activeId;
-          const isRenaming = renamingId === s.id;
-          const visual = tabVisualState(s, isActive);
-          const visualClass = tabVisualClass[visual];
-          // Attention dots signal "something finished in a tab you are
-          // not looking at" (done) or "the agent is waiting on you"
-          // (permission). Shown on Connected tabs and on Busy-in-
-          // background tabs (so a pending permission prompt remains
-          // visible on top of the green pulse). Suppressed on the
-          // active tab (the user is already looking) and when the tab
-          // carries its own strong colour (error / connecting).
-          const showAttentionDot =
-            !isActive &&
-            s.attention !== null &&
-            (visual === 'connected' || visual === 'busy-background');
-          return (
-            <Tooltip key={s.id}>
+        {/* Fixed-position cluster: history + new-tab buttons. Pinned on
+         * the left so the scrolling tab strip to their right cannot
+         * push them off-screen on narrow viewports. */}
+        <div className="flex shrink-0 items-center gap-2">
+          <DropdownMenu>
+            <Tooltip>
               <TooltipTrigger asChild>
-                <div
-                  className={cn(
-                    'group inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-sm border px-2.5 text-xs select-none',
-                    visualClass,
-                    isActive && 'ring-1 ring-ring/50'
-                  )}
-                  style={tabVisualStyle[visual]}
-                  onClick={() => !isRenaming && onActivate(s.id)}
-                  onDoubleClick={(ev) => {
-                    ev.stopPropagation();
-                    setRenamingId(s.id);
-                    setRenameValue(s.label);
-                  }}
-                >
-                  {showAttentionDot && s.attention && (
-                    <span className={cn(attentionDotBase, attentionClass[s.attention])} />
-                  )}
+                <DropdownMenuTrigger asChild>
+                  <Button size="icon" variant="outline" className="size-8" aria-label="History">
+                    <HistoryIcon className="size-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Recently closed</TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="start">
+              <DropdownMenuLabel>Recently closed</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {closed.length === 0 ? (
+                <div className="px-2 py-1.5 text-xs text-muted-foreground">no recently closed sessions</div>
+              ) : (
+                closed.map((entry) => (
+                  <DropdownMenuItem
+                    key={entry.acpSessionId}
+                    onSelect={() => onRestore(entry.acpSessionId)}
+                    className="flex-col items-stretch gap-0.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm text-foreground">{entry.label}</span>
+                      <button
+                        type="button"
+                        className="rounded-sm px-1 text-muted-foreground/60 hover:text-[color:var(--attn-error)]"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          ev.preventDefault();
+                          onForget(entry.acpSessionId);
+                        }}
+                        aria-label="Forget"
+                      >
+                        <XIcon className="size-3" />
+                      </button>
+                    </div>
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      {entry.cwd ? `${entry.cwd} · ` : ''}
+                      {timeAgo(entry.closedAt)}
+                    </div>
+                  </DropdownMenuItem>
+                ))
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
 
-                  {isRenaming ? (
-                    <input
-                      autoFocus
-                      value={renameValue}
-                      onChange={(e) => setRenameValue(e.target.value)}
-                      onBlur={commitRename}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          commitRename();
-                        } else if (e.key === 'Escape') {
-                          setRenamingId(null);
-                          setRenameValue('');
-                        }
-                      }}
-                      className="h-6 w-28 rounded-sm bg-background px-1 text-xs outline-hidden focus:ring-1 focus:ring-ring"
-                    />
-                  ) : (
-                    <span>{s.label}</span>
-                  )}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button size="icon" variant="outline" className="size-8" onClick={onNewTab} aria-label="New session">
+                <PlusIcon className="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">New session</TooltipContent>
+          </Tooltip>
+        </div>
 
-                  <button
-                    type="button"
-                    className="cursor-pointer rounded-sm px-0.5 text-muted-foreground/60 hover:text-[color:var(--attn-error)]"
-                    aria-label="Close session"
-                    onClick={(ev) => {
+        <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto scrollbar-thin">
+          {sessions.map((s) => {
+            const isActive = s.id === activeId;
+            const isRenaming = renamingId === s.id;
+            const visual = tabVisualState(s, isActive);
+            const visualClass = tabVisualClass[visual];
+            // Attention dots signal "something finished in a tab you are
+            // not looking at" (done) or "the agent is waiting on you"
+            // (permission). Shown on Connected tabs and on Busy-in-
+            // background tabs (so a pending permission prompt remains
+            // visible on top of the green pulse). Suppressed on the
+            // active tab (the user is already looking) and when the tab
+            // carries its own strong colour (error / connecting).
+            const showAttentionDot =
+              !isActive &&
+              s.attention !== null &&
+              (visual === 'connected' || visual === 'busy-background');
+            return (
+              <Tooltip key={s.id}>
+                <TooltipTrigger asChild>
+                  <div
+                    data-tab-id={s.id}
+                    className={cn(
+                      // h-11 (44 px) on touch, h-8 (32 px) on mouse.
+                      // Larger text on touch so the label is not
+                      // swallowed by the taller chip.
+                      // `touch-manipulation` disables the iOS
+                      // double-tap-to-zoom delay on tab chips; tabs
+                      // are tapped frequently and the 300 ms delay
+                      // is noticeable.
+                      'group inline-flex h-8 touch:h-11 cursor-pointer items-center gap-1.5 rounded-sm border px-2.5 text-xs touch:text-[13px] select-none touch-manipulation',
+                      visualClass,
+                      isActive && 'ring-1 ring-ring/50'
+                    )}
+                    style={tabVisualStyle[visual]}
+                    onClick={() => !isRenaming && onActivate(s.id)}
+                    onDoubleClick={(ev) => {
                       ev.stopPropagation();
-                      onClose(s.id);
+                      setRenamingId(s.id);
+                      setRenameValue(s.label);
                     }}
                   >
-                    <XIcon className="size-3" />
-                  </button>
-                </div>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">
-                <div>{s.cwd ? `${s.label} · ${s.cwd}` : s.label}</div>
-                <div className="text-muted-foreground mt-2">{tabTooltipStatus(visual)}</div>
-                <div className="text-muted-foreground">Double-click to rename.</div>
-              </TooltipContent>
-            </Tooltip>
-          );
-        })}
-      </div>
+                    {showAttentionDot && s.attention && (
+                      <span className={cn(attentionDotBase, attentionClass[s.attention])} />
+                    )}
 
-      <div className="flex items-center gap-1.5 select-none">
-        <span className="text-sm font-bold tracking-wider text-foreground">Mezame!</span>
-        <span className="text-[10px] text-muted-foreground/70 font-mono">{__MEZAME_VERSION__}</span>
-      </div>
+                    {isRenaming ? (
+                      <input
+                        autoFocus
+                        value={renameValue}
+                        onChange={(e) => setRenameValue(e.target.value)}
+                        onBlur={commitRename}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            commitRename();
+                          } else if (e.key === 'Escape') {
+                            setRenamingId(null);
+                            setRenameValue('');
+                          }
+                        }}
+                        className="h-6 w-28 rounded-sm bg-background px-1 text-base md:text-xs outline-hidden focus:ring-1 focus:ring-ring"
+                      />
+                    ) : (
+                      <span>{s.label}</span>
+                    )}
+
+                    <button
+                      type="button"
+                      className="cursor-pointer rounded-sm px-0.5 touch:p-1.5 text-muted-foreground/60 hover:text-[color:var(--attn-error)]"
+                      aria-label="Close session"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        onClose(s.id);
+                      }}
+                    >
+                      <XIcon className="size-3 touch:size-4" />
+                    </button>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  <div>{s.cwd ? `${s.label} · ${s.cwd}` : s.label}</div>
+                  <div className="text-muted-foreground mt-2">{tabTooltipStatus(visual)}</div>
+                  <div className="text-muted-foreground">Double-click to rename.</div>
+                </TooltipContent>
+              </Tooltip>
+            );
+          })}
+        </div>
       </div>
     </header>
   );

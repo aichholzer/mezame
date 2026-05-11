@@ -3,6 +3,7 @@ import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
 import { ToolCallCard } from '@/features/ToolCallCard';
 import { mezameActions } from '@/hooks/useMezame';
+import { useKeyboardInsetValue } from '@/hooks/useKeyboardInset';
 import { useTick } from '@/hooks/useTick';
 import { formatAbsolute, timeAgo } from '@/lib/time';
 import { cn } from '@/lib/utils';
@@ -53,14 +54,18 @@ const PermissionCard = ({
       {resolved ? (
         <div className="text-xs text-muted-foreground">→ {entry.resolution}</div>
       ) : (
-        <div className="flex flex-wrap gap-1.5">
+        <div className="flex flex-col gap-2 md:flex-row md:flex-wrap md:gap-1.5">
           {options.map((opt) => (
             <button
               key={opt.optionId}
               type="button"
               onClick={() => mezameActions.resolvePermission(session.id, entry.id, opt)}
               className={cn(
-                'cursor-pointer rounded-sm border bg-card px-2.5 py-1 text-xs transition-colors',
+                // Stacked on mobile with 44 px minimum height so each
+                // option has a clearly separate hit area; inline on
+                // desktop with the denser sizing.
+                'cursor-pointer rounded-sm border bg-card text-sm md:text-xs transition-colors',
+                'min-h-11 md:min-h-0 px-4 md:px-2.5 py-2.5 md:py-1',
                 optionTone(opt)
               )}
             >
@@ -134,6 +139,7 @@ export const LogPane = ({ session, isActive }: Props) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastScrollHeight = useRef(0);
   const tick = useTick();
+  const kbInset = useKeyboardInsetValue();
   // Relative-time label refresh needs an actual `now` snapshot. tick just
   // forces this component (and children) to re-render.
   const now = Date.now();
@@ -153,6 +159,21 @@ export const LogPane = ({ session, isActive }: Props) => {
       el.scrollTop = el.scrollHeight;
     }
   });
+
+  // Re-pin the scroll to the bottom when the virtual keyboard opens
+  // or closes. Without this the content that was flush with the
+  // composer would end up either stranded above the now-lifted
+  // composer (keyboard open) or leaving a gap below the new resting
+  // position (keyboard closed). Only runs when the session was
+  // already pinned; if the user had scrolled up to read older
+  // messages, we leave their scroll position alone.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !session.pinnedToBottom) {
+      return;
+    }
+    el.scrollTop = el.scrollHeight;
+  }, [kbInset, session.pinnedToBottom]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -181,12 +202,18 @@ export const LogPane = ({ session, isActive }: Props) => {
       ref={scrollRef}
       className={cn(
         // Bottom padding leaves room for the floating composer so the
-        // final message isn't permanently hidden. ~13rem covers the
-        // composer at its MIN_ROWS height plus gutters; taller composers
-        // visually overlap a bit of scrollback, which is intended.
-        'flex-1 overflow-y-auto px-3 pt-3 pb-[13rem] break-words scrollbar-thin',
+        // final message isn't permanently hidden. The 13rem base
+        // covers the composer at its MIN_ROWS height plus gutters;
+        // `--mz-kb-inset` lifts the reserved area above the virtual
+        // keyboard when it is open, and `--mz-safe-bottom` clears
+        // the iOS home indicator. Both vars default to 0 on desktop.
+        'flex-1 overflow-y-auto px-3 pt-3 break-words scrollbar-thin',
         !isActive && 'hidden'
       )}
+      style={{
+        paddingBottom:
+          'calc(13rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
+      }}
     >
       {session.log.map((entry) => {
         if (entry.kind === 'text') {

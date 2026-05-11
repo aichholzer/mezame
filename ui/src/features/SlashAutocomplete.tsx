@@ -114,7 +114,14 @@ export const SlashAutocomplete = forwardRef<SlashAutocompleteHandle, Props>(
       <div
         role="listbox"
         className={cn(
-          'absolute bottom-full left-2 right-2 z-20 mb-1.5 max-h-64 overflow-y-auto rounded-md border border-border bg-popover shadow-md',
+          // The clamp keeps the popover from extending off-screen when
+          // the virtual keyboard is open: at most 16rem, or the space
+          // between the top of the viewport and a ~200 px reservation
+          // for the composer and its bottom gutter. 200 is empirical;
+          // tune during on-device testing if the popover touches the
+          // composer on a narrow phone.
+          'absolute bottom-full left-2 right-2 z-20 mb-1.5 overflow-y-auto rounded-md border border-border bg-popover shadow-md',
+          'max-h-[min(16rem,calc(100dvh-var(--mz-kb-inset)-200px))]',
           'scrollbar-thin'
         )}
       >

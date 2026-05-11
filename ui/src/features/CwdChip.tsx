@@ -100,7 +100,7 @@ export const CwdChip = ({ session }: Props) => {
         }}
         onBlur={cancel}
         placeholder="/absolute/path"
-        className="h-7 w-[22rem] max-w-[60vw] bg-card px-2 text-[11px]"
+        className="h-7 w-[22rem] max-w-[60vw] bg-card px-2 text-base md:text-[11px]"
         spellCheck={false}
         autoCapitalize="off"
         autoCorrect="off"

@@ -1,11 +1,17 @@
-import { PaperclipIcon, SendIcon, XIcon } from 'lucide-react';
+import { PaperclipIcon, SendIcon, SettingsIcon, XIcon } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { CwdChip } from '@/features/CwdChip';
 import { ModeModelSelectors } from '@/features/ModeModelSelectors';
 import { SlashAutocomplete, type SlashAutocompleteHandle } from '@/features/SlashAutocomplete';
+import { useIsMobile } from '@/hooks/useIsMobile';
 import {
   attachmentToBlock,
   cleanup,
@@ -23,10 +29,19 @@ import type { PromptBlock, Session } from '@/types';
 // backdrop blur lets the latest content show through faintly without
 // ever hiding the composer itself.
 //
-// Layout:
+// Desktop layout:
 //   [ attachment chips (when any)                                 ]
 //   [  textarea                                         [  send ] ]
 //   [ [cwd chip] [attach]              [ Agent ] [ Model picker ] ]
+//
+// Mobile layout (below `md`):
+//   [ attachment chips (when any)                                 ]
+//   [  textarea                                                   ]
+//   [ [cwd] [attach] [settings]                          [ send ] ]
+//
+// On mobile the top-right send button moves to the bottom row so it
+// is within thumb reach, and the Agent/Model pickers move behind a
+// settings icon that opens a DropdownMenu with both pickers stacked.
 //
 // Attachments come in three ways: paste an image from the clipboard,
 // drop a file on the card, or click the paperclip to open a file
@@ -39,10 +54,16 @@ type Props = {
   onSubmit: (text: string, blocks: PromptBlock[]) => void;
 };
 
-const MIN_ROWS = 3;
+// Upper bound stays the same on all viewports; taller than this and the
+// textarea scrolls internally rather than dominating the screen.
 const MAX_ROWS = 8;
 
 export const InputRow = ({ session, onSubmit }: Props) => {
+  const isMobile = useIsMobile();
+  // Start shorter on mobile so more of the log stays visible when the
+  // keyboard is open. Desktop keeps the original 3-row resting height.
+  const minRows = isMobile ? 2 : 3;
+
   const [value, setValue] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -83,7 +104,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
     }
   }, [session?.id, session?.busy]);
 
-  // Auto-grow between MIN_ROWS and MAX_ROWS, scroll thereafter.
+  // Auto-grow between minRows and MAX_ROWS, scroll thereafter.
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) {
@@ -93,10 +114,10 @@ export const InputRow = ({ session, onSubmit }: Props) => {
     const lineHeight = parseFloat(computed.lineHeight || '20');
     const paddingY = parseFloat(computed.paddingTop) + parseFloat(computed.paddingBottom);
     el.style.height = 'auto';
-    const minPx = lineHeight * MIN_ROWS + paddingY;
+    const minPx = lineHeight * minRows + paddingY;
     const maxPx = lineHeight * MAX_ROWS + paddingY;
     el.style.height = `${Math.min(Math.max(el.scrollHeight, minPx), maxPx)}px`;
-  }, [value]);
+  }, [value, minRows]);
 
   const busy = !!session?.busy;
   const disabled = !session || busy;
@@ -256,8 +277,16 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         // Absolute so the log pane behind it keeps using the full
         // viewport height. Insets leave a visible gutter of scrollback
         // around the card so you can see the chat peeking out.
-        'pointer-events-none absolute inset-x-3 bottom-3 z-10'
+        // Bottom offset picks up `--mz-kb-inset` so the composer
+        // rides above the virtual keyboard on mobile, and
+        // `--mz-safe-bottom` so it clears the home indicator on iOS.
+        // Both custom properties default to 0 on desktop, so the
+        // composer rests at `bottom: 0.75rem` as before.
+        'pointer-events-none absolute inset-x-3 z-10'
       )}
+      style={{
+        bottom: 'calc(0.75rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
+      }}
     >
       <div
         onDrop={handleDrop}
@@ -297,26 +326,29 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           disabled={!session}
           readOnly={busy}
           placeholder={busy ? 'The agent is working...' : 'Message... (Enter to send, Shift+Enter for newline)'}
-          rows={MIN_ROWS}
+          rows={minRows}
           autoFocus
           className={cn(
-            // Keep text clear of the overlay widgets on the right.
-            // Top-right holds the send button; bottom row holds the
-            // inline Agent / Model pickers. Extra right padding only
-            // applies on the last line (bottom padding).
-            'border-0 bg-transparent shadow-none pr-14 pl-3 pt-3 pb-12',
+            // Keep text clear of the overlay widgets on the right
+            // (desktop send button) and along the bottom row. The
+            // bottom row is taller on mobile (44 px send button), so
+            // the textarea reserves more bottom padding there.
+            // 16 px (`text-base`) on mobile prevents iOS Safari
+            // auto-zooming on focus; desktop keeps the denser 14 px.
+            'border-0 bg-transparent shadow-none pr-3 md:pr-14 pl-3 pt-3 pb-16 md:pb-12 text-base md:text-sm',
             'focus-visible:ring-0 focus-visible:ring-offset-0'
           )}
         />
 
-        {/* Top-right: send. Disabled while the agent is working. */}
-        <div className="absolute right-2 top-2">
+        {/* Top-right: send (desktop only). On mobile the send button
+         * moves to the bottom row so it is within thumb reach. */}
+        <div className="absolute right-2 top-2 hidden md:block">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 type="submit"
                 size="icon"
-                className="size-9"
+                className="size-9 touch-manipulation"
                 disabled={!canSend}
                 aria-label="Send message"
               >
@@ -327,8 +359,12 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           </Tooltip>
         </div>
 
-        {/* Bottom row: cwd chip + attach button (left), Agent/Model
-         * selectors (right). */}
+        {/* Bottom row.
+         *   Desktop: [cwd] [attach]            [Agent] [Model]
+         *   Mobile:  [cwd] [attach] [settings]          [send]
+         * The settings trigger only shows when the agent advertises at
+         * least one mode or model (`ModeModelSelectors` would otherwise
+         * render nothing). */}
         <div className="absolute inset-x-2 bottom-2 flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5">
             <CwdChip session={session} />
@@ -340,7 +376,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
                       type="button"
                       variant="ghost"
                       size="icon"
-                      className="size-7"
+                      className="size-7 touch:size-11 touch-manipulation"
                       disabled={disabled}
                       onClick={() => fileInputRef.current?.click()}
                       aria-label="Attach file"
@@ -359,8 +395,26 @@ export const InputRow = ({ session, onSubmit }: Props) => {
                 />
               </>
             )}
+            <MobileSettingsTrigger session={session} />
           </div>
-          <ModeModelSelectors session={session} layout="row" />
+          <div className="flex items-center gap-1.5">
+            {/* Inline Agent/Model pickers on desktop only. */}
+            <div className="hidden md:block">
+              <ModeModelSelectors session={session} layout="row" />
+            </div>
+            {/* Mobile send button, matching the desktop one's disabled
+             * state but positioned in the bottom-right where the thumb
+             * can reach it. */}
+            <Button
+              type="submit"
+              size="icon"
+              className="size-11 md:hidden touch-manipulation"
+              disabled={!canSend}
+              aria-label="Send message"
+            >
+              <SendIcon className="size-4" />
+            </Button>
+          </div>
         </div>
 
         {notice && (
@@ -433,4 +487,44 @@ const formatBytes = (bytes: number): string => {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+};
+
+// Mobile-only trigger that opens a DropdownMenu containing the Agent
+// and Model pickers stacked vertically. Reuses the existing
+// `@radix-ui/react-dropdown-menu` primitive so we don't pull in a
+// new dep. Renders nothing when the agent advertised no modes and no
+// models (e.g., non-Kiro agents); matches `ModeModelSelectors`'s own
+// empty-state rule.
+const MobileSettingsTrigger = ({ session }: { session: Session | null }) => {
+  if (!session) {
+    return null;
+  }
+  if (session.modes.length === 0 && session.models.length === 0) {
+    return null;
+  }
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-11 md:hidden touch-manipulation"
+          aria-label="Session settings"
+        >
+          <SettingsIcon className="size-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        side="top"
+        align="start"
+        // Radix applies its own min-width inside DropdownMenuContent;
+        // constrain so the Agent/Model stack (each ~10rem) fits the
+        // popover comfortably on a 320 px viewport.
+        className="p-2"
+      >
+        <ModeModelSelectors session={session} layout="stack" />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
 };

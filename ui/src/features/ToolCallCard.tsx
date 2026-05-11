@@ -153,7 +153,7 @@ export const ToolCallCard = ({ entry }: Props) => {
       </button>
 
       {open && hasDetails && (
-        <div className="space-y-3 border-t border-border/50 px-2.5 py-2.5">
+        <div className="min-w-0 space-y-3 border-t border-border/50 px-2.5 py-2.5">
           {input !== null && (
             <div>
               <div className="mb-1 flex items-center gap-2 text-[11px] text-muted-foreground">

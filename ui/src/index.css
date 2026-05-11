@@ -2,6 +2,8 @@
 @import 'tw-animate-css';
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant touch (&:where(@media (pointer: coarse)));
+@custom-variant mouse (&:where(@media (pointer: fine)));
 
 /* mezame design tokens.
  *
@@ -42,6 +44,21 @@
    * saturated azure that sits forward on the dark background without
    * feeling like a button. */
   --user-bubble: oklch(0.72 0.11 235);
+
+  /* Virtual-keyboard inset, populated by useKeyboardInset() at runtime.
+   * 0 when no keyboard is open or when the visualViewport API is
+   * unavailable. Consumers (composer, log pane) add this to their
+   * positioning so content lifts above the keyboard. */
+  --mz-kb-inset: 0px;
+
+  /* iOS safe-area insets, with a 0 fallback for platforms that do not
+   * report them (desktop browsers, Android without a display cutout).
+   * Bound once here so the rest of the app can reference them as plain
+   * CSS variables rather than repeating env() calls. */
+  --mz-safe-top: env(safe-area-inset-top, 0px);
+  --mz-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --mz-safe-left: env(safe-area-inset-left, 0px);
+  --mz-safe-right: env(safe-area-inset-right, 0px);
 }
 
 .dark {
@@ -76,17 +93,20 @@
 }
 
 @layer base {
+
   html,
   body,
   #root {
     height: 100%;
   }
+
   body {
     font-family: var(--font-mono);
     font-size: 14px;
     background-color: var(--background);
     color: var(--foreground);
   }
+
   * {
     border-color: var(--border);
   }
@@ -97,9 +117,12 @@
  * pipeline can flatten them. Applied via inline style from TabBar.tsx
  * so they win any cascade fight with hover utilities. */
 @keyframes mezame-pulse-orange {
-  0%, 100% {
+
+  0%,
+  100% {
     background-color: rgba(217, 163, 63, 0.25);
   }
+
   50% {
     background-color: rgba(217, 163, 63, 0.6);
   }
@@ -140,25 +163,40 @@
    * moves around the outline, not a rotating half-disc. */
   background:
     linear-gradient(#1a2a20, #1a2a20) padding-box,
-    conic-gradient(
-      from var(--busy-border-angle),
+    conic-gradient(from var(--busy-border-angle),
       transparent 0deg,
       transparent 280deg,
       rgba(110, 196, 140, 0.95) 325deg,
-      transparent 360deg
-    ) border-box;
+      transparent 360deg) border-box;
   animation: mezame-border-spin 2s linear infinite;
 }
+
 .tab-busy-border:hover {
   background:
     linear-gradient(#203428, #203428) padding-box,
-    conic-gradient(
-      from var(--busy-border-angle),
+    conic-gradient(from var(--busy-border-angle),
       transparent 0deg,
       transparent 280deg,
       rgba(110, 196, 140, 0.95) 325deg,
-      transparent 360deg
-    ) border-box;
+      transparent 360deg) border-box;
+}
+
+/* Honour the user's OS-level "reduce motion" preference. The
+ * conic-gradient chase and the connecting pulse are eye-catching by
+ * design but distracting for users with motion sensitivity; both
+ * fall back to a static resting frame, which still carries the
+ * status colour so no signal is lost. */
+@media (prefers-reduced-motion: reduce) {
+  .tab-busy-border {
+    animation: none;
+  }
+}
+
+/* Pause the conic-gradient chase when the browser tab is hidden.
+ * `data-visibility` is set by App.tsx on `visibilitychange`. Running
+ * an animation no one can see wastes CPU, matters more on mobile. */
+html[data-visibility="hidden"] .tab-busy-border {
+  animation: none;
 }
 
 @layer utilities {
@@ -166,13 +204,16 @@
     width: 8px;
     height: 8px;
   }
+
   .scrollbar-thin::-webkit-scrollbar-track {
     background: transparent;
   }
+
   .scrollbar-thin::-webkit-scrollbar-thumb {
     background: var(--border);
     border-radius: 4px;
   }
+
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
     background: var(--muted-foreground);
   }

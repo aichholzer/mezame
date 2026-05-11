@@ -40,7 +40,7 @@ export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent variant="sheet">
         <DialogHeader>
           <DialogTitle>New session</DialogTitle>
           <DialogDescription>
@@ -56,6 +56,7 @@ export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
               value={name}
               onChange={(e) => setName(e.target.value)}
               autoComplete="off"
+              className="text-base md:text-sm"
             />
           </div>
           <div className="flex flex-col gap-1.5">
@@ -66,6 +67,7 @@ export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
               onChange={(e) => setCwd(e.target.value)}
               autoComplete="off"
               placeholder="leave blank for mezame's directory"
+              className="text-base md:text-sm"
             />
           </div>
           <DialogFooter>
