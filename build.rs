@@ -57,13 +57,6 @@ fn main() {
         .unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=MEZAME_BUILD_ID={build_id}");
 
-    // Also write it into the source ui/ directory so `vite.config.ts`
-    // can read it during the Vite build step below.
-    let build_id_file = ui_src.join(".build-id");
-    std::fs::write(&build_id_file, &build_id).unwrap_or_else(|e| {
-        panic!("failed to write {}: {e}", build_id_file.display())
-    });
-
     if std::env::var_os("MEZAME_SKIP_UI_BUILD").is_some() {
         // Leave an empty dist/ directory so rust-embed doesn't fail to
         // resolve the `$OUT_DIR/ui/dist/` folder. The binary will be
@@ -90,6 +83,14 @@ fn main() {
     // We re-sync every build so edits flow through; the copy is cheap
     // compared to the npm install itself.
     sync_ui_sources(&ui_src, &ui_build);
+
+    // Write the build id into the OUT_DIR ui/ copy so `vite.config.ts`
+    // reads it during the Vite build below. Must come after
+    // `sync_ui_sources` so it doesn't get overwritten by a stale copy.
+    let build_id_file = ui_build.join(".build-id");
+    std::fs::write(&build_id_file, &build_id).unwrap_or_else(|e| {
+        panic!("failed to write {}: {e}", build_id_file.display())
+    });
 
     let lock = ui_build.join("package-lock.json");
     let install_args: &[&str] = if lock.exists() {

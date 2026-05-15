@@ -28,7 +28,6 @@
 ui/node_modules/
 ui/dist/
 ui/*.tsbuildinfo
-ui/.build-id
 
 # Security scanner outputs
 .ash/

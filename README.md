@@ -1,8 +1,9 @@
-<div align="center">
-  <img src="assets/Mezame.png" alt="Mezame!" width="100%">
-</div>
+![Mezame](https://github.com/aichholzer/mezame/blob/main/assets/Mezame.png)
 
 # Mezame!
+
+[![Latest version](https://img.shields.io/crates/v/mezame.svg)](https://crates.io/crates/mezame)
+![License](https://img.shields.io/crates/l/mezame.svg)
 
 _Wake your agent up from anywhere. Anytime._
 
