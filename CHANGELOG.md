@@ -15,6 +15,8 @@ build-time Vite define.
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-05-26
+
 ### Added
 
 - MCP OAuth requests are now surfaced to the browser. When an MCP
