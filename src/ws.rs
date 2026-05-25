@@ -13,6 +13,7 @@
 //!   `session/update` notifications.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -48,6 +49,29 @@ async fn start_new_session(agent: &Agent, cwd: &str) -> Result<(String, Option<V
         .ok_or_else(|| anyhow!("Session creation returned no session id"))?
         .to_string();
     Ok((sid, extract_session_info(&result)))
+}
+
+/// Spawn a task that runs `fut` to completion; on error, push a typed
+/// `error` event to the browser prefixed with `error_prefix`.
+///
+/// Used for fire-and-forget agent calls triggered by browser messages
+/// (`set_mode`, `set_model`, `permission_response`, etc.). The select
+/// loop must keep pumping while the call is in flight, so we do not
+/// `.await` the future inline. Errors are not propagated back through
+/// the loop, only surfaced to the browser as a UI notice.
+fn spawn_with_error_report(
+    to_ws: mpsc::UnboundedSender<Message>,
+    error_prefix: &'static str,
+    fut: impl Future<Output = Result<()>> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = fut.await {
+            let _ = to_ws.send(text_msg(json!({
+                "type": "error",
+                "message": format!("{error_prefix}: {e}")
+            })));
+        }
+    });
 }
 
 pub(crate) async fn ws_upgrade(
@@ -287,21 +311,23 @@ async fn handle_ws(
                             .unwrap_or("")
                             .to_string();
                         let agent = agent.clone();
-                        let to_ws = to_ws_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = agent
-                                .respond(
-                                    id,
-                                    json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
-                                )
-                                .await
-                            {
-                                let _ = to_ws.send(text_msg(json!({
-                                    "type": "error",
-                                    "message": format!("Permission reply failed: {e}")
-                                })));
-                            }
-                        });
+                        spawn_with_error_report(
+                            to_ws_tx.clone(),
+                            "Permission reply failed",
+                            async move {
+                                agent
+                                    .respond(
+                                        id,
+                                        json!({
+                                            "outcome": {
+                                                "outcome": "selected",
+                                                "optionId": option_id
+                                            }
+                                        }),
+                                    )
+                                    .await
+                            },
+                        );
                     }
                     Some("cancel") => {
                         // ACP `session/cancel` is a notification (no id, no
@@ -331,21 +357,19 @@ async fn handle_ws(
                         let mode_id = mode_id.to_string();
                         let agent = agent.clone();
                         let sid = session_id.clone();
-                        let to_ws = to_ws_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = agent
-                                .request(
-                                    "session/set_mode",
-                                    json!({ "sessionId": sid, "modeId": mode_id })
-                                )
-                                .await
-                            {
-                                let _ = to_ws.send(text_msg(json!({
-                                    "type": "error",
-                                    "message": format!("Failed to change agent mode: {e}")
-                                })));
-                            }
-                        });
+                        spawn_with_error_report(
+                            to_ws_tx.clone(),
+                            "Failed to change agent mode",
+                            async move {
+                                agent
+                                    .request(
+                                        "session/set_mode",
+                                        json!({ "sessionId": sid, "modeId": mode_id }),
+                                    )
+                                    .await?;
+                                Ok(())
+                            },
+                        );
                     }
                     Some("set_model") => {
                         let Some(model_id) = v.get("modelId").and_then(Value::as_str) else {
@@ -354,21 +378,19 @@ async fn handle_ws(
                         let model_id = model_id.to_string();
                         let agent = agent.clone();
                         let sid = session_id.clone();
-                        let to_ws = to_ws_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = agent
-                                .request(
-                                    "session/set_model",
-                                    json!({ "sessionId": sid, "modelId": model_id })
-                                )
-                                .await
-                            {
-                                let _ = to_ws.send(text_msg(json!({
-                                    "type": "error",
-                                    "message": format!("Failed to change model: {e}")
-                                })));
-                            }
-                        });
+                        spawn_with_error_report(
+                            to_ws_tx.clone(),
+                            "Failed to change model",
+                            async move {
+                                agent
+                                    .request(
+                                        "session/set_model",
+                                        json!({ "sessionId": sid, "modelId": model_id }),
+                                    )
+                                    .await?;
+                                Ok(())
+                            },
+                        );
                     }
                     _ => continue
                 }

@@ -15,6 +15,16 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Changed
+
+- The browser-message arms in `handle_ws` for `permission_response`,
+  `set_mode`, and `set_model` now go through a shared
+  `spawn_with_error_report` helper that owns the spawn-and-forward
+  pattern: clone, spawn, await the agent call, send a typed `error`
+  event with a per-arm prefix on failure. Behaviour unchanged. The
+  `cancel` arm intentionally stays direct because its underlying
+  `notify` is fire-and-forget and surfacing failures would be noise.
+
 ## [0.8.6] - 2026-05-25
 
 ### Changed
