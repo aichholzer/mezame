@@ -19,6 +19,15 @@ build-time Vite define.
 
 ### Added
 
+- JSON-RPC framing round-trip tests for `Agent`. Six cases under
+  `tests/agent_jsonrpc.rs` exercise the wire bytes of `request`,
+  `respond`, and `notify` end-to-end via `Agent::from_io` and a
+  duplex pipe: happy-path request, error-response propagation,
+  result frames, notification frames (no id), monotonic id
+  allocation with out-of-order response routing, and the
+  notification-fallthrough path that lands unmatched messages on
+  the updates channel.
+
 - WebSocket integration tests. New `Agent::from_io` constructor and an
   extracted `ws::run_select_loop` function let the per-session loop be
   tested with in-memory streams instead of a real subprocess. Five
