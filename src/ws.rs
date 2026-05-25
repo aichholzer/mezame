@@ -236,12 +236,23 @@ async fn handle_ws(
 
     loop {
         tokio::select! {
-            // User → agent: messages from the browser.
-            Some(Ok(msg)) = stream.next() => {
-                let text = match msg {
-                    Message::Text(t) => t,
-                    Message::Close(_) => break,
-                    _ => continue
+            // User → agent: messages from the browser. Match the full
+            // Option<Result<Message, _>> here rather than relying on a
+            // `Some(Ok(...))` pattern guard. With a guard, a closed
+            // stream (`None`) or a transport error (`Some(Err(_))`)
+            // disables this select branch silently while the other
+            // branch keeps delivering agent updates. The `else => break`
+            // arm only fires when ALL branches are disabled, so the
+            // loop would never exit and `agent.shutdown()` would never
+            // run. Result: leaked agent subprocess + stale Kiro session
+            // lockfile on every browser disconnect during a long turn.
+            ws_msg = stream.next() => {
+                let text = match ws_msg {
+                    None => break,                              // peer closed the socket
+                    Some(Err(_)) => break,                      // transport error
+                    Some(Ok(Message::Close(_))) => break,       // clean close frame
+                    Some(Ok(Message::Text(t))) => t,
+                    Some(Ok(_)) => continue,                    // ping/pong/binary
                 };
                 let v: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -396,8 +407,15 @@ async fn handle_ws(
                 }
             }
             // Agent → user: notifications and server-initiated requests.
-            Some(agent_msg) = updates_rx.recv() => {
-                handle_agent_message(&to_ws_tx, agent_msg, suppress_session_updates).await;
+            // Same caveat as the stream branch: a guarded `Some(...)`
+            // pattern would silently disable the branch when the agent
+            // exits. Match the full `Option<Value>` so we can break out
+            // of the loop and run cooperative shutdown.
+            agent_msg = updates_rx.recv() => {
+                match agent_msg {
+                    Some(msg) => handle_agent_message(&to_ws_tx, msg, suppress_session_updates).await,
+                    None => break, // agent stdout reader exited; child is gone or going
+                }
             }
             else => break
         }

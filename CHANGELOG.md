@@ -15,15 +15,20 @@ build-time Vite define.
 
 ## [Unreleased]
 
-### Changed
+### Fixed
 
-- The browser-message arms in `handle_ws` for `permission_response`,
-  `set_mode`, and `set_model` now go through a shared
-  `spawn_with_error_report` helper that owns the spawn-and-forward
-  pattern: clone, spawn, await the agent call, send a typed `error`
-  event with a per-arm prefix on failure. Behaviour unchanged. The
-  `cancel` arm intentionally stays direct because its underlying
-  `notify` is fire-and-forget and surfacing failures would be noise.
+- WebSocket disconnect now reliably triggers cooperative agent shutdown.
+  Previously, the select-loop branch matching browser frames used a
+  `Some(Ok(...))` pattern guard. When the stream returned `None`
+  (peer closed) or `Some(Err(_))` (transport error), the pattern did
+  not match and tokio disabled the branch silently. The agent-updates
+  branch stayed active, so the loop kept looping, never reached
+  `else => break`, and `agent.shutdown()` never ran. Symptoms: leaked
+  agent subprocess on every browser close during a long turn, stale
+  Kiro session lockfile blocking the next `session/load`, and
+  long-running servers accumulating orphans until OOM. Both branches
+  now match the full `Option<Result<...>>` / `Option<Value>` and break
+  out cleanly on close, error, or agent exit.
 
 ## [0.8.6] - 2026-05-25
 
