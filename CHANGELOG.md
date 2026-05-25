@@ -17,6 +17,16 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Changed
+
+- Tests moved out of `#[cfg(test)] mod tests { ... }` blocks inside
+  source files into the `tests/` directory. The functions they cover
+  (`mime_for`, `parse_kiro_history`, `extract_text_blocks`,
+  `is_stale_lock_error`, `extract_session_info`, `short_reason`,
+  `pid_is_alive`, `send_signal`) are now `pub` so the integration
+  tests can reach them through the crate's public API. Source files
+  read cleaner; test surface area is identical.
+
 ### Added
 
 - Test foundation. Crate is now split into `src/lib.rs` + a thin

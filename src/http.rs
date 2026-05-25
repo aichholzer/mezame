@@ -175,7 +175,7 @@ const MIME_TABLE: &[(&str, &str)] = &[
     ("webmanifest", "application/manifest+json"),
 ];
 
-fn mime_for(path: &str) -> &'static str {
+pub fn mime_for(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
     MIME_TABLE
         .iter()
@@ -274,7 +274,7 @@ async fn get_history(
 /// don't try to reconstruct thinking blocks, tool calls, or tool results
 /// in the history view. If Kiro ever starts emitting verbose tool panels
 /// in the UI, those should come through as structured events separately.
-fn parse_kiro_history(raw: &str) -> Vec<Value> {
+pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     // Timestamp of the most recent Prompt. Persisted in ms for the
     // browser's `Date` math; Kiro stores seconds.
@@ -330,7 +330,7 @@ fn parse_kiro_history(raw: &str) -> Vec<Value> {
 /// Concatenate all `content[].data` strings where `content[].kind == "text"`,
 /// with newlines between blocks. Returns `None` when there's nothing useful
 /// (e.g. an assistant turn that was only a tool call).
-fn extract_text_blocks(data: &Value) -> Option<String> {
+pub fn extract_text_blocks(data: &Value) -> Option<String> {
     let content = data.get("content")?.as_array()?;
     let mut buf = String::new();
     for block in content {
@@ -349,185 +349,5 @@ fn extract_text_blocks(data: &Value) -> Option<String> {
         None
     } else {
         Some(buf)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ---------- mime_for ----------
-
-    #[test]
-    fn mime_for_known_extensions() {
-        assert_eq!(mime_for("index.html"), "text/html; charset=utf-8");
-        assert_eq!(
-            mime_for("a/b/c.js"),
-            "application/javascript; charset=utf-8"
-        );
-        assert_eq!(
-            mime_for("worker.mjs"),
-            "application/javascript; charset=utf-8"
-        );
-        assert_eq!(mime_for("style.css"), "text/css; charset=utf-8");
-        assert_eq!(mime_for("logo.png"), "image/png");
-        assert_eq!(mime_for("photo.JPG"), "image/jpeg");
-        assert_eq!(mime_for("favicon.ico"), "image/x-icon");
-        assert_eq!(mime_for("font.woff2"), "font/woff2");
-        assert_eq!(
-            mime_for("manifest.webmanifest"),
-            "application/manifest+json"
-        );
-    }
-
-    #[test]
-    fn mime_for_unknown_extension_falls_back_to_octet_stream() {
-        assert_eq!(mime_for("blob.unknownext"), "application/octet-stream");
-        assert_eq!(mime_for("noextension"), "application/octet-stream");
-    }
-
-    #[test]
-    fn mime_for_is_case_insensitive() {
-        assert_eq!(mime_for("INDEX.HTML"), "text/html; charset=utf-8");
-        assert_eq!(mime_for("img.PnG"), "image/png");
-    }
-
-    // ---------- extract_text_blocks ----------
-
-    #[test]
-    fn extract_text_blocks_concatenates_text_kinds_with_newline() {
-        let data = json!({
-            "content": [
-                { "kind": "text", "data": "first line" },
-                { "kind": "text", "data": "second line" }
-            ]
-        });
-        assert_eq!(
-            extract_text_blocks(&data).as_deref(),
-            Some("first line\nsecond line")
-        );
-    }
-
-    #[test]
-    fn extract_text_blocks_skips_non_text_kinds() {
-        let data = json!({
-            "content": [
-                { "kind": "tool_call", "data": "ignored" },
-                { "kind": "text", "data": "kept" },
-                { "kind": "image", "data": "ignored too" }
-            ]
-        });
-        assert_eq!(extract_text_blocks(&data).as_deref(), Some("kept"));
-    }
-
-    #[test]
-    fn extract_text_blocks_returns_none_when_no_text() {
-        let data = json!({
-            "content": [{ "kind": "tool_call", "data": "x" }]
-        });
-        assert!(extract_text_blocks(&data).is_none());
-    }
-
-    #[test]
-    fn extract_text_blocks_returns_none_for_empty_content() {
-        let data = json!({ "content": [] });
-        assert!(extract_text_blocks(&data).is_none());
-    }
-
-    #[test]
-    fn extract_text_blocks_returns_none_when_content_missing() {
-        let data = json!({});
-        assert!(extract_text_blocks(&data).is_none());
-    }
-
-    // ---------- parse_kiro_history ----------
-
-    #[test]
-    fn parse_kiro_history_pairs_prompt_with_assistant_reply() {
-        let raw = concat!(
-            r#"{"kind":"Prompt","data":{"content":[{"kind":"text","data":"hello"}],"meta":{"timestamp":1700000000}}}"#,
-            "\n",
-            r#"{"kind":"AssistantMessage","data":{"content":[{"kind":"text","data":"hi back"}]}}"#,
-            "\n",
-        );
-        let entries = parse_kiro_history(raw);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].get("role"), Some(&json!("user")));
-        assert_eq!(entries[0].get("text"), Some(&json!("hello")));
-        // Timestamp converted from seconds to ms.
-        assert_eq!(
-            entries[0].get("timestamp"),
-            Some(&json!(1_700_000_000_000_i64))
-        );
-        assert_eq!(entries[1].get("role"), Some(&json!("agent")));
-        assert_eq!(entries[1].get("text"), Some(&json!("hi back")));
-        // Assistant inherits the prompt's timestamp.
-        assert_eq!(
-            entries[1].get("timestamp"),
-            Some(&json!(1_700_000_000_000_i64))
-        );
-    }
-
-    #[test]
-    fn parse_kiro_history_skips_unknown_kinds_and_blank_lines() {
-        let raw = concat!(
-            "\n",
-            r#"{"kind":"ToolResults","data":{}}"#,
-            "\n",
-            r#"{"kind":"Prompt","data":{"content":[{"kind":"text","data":"q"}],"meta":{"timestamp":1}}}"#,
-            "\n",
-            "   \n",
-            r#"{"kind":"AssistantMessage","data":{"content":[{"kind":"text","data":"a"}]}}"#,
-            "\n",
-        );
-        let entries = parse_kiro_history(raw);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].get("role"), Some(&json!("user")));
-        assert_eq!(entries[1].get("role"), Some(&json!("agent")));
-    }
-
-    #[test]
-    fn parse_kiro_history_skips_malformed_json_lines() {
-        let raw = concat!(
-            "this is not json\n",
-            r#"{"kind":"Prompt","data":{"content":[{"kind":"text","data":"q"}],"meta":{"timestamp":2}}}"#,
-            "\n",
-        );
-        let entries = parse_kiro_history(raw);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].get("text"), Some(&json!("q")));
-    }
-
-    #[test]
-    fn parse_kiro_history_assistant_before_any_prompt_has_null_timestamp() {
-        // Documented edge case from task #8 (id 42). If the on-disk
-        // log starts with an assistant message, no Prompt has set a
-        // baseline timestamp yet, so the entry is emitted with
-        // `timestamp: null`.
-        let raw =
-            r#"{"kind":"AssistantMessage","data":{"content":[{"kind":"text","data":"orphan"}]}}"#;
-        let entries = parse_kiro_history(raw);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].get("role"), Some(&json!("agent")));
-        assert_eq!(entries[0].get("timestamp"), Some(&Value::Null));
-    }
-
-    #[test]
-    fn parse_kiro_history_drops_prompt_with_no_text_blocks() {
-        // A prompt that contained only an image (no text content) has
-        // nothing useful to render in history. extract_text_blocks
-        // returns None and the entry is skipped.
-        let raw = concat!(
-            r#"{"kind":"Prompt","data":{"content":[{"kind":"image","data":"..."}],"meta":{"timestamp":1}}}"#,
-            "\n",
-        );
-        let entries = parse_kiro_history(raw);
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn parse_kiro_history_handles_empty_input() {
-        assert!(parse_kiro_history("").is_empty());
-        assert!(parse_kiro_history("\n\n  \n").is_empty());
     }
 }
