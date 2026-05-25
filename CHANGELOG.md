@@ -19,6 +19,17 @@ build-time Vite define.
 
 ### Added
 
+- Dispatch tests for `ws::handle_agent_message`. Sixteen cases under
+  `tests/ws_handle_agent_message.rs` lock down the wire shape of every
+  branch: `agent_message_chunk`, `user_message_chunk`,
+  `agent_thought_chunk`, `tool_call` (with and without id),
+  `tool_call_update`, `session/request_permission` (including the
+  `name`-fallback for the title and the suppression-during-resume
+  bypass), `_kiro.dev/commands/available` (asserts the `tools`
+  catalogue is dropped), `_kiro.dev/mcp/oauth_request` (canonical
+  fields, alternative field names, missing-URL drop), the
+  resume-suppression toggle, and unknown-method silent drops.
+
 - Retry/back-off tests for `session::try_load_session`. Five cases
   across `tests/session_try_load.rs` and `tests/session_steal_stale_lock.rs`
   cover the full state machine: first-attempt success,

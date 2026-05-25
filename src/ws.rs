@@ -493,7 +493,7 @@ pub async fn run_select_loop<S, E>(
 ///
 /// Everything else is silently dropped, including Kiro's other
 /// `_kiro.dev/*` extension notifications.
-async fn handle_agent_message(
+pub async fn handle_agent_message(
     tx: &mpsc::UnboundedSender<Message>,
     msg: Value,
     suppress_session_updates: bool,
