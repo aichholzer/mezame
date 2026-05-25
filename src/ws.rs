@@ -24,7 +24,7 @@ use axum::{
     },
     response::Response,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -234,6 +234,53 @@ async fn handle_ws(
     // prompt after resume; permission/tool requests still flow through.
     let mut suppress_session_updates = resumed;
 
+    run_select_loop(
+        &mut stream,
+        &to_ws_tx,
+        agent.clone(),
+        &mut updates_rx,
+        &session_id,
+        &mut suppress_session_updates,
+    )
+    .await;
+
+    // Cooperative shutdown of the agent subprocess. Sends `session/cancel`,
+    // closes stdin, and waits briefly for exit so Kiro can release its
+    // session lock. `kill_on_drop` stays on as a safety net in case the
+    // agent doesn't honour EOF within the timeout.
+    agent.shutdown(Some(&session_id)).await;
+
+    // Closing the outbound channel unblocks the writer task. The agent
+    // child is killed on drop of the `Agent` (see `kill_on_drop(true)` in
+    // `spawn_agent`) if shutdown timed out above.
+    drop(to_ws_tx);
+    let _ = writer.await;
+    Ok(())
+}
+
+/// Drive the per-session select loop until either the WS stream or the
+/// agent updates channel ends. Extracted from `handle_ws` so integration
+/// tests can build a fake stream and a fake agent and exercise the same
+/// logic without spinning up axum or spawning a real subprocess.
+///
+/// The loop never returns an error; transport-level failures cause it
+/// to break out so the caller can run cooperative shutdown.
+///
+/// The pattern matching here is deliberately exhaustive on the
+/// `Option<Result<Message, _>>` returned by `stream.next()`. An earlier
+/// version used a `Some(Ok(...))` guard, which silently disabled the
+/// branch on stream close or transport error and prevented shutdown
+/// from running. See the `Fixed` entry for 0.8.7 in CHANGELOG.md.
+pub async fn run_select_loop<S, E>(
+    stream: &mut S,
+    to_ws_tx: &mpsc::UnboundedSender<Message>,
+    agent: Arc<Agent>,
+    updates_rx: &mut mpsc::UnboundedReceiver<Value>,
+    session_id: &str,
+    suppress_session_updates: &mut bool,
+) where
+    S: Stream<Item = std::result::Result<Message, E>> + Unpin,
+{
     loop {
         tokio::select! {
             // User → agent: messages from the browser. Match the full
@@ -282,7 +329,7 @@ async fn handle_ws(
                         // First live prompt after resume: stop hiding
                         // `session/update` events. From here on everything
                         // the agent emits is genuinely new.
-                        suppress_session_updates = false;
+                        *suppress_session_updates = false;
 
                         // Run `session/prompt` in its own task so the select
                         // loop keeps pumping `session/update` notifications
@@ -291,7 +338,7 @@ async fn handle_ws(
                         // surface the error).
                         let agent = agent.clone();
                         let to_ws = to_ws_tx.clone();
-                        let sid = session_id.clone();
+                        let sid = session_id.to_string();
                         tokio::spawn(async move {
                             let res = agent
                                 .request(
@@ -348,7 +395,7 @@ async fn handle_ws(
                         // `session/prompt` request, which is what unblocks
                         // the browser's "busy" state.
                         let agent = agent.clone();
-                        let sid = session_id.clone();
+                        let sid = session_id.to_string();
                         tokio::spawn(async move {
                             let _ = agent
                                 .notify(
@@ -367,7 +414,7 @@ async fn handle_ws(
                         };
                         let mode_id = mode_id.to_string();
                         let agent = agent.clone();
-                        let sid = session_id.clone();
+                        let sid = session_id.to_string();
                         spawn_with_error_report(
                             to_ws_tx.clone(),
                             "Failed to change agent mode",
@@ -388,7 +435,7 @@ async fn handle_ws(
                         };
                         let model_id = model_id.to_string();
                         let agent = agent.clone();
-                        let sid = session_id.clone();
+                        let sid = session_id.to_string();
                         spawn_with_error_report(
                             to_ws_tx.clone(),
                             "Failed to change model",
@@ -413,26 +460,13 @@ async fn handle_ws(
             // of the loop and run cooperative shutdown.
             agent_msg = updates_rx.recv() => {
                 match agent_msg {
-                    Some(msg) => handle_agent_message(&to_ws_tx, msg, suppress_session_updates).await,
+                    Some(msg) => handle_agent_message(to_ws_tx, msg, *suppress_session_updates).await,
                     None => break, // agent stdout reader exited; child is gone or going
                 }
             }
             else => break
         }
     }
-
-    // Cooperative shutdown of the agent subprocess. Sends `session/cancel`,
-    // closes stdin, and waits briefly for exit so Kiro can release its
-    // session lock. `kill_on_drop` stays on as a safety net in case the
-    // agent doesn't honour EOF within the timeout.
-    agent.shutdown(Some(&session_id)).await;
-
-    // Closing the outbound channel unblocks the writer task. The agent
-    // child is killed on drop of the `Agent` (see `kill_on_drop(true)` in
-    // `spawn_agent`) if shutdown timed out above.
-    drop(to_ws_tx);
-    let _ = writer.await;
-    Ok(())
 }
 
 /// Translate an agent-originated message into browser-facing events.

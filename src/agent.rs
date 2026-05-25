@@ -9,39 +9,56 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::config::Config;
 
-/// Handle on the ACP agent subprocess.
+/// Type-erased writer the JSON-RPC framing helpers send into. In
+/// production this wraps `ChildStdin`; tests pass in a `tokio::io::duplex`
+/// half so the loop can be exercised without a real subprocess.
+type Writer = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// Handle on the ACP agent.
+///
+/// In production the handle owns a spawned subprocess (`child` is `Some`)
+/// and a process-group id (`pgid > 0`). Tests build the same shape from
+/// in-memory streams via `Agent::from_io`; in that mode `child` is `None`
+/// and `pgid` is 0, so `shutdown` becomes a stdin EOF without any
+/// process-management side effects.
 ///
 /// Thread-safety: all mutable state is behind `Mutex`/`Arc`, so the handle
 /// can be cloned into spawned tasks (as `Arc<Agent>` in `handle_ws`).
-pub(crate) struct Agent {
+pub struct Agent {
     /// Stdin to the child; serialised by a Mutex because prompt tasks may
     /// try to write concurrently.
-    stdin: Mutex<ChildStdin>,
+    stdin: Mutex<Writer>,
     /// Monotonic JSON-RPC id generator.
     next_id: AtomicI64,
     /// Map from in-flight request id to the oneshot waiting for its
     /// response. Shared with the reader task that populates responses.
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
-    /// Owned child. SIGKILL on drop (kill_on_drop) remains as a safety net,
-    /// but `shutdown` tries a clean EOF+wait first so Kiro can release its
-    /// per-session lockfile.
-    child: Mutex<Child>,
+    /// Owned child. `None` for test-built agents constructed via
+    /// `from_io`. SIGKILL on drop (kill_on_drop) remains as a safety net,
+    /// but `shutdown` tries a clean EOF+wait first so Kiro can release
+    /// its per-session lockfile.
+    child: Option<Mutex<Child>>,
     /// Process group ID (Unix only). The child is spawned in its own
     /// process group so `shutdown` can kill the entire tree (MCP servers,
-    /// npm wrappers, etc.) rather than just the direct child.
+    /// npm wrappers, etc.) rather than just the direct child. 0 when
+    /// there is no real subprocess (tests).
     #[cfg(unix)]
     pgid: i32,
+    /// Set to true once `shutdown()` has finished. Tests read this to
+    /// confirm cooperative shutdown ran. Not serialised; relaxed
+    /// ordering is fine for the read-after-write that tests perform.
+    shutdown_done: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -63,7 +80,7 @@ impl Agent {
     /// failed. The caller is responsible for cancellation semantics — if
     /// the future is dropped mid-flight, the response will arrive at a
     /// dangling oneshot and be discarded.
-    pub(crate) async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -84,7 +101,7 @@ impl Agent {
     }
 
     /// Reply to a server-initiated request (e.g. `session/request_permission`).
-    pub(crate) async fn respond(&self, id: Value, result: Value) -> Result<()> {
+    pub async fn respond(&self, id: Value, result: Value) -> Result<()> {
         self.write_message(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -95,7 +112,7 @@ impl Agent {
 
     /// Send a JSON-RPC notification (no id, no response expected). Used for
     /// one-way signals like `session/cancel`.
-    pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
+    pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.write_message(json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -115,7 +132,7 @@ impl Agent {
     ///      idempotent: if the agent and its children already exited, the
     ///      kill is a no-op. If `kiro-cli` exited cleanly but left its MCP
     ///      server grandchildren alive (the common case), this reaps them.
-    pub(crate) async fn shutdown(&self, session_id: Option<&str>) {
+    pub async fn shutdown(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
             let _ = self
                 .notify("session/cancel", json!({ "sessionId": sid }))
@@ -125,16 +142,27 @@ impl Agent {
             let mut stdin = self.stdin.lock().await;
             let _ = stdin.shutdown().await;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-            let mut child = self.child.lock().await;
-            let _ = child.wait().await;
-        })
-        .await;
+        if let Some(child) = self.child.as_ref() {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                let mut child = child.lock().await;
+                let _ = child.wait().await;
+            })
+            .await;
+        }
 
         // Always kill the group. Idempotent: a no-op if everything already
         // exited, otherwise reaps any orphaned MCP servers / npm wrappers
         // that kiro-cli did not clean up.
         self.kill_process_group();
+        self.shutdown_done.store(true, Ordering::Relaxed);
+    }
+
+    /// True once `shutdown()` has run to completion. Test-only signal so
+    /// integration suites can assert cooperative shutdown happened
+    /// without polling for process state.
+    #[doc(hidden)]
+    pub fn shutdown_complete(&self) -> bool {
+        self.shutdown_done.load(Ordering::Relaxed)
     }
 
     /// Send SIGKILL to the entire process group rooted at the child.
@@ -155,7 +183,8 @@ impl Agent {
 /// Safety net: if the Agent is dropped without a prior `shutdown()` call
 /// (e.g. a panic unwind or early return), kill the entire process group
 /// so grandchildren do not leak. `kill_on_drop(true)` on the Child only
-/// kills the direct child; this covers the rest of the tree.
+/// kills the direct child; this covers the rest of the tree. No-op for
+/// test-built agents because `pgid == 0`.
 #[cfg(unix)]
 impl Drop for Agent {
     fn drop(&mut self) {
@@ -276,13 +305,66 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedR
 
     Ok((
         Agent {
-            stdin: Mutex::new(stdin),
+            stdin: Mutex::new(Box::new(stdin)),
             next_id: AtomicI64::new(1),
             pending,
-            child: Mutex::new(child),
+            child: Some(Mutex::new(child)),
             #[cfg(unix)]
             pgid,
+            shutdown_done: Arc::new(AtomicBool::new(false)),
         },
         updates_rx,
     ))
+}
+
+/// Build an `Agent` from in-memory streams. Test-only escape hatch:
+/// production code should always go through `spawn_agent`. The returned
+/// agent has no child process, so `shutdown` only closes stdin and
+/// flips the `shutdown_complete()` flag.
+///
+/// The `stdout` reader runs the same routing logic as the production
+/// path, so tests that care about response correlation get it for
+/// free.
+#[doc(hidden)]
+pub fn from_io(
+    stdin: impl AsyncWrite + Send + Unpin + 'static,
+    stdout: impl AsyncRead + Send + Unpin + 'static,
+) -> (Agent, mpsc::UnboundedReceiver<Value>) {
+    let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+
+    let pending_reader = pending.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let is_response = msg.get("result").is_some() || msg.get("error").is_some();
+            if is_response {
+                if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+                    if let Some(tx) = pending_reader.lock().await.remove(&id) {
+                        let _ = tx.send(msg);
+                        continue;
+                    }
+                }
+            }
+            let _ = updates_tx.send(msg);
+        }
+    });
+
+    (
+        Agent {
+            stdin: Mutex::new(Box::new(stdin)),
+            next_id: AtomicI64::new(1),
+            pending,
+            child: None,
+            #[cfg(unix)]
+            pgid: 0,
+            shutdown_done: Arc::new(AtomicBool::new(false)),
+        },
+        updates_rx,
+    )
 }

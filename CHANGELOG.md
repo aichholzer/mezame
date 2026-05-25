@@ -17,6 +17,16 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Added
+
+- WebSocket integration tests. New `Agent::from_io` constructor and an
+  extracted `ws::run_select_loop` function let the per-session loop be
+  tested with in-memory streams instead of a real subprocess. Five
+  tests under `tests/ws_select_loop.rs` cover the disconnect paths
+  that bug #32 missed: stream close (`None`), Close frame, transport
+  error, agent exit, and a permission round-trip that confirms a
+  browser reply lands on the agent's stdin.
+
 ### Changed
 
 - Tests moved out of `#[cfg(test)] mod tests { ... }` blocks inside
