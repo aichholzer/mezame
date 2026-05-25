@@ -15,6 +15,13 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Changed
+
+- HTTP handlers `/state`, `/history`, and the corresponding writes now
+  use `tokio::fs` instead of the synchronous `std::fs` API. Removes a
+  latent footgun where each request blocked a tokio worker thread for
+  the duration of the I/O. Behaviour and response shape unchanged.
+
 ### Breaking
 
 - **Project renamed from `okiro` to `mezame`** to avoid confusion with

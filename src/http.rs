@@ -179,7 +179,7 @@ fn mime_for(path: &str) -> &'static str {
 /// purely a cross-device store for the UI.
 async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
     let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(raw) => {
             let v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
             Ok(Json(v))
@@ -194,14 +194,18 @@ async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
 async fn put_state(Json(body): Json<Value>) -> Result<StatusCode, (StatusCode, String)> {
     let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     }
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_string_pretty(&body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    std::fs::write(&tmp, data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    std::fs::rename(&tmp, &path)
+    tokio::fs::write(&tmp, data)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -235,7 +239,7 @@ async fn get_history(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "HOME not set".into()));
     };
     let path = PathBuf::from(home).join(format!(".kiro/sessions/cli/{sid}.jsonl"));
-    let raw = match std::fs::read_to_string(&path) {
+    let raw = match tokio::fs::read_to_string(&path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Json(json!({ "entries": [] })));
