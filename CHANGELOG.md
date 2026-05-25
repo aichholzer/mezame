@@ -15,6 +15,19 @@ build-time Vite define.
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Added
+
+- Test foundation. Crate is now split into `src/lib.rs` + a thin
+  `src/main.rs` so integration tests in `tests/` can reach internals.
+  25 unit tests cover the pure functions in `session.rs`, `http.rs`,
+  and `unix.rs`: lock-recovery helpers, session-info extraction,
+  Kiro JSONL history parsing, mime lookup, and the libc FFI
+  bindings. The pre-commit hook now runs `cargo test` as a fourth
+  check after fmt, clippy, and check. WS integration tests are
+  tracked separately because they need a mockable agent.
+
 ## [0.8.9] - 2026-05-26
 
 ### Added
