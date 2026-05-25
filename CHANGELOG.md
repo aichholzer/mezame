@@ -17,6 +17,11 @@ build-time Vite define.
 
 ### Changed
 
+- Consolidated the duplicated `extern "C" { fn kill, fn setsid }`
+  declarations from `agent.rs` and `session.rs` into a new
+  `src/unix.rs` module exposing `send_signal` and `new_session` helpers.
+  Removes drift risk between the two FFI blocks and keeps the unsafe
+  surface in one place. Behaviour unchanged.
 - `Agent` no longer hands the updates receiver out via a runtime-checked
   `take_updates` method. `spawn_agent` now returns
   `(Agent, UnboundedReceiver<Value>)`, making single-ownership of the

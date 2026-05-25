@@ -137,9 +137,7 @@ impl Agent {
     fn kill_process_group(&self) {
         if self.pgid > 0 {
             // kill(-pgid, SIGKILL) sends to every process in the group.
-            unsafe {
-                libc_kill(-self.pgid, 9);
-            }
+            crate::unix::send_signal(-self.pgid, 9);
         }
     }
 
@@ -157,9 +155,7 @@ impl Agent {
 impl Drop for Agent {
     fn drop(&mut self) {
         if self.pgid > 0 {
-            unsafe {
-                libc_kill(-self.pgid, 9);
-            }
+            crate::unix::send_signal(-self.pgid, 9);
         }
     }
 }
@@ -208,7 +204,7 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedR
             // the child its own group leader. Bail loudly if it fails so
             // we never end up with a wrong pgid that could target the
             // parent's group on shutdown.
-            if libc_setsid() == -1 {
+            if crate::unix::new_session() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -284,13 +280,4 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedR
         },
         updates_rx,
     ))
-}
-
-// Minimal FFI bindings to avoid pulling in `libc` for two calls.
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
-    #[link_name = "setsid"]
-    fn libc_setsid() -> i32;
 }

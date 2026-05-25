@@ -124,22 +124,15 @@ fn steal_stale_session_lock(session_id: &str) -> bool {
 /// signal it, which for our case means we should NOT steal the lock.
 #[cfg(unix)]
 fn pid_is_alive(pid: i32) -> bool {
-    // SAFETY: `kill` with signal 0 does not send a signal, it only
-    // queries existence. No state is mutated.
-    unsafe { libc_kill(pid, 0) == 0 }
+    // `kill` with signal 0 does not send a signal, it only queries
+    // existence.
+    crate::unix::send_signal(pid, 0) == 0
 }
 
 #[cfg(not(unix))]
 fn pid_is_alive(_pid: i32) -> bool {
     // Non-unix: don't risk stealing a lock we can't verify.
     true
-}
-
-// Minimal FFI binding to avoid pulling in `libc` for one call.
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 /// Pull the `modes` and `models` blocks out of a `session/new` or

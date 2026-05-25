@@ -19,6 +19,9 @@ mod http;
 mod session;
 mod ws;
 
+#[cfg(unix)]
+mod unix;
+
 use anyhow::{bail, Result};
 
 use crate::config::{config_path, init_config, load_config, TransportConfig};
