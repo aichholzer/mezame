@@ -17,6 +17,11 @@ build-time Vite define.
 
 ### Changed
 
+- `Agent::request`, `Agent::respond`, and `Agent::notify` now share a
+  single `write_message` helper that owns the JSON-RPC framing (line
+  serialise, lock stdin, write, flush). Removes three near-identical
+  copies of the same dance and keeps the wire format in one place.
+  Behaviour unchanged.
 - Consolidated the duplicated `extern "C" { fn kill, fn setsid }`
   declarations from `agent.rs` and `session.rs` into a new
   `src/unix.rs` module exposing `send_signal` and `new_session` helpers.

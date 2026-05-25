@@ -45,6 +45,17 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
+    /// Write a single JSON-RPC message to the agent's stdin, terminated by
+    /// newline and flushed. The agent reads newline-delimited JSON, so the
+    /// trailing `\n` is part of the wire framing, not cosmetic.
+    async fn write_message(&self, msg: Value) -> Result<()> {
+        let line = format!("{msg}\n");
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
     /// Send a JSON-RPC request and await its response.
     ///
     /// Returns the `result` value on success, or an error if the agent
@@ -57,15 +68,13 @@ impl Agent {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        let line = format!(
-            "{}\n",
-            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-        );
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.flush().await?;
-        }
+        self.write_message(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await?;
 
         let resp = rx.await.context("Agent closed before replying")?;
         if let Some(err) = resp.get("error") {
@@ -76,27 +85,23 @@ impl Agent {
 
     /// Reply to a server-initiated request (e.g. `session/request_permission`).
     pub(crate) async fn respond(&self, id: Value, result: Value) -> Result<()> {
-        let line = format!(
-            "{}\n",
-            json!({ "jsonrpc": "2.0", "id": id, "result": result })
-        );
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        self.write_message(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }))
+        .await
     }
 
     /// Send a JSON-RPC notification (no id, no response expected). Used for
     /// one-way signals like `session/cancel`.
     pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        let line = format!(
-            "{}\n",
-            json!({ "jsonrpc": "2.0", "method": method, "params": params })
-        );
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        self.write_message(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .await
     }
 
     /// Cooperative shutdown:
