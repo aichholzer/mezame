@@ -2,6 +2,7 @@
 name = "mezame"
 version = "0.8.9"
 edition = "2021"
+rust-version = "1.86"
 build = "build.rs"
 description = "An ACP client that bridges a local agent (Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, ...) to a browser UI over WebSockets."
 license = "MIT"
