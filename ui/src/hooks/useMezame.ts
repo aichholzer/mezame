@@ -565,6 +565,62 @@ const forgetHistory = (acpSessionId: string) => {
   scheduleSync();
 };
 
+// Derive a short label from the user's first prompt. Pure heuristic,
+// no network, no model — keeps Mezame "a dumb pipe" while making
+// numeric tab labels less anonymous after the first turn.
+//
+// Returns null when the prompt isn't useful as a label (empty, slash
+// command, attachments-only). The caller leaves the original label in
+// that case.
+const deriveLabel = (text: string): string | null => {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned || cleaned.startsWith('/')) {
+    return null;
+  }
+
+  const locale = typeof navigator !== 'undefined' ? navigator.language : 'en';
+
+  // Sentence boundary: Intl.Segmenter handles CJK punctuation that a
+  // plain /[.!?\n]/ regex would miss.
+  let firstSentence = cleaned;
+  const sentSeg = new Intl.Segmenter(locale, { granularity: 'sentence' });
+  for (const seg of sentSeg.segment(cleaned)) {
+    firstSentence = seg.segment.trim();
+    break;
+  }
+
+  if (firstSentence.length < 2) {
+    return null;
+  }
+
+  // Soft cap so a long single sentence doesn't become the label.
+  // Word segmentation matters for scripts without spaces (CJK). We
+  // slice the original string up to the end of the last word we keep,
+  // so spacing and punctuation between words are preserved verbatim.
+  const MAX_WORDS = 10;
+  const wordSeg = new Intl.Segmenter(locale, { granularity: 'word' });
+  let lastEnd = 0;
+  let wordCount = 0;
+  for (const piece of wordSeg.segment(firstSentence)) {
+    if (piece.isWordLike) {
+      lastEnd = piece.index + piece.segment.length;
+      wordCount += 1;
+      if (wordCount >= MAX_WORDS) {
+        break;
+      }
+    }
+  }
+  if (wordCount === 0) {
+    return null;
+  }
+  return firstSentence.slice(0, lastEnd).trim();
+};
+
 const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   const s = currentSession();
   if (!s || !s.ws || s.ws.readyState !== WebSocket.OPEN) {
@@ -595,6 +651,15 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   setBusy(s, true);
   if (!s.used) {
     s.used = true;
+    // Auto-label new sessions from their first prompt. Only override
+    // the bare numeric placeholder (e.g. "3"); manual names set via
+    // NewSessionDialog or renameSession are non-numeric and survive.
+    if (/^\d+$/.test(s.label)) {
+      const derived = deriveLabel(text);
+      if (derived) {
+        s.label = derived;
+      }
+    }
     scheduleSync();
   }
   notify();
