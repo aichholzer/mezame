@@ -61,9 +61,8 @@ fn main() {
         // Leave an empty dist/ directory so rust-embed doesn't fail to
         // resolve the `$OUT_DIR/ui/dist/` folder. The binary will be
         // missing the UI; that's on the developer who set the flag.
-        std::fs::create_dir_all(&dist_dir).unwrap_or_else(|e| {
-            panic!("failed to create {}: {e}", dist_dir.display())
-        });
+        std::fs::create_dir_all(&dist_dir)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", dist_dir.display()));
         return;
     }
 
@@ -88,9 +87,8 @@ fn main() {
     // reads it during the Vite build below. Must come after
     // `sync_ui_sources` so it doesn't get overwritten by a stale copy.
     let build_id_file = ui_build.join(".build-id");
-    std::fs::write(&build_id_file, &build_id).unwrap_or_else(|e| {
-        panic!("failed to write {}: {e}", build_id_file.display())
-    });
+    std::fs::write(&build_id_file, &build_id)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", build_id_file.display()));
 
     let lock = ui_build.join("package-lock.json");
     let install_args: &[&str] = if lock.exists() {
@@ -117,12 +115,11 @@ fn sync_ui_sources(src: &Path, dst: &Path) {
     if src == dst {
         return;
     }
-    std::fs::create_dir_all(dst).unwrap_or_else(|e| {
-        panic!("failed to create {}: {e}", dst.display())
-    });
-    for entry in std::fs::read_dir(src).unwrap_or_else(|e| {
-        panic!("failed to read {}: {e}", src.display())
-    }) {
+    std::fs::create_dir_all(dst)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", dst.display()));
+    for entry in
+        std::fs::read_dir(src).unwrap_or_else(|e| panic!("failed to read {}: {e}", src.display()))
+    {
         let entry = entry.unwrap_or_else(|e| panic!("read_dir entry failed: {e}"));
         let name = entry.file_name();
         // Skip caches and build outputs. `node_modules` is the expensive
@@ -152,8 +149,7 @@ fn sync_ui_sources(src: &Path, dst: &Path) {
 /// Copy only when the source is newer than the destination. Keeps npm's
 /// caches happy by not touching files that did not actually change.
 fn copy_if_changed(src: &Path, dst: &Path) {
-    let src_meta = std::fs::metadata(src)
-        .unwrap_or_else(|e| panic!("stat {}: {e}", src.display()));
+    let src_meta = std::fs::metadata(src).unwrap_or_else(|e| panic!("stat {}: {e}", src.display()));
     if let Ok(dst_meta) = std::fs::metadata(dst) {
         let (Ok(s), Ok(d)) = (src_meta.modified(), dst_meta.modified()) else {
             copy_file(src, dst);
@@ -168,13 +164,11 @@ fn copy_if_changed(src: &Path, dst: &Path) {
 
 fn copy_file(src: &Path, dst: &Path) {
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-            panic!("failed to create {}: {e}", parent.display())
-        });
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
     }
-    std::fs::copy(src, dst).unwrap_or_else(|e| {
-        panic!("copy {} -> {} failed: {e}", src.display(), dst.display())
-    });
+    std::fs::copy(src, dst)
+        .unwrap_or_else(|e| panic!("copy {} -> {} failed: {e}", src.display(), dst.display()));
 }
 
 fn run(cmd: &str, args: &[&str], cwd: &std::path::Path) {

@@ -18,7 +18,7 @@ use axum::{
     http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router
+    Json, Router,
 };
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
@@ -116,7 +116,7 @@ async fn serve_ui_asset(uri: Uri) -> Response {
             None => {
                 return (StatusCode::NOT_FOUND, "UI bundle missing").into_response();
             }
-        }
+        },
     };
     let is_index = resolved_path == "index.html";
 
@@ -139,9 +139,14 @@ async fn serve_ui_asset(uri: Uri) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
-        .header(header::CACHE_CONTROL, HeaderValue::from_static(cache_control))
+        .header(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(cache_control),
+        )
         .body(Body::from(asset.data.into_owned()))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "response build failed").into_response())
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "response build failed").into_response()
+        })
 }
 
 /// Tiny mime-type lookup for the handful of extensions Vite emits. Keeps us
@@ -165,7 +170,7 @@ fn mime_for(path: &str) -> &'static str {
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "txt" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream"
+        _ => "application/octet-stream",
     }
 }
 
@@ -180,7 +185,7 @@ async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
             Ok(Json(v))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Json(json!({}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
     }
 }
 
@@ -195,8 +200,7 @@ async fn put_state(Json(body): Json<Value>) -> Result<StatusCode, (StatusCode, S
     let tmp = path.with_extension("json.tmp");
     let data = serde_json::to_string_pretty(&body)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    std::fs::write(&tmp, data)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    std::fs::write(&tmp, data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     std::fs::rename(&tmp, &path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     Ok(StatusCode::NO_CONTENT)
@@ -217,7 +221,7 @@ async fn put_state(Json(body): Json<Value>) -> Result<StatusCode, (StatusCode, S
 /// Missing session file → `{ "entries": [] }`, not an error. Reading a
 /// file Kiro currently has open for append is safe; we only read.
 async fn get_history(
-    Query(params): Query<HashMap<String, String>>
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let Some(sid) = params.get("session") else {
         return Err((StatusCode::BAD_REQUEST, "missing ?session=<id>".into()));
@@ -236,7 +240,7 @@ async fn get_history(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Json(json!({ "entries": [] })));
         }
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
     };
 
     let entries = parse_kiro_history(&raw);

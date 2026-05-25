@@ -1,0 +1,57 @@
+#!/bin/bash
+# Pre-commit hook for Rust code quality checks
+# This hook runs cargo fmt and cargo clippy before allowing commits
+
+set -e
+
+# ANSI color codes for better output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# Check if we're in the right directory (should contain Cargo.toml)
+if [ ! -f "Cargo.toml" ]; then
+    echo -e "\n ${RED}Error: Cargo.toml not found. This hook should run in the Rust project root.${RESET}"
+    exit 1
+fi
+
+# Function to print section headers
+print_section() {
+    echo -e "\n ${YELLOW}${BOLD}$1${RESET}"
+}
+
+# Check 1: Cargo fmt (formatting)
+print_section "Checking code format.."
+if cargo fmt -- --check; then
+    echo -e " ${GREEN}• Pass${RESET}"
+else
+    echo -e " ${RED}• Fail${RESET}"
+    echo -e " ${YELLOW}• Run 'cargo fmt' to fix formatting issues${RESET}"
+    exit 1
+fi
+
+# Check 2: Cargo clippy (linting)
+print_section "Checking lints..."
+if cargo clippy -- -D warnings; then
+    echo -e " ${GREEN}• Pass${RESET}"
+else
+    echo -e " ${RED}• Fail${RESET}"
+    echo -e " ${YELLOW}• Fix the clippy issues above before committing${RESET}"
+    exit 1
+fi
+
+# Check 3: Cargo check (compilation)
+print_section "Checking compilation..."
+if cargo check; then
+    echo -e " ${GREEN}• Pass${RESET}"
+else
+    echo -e " ${RED}• Fail${RESET}"
+    echo -e " ${YELLOW}• Fix compilation errors before committing${RESET}"
+    exit 1
+fi
+
+# All checks passed
+echo -e "\n ${GREEN}${BOLD}All checks passed! Ready to commit.${RESET}\n"

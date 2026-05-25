@@ -19,9 +19,9 @@ use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State
+        Query, State,
     },
-    response::Response
+    response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -36,7 +36,7 @@ const PROTOCOL_VERSION: u32 = 1;
 pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
     Query(params): Query<HashMap<String, String>>,
-    State(cfg): State<Arc<Config>>
+    State(cfg): State<Arc<Config>>,
 ) -> Response {
     // `/ws?session=<acp-session-id>` asks Mezame to call `session/load` on the
     // agent instead of `session/new`. Absent = always new session.
@@ -64,7 +64,7 @@ async fn handle_ws(
     ws: WebSocket,
     cfg: Arc<Config>,
     resume_session_id: Option<String>,
-    cwd_override: Option<String>
+    cwd_override: Option<String>,
 ) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
     let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
@@ -89,7 +89,9 @@ async fn handle_ws(
     let agent = match spawn_agent(&cfg).await {
         Ok(a) => Arc::new(a),
         Err(e) => {
-            let _ = to_ws_tx.send(text_msg(json!({ "type": "error", "message": format!("{e}") })));
+            let _ = to_ws_tx.send(text_msg(
+                json!({ "type": "error", "message": format!("{e}") }),
+            ));
             drop(to_ws_tx);
             let _ = writer.await;
             return Ok(());
@@ -112,7 +114,7 @@ async fn handle_ws(
                 "clientCapabilities": {
                     "fs": { "readTextFile": false, "writeTextFile": false }
                 }
-            })
+            }),
         )
         .await
         .context("Failed to initialize agent")?;
@@ -132,7 +134,7 @@ async fn handle_ws(
     // otherwise we use Mezame's own process cwd.
     let cwd_str = match cwd_override {
         Some(c) => c,
-        None => std::env::current_dir()?.to_string_lossy().to_string()
+        None => std::env::current_dir()?.to_string_lossy().to_string(),
     };
 
     let (session_id, resumed, session_info) = match resume_session_id {
@@ -149,10 +151,7 @@ async fn handle_ws(
                     )
                 })));
                 let new_session = agent
-                    .request(
-                        "session/new",
-                        json!({ "cwd": cwd_str, "mcpServers": [] })
-                    )
+                    .request("session/new", json!({ "cwd": cwd_str, "mcpServers": [] }))
                     .await
                     .context("Failed to start fallback session")?;
                 let sid = new_session
@@ -165,10 +164,7 @@ async fn handle_ws(
         },
         None => {
             let new_session = agent
-                .request(
-                    "session/new",
-                    json!({ "cwd": cwd_str, "mcpServers": [] })
-                )
+                .request("session/new", json!({ "cwd": cwd_str, "mcpServers": [] }))
                 .await
                 .context("Failed to start new session")?;
             let sid = new_session
@@ -427,7 +423,7 @@ async fn handle_ws(
 async fn handle_agent_message(
     tx: &mpsc::UnboundedSender<Message>,
     msg: Value,
-    suppress_session_updates: bool
+    suppress_session_updates: bool,
 ) {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
@@ -436,8 +432,14 @@ async fn handle_agent_message(
             // (MCP servers load, etc.). We treat each emission as the
             // full current catalogue; last-wins semantics on the browser.
             if let Some(params) = msg.get("params") {
-                let commands = params.get("commands").cloned().unwrap_or(Value::Array(vec![]));
-                let prompts = params.get("prompts").cloned().unwrap_or(Value::Array(vec![]));
+                let commands = params
+                    .get("commands")
+                    .cloned()
+                    .unwrap_or(Value::Array(vec![]));
+                let prompts = params
+                    .get("prompts")
+                    .cloned()
+                    .unwrap_or(Value::Array(vec![]));
                 let _ = tx.send(text_msg(json!({
                     "type": "commands",
                     "commands": commands,
@@ -449,19 +451,36 @@ async fn handle_agent_message(
             if suppress_session_updates {
                 return;
             }
-            let update = msg.get("params").and_then(|p| p.get("update")).cloned().unwrap_or(Value::Null);
-            let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+            let update = msg
+                .get("params")
+                .and_then(|p| p.get("update"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let kind = update
+                .get("sessionUpdate")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             match kind {
                 "agent_message_chunk" => {
-                    if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(Value::as_str) {
-                        let _ = tx.send(text_msg(json!({ "type": "append", "role": "agent", "text": text })));
+                    if let Some(text) = update
+                        .get("content")
+                        .and_then(|c| c.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        let _ = tx.send(text_msg(
+                            json!({ "type": "append", "role": "agent", "text": text }),
+                        ));
                     }
                 }
                 "user_message_chunk" => {
                     // Only emitted during `session/load` replay, so this
                     // does not double-render live prompts (the browser
                     // already echoes those locally).
-                    if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(Value::as_str) {
+                    if let Some(text) = update
+                        .get("content")
+                        .and_then(|c| c.get("text"))
+                        .and_then(Value::as_str)
+                    {
                         let _ = tx.send(text_msg(json!({
                             "type": "append",
                             "role": "user",
@@ -473,7 +492,11 @@ async fn handle_agent_message(
                     // Reasoning tokens. Kiro does not currently emit these,
                     // but leave the handler in place so reasoning-model
                     // agents light up the UI with `(thinking)` lines.
-                    if let Some(text) = update.get("content").and_then(|c| c.get("text")).and_then(Value::as_str) {
+                    if let Some(text) = update
+                        .get("content")
+                        .and_then(|c| c.get("text"))
+                        .and_then(Value::as_str)
+                    {
                         let _ = tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": format!("(thinking) {text}") })));
                     }
                 }
@@ -487,21 +510,23 @@ async fn handle_agent_message(
                     // render whatever the agent supplied (title, status,
                     // kind, input args, output content blocks, and file
                     // locations touched).
-                    let tool_call_id = update
-                        .get("toolCallId")
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                    let tool_call_id = update.get("toolCallId").cloned().unwrap_or(Value::Null);
                     if tool_call_id.is_null() {
                         // Nothing to key on; fall back to a sys line so
                         // the user at least knows something happened.
-                        let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
+                        let title = update
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool");
                         let status = update.get("status").and_then(Value::as_str).unwrap_or("");
                         let line = if status.is_empty() {
                             format!("\n[{title}]\n")
                         } else {
                             format!("\n[{title}: {status}]\n")
                         };
-                        let _ = tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": line })));
+                        let _ = tx.send(text_msg(
+                            json!({ "type": "append", "role": "sys", "text": line }),
+                        ));
                         return;
                     }
                     let _ = tx.send(text_msg(json!({
@@ -531,7 +556,10 @@ async fn handle_agent_message(
                     .and_then(Value::as_str)
                     .unwrap_or("tool")
                     .to_string();
-                let options = params.get("options").cloned().unwrap_or(Value::Array(vec![]));
+                let options = params
+                    .get("options")
+                    .cloned()
+                    .unwrap_or(Value::Array(vec![]));
                 let _ = tx.send(text_msg(json!({
                     "type": "permission_request",
                     "id": id,

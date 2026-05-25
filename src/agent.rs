@@ -43,7 +43,7 @@ pub(crate) struct Agent {
     /// process group so `shutdown` can kill the entire tree (MCP servers,
     /// npm wrappers, etc.) rather than just the direct child.
     #[cfg(unix)]
-    pgid: i32
+    pgid: i32,
 }
 
 impl Agent {
@@ -68,7 +68,10 @@ impl Agent {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        let line = format!("{}\n", json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        let line = format!(
+            "{}\n",
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+        );
         {
             let mut stdin = self.stdin.lock().await;
             stdin.write_all(line.as_bytes()).await?;
@@ -84,7 +87,10 @@ impl Agent {
 
     /// Reply to a server-initiated request (e.g. `session/request_permission`).
     pub(crate) async fn respond(&self, id: Value, result: Value) -> Result<()> {
-        let line = format!("{}\n", json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        let line = format!(
+            "{}\n",
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        );
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(line.as_bytes()).await?;
         stdin.flush().await?;
@@ -94,7 +100,10 @@ impl Agent {
     /// Send a JSON-RPC notification (no id, no response expected). Used for
     /// one-way signals like `session/cancel`.
     pub(crate) async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        let line = format!("{}\n", json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+        let line = format!(
+            "{}\n",
+            json!({ "jsonrpc": "2.0", "method": method, "params": params })
+        );
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(line.as_bytes()).await?;
         stdin.flush().await?;
@@ -114,7 +123,9 @@ impl Agent {
     ///      server grandchildren alive (the common case), this reaps them.
     pub(crate) async fn shutdown(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
-            let _ = self.notify("session/cancel", json!({ "sessionId": sid })).await;
+            let _ = self
+                .notify("session/cancel", json!({ "sessionId": sid }))
+                .await;
         }
         {
             let mut stdin = self.stdin.lock().await;
@@ -230,7 +241,8 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
         }
     });
 
-    let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
 
     // Optional ACP tracing. Set `MEZAME_DEBUG_ACP=1` to dump every inbound
@@ -253,7 +265,7 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
             }
             let msg: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
-                Err(_) => continue // malformed line; skip silently
+                Err(_) => continue, // malformed line; skip silently
             };
             let is_response = msg.get("result").is_some() || msg.get("error").is_some();
             if is_response {
@@ -275,7 +287,7 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
         updates_rx: Mutex::new(Some(updates_rx)),
         child: Mutex::new(child),
         #[cfg(unix)]
-        pgid
+        pgid,
     })
 }
 

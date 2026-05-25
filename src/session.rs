@@ -43,7 +43,7 @@ pub(crate) async fn try_load_session(agent: &Agent, sid: &str, cwd: &str) -> Res
                     "sessionId": sid,
                     "cwd": cwd,
                     "mcpServers": []
-                })
+                }),
             )
             .await;
         match res {
@@ -62,7 +62,10 @@ pub(crate) async fn try_load_session(agent: &Agent, sid: &str, cwd: &str) -> Res
                 // alone and let the shutdown-race back-off do its job.
                 let stole = steal_stale_session_lock(sid);
                 if stole {
-                    eprintln!("Session {sid}: stale lock stolen on attempt {}.", attempt + 1);
+                    eprintln!(
+                        "Session {sid}: stale lock stolen on attempt {}.",
+                        attempt + 1
+                    );
                     // Don't burn a backoff sleep if we just cleared the
                     // blocker ourselves.
                     continue;
@@ -105,10 +108,13 @@ fn steal_stale_session_lock(session_id: &str) -> bool {
     }
     match std::fs::remove_file(&path) {
         Ok(()) => {
-            eprintln!("Stole stale Kiro session lock (pid {pid}): {}", path.display());
+            eprintln!(
+                "Stole stale Kiro session lock (pid {pid}): {}",
+                path.display()
+            );
             true
         }
-        Err(_) => false
+        Err(_) => false,
     }
 }
 

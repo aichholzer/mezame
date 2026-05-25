@@ -47,7 +47,9 @@ fn main() -> Result<()> {
         init_config()?
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async move {
         // Single-transport runtime for now: pick the first entry, bail on
         // empty or multi-entry configs. When multi-transport lands
@@ -55,12 +57,12 @@ fn main() -> Result<()> {
         match cfg.transports.as_slice() {
             [] => bail!("No transports configured. Re-run `mezame init`."),
             [one] => match one.clone() {
-                TransportConfig::Cloudflared { bind } => run_cloudflared(cfg, bind).await
+                TransportConfig::Cloudflared { bind } => run_cloudflared(cfg, bind).await,
             },
             _ => bail!(
                 "Running more than one transport at once is not yet supported. \
                  Leave a single entry in `transports` until multi-transport ships."
-            )
+            ),
         }
     })
 }

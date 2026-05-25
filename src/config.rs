@@ -28,7 +28,7 @@ pub(crate) struct Config {
     pub(crate) transports: Vec<TransportConfig>,
     pub(crate) agent_cmd: String,
     #[serde(default)]
-    pub(crate) agent_args: Vec<String>
+    pub(crate) agent_args: Vec<String>,
 }
 
 /// Transport entries are internally tagged by `kind`, so each variant can
@@ -59,7 +59,8 @@ pub(crate) fn state_path() -> Result<PathBuf> {
 
 pub(crate) fn load_config() -> Result<Config> {
     let path = config_path()?;
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;
     let cfg: Config = serde_json::from_str(&raw).context("Parsing config.json")?;
     Ok(cfg)
 }
@@ -86,7 +87,7 @@ pub(crate) fn init_config() -> Result<Config> {
     let bind_options = [
         format!("{loopback}  (loopback only, default)"),
         format!("{all}    (all IPv4 interfaces, reachable from LAN)"),
-        "Custom          (type an address:port)".to_string()
+        "Custom          (type an address:port)".to_string(),
     ];
 
     println!("{}", MEZAME_ART);
@@ -102,7 +103,11 @@ pub(crate) fn init_config() -> Result<Config> {
             let s: String = Input::with_theme(&theme)
                 .with_prompt("Bind address")
                 .validate_with(|input: &String| -> Result<(), &str> {
-                    if input.trim().is_empty() { Err("Bind address is required") } else { Ok(()) }
+                    if input.trim().is_empty() {
+                        Err("Bind address is required")
+                    } else {
+                        Ok(())
+                    }
                 })
                 .interact_text()?;
             s.trim().to_string()
@@ -120,7 +125,11 @@ pub(crate) fn init_config() -> Result<Config> {
             let typed: String = Input::with_theme(&theme)
                 .with_prompt("ACP agent command (e.g. kiro-cli, claude, gemini, codex)")
                 .validate_with(|input: &String| -> Result<(), &str> {
-                    if input.trim().is_empty() { Err("Agent command is required") } else { Ok(()) }
+                    if input.trim().is_empty() {
+                        Err("Agent command is required")
+                    } else {
+                        Ok(())
+                    }
                 })
                 .interact_text()?;
             agent_cmd = typed.trim().to_string();
@@ -143,7 +152,7 @@ pub(crate) fn init_config() -> Result<Config> {
     let cfg = Config {
         transports: vec![TransportConfig::Cloudflared { bind }],
         agent_cmd,
-        agent_args
+        agent_args,
     };
 
     let path = config_path()?;
@@ -167,14 +176,30 @@ struct KnownAgent {
     /// Args we pre-fill when the user picks this agent. Only set it when
     /// we are sure the subcommand is correct (Kiro CLI uses `acp`; the
     /// others currently hedge, so leave empty).
-    default_args: &'static [&'static str]
+    default_args: &'static [&'static str],
 }
 
 const KNOWN_AGENTS: &[KnownAgent] = &[
-    KnownAgent { display: "Kiro CLI",         bin: "kiro-cli", default_args: &["acp"] },
-    KnownAgent { display: "Claude Agent CLI", bin: "claude",   default_args: &[] },
-    KnownAgent { display: "Gemini CLI",       bin: "gemini",   default_args: &[] },
-    KnownAgent { display: "Codex",            bin: "codex",    default_args: &[] }
+    KnownAgent {
+        display: "Kiro CLI",
+        bin: "kiro-cli",
+        default_args: &["acp"],
+    },
+    KnownAgent {
+        display: "Claude Agent CLI",
+        bin: "claude",
+        default_args: &[],
+    },
+    KnownAgent {
+        display: "Gemini CLI",
+        bin: "gemini",
+        default_args: &[],
+    },
+    KnownAgent {
+        display: "Codex",
+        bin: "codex",
+        default_args: &[],
+    },
 ];
 
 /// Resolved agent picked from the menu. The path carries the full
@@ -182,7 +207,7 @@ const KNOWN_AGENTS: &[KnownAgent] = &[
 /// binary at run time (handy when the user has multiple installs).
 struct PickedAgent {
     path: PathBuf,
-    default_args: Vec<String>
+    default_args: Vec<String>,
 }
 
 /// Offer known agents found on `$PATH` as a `Select`. Returns `Ok(None)`
@@ -219,7 +244,7 @@ fn pick_agent(theme: &ColorfulTheme) -> Result<Option<PickedAgent>> {
     let (agent, path) = &found[idx];
     Ok(Some(PickedAgent {
         path: path.clone(),
-        default_args: agent.default_args.iter().map(|s| s.to_string()).collect()
+        default_args: agent.default_args.iter().map(|s| s.to_string()).collect(),
     }))
 }
 
