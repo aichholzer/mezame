@@ -199,4 +199,10 @@ export type PersistedState = {
   closed: ClosedEntry[];
   activeId: string | null;
   nextLabel: number;
+  /** Last mode picked by the user. Auto-applied to fresh sessions
+   * when the agent advertises the option in `session_info`. */
+  lastModeId: string | null;
+  /** Last model picked by the user. Auto-applied to fresh sessions
+   * when the agent advertises the option in `session_info`. */
+  lastModelId: string | null;
 };
