@@ -38,7 +38,12 @@ pub(crate) struct Agent {
     /// Owned child. SIGKILL on drop (kill_on_drop) remains as a safety net,
     /// but `shutdown` tries a clean EOF+wait first so Kiro can release its
     /// per-session lockfile.
-    child: Mutex<Child>
+    child: Mutex<Child>,
+    /// Process group ID (Unix only). The child is spawned in its own
+    /// process group so `shutdown` can kill the entire tree (MCP servers,
+    /// npm wrappers, etc.) rather than just the direct child.
+    #[cfg(unix)]
+    pgid: i32
 }
 
 impl Agent {
@@ -103,8 +108,9 @@ impl Agent {
     ///      you get "Session is active in another process (PID ...)" errors
     ///      on the next `session/load`.
     ///   3. Wait up to 500ms for the child to exit.
-    ///   4. If the timeout expires, fall through — `kill_on_drop` will still
-    ///      SIGKILL the child when the Agent is dropped shortly after.
+    ///   4. If the timeout expires, kill the entire process group (not just
+    ///      the direct child) so MCP servers and npm wrappers die too.
+    ///      `kill_on_drop` remains as a final safety net for the direct child.
     pub(crate) async fn shutdown(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
             let _ = self.notify("session/cancel", json!({ "sessionId": sid })).await;
@@ -113,11 +119,49 @@ impl Agent {
             let mut stdin = self.stdin.lock().await;
             let _ = stdin.shutdown().await;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        let exited = tokio::time::timeout(std::time::Duration::from_millis(500), async {
             let mut child = self.child.lock().await;
             let _ = child.wait().await;
         })
-        .await;
+        .await
+        .is_ok();
+
+        // If the child did not exit cooperatively, kill the entire process
+        // group so grandchildren (MCP servers, npm wrappers) are reaped.
+        if !exited {
+            self.kill_process_group();
+        }
+    }
+
+    /// Send SIGKILL to the entire process group rooted at the child.
+    #[cfg(unix)]
+    fn kill_process_group(&self) {
+        if self.pgid > 0 {
+            // kill(-pgid, SIGKILL) sends to every process in the group.
+            unsafe {
+                libc_kill(-self.pgid, 9);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn kill_process_group(&self) {
+        // Non-unix: fall through to kill_on_drop for the direct child.
+    }
+}
+
+/// Safety net: if the Agent is dropped without a prior `shutdown()` call
+/// (e.g. a panic unwind or early return), kill the entire process group
+/// so grandchildren do not leak. `kill_on_drop(true)` on the Child only
+/// kills the direct child; this covers the rest of the tree.
+#[cfg(unix)]
+impl Drop for Agent {
+    fn drop(&mut self) {
+        if self.pgid > 0 {
+            unsafe {
+                libc_kill(-self.pgid, 9);
+            }
+        }
     }
 }
 
@@ -142,9 +186,27 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    // Spawn the child in its own process group so we can kill the entire
+    // tree (MCP servers, npm wrappers, bun, node, etc.) on shutdown rather
+    // than just the direct child. Without this, grandchildren survive as
+    // orphans inside the systemd cgroup and accumulate memory.
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            // setsid() creates a new session (and process group). This
+            // detaches the child from Mezame's own group so a
+            // kill(-pgid, SIGKILL) targets only the agent tree.
+            libc_setsid();
+            Ok(())
+        });
+    }
+
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn `{}`", cfg.agent_cmd))?;
+
+    #[cfg(unix)]
+    let pgid = child.id().map(|id| id as i32).unwrap_or(0);
 
     let stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -201,6 +263,17 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
         next_id: AtomicI64::new(1),
         pending,
         updates_rx: Mutex::new(Some(updates_rx)),
-        child: Mutex::new(child)
+        child: Mutex::new(child),
+        #[cfg(unix)]
+        pgid
     })
+}
+
+// Minimal FFI bindings to avoid pulling in `libc` for two calls.
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+    #[link_name = "setsid"]
+    fn libc_setsid() -> i32;
 }
