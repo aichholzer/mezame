@@ -27,11 +27,28 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::agent::spawn_agent;
+use crate::agent::{spawn_agent, Agent};
 use crate::config::Config;
 use crate::session::{extract_session_info, short_reason, try_load_session};
 
 const PROTOCOL_VERSION: u32 = 1;
+
+/// Open a fresh ACP session and pull out the bits we forward to the
+/// browser. Returns `(sessionId, modes/models payload)`. Used both as
+/// the primary path when the browser does not request a resume, and as
+/// the fallback when `session/load` fails.
+async fn start_new_session(agent: &Agent, cwd: &str) -> Result<(String, Option<Value>)> {
+    let result = agent
+        .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+        .await
+        .context("Failed to start new session")?;
+    let sid = result
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Session creation returned no session id"))?
+        .to_string();
+    Ok((sid, extract_session_info(&result)))
+}
 
 pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
@@ -150,29 +167,13 @@ async fn handle_ws(
                         short_reason(&err_str)
                     )
                 })));
-                let new_session = agent
-                    .request("session/new", json!({ "cwd": cwd_str, "mcpServers": [] }))
-                    .await
-                    .context("Failed to start fallback session")?;
-                let sid = new_session
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("Session creation returned no session id"))?
-                    .to_string();
-                (sid, false, extract_session_info(&new_session))
+                let (sid, info) = start_new_session(&agent, &cwd_str).await?;
+                (sid, false, info)
             }
         },
         None => {
-            let new_session = agent
-                .request("session/new", json!({ "cwd": cwd_str, "mcpServers": [] }))
-                .await
-                .context("Failed to start new session")?;
-            let sid = new_session
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("Session creation returned no session id"))?
-                .to_string();
-            (sid, false, extract_session_info(&new_session))
+            let (sid, info) = start_new_session(&agent, &cwd_str).await?;
+            (sid, false, info)
         }
     };
 

@@ -17,6 +17,10 @@ build-time Vite define.
 
 ### Changed
 
+- `handle_ws` no longer duplicates the `session/new` plumbing across the
+  resume-fallback arm and the no-resume arm. Both paths now go through
+  a small `start_new_session` helper that owns the request, sessionId
+  extraction, and `extract_session_info` call. Behaviour unchanged.
 - `Agent::request`, `Agent::respond`, and `Agent::notify` now share a
   single `write_message` helper that owns the JSON-RPC framing (line
   serialise, lock stdin, write, flush). Removes three near-identical
