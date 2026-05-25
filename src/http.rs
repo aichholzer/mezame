@@ -150,27 +150,44 @@ async fn serve_ui_asset(uri: Uri) -> Response {
 }
 
 /// Tiny mime-type lookup for the handful of extensions Vite emits. Keeps us
-/// off a `mime_guess` dependency.
+/// off a `mime_guess` dependency. Uses `eq_ignore_ascii_case` to avoid
+/// allocating a lowercase copy of the extension on every request.
 fn mime_for(path: &str) -> &'static str {
-    let lower = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match lower.as_str() {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "application/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
-        "map" => "application/json; charset=utf-8",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "txt" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
+    let ext = path.rsplit('.').next().unwrap_or("");
+    if ext.eq_ignore_ascii_case("html") {
+        "text/html; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("mjs") {
+        "application/javascript; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("css") {
+        "text/css; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("map") {
+        "application/json; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("svg") {
+        "image/svg+xml"
+    } else if ext.eq_ignore_ascii_case("png") {
+        "image/png"
+    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        "image/jpeg"
+    } else if ext.eq_ignore_ascii_case("gif") {
+        "image/gif"
+    } else if ext.eq_ignore_ascii_case("webp") {
+        "image/webp"
+    } else if ext.eq_ignore_ascii_case("ico") {
+        "image/x-icon"
+    } else if ext.eq_ignore_ascii_case("woff") {
+        "font/woff"
+    } else if ext.eq_ignore_ascii_case("woff2") {
+        "font/woff2"
+    } else if ext.eq_ignore_ascii_case("ttf") {
+        "font/ttf"
+    } else if ext.eq_ignore_ascii_case("otf") {
+        "font/otf"
+    } else if ext.eq_ignore_ascii_case("txt") {
+        "text/plain; charset=utf-8"
+    } else if ext.eq_ignore_ascii_case("webmanifest") {
+        "application/manifest+json"
+    } else {
+        "application/octet-stream"
     }
 }
 
