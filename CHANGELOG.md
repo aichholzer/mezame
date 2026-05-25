@@ -15,6 +15,8 @@ build-time Vite define.
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-05-25
+
 ### Changed
 
 - `handle_ws` no longer duplicates the `session/new` plumbing across the
