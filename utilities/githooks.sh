@@ -5,7 +5,6 @@ set -e
 
 # ANSI color codes
 WHITE='\033[1;37m'
-GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RESET='\033[0m'
 
@@ -13,14 +12,33 @@ echo ""
 echo -e " ${WHITE}Setting up Git pre-commit hooks...${RESET}"
 echo ""
 
-# Check if we're in a Git repository
-if [ ! -d ".git" ]; then
-    echo -e " ${YELLOW}Error: Not in a Git repository. Please run this from the project root.${RESET}"
+# Resolve repo root and script directory so the script works from anywhere
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo -e " ${YELLOW}Error: Not in a Git repository. Please run this from inside the project.${RESET}"
+    exit 1
+fi
+
+GIT_DIR="$(git -C "$REPO_ROOT" rev-parse --git-dir)"
+# git rev-parse may return a relative path; normalise it against the repo root
+case "$GIT_DIR" in
+    /*) ;;
+    *) GIT_DIR="$REPO_ROOT/$GIT_DIR" ;;
+esac
+
+HOOKS_DIR="$GIT_DIR/hooks"
+SOURCE_HOOK="$SCRIPT_DIR/pre-commit"
+TARGET_HOOK="$HOOKS_DIR/pre-commit"
+
+# Check the source hook is present before we touch anything
+if [ ! -f "$SOURCE_HOOK" ]; then
+    echo -e " ${YELLOW}Error: Source hook not found at ${SOURCE_HOOK}.${RESET}"
     exit 1
 fi
 
 # Check if pre-commit hook already exists
-if [ -f ".git/hooks/pre-commit" ]; then
+if [ -f "$TARGET_HOOK" ]; then
     echo -e " ${YELLOW}Pre-commit hook already exists.${RESET}"
     read -p " Do you want to overwrite it? (y/N): " -n 1 -r
     echo
@@ -32,11 +50,11 @@ if [ -f ".git/hooks/pre-commit" ]; then
 fi
 
 # Make sure the hooks directory exists
-mkdir -p .git/hooks
+mkdir -p "$HOOKS_DIR"
 
 # Copy the hook file and make sure it's executable
-cp ./utilities/pre-commit .git/hooks/pre-commit
-chmod u+x .git/hooks/pre-commit
+cp "$SOURCE_HOOK" "$TARGET_HOOK"
+chmod u+x "$TARGET_HOOK"
 
 echo ""
 echo -e " ${WHITE}Pre-commit hook setup complete!${RESET}"
@@ -46,5 +64,5 @@ echo -e " - ${WHITE}cargo fmt -- --check${RESET} (code formatting)"
 echo -e " - ${WHITE}cargo clippy -- -D warnings${RESET} (linting)"
 echo -e " - ${WHITE}cargo check${RESET} (compilation)"
 echo
-echo -e " To test the hook manually, run: ${WHITE}./.git/hooks/pre-commit${RESET}"
-echo -e " To skip the hook for a commit, use: ${WHITE}git commit --no-verify${RESET} ${YELLOW}— (Not recommended)${RESET}"
+echo -e " To test the hook manually, run: ${WHITE}${TARGET_HOOK}${RESET}"
+echo -e " To skip the hook for a commit, use: ${WHITE}git commit --no-verify${RESET}${YELLOW}, not recommended.${RESET}"
