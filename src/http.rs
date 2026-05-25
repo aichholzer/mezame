@@ -150,45 +150,38 @@ async fn serve_ui_asset(uri: Uri) -> Response {
 }
 
 /// Tiny mime-type lookup for the handful of extensions Vite emits. Keeps us
-/// off a `mime_guess` dependency. Uses `eq_ignore_ascii_case` to avoid
-/// allocating a lowercase copy of the extension on every request.
+/// off a `mime_guess` dependency. The const table is the single source of
+/// truth; matching is case-insensitive without allocating a lowercase copy
+/// of the extension on every request.
+const MIME_TABLE: &[(&str, &str)] = &[
+    ("html", "text/html; charset=utf-8"),
+    ("js", "application/javascript; charset=utf-8"),
+    ("mjs", "application/javascript; charset=utf-8"),
+    ("css", "text/css; charset=utf-8"),
+    ("json", "application/json; charset=utf-8"),
+    ("map", "application/json; charset=utf-8"),
+    ("svg", "image/svg+xml"),
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("ico", "image/x-icon"),
+    ("woff", "font/woff"),
+    ("woff2", "font/woff2"),
+    ("ttf", "font/ttf"),
+    ("otf", "font/otf"),
+    ("txt", "text/plain; charset=utf-8"),
+    ("webmanifest", "application/manifest+json"),
+];
+
 fn mime_for(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("");
-    if ext.eq_ignore_ascii_case("html") {
-        "text/html; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("mjs") {
-        "application/javascript; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("css") {
-        "text/css; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("map") {
-        "application/json; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("svg") {
-        "image/svg+xml"
-    } else if ext.eq_ignore_ascii_case("png") {
-        "image/png"
-    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
-        "image/jpeg"
-    } else if ext.eq_ignore_ascii_case("gif") {
-        "image/gif"
-    } else if ext.eq_ignore_ascii_case("webp") {
-        "image/webp"
-    } else if ext.eq_ignore_ascii_case("ico") {
-        "image/x-icon"
-    } else if ext.eq_ignore_ascii_case("woff") {
-        "font/woff"
-    } else if ext.eq_ignore_ascii_case("woff2") {
-        "font/woff2"
-    } else if ext.eq_ignore_ascii_case("ttf") {
-        "font/ttf"
-    } else if ext.eq_ignore_ascii_case("otf") {
-        "font/otf"
-    } else if ext.eq_ignore_ascii_case("txt") {
-        "text/plain; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("webmanifest") {
-        "application/manifest+json"
-    } else {
-        "application/octet-stream"
-    }
+    MIME_TABLE
+        .iter()
+        .find(|(k, _)| ext.eq_ignore_ascii_case(k))
+        .map(|(_, v)| *v)
+        .unwrap_or("application/octet-stream")
 }
 
 /// GET /state — returns the persisted browser state as JSON, or `{}` if the
