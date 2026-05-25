@@ -108,9 +108,10 @@ impl Agent {
     ///      you get "Session is active in another process (PID ...)" errors
     ///      on the next `session/load`.
     ///   3. Wait up to 500ms for the child to exit.
-    ///   4. If the timeout expires, kill the entire process group (not just
-    ///      the direct child) so MCP servers and npm wrappers die too.
-    ///      `kill_on_drop` remains as a final safety net for the direct child.
+    ///   4. Kill the entire process group. This is unconditional and
+    ///      idempotent: if the agent and its children already exited, the
+    ///      kill is a no-op. If `kiro-cli` exited cleanly but left its MCP
+    ///      server grandchildren alive (the common case), this reaps them.
     pub(crate) async fn shutdown(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
             let _ = self.notify("session/cancel", json!({ "sessionId": sid })).await;
@@ -119,18 +120,16 @@ impl Agent {
             let mut stdin = self.stdin.lock().await;
             let _ = stdin.shutdown().await;
         }
-        let exited = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
             let mut child = self.child.lock().await;
             let _ = child.wait().await;
         })
-        .await
-        .is_ok();
+        .await;
 
-        // If the child did not exit cooperatively, kill the entire process
-        // group so grandchildren (MCP servers, npm wrappers) are reaped.
-        if !exited {
-            self.kill_process_group();
-        }
+        // Always kill the group. Idempotent: a no-op if everything already
+        // exited, otherwise reaps any orphaned MCP servers / npm wrappers
+        // that kiro-cli did not clean up.
+        self.kill_process_group();
     }
 
     /// Send SIGKILL to the entire process group rooted at the child.
@@ -167,10 +166,14 @@ impl Drop for Agent {
 
 /// Spawn the configured agent and wire its stdio into the `Agent` handle.
 ///
-/// The child is configured with `kill_on_drop(true)` so that when the
-/// returned `Agent` (or an `Arc` containing it) is dropped, the process
-/// goes with it — important because each browser session owns its own
-/// agent and we do not want orphan children hanging around.
+/// Process lifecycle:
+/// - The child is spawned in its own process group via `setsid()` so the
+///   entire descendant tree (MCP servers, npm wrappers, bun/node) can be
+///   killed as a unit rather than only the direct child.
+/// - `kill_on_drop(true)` provides a tokio-level safety net for the direct
+///   child; the `Drop` impl on `Agent` covers the rest of the group.
+/// - Cooperative shutdown is preferred: `shutdown()` closes stdin and
+///   waits briefly so Kiro can release its session lockfile.
 ///
 /// Two background tasks are spawned here:
 ///   1. Stderr forwarder — writes each line to our stderr prefixed with
@@ -190,13 +193,20 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
     // tree (MCP servers, npm wrappers, bun, node, etc.) on shutdown rather
     // than just the direct child. Without this, grandchildren survive as
     // orphans inside the systemd cgroup and accumulate memory.
+    //
+    // SAFETY: `pre_exec` runs after fork() but before exec(), in a context
+    // where only async-signal-safe functions may be called. `setsid` is
+    // listed as async-signal-safe by POSIX.
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
-            // setsid() creates a new session (and process group). This
-            // detaches the child from Mezame's own group so a
-            // kill(-pgid, SIGKILL) targets only the agent tree.
-            libc_setsid();
+            // setsid() creates a new session (and process group), making
+            // the child its own group leader. Bail loudly if it fails so
+            // we never end up with a wrong pgid that could target the
+            // parent's group on shutdown.
+            if libc_setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
