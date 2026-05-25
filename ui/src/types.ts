@@ -19,6 +19,7 @@ export type ServerMessage =
   | { type: 'append'; role: Role; text: string }
   | { type: 'tool_call'; toolCallId: string; title?: string | null; status?: string | null; kind?: string | null; rawInput?: unknown; content?: unknown; locations?: unknown }
   | { type: 'permission_request'; id: number | string; title: string; options: PermissionOption[] }
+  | { type: 'mcp_oauth_request'; id: number | string | null; serverName: string; url: string }
   | { type: 'prompt_done' }
   | { type: 'error'; message: string };
 
@@ -125,6 +126,20 @@ export type LogEntry =
     timestamp: number;
     /** Set once the user picks an option. Presence disables buttons. */
     resolution?: string;
+  }
+  | {
+    kind: 'mcp_oauth';
+    id: string;
+    /** Server-provided id used to dedupe re-emitted requests. May be
+     * null when the agent did not include one; in that case we dedupe
+     * by `serverName` + `url` instead. */
+    requestId: number | string | null;
+    serverName: string;
+    url: string;
+    timestamp: number;
+    /** Flipped when the user clicks Open. The card stays in the log so
+     * the URL remains accessible if the user closes the new tab. */
+    opened: boolean;
   }
   | {
     kind: 'tool_call';

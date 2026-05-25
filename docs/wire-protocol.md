@@ -66,5 +66,6 @@ Notifications Mezame handles:
   - `tool_call` / `tool_call_update` forwarded as a structured `tool_call` event keyed by `toolCallId`. Updates mutate the existing entry in place on the browser, so one tool call equals one collapsible row regardless of how many update notifications it emits.
 - `session/request_permission` to `permission_request` event for the browser.
 - `_kiro.dev/commands/available` to `commands` event (trimmed to `commands` + `prompts`).
+- `_kiro.dev/mcp/oauth_request` to `mcp_oauth_request` event (serverName + url + dedupe id).
 
-Other `_kiro.dev/*` notifications (MCP OAuth URL, compaction status, clear status) are currently ignored. Extension points live in `handle_agent_message` in `src/ws.rs`.
+Other `_kiro.dev/*` notifications (compaction status, clear status) are currently ignored. Extension points live in `handle_agent_message` in `src/ws.rs`.

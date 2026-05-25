@@ -145,7 +145,7 @@ Stderr carries Mezame's own logs and, prefixed with `[agent]`, the agent's stder
 ## Known gaps
 
 1. **Auth enforcement.** Mezame trusts everything that reaches the WebSocket upgrade. When fronted by Cloudflare Access, validate the `Cf-Access-Jwt-Assertion` header (JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`). See `ws_upgrade` in `src/ws.rs` and the backlog in `todo.md`.
-2. **Remaining Kiro extensions.** MCP OAuth URL (needs user redirect) and compaction / clear status notifications are still dropped. Slash commands and the commands catalogue are surfaced.
+2. **Remaining Kiro extensions.** Compaction and clear status notifications are still dropped. Slash commands, the commands catalogue, and MCP OAuth URL requests are surfaced.
 3. **Attachment rehydration on resume.** Prompts with images or embedded resources are sent correctly on the live path, but when the browser reconnects and Mezame replays history via Kiro's on-disk JSONL, only text turns are rendered. The parser in `parse_kiro_history` (`src/http.rs`) only knows about user/agent text today. Extending it requires knowing the shape Kiro uses for non-text prompt blocks in its JSONL, which has not been inspected yet. Until then, attachments in historical turns will appear as plain text (or be missing entirely) after a resume.
 
 ## Roadmap

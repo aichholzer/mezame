@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
+import { McpOauthCard } from '@/features/McpOauthCard';
 import { ToolCallCard } from '@/features/ToolCallCard';
 import { mezameActions } from '@/hooks/useMezame';
 import { useKeyboardInsetValue } from '@/hooks/useKeyboardInset';
@@ -221,6 +222,9 @@ export const LogPane = ({ session, isActive }: Props) => {
         }
         if (entry.kind === 'tool_call') {
           return <ToolCallCard key={entry.id} entry={entry} />;
+        }
+        if (entry.kind === 'mcp_oauth') {
+          return <McpOauthCard key={entry.id} session={session} entry={entry} />;
         }
         return (
           <PermissionCard key={entry.id} session={session} entry={entry} options={entry.options} />

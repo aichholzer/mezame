@@ -13,6 +13,19 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [Unreleased]
+
+### Added
+
+- MCP OAuth requests are now surfaced to the browser. When an MCP
+  server emits `_kiro.dev/mcp/oauth_request`, Mezame forwards a
+  `mcp_oauth_request` WS event and the UI renders an inline card with
+  the server name, the auth URL, and an "Open" button. The button
+  must be triggered by a user gesture (browsers block popups
+  otherwise), so we never auto-open. Re-emissions are de-duped by
+  request id, falling back to serverName + url when the agent did not
+  include an id.
+
 ## [0.8.8] - 2026-05-25
 
 ### Changed

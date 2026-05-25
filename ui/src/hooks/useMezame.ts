@@ -358,6 +358,30 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
         timestamp: Date.now()
       });
       break;
+    case 'mcp_oauth_request': {
+      // De-dupe re-emissions: Kiro keeps sending while the agent waits.
+      // Match by `requestId` when present, otherwise by serverName+url.
+      const existing = s.log.find(
+        (e) =>
+          e.kind === 'mcp_oauth' &&
+          ((msg.id !== null && e.requestId === msg.id) ||
+            (e.serverName === msg.serverName && e.url === msg.url))
+      );
+      if (existing) {
+        break;
+      }
+      raiseAttention(s, 'permission');
+      s.log.push({
+        kind: 'mcp_oauth',
+        id: newLogId(),
+        requestId: msg.id,
+        serverName: msg.serverName,
+        url: msg.url,
+        timestamp: Date.now(),
+        opened: false
+      });
+      break;
+    }
     case 'tool_call': {
       // Merge with an existing tool-call entry if we have seen this id
       // before (ACP `tool_call_update`); otherwise push a new row.
@@ -669,6 +693,24 @@ const setPinnedToBottom = (sessionId: string, pinned: boolean) => {
   }
 };
 
+const markOauthOpened = (sessionId: string, logEntryId: string) => {
+  const s = findSession(sessionId);
+  if (!s) {
+    return;
+  }
+  const entry = s.log.find((e) => e.id === logEntryId);
+  if (!entry || entry.kind !== 'mcp_oauth') {
+    return;
+  }
+  entry.opened = true;
+  // The card stays in the log (the URL may be needed again), but the
+  // attention dot can drop: the user has acknowledged the request.
+  if (s.attention === 'permission') {
+    s.attention = null;
+  }
+  notify();
+};
+
 // ---------- init ----------
 
 let initStarted = false;
@@ -720,5 +762,6 @@ export const mezameActions = {
   resolvePermission,
   setPinnedToBottom,
   setMode,
-  setModel
+  setModel,
+  markOauthOpened
 };

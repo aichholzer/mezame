@@ -454,6 +454,8 @@ async fn handle_ws(
 /// - `_kiro.dev/commands/available` → trimmed and forwarded as a
 ///   `commands` event (just the `commands` + `prompts` arrays; the big
 ///   `tools` catalogue is dropped to keep the WS frame small).
+/// - `_kiro.dev/mcp/oauth_request` → forwarded as `mcp_oauth_request`
+///   so the browser can render an inline card with an Open button.
 ///
 /// Everything else is silently dropped, including Kiro's other
 /// `_kiro.dev/*` extension notifications.
@@ -481,6 +483,44 @@ async fn handle_agent_message(
                     "type": "commands",
                     "commands": commands,
                     "prompts": prompts
+                })));
+            }
+        }
+        "_kiro.dev/mcp/oauth_request" => {
+            // An MCP server wants the user to authorise at a URL out of
+            // band. We surface the request so the browser can render a
+            // card with an "Open" button. Kiro re-emits while waiting,
+            // so we forward an `id` (when present) and let the browser
+            // de-dup. Field shapes are best-effort: we accept either
+            // `serverName` / `name`, and `url` / `authUrl`.
+            if let Some(params) = msg.get("params") {
+                let server_name = params
+                    .get("serverName")
+                    .or_else(|| params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP server")
+                    .to_string();
+                let url = params
+                    .get("url")
+                    .or_else(|| params.get("authUrl"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if url.is_empty() {
+                    // Without a URL there is nothing actionable; drop
+                    // silently rather than rendering a dead card.
+                    return;
+                }
+                let id = params
+                    .get("id")
+                    .or_else(|| params.get("requestId"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let _ = tx.send(text_msg(json!({
+                    "type": "mcp_oauth_request",
+                    "id": id,
+                    "serverName": server_name,
+                    "url": url
                 })));
             }
         }
