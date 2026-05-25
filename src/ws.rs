@@ -86,8 +86,8 @@ async fn handle_ws(
     // If spawn fails (bad agent_cmd, missing binary, ...) tell the browser
     // and close cleanly. Do NOT return an Err here: the writer task still
     // needs to drain the error message before we exit.
-    let agent = match spawn_agent(&cfg).await {
-        Ok(a) => Arc::new(a),
+    let (agent, mut updates_rx) = match spawn_agent(&cfg).await {
+        Ok((a, rx)) => (Arc::new(a), rx),
         Err(e) => {
             let _ = to_ws_tx.send(text_msg(
                 json!({ "type": "error", "message": format!("{e}") }),
@@ -208,10 +208,6 @@ async fn handle_ws(
     // duplicates. Drop `session/update` events until the first user-sent
     // prompt after resume; permission/tool requests still flow through.
     let mut suppress_session_updates = resumed;
-
-    // Hand over the single updates receiver produced by `spawn_agent`. Only
-    // one task may own it; we own it here, for the life of the session.
-    let mut updates_rx = agent.take_updates();
 
     loop {
         tokio::select! {

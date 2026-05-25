@@ -17,6 +17,11 @@ build-time Vite define.
 
 ### Changed
 
+- `Agent` no longer hands the updates receiver out via a runtime-checked
+  `take_updates` method. `spawn_agent` now returns
+  `(Agent, UnboundedReceiver<Value>)`, making single-ownership of the
+  channel a compile-time invariant. Removes two `expect()` panics and
+  the `Mutex<Option<...>>` wrapper. Behaviour unchanged.
 - HTTP handlers `/state`, `/history`, and the corresponding writes now
   use `tokio::fs` instead of the synchronous `std::fs` API. Removes a
   latent footgun where each request blocked a tokio worker thread for

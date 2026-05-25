@@ -33,8 +33,6 @@ pub(crate) struct Agent {
     /// Map from in-flight request id to the oneshot waiting for its
     /// response. Shared with the reader task that populates responses.
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
-    /// Updates receiver, handed out exactly once via `take_updates`.
-    updates_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
     /// Owned child. SIGKILL on drop (kill_on_drop) remains as a safety net,
     /// but `shutdown` tries a clean EOF+wait first so Kiro can release its
     /// per-session lockfile.
@@ -47,15 +45,6 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
-    /// Extract the updates receiver. Must only be called once per Agent.
-    pub(crate) fn take_updates(&self) -> mpsc::UnboundedReceiver<Value> {
-        self.updates_rx
-            .try_lock()
-            .expect("updates_rx already locked")
-            .take()
-            .expect("updates_rx already taken")
-    }
-
     /// Send a JSON-RPC request and await its response.
     ///
     /// Returns the `result` value on success, or an error if the agent
@@ -177,6 +166,10 @@ impl Drop for Agent {
 
 /// Spawn the configured agent and wire its stdio into the `Agent` handle.
 ///
+/// Returns the handle plus the receiver end of the agent-updates channel.
+/// The receiver is owned by the caller (the WS select loop) for the life
+/// of the session.
+///
 /// Process lifecycle:
 /// - The child is spawned in its own process group via `setsid()` so the
 ///   entire descendant tree (MCP servers, npm wrappers, bun/node) can be
@@ -187,12 +180,12 @@ impl Drop for Agent {
 ///   waits briefly so Kiro can release its session lockfile.
 ///
 /// Two background tasks are spawned here:
-///   1. Stderr forwarder — writes each line to our stderr prefixed with
+///   1. Stderr forwarder, writes each line to our stderr prefixed with
 ///      `[agent]`, for debugging.
-///   2. Stdout reader — newline-delimited JSON decoder that routes
+///   2. Stdout reader, newline-delimited JSON decoder that routes
 ///      responses to their pending oneshots and everything else to the
-///      `updates_tx` mpsc.
-pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
+///      returned mpsc receiver.
+pub(crate) async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver<Value>)> {
     let mut cmd = Command::new(&cfg.agent_cmd);
     cmd.args(&cfg.agent_args)
         .stdin(Stdio::piped())
@@ -280,15 +273,17 @@ pub(crate) async fn spawn_agent(cfg: &Config) -> Result<Agent> {
         }
     });
 
-    Ok(Agent {
-        stdin: Mutex::new(stdin),
-        next_id: AtomicI64::new(1),
-        pending,
-        updates_rx: Mutex::new(Some(updates_rx)),
-        child: Mutex::new(child),
-        #[cfg(unix)]
-        pgid,
-    })
+    Ok((
+        Agent {
+            stdin: Mutex::new(stdin),
+            next_id: AtomicI64::new(1),
+            pending,
+            child: Mutex::new(child),
+            #[cfg(unix)]
+            pgid,
+        },
+        updates_rx,
+    ))
 }
 
 // Minimal FFI bindings to avoid pulling in `libc` for two calls.
