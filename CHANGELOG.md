@@ -19,6 +19,15 @@ build-time Vite define.
 
 ### Added
 
+- Retry/back-off tests for `session::try_load_session`. Five cases
+  across `tests/session_try_load.rs` and `tests/session_steal_stale_lock.rs`
+  cover the full state machine: first-attempt success,
+  non-recoverable error breaks immediately, stale-lock error retries
+  through to success, dead-PID lockfile is stolen and the retry
+  succeeds, and the attempt budget is exhausted on a permanent
+  stale-lock condition. Uses `tokio::time::pause` to fast-forward
+  through the back-off so the suite stays under a second.
+
 - JSON-RPC framing round-trip tests for `Agent`. Six cases under
   `tests/agent_jsonrpc.rs` exercise the wire bytes of `request`,
   `respond`, and `notify` end-to-end via `Agent::from_io` and a

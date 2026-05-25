@@ -27,7 +27,7 @@ use crate::agent::Agent;
 /// forward modes/models to the browser just like on `session/new`. On a
 /// non-recoverable error, or if retries are exhausted, returns
 /// `Err(last_error_message)`.
-pub(crate) async fn try_load_session(agent: &Agent, sid: &str, cwd: &str) -> Result<Value, String> {
+pub async fn try_load_session(agent: &Agent, sid: &str, cwd: &str) -> Result<Value, String> {
     // ~1.25s total budget: 5 attempts at 250ms spacing. Empirically covers
     // the cooperative shutdown path (500ms) plus a little headroom for
     // Kiro to actually release the lockfile after its child exits.
