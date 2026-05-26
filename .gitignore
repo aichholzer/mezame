@@ -7,6 +7,8 @@
 # Editors / IDEs
 .vscode/
 .idea/
+.kiro/
+.claude/
 *.swp
 *.swo
 
@@ -17,12 +19,6 @@
 
 # Logs
 *.log
-
-# Kiro workspace state (sessions, local agents, settings)
-.kiro/
-
-# Claude Code local state
-.claude/
 
 # React UI (ui/)
 ui/node_modules/
