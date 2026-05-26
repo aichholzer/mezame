@@ -15,6 +15,8 @@ build-time Vite define.
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-05-26
+
 ### Fixed
 
 - PDF and other non-image binary uploads no longer surface a misleading
