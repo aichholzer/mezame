@@ -13,7 +13,7 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
-## [Unreleased]
+## [0.8.11] - 2026-05-26
 
 ### Changed
 
@@ -48,6 +48,18 @@ build-time Vite define.
   comes back into focus, dropping the worst-case "back to a stale UI"
   delay from 30s to under a second.
 
+- Fenced code blocks render with their language pill and copy button
+  again. The Markdown renderer's switch between fenced and inline code
+  used `className.startsWith('language-')`, but `rehype-highlight`
+  runs first and prepends `hljs` to the className, so fenced blocks
+  arrived as `"hljs language-rust"` and fell through to the inline
+  branch. Switched the test to `/(?:^|\s)language-\w/` which matches
+  the language token wherever it sits in the class list. Side
+  effects: code blocks now show the language pill (top-left), the
+  copy-on-hover button (top-right), and the proper `pre` wrapper
+  styling that was getting skipped before. Caught by the new
+  Markdown smoke tests.
+
 ### Added
 
 - "Remember for this session" tickbox on permission cards. When ticked,
@@ -62,22 +74,6 @@ build-time Vite define.
   reducer tests under `tests/ui/useMezame.test.ts` cover the
   auto-resolve path, the no-match path, and the existing
   prompt-the-user path.
-
-### Fixed
-
-- Fenced code blocks render with their language pill and copy button
-  again. The Markdown renderer's switch between fenced and inline code
-  used `className.startsWith('language-')`, but `rehype-highlight`
-  runs first and prepends `hljs` to the className, so fenced blocks
-  arrived as `"hljs language-rust"` and fell through to the inline
-  branch. Switched the test to `/(?:^|\s)language-\w/` which matches
-  the language token wherever it sits in the class list. Side
-  effects: code blocks now show the language pill (top-left), the
-  copy-on-hover button (top-right), and the proper `pre` wrapper
-  styling that was getting skipped before. Caught by the new
-  Markdown smoke tests.
-
-### Added
 
 - `mezame --version` and `mezame -V` print the version and exit
   cleanly, instead of falling through to the normal startup path.
