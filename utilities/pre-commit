@@ -65,7 +65,24 @@ else
     exit 1
 fi
 
-# Check 5: UI tests (Vitest). Skipped quietly when node_modules has not
+# Check 5: UI lockfile sync. CI's `npm ci` refuses when
+# `package-lock.json` does not agree with `package.json`. `npm ci
+# --dry-run` does the same comparison locally without hitting the
+# network or writing anything, so we surface drift before the push
+# instead of letting CI catch it.
+if [ -d "ui/node_modules" ]; then
+    print_section "Checking UI lockfile sync..."
+    if (cd ui && npm ci --dry-run --silent --no-audit --no-fund > /dev/null 2>&1); then
+        echo -e " ${GREEN}• Pass${RESET}"
+    else
+        echo -e " ${RED}• Fail${RESET}"
+        echo -e " ${YELLOW}• ui/package-lock.json and ui/package.json disagree.${RESET}"
+        echo -e " ${YELLOW}• Run 'npm install' in ui/ to refresh the lockfile, then stage it.${RESET}"
+        exit 1
+    fi
+fi
+
+# Check 6: UI tests (Vitest). Skipped quietly when node_modules has not
 # been installed yet (a fresh clone) so the hook does not block the
 # very first commit on a new machine. Run `npm install` in `ui/` to
 # enable.

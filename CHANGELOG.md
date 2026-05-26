@@ -13,6 +13,29 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.14] - 2026-05-26
+
+### Changed
+
+- Pre-commit hook now refuses to commit when `ui/package-lock.json`
+  has drifted from `ui/package.json`. Runs `npm ci --dry-run` against
+  the lockfile and reports the mismatch with the fix instructions
+  (`npm install` in `ui/`). Catches the class of CI failure that
+  triggered 0.8.13 before it leaves the developer's machine. Skipped
+  silently when `ui/node_modules` has not been populated, same
+  pattern the Vitest step uses.
+
+## [0.8.13] - 2026-05-26
+
+### Fixed
+
+- CI's `ui-tests` job no longer fails on `npm ci`. The lockfile had
+  drifted from `package.json`: a prior local install had pulled
+  `@emnapi/core` and `@emnapi/runtime` in transitively without
+  refreshing `package-lock.json`. CI's strict `npm ci` refused to
+  install. Regenerated the lockfile so it matches the manifest;
+  twelve missing entries are now in place.
+
 ## [0.8.12] - 2026-05-26
 
 ### Changed

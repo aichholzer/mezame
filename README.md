@@ -2,8 +2,12 @@
 
 # Mezame!
 
+[![Tests](https://github.com/aichholzer/mezame/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aichholzer/mezame/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/aichholzer/mezame/graph/badge.svg?token=UV3BE0RQ0U)](https://codecov.io/gh/aichholzer/mezame)
 [![Latest version](https://img.shields.io/crates/v/mezame.svg)](https://crates.io/crates/mezame)
-![License](https://img.shields.io/crates/l/mezame.svg)
+![License](https://img.shields.io/crates/l/mezame.svg)<br />
+![OSX](https://img.shields.io/badge/-OSX-black)
+![Linux](https://img.shields.io/badge/-Linux-green)
 
 _Wake your agent up from anywhere. Anytime._
 
