@@ -2,17 +2,47 @@
 //! `mezame::session::try_load_session`. Lives in its own integration
 //! binary because it has to override `HOME`, which is process-wide.
 //! Cargo runs each `tests/*.rs` file as a separate test binary, so the
-//! override here cannot bleed into other test files.
+//! override here cannot bleed into other test files. Within the file,
+//! cargo still runs the individual tests concurrently, so we take a
+//! file-scoped mutex around every test that touches `HOME` to keep
+//! them serialised against each other.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use mezame::agent::{from_io, Agent};
 use mezame::session::{steal_stale_session_lock, try_load_session};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 const STALE_LOCK_ERR: &str = "Session is active in another process (pid 1234)";
+
+fn home_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Spawn a short-lived child, wait for it to exit, return its PID. The
+/// PID is guaranteed not to be live at the moment of the call: the
+/// kernel only reuses PIDs after wrap-around, which (under normal CI
+/// load) takes long enough that subsequent `pid_is_alive` checks
+/// against the same PID will return false.
+///
+/// Why not `i32::MAX`: macOS treats out-of-range PIDs as "no such
+/// process" so `kill(MAX, 0)` returns ESRCH, but on some Linux
+/// configurations the same call returns EPERM, which `pid_is_alive`
+/// then reports as "alive" out of conservatism. Using a real reaped
+/// PID side-steps the platform difference.
+fn reaped_child_pid() -> i64 {
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn `true`");
+    let pid = child.id() as i64;
+    let _ = child.wait().expect("wait for `true`");
+    pid
+}
 
 fn spawn_fake_agent(responses: Vec<Result<Value, String>>) -> Agent {
     let (server_to_agent, agent_stdin) = tokio::io::duplex(8 * 1024);
@@ -58,6 +88,7 @@ fn spawn_fake_agent(responses: Vec<Result<Value, String>>) -> Agent {
 
 #[tokio::test(start_paused = true)]
 async fn dead_pid_lockfile_is_stolen_and_retry_succeeds() {
+    let _g = home_lock().lock().await;
     timeout(Duration::from_secs(2), async {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
@@ -66,12 +97,17 @@ async fn dead_pid_lockfile_is_stolen_and_retry_succeeds() {
         let kiro_dir = home.join(".kiro/sessions/cli");
         std::fs::create_dir_all(&kiro_dir).expect("create kiro dir");
         let lock_path = kiro_dir.join(format!("{sid}.lock"));
-        // i32::MAX is virtually guaranteed to be outside the kernel's
-        // PID range, so `pid_is_alive` will return false and the lock
-        // is eligible for stealing.
+        // Use a PID we know is dead: spawn a short-lived child and
+        // reap it. After `wait()`, the kernel has freed the PID and
+        // (on both Linux and macOS) won't reuse it immediately, since
+        // PIDs are allocated sequentially. Using `i32::MAX` here was
+        // not portable: some Linux runners treat very large PIDs
+        // differently from macOS, and `pid_is_alive` would return a
+        // truthy result and the steal would refuse to fire.
+        let pid = reaped_child_pid();
         std::fs::write(
             &lock_path,
-            json!({ "pid": i32::MAX, "started_at": "2026-01-01T00:00:00Z" }).to_string(),
+            json!({ "pid": pid, "started_at": "2026-01-01T00:00:00Z" }).to_string(),
         )
         .expect("write lockfile");
 
@@ -121,6 +157,7 @@ fn isolate_home(sid: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[tokio::test]
 async fn returns_false_when_lockfile_is_missing() {
+    let _g = home_lock().lock().await;
     timeout(Duration::from_secs(2), async {
         let (_tmp, lock_path) = isolate_home("missing");
         assert!(!lock_path.exists(), "tempdir should not contain the lock");
@@ -132,6 +169,7 @@ async fn returns_false_when_lockfile_is_missing() {
 
 #[tokio::test]
 async fn returns_false_when_lockfile_is_malformed_json() {
+    let _g = home_lock().lock().await;
     timeout(Duration::from_secs(2), async {
         let (_tmp, lock_path) = isolate_home("malformed");
         std::fs::write(&lock_path, b"not json at all").expect("write lock");
@@ -148,6 +186,7 @@ async fn returns_false_when_lockfile_is_malformed_json() {
 
 #[tokio::test]
 async fn returns_false_when_lockfile_has_no_pid_field() {
+    let _g = home_lock().lock().await;
     timeout(Duration::from_secs(2), async {
         let (_tmp, lock_path) = isolate_home("nopid");
         std::fs::write(
@@ -165,6 +204,7 @@ async fn returns_false_when_lockfile_has_no_pid_field() {
 
 #[tokio::test]
 async fn returns_false_when_pid_is_alive() {
+    let _g = home_lock().lock().await;
     timeout(Duration::from_secs(2), async {
         let (_tmp, lock_path) = isolate_home("live");
         // Use the test process's own pid: it's running this code, so

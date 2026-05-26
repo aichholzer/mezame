@@ -13,6 +13,36 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.15] - 2026-05-26
+
+### Fixed
+
+- Coverage job started failing after the cargo-llvm-cov switch in
+  0.8.12 because the `tests/session_steal_stale_lock.rs` file had
+  two latent bugs that tarpaulin's parallelism throttle had been
+  hiding. First: the five tests in the file all mutate the
+  process-global `HOME` env var, so cargo's default
+  intra-binary parallelism let one test swap `HOME` mid-flight
+  for another. Second: the dead-PID test used `i32::MAX` as a
+  "definitely dead" sentinel, which macOS reports as ESRCH but
+  some Linux runners do not, so `steal_stale_session_lock`
+  refused to fire. Added a file-scoped `tokio::sync::Mutex` via
+  `OnceLock` (same pattern `tests/http_routes.rs` uses) to
+  serialise the HOME-mutating tests, and replaced the magic PID
+  with a freshly-reaped child PID (`std::process::Command::new("true").spawn().wait()`)
+  which both kernels agree is dead.
+
+- CI's `ui-tests` job kept failing on `npm ci` with `@emnapi/core`
+  and `@emnapi/runtime` missing from `ui/package-lock.json`, even
+  after the 0.8.13 refresh. Cause: Tailwind's optional
+  `@tailwindcss/oxide-wasm32-wasi` package pulls in
+  `@napi-rs/wasm-runtime`, which depends on emnapi. A plain
+  `npm install` on macOS picks the macos-arm64 oxide and never
+  visits the wasi variant, so the emnapi entries never landed in
+  the lockfile; Linux `npm ci` walks a different optional tree and
+  demands them. Regenerated with `npm install --include=optional`
+  so the lockfile is a cross-platform superset.
+
 ## [0.8.14] - 2026-05-26
 
 ### Changed
