@@ -17,6 +17,15 @@ build-time Vite define.
 
 ### Added
 
+- Routing tests for `attachments::fileToAttachment` and the surrounding
+  helpers. Sixteen cases across `tests/ui/attachments.test.ts` cover
+  every accept/reject branch (images, text-resources, binary-resources,
+  size cap), the rejection-message rendering, the `attachmentToBlock`
+  base64/text reader paths, and the `cleanup` URL revocation. The PDF
+  bug (#31) has both an expected-failing test for the desired
+  behaviour and a passing test that locks in the current buggy
+  behaviour, so the fix lands paired with the `it.fails` removal.
+
 - Reducer tests for `useMezame`. Sixteen cases across
   `tests/ui/useMezame.test.ts` lock down the wire shape the UI
   expects from every server message: `ready` (with and without
