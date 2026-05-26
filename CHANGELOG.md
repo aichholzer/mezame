@@ -15,6 +15,17 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Added
+
+- Pure-formatter tests for `lib/time.ts`. Thirteen cases under
+  `tests/ui/time.test.ts` lock the wording `timeAgo` produces at every
+  threshold (just now, 1 min, 59 min, 1 h, 23 h, 1 d, multi-day),
+  confirm the singular noun does not gain an "s", clamp future
+  timestamps to "just now", and assert `formatAbsolute` includes
+  year, day, month token, and a hh:mm separator. Test inputs use
+  explicit `now` arguments and locale-tolerant assertions so the
+  suite is deterministic across hosts and time zones.
+
 ## [0.8.10] - 2026-05-26
 
 ### Fixed
