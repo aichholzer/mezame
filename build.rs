@@ -58,11 +58,24 @@ fn main() {
     println!("cargo:rustc-env=MEZAME_BUILD_ID={build_id}");
 
     if std::env::var_os("MEZAME_SKIP_UI_BUILD").is_some() {
-        // Leave an empty dist/ directory so rust-embed doesn't fail to
-        // resolve the `$OUT_DIR/ui/dist/` folder. The binary will be
-        // missing the UI; that's on the developer who set the flag.
-        std::fs::create_dir_all(&dist_dir)
+        // Leave a minimal dist/ behind: an `index.html` and one hashed
+        // asset under `assets/`. Production code embeds whatever lives
+        // here via rust-embed; the routing tests need real bytes to
+        // serve. The resulting binary is unusable as a UI (no React,
+        // just a stub) but cargo build, cargo test, and the HTTP
+        // integration tests all pass without running Vite.
+        std::fs::create_dir_all(dist_dir.join("assets"))
             .unwrap_or_else(|e| panic!("failed to create {}: {e}", dist_dir.display()));
+        std::fs::write(
+            dist_dir.join("index.html"),
+            "<!doctype html><title>Mezame stub</title>",
+        )
+        .expect("write stub index.html");
+        std::fs::write(
+            dist_dir.join("assets").join("main.abc123.js"),
+            "// stub for tests\n",
+        )
+        .expect("write stub asset");
         return;
     }
 

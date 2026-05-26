@@ -17,6 +17,24 @@ build-time Vite define.
 
 ### Added
 
+- HTTP route tests for the cloudflared transport. Nine cases under
+  `tests/http_routes.rs` drive the real axum router via
+  `tower::ServiceExt::oneshot`, no TCP port required: `GET /state`
+  returns `{}` when the file is missing, `PUT /state` round-trips
+  through `state_path()`, `GET /history` rejects missing and
+  traversing session ids with `400`, returns `{ entries: [] }` for
+  a missing fixture, and parses a real Kiro JSONL into the wire
+  shape the UI expects (role, text, ms-precision timestamps that
+  inherit forward from the most recent `Prompt`). The asset path
+  asserts the cache headers we promise: long max-age + `immutable`
+  for hashed `/assets/*`, `no-cache` for `index.html`, SPA fallback
+  for unknown routes. Drives a new `pub fn build_router` extracted
+  from `run_cloudflared` so production behaviour stays the same.
+  Unblocked by a small `build.rs` tweak: when `MEZAME_SKIP_UI_BUILD=1`
+  the build script now writes a stub `index.html` plus a hashed
+  asset under `assets/` so `rust-embed` has real bytes for the
+  routing tests in CI.
+
 - Browser push notifications for background sessions. When a session
   that is not the active in-app tab transitions into an attention
   state (turn complete, permission requested, error), or any session

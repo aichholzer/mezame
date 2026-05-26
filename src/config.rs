@@ -21,14 +21,14 @@ const MEZAME_ART: &str = r#"
  目覚め!
 "#;
 
-pub(crate) const DEFAULT_PORT: u16 = 9510;
+pub const DEFAULT_PORT: u16 = 9510;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Config {
-    pub(crate) transports: Vec<TransportConfig>,
-    pub(crate) agent_cmd: String,
+pub struct Config {
+    pub transports: Vec<TransportConfig>,
+    pub agent_cmd: String,
     #[serde(default)]
-    pub(crate) agent_args: Vec<String>,
+    pub agent_args: Vec<String>,
 }
 
 /// Transport entries are internally tagged by `kind`, so each variant can
@@ -37,7 +37,7 @@ pub(crate) struct Config {
 /// `run_*` entry point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub(crate) enum TransportConfig {
+pub enum TransportConfig {
     Cloudflared { bind: String },
     // Telegram { token: String } — commented out until `run_telegram`
     // ships. Leaving the variant here would require it to round-trip, and
@@ -52,7 +52,7 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 /// Path to the persistent browser state (currently-open tabs, history list,
 /// active id, next numeric label). Server-side so any device hitting Mezame
 /// sees the same list.
-pub(crate) fn state_path() -> Result<PathBuf> {
+pub fn state_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join(".mezame/state.json"))
 }

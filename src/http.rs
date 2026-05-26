@@ -44,16 +44,7 @@ struct UiAssets;
 //   https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
 
 pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
-    let shared = Arc::new(cfg);
-    let app = Router::new()
-        .route("/ws", get(ws_upgrade))
-        .route("/state", get(get_state).put(put_state))
-        .route("/history", get(get_history))
-        // SPA fallback: /, /assets/*, and any unknown path resolve against
-        // the embedded UI bundle, with index.html as the fallback for
-        // client-side routes.
-        .fallback(get(serve_ui_asset))
-        .with_state(shared);
+    let app = build_router(Arc::new(cfg));
 
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("Mezame is listening on: http://{bind}");
@@ -61,6 +52,21 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Construct the axum router with all production routes wired in. Split
+/// out from `run_cloudflared` so integration tests can drive it via
+/// `tower::ServiceExt::oneshot` without binding a TCP port.
+pub fn build_router(cfg: Arc<Config>) -> Router {
+    Router::new()
+        .route("/ws", get(ws_upgrade))
+        .route("/state", get(get_state).put(put_state))
+        .route("/history", get(get_history))
+        // SPA fallback: /, /assets/*, and any unknown path resolve against
+        // the embedded UI bundle, with index.html as the fallback for
+        // client-side routes.
+        .fallback(get(serve_ui_asset))
+        .with_state(cfg)
 }
 
 /// Resolve when the process receives SIGINT (Ctrl+C) or SIGTERM (systemd

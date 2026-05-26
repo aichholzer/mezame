@@ -41,3 +41,4 @@ strip = true
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["test-util"] }
 tempfile = "3.13"
+tower = { version = "0.5", features = ["util"] }
