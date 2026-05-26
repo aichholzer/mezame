@@ -129,11 +129,12 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Run tests with coverage
-        # Threshold is intentionally modest: ws.rs::handle_ws and the
-        # config interactive setup are not covered. Lift this as new
-        # tests land. Tracking trend over time is more useful than a
-        # tight gate on a young suite.
-        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --fail-under-lines 35
+        # Floor sits comfortably below the current 65.57 figure so
+        # routine drift does not break CI, while still being a
+        # meaningful regression signal: a 5+ point drop will fail
+        # the build. Lift this whenever we land a meaningful
+        # coverage gain.
+        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --fail-under-lines 60
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

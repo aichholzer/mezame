@@ -13,6 +13,18 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.18] - 2026-05-26
+
+### Changed
+
+- CI coverage floor lifted from 35 to 60. Actual coverage is now
+  65.57 after the 0.8.16 and 0.8.17 test additions; the old
+  threshold no longer caught regressions because a wipeout of
+  nearly half the suite would have been needed to trip it. The new
+  floor sits comfortably below the current figure: routine drift
+  passes, a five-plus-point drop fails. The floor is a regression
+  alarm, not a target.
+
 ## [0.8.17] - 2026-05-26
 
 ### Changed
