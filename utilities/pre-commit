@@ -56,13 +56,28 @@ fi
 # Check 4: Cargo test (unit and integration tests)
 # Skip the UI build for tests; they only exercise Rust code and the
 # Vite build is the slowest single step in `cargo test`.
-print_section "Running tests..."
+print_section "Running Rust tests..."
 if MEZAME_SKIP_UI_BUILD=1 cargo test --lib --tests; then
     echo -e " ${GREEN}• Pass${RESET}"
 else
     echo -e " ${RED}• Fail${RESET}"
     echo -e " ${YELLOW}• Fix failing tests before committing${RESET}"
     exit 1
+fi
+
+# Check 5: UI tests (Vitest). Skipped quietly when node_modules has not
+# been installed yet (a fresh clone) so the hook does not block the
+# very first commit on a new machine. Run `npm install` in `ui/` to
+# enable.
+if [ -d "ui/node_modules/vitest" ]; then
+    print_section "Running UI tests..."
+    if (cd ui && npm test --silent); then
+        echo -e " ${GREEN}• Pass${RESET}"
+    else
+        echo -e " ${RED}• Fail${RESET}"
+        echo -e " ${YELLOW}• Fix failing UI tests before committing${RESET}"
+        exit 1
+    fi
 fi
 
 # All checks passed

@@ -17,6 +17,16 @@ build-time Vite define.
 
 ### Added
 
+- UI test scaffolding: Vitest 4.1, jsdom 29, @testing-library/react
+  16, @testing-library/jest-dom 6 and @testing-library/user-event 14.
+  Tests live under `tests/ui/` to match the Rust convention; vitest
+  config inherits `vite.config.ts` so the `@/` alias and Tailwind
+  plugin work the same in tests as in production. New scripts:
+  `npm test` (single pass), `npm run test:watch`, `npm run test:ui`.
+  CI runs the suite in a dedicated `ui-tests` job; the pre-commit
+  hook runs Vitest after the Rust steps when `ui/node_modules` is
+  present.
+
 - Branch coverage for `session::steal_stale_session_lock`. Four new
   cases under `tests/session_steal_stale_lock.rs` cover the
   failure-path returns: lockfile missing, lockfile not valid JSON,

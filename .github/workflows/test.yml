@@ -57,6 +57,27 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --verbose
 
+  ui-tests:
+    name: UI tests (Vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI deps
+        run: npm ci
+        working-directory: ui
+
+      - name: Run Vitest
+        run: npm test
+        working-directory: ui
+
   # Separate job to verify the full release build, including the UI
   # bundle. Slower than the test matrix because it runs the Vite build,
   # so we only do it on Linux.
