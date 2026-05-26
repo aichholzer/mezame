@@ -13,6 +13,23 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.17] - 2026-05-26
+
+### Changed
+
+- Extracted `ws::negotiate_session` from `handle_ws`. The ACP
+  handshake, the resume-vs-new branch, the `ready` emission, and the
+  optional `session_info` emission are now in a public (but
+  `#[doc(hidden)]`) function returning a `NegotiationOutcome`.
+  `handle_ws` reads as a thin attach: spawn agent, negotiate, run the
+  select loop. Production wire shape identical. Five new integration
+  tests under `tests/ws_negotiate_session.rs` drive the helper with a
+  duplex-pipe fake agent (via `Agent::from_io`), covering the fresh
+  path, the resume path with replay-suppression, the fallback after
+  a non-recoverable resume error (sys notice plus new session), the
+  missing-sessionId error, and the empty-promptCapabilities default.
+  Test count went from 84 to 88 Rust tests across 17 files.
+
 ## [0.8.16] - 2026-05-26
 
 ### Changed

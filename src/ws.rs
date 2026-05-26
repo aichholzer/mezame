@@ -51,6 +51,122 @@ async fn start_new_session(agent: &Agent, cwd: &str) -> Result<(String, Option<V
     Ok((sid, extract_session_info(&result)))
 }
 
+/// Outcome of the agent handshake plus session-setup phase. Returned
+/// to `handle_ws` so it can drive the select loop with the right
+/// session id and replay-suppression flag.
+#[doc(hidden)]
+pub struct NegotiationOutcome {
+    pub session_id: String,
+    /// True after a `session/load` resume; the select loop drops Kiro's
+    /// `session/update` replay so the browser's parallel `/history`
+    /// fetch is the single source of truth for past turns.
+    pub suppress_session_updates: bool,
+}
+
+/// Drive the agent handshake and session setup, emitting the `ready`
+/// and (optionally) `session_info` events to the browser via `to_ws_tx`.
+///
+/// Extracted from `handle_ws` so integration tests can drive it with
+/// `Agent::from_io` and a fake agent that responds to `initialize`,
+/// `session/new`, and `session/load`. Production code path is
+/// unchanged: `handle_ws` calls this and continues straight into the
+/// select loop with the returned `NegotiationOutcome`.
+#[doc(hidden)]
+pub async fn negotiate_session(
+    agent: &Agent,
+    to_ws_tx: &mpsc::UnboundedSender<Message>,
+    resume_session_id: Option<String>,
+    cwd_override: Option<String>,
+    build_id: &str,
+) -> Result<NegotiationOutcome> {
+    // ACP handshake. `initialize` advertises no filesystem capabilities
+    // because Mezame does not back `fs/read_text_file` etc. today; the
+    // agent is expected to use its own tools for file I/O.
+    //
+    // The agent responds with its own `agentCapabilities`, including
+    // `promptCapabilities` (image, audio, embeddedContext). We capture
+    // the prompt capabilities to forward to the UI so it can decide
+    // whether to surface image paste/drop and file upload.
+    let initialize_result = agent
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false }
+                }
+            }),
+        )
+        .await
+        .context("Failed to initialize agent")?;
+    let prompt_capabilities = initialize_result
+        .get("agentCapabilities")
+        .and_then(|c| c.get("promptCapabilities"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    // `cwd` comes from the browser's `?cwd=<path>` query param if
+    // provided; otherwise we use Mezame's own process cwd.
+    let cwd_str = match cwd_override {
+        Some(c) => c,
+        None => std::env::current_dir()?.to_string_lossy().to_string(),
+    };
+
+    let (session_id, resumed, session_info) = match resume_session_id {
+        Some(sid) => match try_load_session(agent, &sid, &cwd_str).await {
+            Ok(value) => (sid, true, extract_session_info(&value)),
+            Err(err_str) => {
+                eprintln!("Session load failed: {err_str}. Falling back to a new session.");
+                let _ = to_ws_tx.send(text_msg(json!({
+                    "type": "append",
+                    "role": "sys",
+                    "text": format!(
+                        "\n[{} — Starting a new one.]\n",
+                        short_reason(&err_str)
+                    )
+                })));
+                let (sid, info) = start_new_session(agent, &cwd_str).await?;
+                (sid, false, info)
+            }
+        },
+        None => {
+            let (sid, info) = start_new_session(agent, &cwd_str).await?;
+            (sid, false, info)
+        }
+    };
+
+    // Tell the browser which session id it is bound to so it can
+    // persist it for reconnect, and whether this was a resume (so it
+    // can clear stale log before the replay lands). The `cwd` is the
+    // actual path the agent session was opened with, so the UI can
+    // display it even when no `?cwd=` override was supplied.
+    // `buildId` is a unique-per-build token so the UI can detect a
+    // stale bundle and force a reload.
+    let _ = to_ws_tx.send(text_msg(json!({
+        "type": "ready",
+        "sessionId": session_id,
+        "resumed": resumed,
+        "cwd": cwd_str,
+        "promptCapabilities": prompt_capabilities,
+        "buildId": build_id
+    })));
+
+    // Send the `modes` and `models` payload (if present in either
+    // session/new or session/load result) so the UI can render its
+    // mode/model selectors and the current selections.
+    if let Some(info) = session_info {
+        let _ = to_ws_tx.send(text_msg(json!({
+            "type": "session_info",
+            "info": info
+        })));
+    }
+
+    Ok(NegotiationOutcome {
+        session_id,
+        suppress_session_updates: resumed,
+    })
+}
+
 /// Spawn a task that runs `fut` to completion; on error, push a typed
 /// `error` event to the browser prefixed with `error_prefix`.
 ///
@@ -139,92 +255,18 @@ async fn handle_ws(
         }
     };
 
-    // ACP handshake. `initialize` advertises no filesystem capabilities
-    // because Mezame does not back `fs/read_text_file` etc. today; the agent
-    // is expected to use its own tools for file I/O.
-    //
-    // The agent responds with its own `agentCapabilities`, including
-    // `promptCapabilities` (image, audio, embeddedContext). We capture
-    // the prompt capabilities to forward to the UI so it can decide
-    // whether to surface image paste/drop and file upload.
-    let initialize_result = agent
-        .request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false }
-                }
-            }),
-        )
-        .await
-        .context("Failed to initialize agent")?;
-    let prompt_capabilities = initialize_result
-        .get("agentCapabilities")
-        .and_then(|c| c.get("promptCapabilities"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    // Session setup. If the browser supplied a resume id, try `session/load`
-    // first; on failure fall back to `session/new`. ACP's session/load
-    // replays past messages via session/update notifications on the same
-    // stream, which the select loop will forward to the browser as the
-    // history rehydrates.
-    //
-    // `cwd` comes from the browser's `?cwd=<path>` query param if provided;
-    // otherwise we use Mezame's own process cwd.
-    let cwd_str = match cwd_override {
-        Some(c) => c,
-        None => std::env::current_dir()?.to_string_lossy().to_string(),
-    };
-
-    let (session_id, resumed, session_info) = match resume_session_id {
-        Some(sid) => match try_load_session(&agent, &sid, &cwd_str).await {
-            Ok(value) => (sid, true, extract_session_info(&value)),
-            Err(err_str) => {
-                eprintln!("Session load failed: {err_str}. Falling back to a new session.");
-                let _ = to_ws_tx.send(text_msg(json!({
-                    "type": "append",
-                    "role": "sys",
-                    "text": format!(
-                        "\n[{} — Starting a new one.]\n",
-                        short_reason(&err_str)
-                    )
-                })));
-                let (sid, info) = start_new_session(&agent, &cwd_str).await?;
-                (sid, false, info)
-            }
-        },
-        None => {
-            let (sid, info) = start_new_session(&agent, &cwd_str).await?;
-            (sid, false, info)
-        }
-    };
-
-    // Tell the browser which session id it is bound to so it can persist it
-    // for reconnect, and whether this was a resume (so it can clear stale
-    // log before the replay lands). The `cwd` is the actual path the agent
-    // session was opened with, so the UI can display it even when no
-    // `?cwd=` override was supplied. `buildId` is a unique-per-build token
-    // so the UI can detect a stale bundle and force a reload.
-    let _ = to_ws_tx.send(text_msg(json!({
-        "type": "ready",
-        "sessionId": session_id,
-        "resumed": resumed,
-        "cwd": cwd_str,
-        "promptCapabilities": prompt_capabilities,
-        "buildId": env!("MEZAME_BUILD_ID")
-    })));
-
-    // Send the `modes` and `models` payload (if present in either
-    // session/new or session/load result) so the UI can render its
-    // mode/model selectors and the current selections.
-    if let Some(info) = session_info {
-        let _ = to_ws_tx.send(text_msg(json!({
-            "type": "session_info",
-            "info": info
-        })));
-    }
+    // ACP handshake, session setup, ready/session_info emission. All
+    // moved to a dedicated helper so it can be exercised by an
+    // integration test driving `Agent::from_io`.
+    let outcome = negotiate_session(
+        &agent,
+        &to_ws_tx,
+        resume_session_id,
+        cwd_override,
+        env!("MEZAME_BUILD_ID"),
+    )
+    .await?;
+    let session_id = outcome.session_id;
 
     // After a successful `session/load`, Kiro replays past messages via
     // `session/update` notifications. The browser instead fetches the
@@ -232,7 +274,7 @@ async fn handle_ws(
     // on-disk `.jsonl`), so forwarding Kiro's replay would produce
     // duplicates. Drop `session/update` events until the first user-sent
     // prompt after resume; permission/tool requests still flow through.
-    let mut suppress_session_updates = resumed;
+    let mut suppress_session_updates = outcome.suppress_session_updates;
 
     run_select_loop(
         &mut stream,
