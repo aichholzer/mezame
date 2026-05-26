@@ -75,6 +75,24 @@ export const InputRow = ({ session, onSubmit }: Props) => {
   const caps = session?.promptCapabilities ?? {};
   const canAttachAnything = !!(caps.image || caps.embeddedContext);
 
+  // The picker's `accept` attribute reflects the agent's advertised
+  // capabilities so the OS file dialogue only offers files the agent
+  // can actually take. `image/*` covers every image mime; the textish
+  // branch in `fileToAttachment` recognises a small allowlist so we
+  // hint at those mime types explicitly. When `embeddedContext` is on
+  // we accept everything (binary embedded resources cover anything
+  // not matched by the image / text branches).
+  const acceptAttr = (() => {
+    if (caps.embeddedContext) {
+      // No restriction: any file is fine.
+      return undefined;
+    }
+    if (caps.image) {
+      return 'image/*';
+    }
+    return undefined;
+  })();
+
   // Auto-dismiss any transient notice (rejection reason) after a few
   // seconds so the composer does not accumulate stale messages.
   useEffect(() => {
@@ -391,6 +409,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
                   type="file"
                   multiple
                   hidden
+                  accept={acceptAttr}
                   onChange={handleFilePicker}
                 />
               </>

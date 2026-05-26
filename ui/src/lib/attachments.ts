@@ -42,8 +42,7 @@ export type Attachment = {
 export type RejectReason =
   | { kind: 'too-large'; bytes: number; limit: number }
   | { kind: 'image-not-supported' }
-  | { kind: 'embed-not-supported' }
-  | { kind: 'unknown-type' };
+  | { kind: 'embed-not-supported' };
 
 export type StageResult =
   | { ok: true; attachment: Attachment }
@@ -116,22 +115,28 @@ export const fileToAttachment = (file: File, caps: PromptCapabilities): StageRes
     };
   }
 
-  if (caps.embeddedContext) {
-    return {
-      ok: true,
-      attachment: {
-        id: newId(),
-        name: file.name,
-        mimeType: mime,
-        size: file.size,
-        kind: 'binary-resource',
-        previewUrl: null,
-        file
-      }
-    };
+  if (!caps.embeddedContext) {
+    // Non-image, non-textish (e.g. application/pdf) only ever reaches
+    // the agent as a binary embedded resource. If embeddedContext is
+    // off, the rejection is the same as for textish files: the agent
+    // does not accept embedded content. The previous "unknown-type"
+    // path was misleading; the mime type was fine, the agent just
+    // wouldn't take it.
+    return { ok: false, reason: { kind: 'embed-not-supported' } };
   }
 
-  return { ok: false, reason: { kind: 'unknown-type' } };
+  return {
+    ok: true,
+    attachment: {
+      id: newId(),
+      name: file.name,
+      mimeType: mime,
+      size: file.size,
+      kind: 'binary-resource',
+      previewUrl: null,
+      file
+    }
+  };
 };
 
 const readAsBase64 = (file: File): Promise<string> =>
@@ -195,9 +200,7 @@ export const describeRejection = (reason: RejectReason): string => {
     case 'image-not-supported':
       return 'This agent did not advertise image support.';
     case 'embed-not-supported':
-      return 'This agent did not advertise embedded content support.';
-    case 'unknown-type':
-      return 'Unrecognised file type.';
+      return 'This agent does not accept embedded files.';
   }
 };
 

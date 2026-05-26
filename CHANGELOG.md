@@ -15,6 +15,21 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Fixed
+
+- PDF and other non-image binary uploads no longer surface a misleading
+  "Unrecognised file type." error when the agent has not advertised
+  `embeddedContext`. The mime was always fine; the rejection was
+  always about the missing capability. `fileToAttachment` now folds
+  the trailing `unknown-type` branch into the existing
+  `embed-not-supported` reason, so any non-image embedded file gets
+  the same accurate message regardless of mime ("This agent does not
+  accept embedded files."). The `unknown-type` variant of
+  `RejectReason` is gone; tests for it removed in lockstep. Bonus:
+  the file picker's `accept` attribute now narrows to `image/*` when
+  the agent only advertises image support, so the OS dialogue does
+  not even offer file types the agent will reject.
+
 ### Added
 
 - HTTP route tests for the cloudflared transport. Nine cases under

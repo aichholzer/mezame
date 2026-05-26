@@ -98,28 +98,14 @@ describe('fileToAttachment / binary resources', () => {
     expect(a.previewUrl).toBeNull();
   });
 
-  // KNOWN BUG (#31): when caps.embeddedContext is false and the file is
-  // not an image and not in the small textish allowlist, the function
-  // returns `{ kind: 'unknown-type' }` instead of the more accurate
-  // `embed-not-supported`. The user sees "Unrecognised file type."
-  // when the real cause is that the agent simply doesn't accept
-  // embedded files. `it.fails` marks this as expected-to-fail; once
-  // #31 ships the fix, removing `.fails` will require this test to
-  // pass with the new wording.
-  it.fails(
-    'should reject application/pdf with embed-not-supported when caps.embeddedContext is false (#31)',
-    () => {
-      const r = rejected(pdf(), {});
-      expect(r.kind).toBe('embed-not-supported');
-    }
-  );
-
-  // Lock in the current behaviour so a refactor doesn't accidentally
-  // change the user-facing message in either direction. Update or
-  // remove this test alongside the #31 fix.
-  it('currently returns unknown-type for non-image, non-textish files when embeddedContext is false (#31)', () => {
+  // #31 fix: a non-image, non-textish file (PDF, .docx, etc.) gets
+  // rejected with `embed-not-supported` when the agent does not
+  // advertise embedded content. The previous `unknown-type` rejection
+  // misled users into thinking the mime was wrong; the real reason
+  // was always the missing capability.
+  it('rejects application/pdf with embed-not-supported when caps.embeddedContext is false (#31)', () => {
     const r = rejected(pdf(), {});
-    expect(r.kind).toBe('unknown-type');
+    expect(r.kind).toBe('embed-not-supported');
   });
 });
 
@@ -154,8 +140,7 @@ describe('describeRejection', () => {
     const cases: RejectReason[] = [
       { kind: 'too-large', bytes: 10 * 1024 * 1024, limit: 5 * 1024 * 1024 },
       { kind: 'image-not-supported' },
-      { kind: 'embed-not-supported' },
-      { kind: 'unknown-type' }
+      { kind: 'embed-not-supported' }
     ];
     for (const reason of cases) {
       const text = describeRejection(reason);
