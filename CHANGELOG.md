@@ -17,6 +17,21 @@ build-time Vite define.
 
 ### Added
 
+- Browser push notifications for background sessions. When a session
+  that is not the active in-app tab transitions into an attention
+  state (turn complete, permission requested, error), or any session
+  does so while the whole Mezame tab is hidden, Mezame fires a
+  desktop notification via the browser's `Notification` API. First
+  use surfaces an inline banner asking the user to opt in; clicking
+  "Enable" triggers `Notification.requestPermission()` and persists
+  the choice. The `tag` field deduplicates rapid status changes so
+  the OS replaces prior notifications instead of stacking them.
+  Preference stored in `state.json` under `settings.notifications`
+  (`unset` / `pending` / `on` / `off`). Requires a secure context
+  (https or localhost), so plain-LAN bind addresses won't see the
+  prompt; the favicon badge and attention dots still work in that
+  case.
+
 - Routing tests for `attachments::fileToAttachment` and the surrounding
   helpers. Sixteen cases across `tests/ui/attachments.test.ts` cover
   every accept/reject branch (images, text-resources, binary-resources,

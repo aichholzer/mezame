@@ -35,3 +35,9 @@ ui/*.tsbuildinfo
 .grype/
 .semgrep/
 .syft/
+
+# UI test resolution: the symlink at tests/ui/node_modules points to
+# ui/node_modules so Vite's bare-import resolver can find the package's
+# deps from outside the package root. Don't commit it; the pre-commit
+# script and CI both create it on demand.
+tests/ui/node_modules

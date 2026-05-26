@@ -74,6 +74,13 @@ jobs:
         run: npm ci
         working-directory: ui
 
+      - name: Link node_modules into tests/ui
+        # Vite's bare-import resolver only walks parent directories from
+        # the importing file. Tests live at tests/ui/ which is outside
+        # the ui/ package, so we expose the package's node_modules via
+        # a symlink. Same treatment as the local pre-commit hook.
+        run: ln -s ../../ui/node_modules tests/ui/node_modules
+
       - name: Run Vitest
         run: npm test
         working-directory: ui

@@ -4,10 +4,13 @@ import { Button } from '@/components/ui/button';
 import { InputRow } from '@/features/InputRow';
 import { LogPane } from '@/features/LogPane';
 import { NewSessionDialog } from '@/features/NewSessionDialog';
+import { NotificationsPrompt } from '@/features/NotificationsPrompt';
 import { SideBar } from '@/features/SideBar';
 import { useAttentionBadge } from '@/hooks/useAttentionBadge';
 import { useKeyboardInset } from '@/hooks/useKeyboardInset';
+import { useNotifications } from '@/hooks/useNotifications';
 import { mezameActions, useMezame } from '@/hooks/useMezame';
+import { initSettings } from '@/lib/settings';
 
 export const App = () => {
   const { sessions, closed, activeId, activeSession } = useMezame();
@@ -19,6 +22,7 @@ export const App = () => {
 
   useAttentionBadge();
   useKeyboardInset();
+  useNotifications();
 
   // Mirror the browser tab's visibility onto
   // `<html data-visibility="visible|hidden">` so CSS can pause
@@ -35,6 +39,7 @@ export const App = () => {
 
   useEffect(() => {
     void mezameActions.init();
+    void initSettings();
   }, []);
 
   return (
@@ -103,6 +108,7 @@ export const App = () => {
         onOpenChange={setNewSessionOpen}
         onCreate={(cwd, name) => mezameActions.newSession(cwd, name)}
       />
+      <NotificationsPrompt />
     </div>
   );
 };

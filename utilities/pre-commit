@@ -71,6 +71,13 @@ fi
 # enable.
 if [ -d "ui/node_modules/vitest" ]; then
     print_section "Running UI tests..."
+    # Vite's bare-import resolver only walks parent directories from
+    # the importing file. Tests live at tests/ui/ which is outside
+    # ui/, so we expose the package's node_modules via a symlink that
+    # we recreate on every run. The symlink itself is gitignored.
+    if [ ! -e "tests/ui/node_modules" ]; then
+        ln -s ../../ui/node_modules tests/ui/node_modules
+    fi
     if (cd ui && npm test --silent); then
         echo -e " ${GREEN}• Pass${RESET}"
     else
