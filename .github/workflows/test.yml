@@ -116,28 +116,30 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust
+      - name: Install Rust with llvm-tools
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-tarpaulin
+      - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-tarpaulin
+          tool: cargo-llvm-cov
 
       - name: Run tests with coverage
         # Threshold is intentionally modest: ws.rs::handle_ws and the
         # config interactive setup are not covered. Lift this as new
         # tests land. Tracking trend over time is more useful than a
         # tight gate on a young suite.
-        run: cargo tarpaulin --out Xml --out Stdout --fail-under 35
+        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --fail-under-lines 35
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./cobertura.xml
+          files: ./lcov.info
           flags: rust
           name: codecov-rust
 

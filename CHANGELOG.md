@@ -13,6 +13,18 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.12] - 2026-05-26
+
+### Changed
+
+- Coverage job switched from cargo-tarpaulin to cargo-llvm-cov. Tarpaulin
+  was failing reliably on Linux despite every test binary it spawned
+  reporting ok; the recent duplex-pipe async tests and `tokio::time::pause`
+  usage tripped its instrumentation. llvm-cov uses LLVM's source-based
+  coverage built into rustc, so it does not need a custom test harness,
+  is faster, and emits lcov directly which Codecov v5 accepts natively.
+  The 35% threshold carries over.
+
 ## [0.8.11] - 2026-05-26
 
 ### Changed
