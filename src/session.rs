@@ -87,7 +87,7 @@ pub fn is_stale_lock_error(msg: &str) -> bool {
 /// If the lockfile for `session_id` points at a dead PID, remove it and
 /// return true. Any uncertainty (lockfile missing, unreadable, malformed,
 /// PID still alive) returns false so we fall through to `session/new`.
-fn steal_stale_session_lock(session_id: &str) -> bool {
+pub fn steal_stale_session_lock(session_id: &str) -> bool {
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };

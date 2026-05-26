@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use mezame::agent::{from_io, Agent};
-use mezame::session::try_load_session;
+use mezame::session::{steal_stale_session_lock, try_load_session};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
@@ -95,6 +95,91 @@ async fn dead_pid_lockfile_is_stolen_and_retry_succeeds() {
         assert!(
             !lock_path.exists(),
             "lockfile should have been removed by steal"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+// ---------- direct branch coverage of steal_stale_session_lock ----------
+//
+// The remaining cases call the function directly and never go near
+// `try_load_session`, so they don't need the agent fixture above.
+
+/// Set up an isolated `HOME` for the rest of the test and return the
+/// lockfile path for `sid`. `HOME` is process-wide; this is safe here
+/// because cargo runs each integration test file in its own binary and
+/// the tests within share that file-level isolation.
+fn isolate_home(sid: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kiro_dir = tmp.path().join(".kiro/sessions/cli");
+    std::fs::create_dir_all(&kiro_dir).expect("create kiro dir");
+    std::env::set_var("HOME", tmp.path());
+    let lock = kiro_dir.join(format!("{sid}.lock"));
+    (tmp, lock)
+}
+
+#[tokio::test]
+async fn returns_false_when_lockfile_is_missing() {
+    timeout(Duration::from_secs(2), async {
+        let (_tmp, lock_path) = isolate_home("missing");
+        assert!(!lock_path.exists(), "tempdir should not contain the lock");
+        assert!(!steal_stale_session_lock("missing"));
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn returns_false_when_lockfile_is_malformed_json() {
+    timeout(Duration::from_secs(2), async {
+        let (_tmp, lock_path) = isolate_home("malformed");
+        std::fs::write(&lock_path, b"not json at all").expect("write lock");
+
+        assert!(!steal_stale_session_lock("malformed"));
+        assert!(
+            lock_path.exists(),
+            "malformed lockfile must be preserved, not deleted"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn returns_false_when_lockfile_has_no_pid_field() {
+    timeout(Duration::from_secs(2), async {
+        let (_tmp, lock_path) = isolate_home("nopid");
+        std::fs::write(
+            &lock_path,
+            json!({ "started_at": "2026-01-01T00:00:00Z" }).to_string(),
+        )
+        .expect("write lock");
+
+        assert!(!steal_stale_session_lock("nopid"));
+        assert!(lock_path.exists(), "lockfile without pid must be preserved");
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn returns_false_when_pid_is_alive() {
+    timeout(Duration::from_secs(2), async {
+        let (_tmp, lock_path) = isolate_home("live");
+        // Use the test process's own pid: it's running this code, so
+        // it must be alive, and `pid_is_alive` must return true.
+        let pid = std::process::id() as i64;
+        std::fs::write(
+            &lock_path,
+            json!({ "pid": pid, "started_at": "2026-01-01T00:00:00Z" }).to_string(),
+        )
+        .expect("write lock");
+
+        assert!(!steal_stale_session_lock("live"));
+        assert!(
+            lock_path.exists(),
+            "live-PID lockfile must be preserved (don't kill yourself)"
         );
     })
     .await

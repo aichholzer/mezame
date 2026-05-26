@@ -15,9 +15,14 @@ build-time Vite define.
 
 ## [Unreleased]
 
-## [Unreleased]
-
 ### Added
+
+- Branch coverage for `session::steal_stale_session_lock`. Four new
+  cases under `tests/session_steal_stale_lock.rs` cover the
+  failure-path returns: lockfile missing, lockfile not valid JSON,
+  lockfile JSON without a `pid` field, and live PID (the test
+  process's own pid, which must never be stolen). Each case asserts
+  the lockfile is preserved when stealing was refused.
 
 - Dispatch tests for `ws::handle_agent_message`. Sixteen cases under
   `tests/ws_handle_agent_message.rs` lock down the wire shape of every
