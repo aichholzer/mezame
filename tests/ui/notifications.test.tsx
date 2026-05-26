@@ -89,6 +89,7 @@ const baseSession = (overrides: Partial<Session> = {}): Session => ({
   reconnectAttempt: 0,
   reconnectTimer: null,
   closing: false,
+  inFlight: false,
   ...overrides
 });
 

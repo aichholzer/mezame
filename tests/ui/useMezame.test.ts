@@ -33,6 +33,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     reconnectAttempt: 0,
     reconnectTimer: null,
     closing: false,
+    inFlight: false,
     ...overrides
   };
 }
@@ -79,6 +80,42 @@ describe('applyServerMessage / ready', () => {
     });
     expect(s.log).toEqual([]);
     expect(s.pinnedToBottom).toBe(true);
+  });
+
+  it('clears busy / thinking / inFlight on resume so the composer unsticks', () => {
+    // Simulates the post-idle-drop path: the socket dropped while a
+    // turn was in flight, the close handler set busy=true, and now
+    // the reconnect succeeds. The historical `prompt_done` is not
+    // replayed, so the reducer has to clear the flags itself.
+    const s = makeSession({
+      busy: true,
+      thinking: true,
+      inFlight: true
+    });
+    applyServerMessage(s, {
+      type: 'ready',
+      sessionId: 'abc',
+      resumed: true
+    });
+    expect(s.busy).toBe(false);
+    expect(s.thinking).toBe(false);
+    expect(s.inFlight).toBe(false);
+  });
+
+  it('does not touch busy / thinking on a fresh (non-resume) ready', () => {
+    const s = makeSession({
+      busy: false,
+      thinking: false,
+      inFlight: false
+    });
+    applyServerMessage(s, {
+      type: 'ready',
+      sessionId: 'abc',
+      resumed: false
+    });
+    expect(s.busy).toBe(false);
+    expect(s.thinking).toBe(false);
+    expect(s.inFlight).toBe(false);
   });
 });
 
@@ -298,11 +335,12 @@ describe('applyServerMessage / tool_call', () => {
 // ---------- prompt_done ----------
 
 describe('applyServerMessage / prompt_done', () => {
-  it('clears thinking, clears busy, raises attention to done', () => {
-    const s = makeSession({ thinking: true, busy: true });
+  it('clears thinking, clears busy, clears inFlight, raises attention to done', () => {
+    const s = makeSession({ thinking: true, busy: true, inFlight: true });
     applyServerMessage(s, { type: 'prompt_done' });
     expect(s.thinking).toBe(false);
     expect(s.busy).toBe(false);
+    expect(s.inFlight).toBe(false);
     expect(s.attention).toBe('done');
   });
 });
@@ -311,7 +349,7 @@ describe('applyServerMessage / prompt_done', () => {
 
 describe('applyServerMessage / error', () => {
   it('appends a sys error line and raises error attention', () => {
-    const s = makeSession({ thinking: true, busy: true });
+    const s = makeSession({ thinking: true, busy: true, inFlight: true });
     applyServerMessage(s, { type: 'error', message: 'boom' });
     const entry = lastEntry(s);
     if (entry?.kind === 'text') {
@@ -320,6 +358,7 @@ describe('applyServerMessage / error', () => {
     }
     expect(s.thinking).toBe(false);
     expect(s.busy).toBe(false);
+    expect(s.inFlight).toBe(false);
     expect(s.attention).toBe('error');
   });
 });

@@ -15,6 +15,30 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Fixed
+
+- Composer no longer pins to "Agent is working..." after a long idle
+  drop. Three compounding issues were behind it:
+  1. `ws.onclose` flagged every disconnect as busy, even when no turn
+     was in flight. Idle drops (laptop sleep, network blip, the macOS
+     WebSocket dying quietly across hours of inactivity) left the
+     session pinned to busy with no `prompt_done` coming to clear it.
+  2. `ready { resumed: true }` after a successful reconnect did not
+     clear the busy markers. The server suppresses Kiro's live replay
+     during the resume window, so the historical `prompt_done` never
+     landed.
+  3. Reconnect was driven solely by the exponential back-off (capped
+     at 30s), so returning to an idle tab could mean waiting half a
+     minute for the next attempt instead of going through immediately.
+
+  Fixes: a new `Session.inFlight` flag tracks whether a prompt is
+  actually outstanding, so `ws.onclose` only flags busy when one is.
+  `ready { resumed: true }` now clears `busy`, `thinking`, and
+  `inFlight` as a safety net. A `visibilitychange` listener kicks any
+  session sitting in `reconnecting` to retry immediately when the tab
+  comes back into focus, dropping the worst-case "back to a stale UI"
+  delay from 30s to under a second.
+
 ### Added
 
 - "Remember for this session" tickbox on permission cards. When ticked,

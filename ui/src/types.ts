@@ -213,6 +213,12 @@ export type Session = {
   reconnectAttempt: number;
   reconnectTimer: number | null;
   closing: boolean;
+  /** Whether a `session/prompt` request is currently in flight. Used
+   * by the WS close handler to decide whether to re-flag the session
+   * as `busy` while reconnecting. Set when the user sends a prompt,
+   * cleared on `prompt_done` or `error`. Idle sessions therefore do
+   * not get pinned to "Agent is working..." across an idle drop. */
+  inFlight: boolean;
 };
 
 export type ClosedEntry = {

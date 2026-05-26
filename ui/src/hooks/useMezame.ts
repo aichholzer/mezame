@@ -257,7 +257,8 @@ const makeSession = (
   ws: null,
   reconnectAttempt: 0,
   reconnectTimer: null,
-  closing: false
+  closing: false,
+  inFlight: false
 });
 
 const connect = (s: Session) => {
@@ -288,7 +289,13 @@ const connect = (s: Session) => {
       return;
     }
     setStatus(s, 'reconnecting');
-    setBusy(s, true);
+    // Only treat the disconnect as "still busy" when a turn was
+    // actually in flight when the socket dropped. Idle sessions
+    // would otherwise be pinned to busy until the next prompt_done,
+    // which is never coming if there is no outstanding request.
+    if (s.inFlight) {
+      setBusy(s, true);
+    }
     const delay = Math.min(30000, 500 * Math.pow(2, s.reconnectAttempt));
     s.reconnectAttempt += 1;
     s.reconnectTimer = window.setTimeout(() => connect(s), delay);
@@ -373,6 +380,18 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       s.acpSessionId = msg.sessionId;
       s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
       s.promptCapabilities = msg.promptCapabilities ?? {};
+      // After a resume, clear any in-flight markers we set when the
+      // socket dropped. The agent will not replay the old
+      // `prompt_done` (the server suppresses the live replay during
+      // the resume window), so without this the composer would stay
+      // pinned to busy until the next turn naturally completed.
+      // Safe even on a fresh connect: a session that has not sent a
+      // prompt has both flags clear already.
+      if (msg.resumed) {
+        s.thinking = false;
+        s.inFlight = false;
+        setBusy(s, false);
+      }
       setStatus(s, 'connected');
       break;
     case 'append':
@@ -495,6 +514,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
     }
     case 'prompt_done':
       s.thinking = false;
+      s.inFlight = false;
       ensureTrailingNewline(s);
       // Force a blank line between turns regardless of what the agent's
       // last chunk ended with.
@@ -517,6 +537,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         timestamp: Date.now()
       });
       s.thinking = false;
+      s.inFlight = false;
       setBusy(s, false);
       raiseAttention(s, 'error');
       break;
@@ -560,8 +581,38 @@ const clearActiveAttentionOnVisible = () => {
   }
 };
 
+/** When the browser tab becomes visible after being idle, kick any
+ * session that is currently sitting in `reconnecting` to retry now
+ * instead of waiting out the exponential back-off. macOS' WebSocket
+ * tends to die quietly across long idle periods or display sleep,
+ * so without this the user sees stale UI for up to 30 seconds. */
+const kickReconnectsOnVisible = () => {
+  if (typeof document === 'undefined' || document.visibilityState !== 'visible') {
+    return;
+  }
+  let dirty = false;
+  for (const s of sessions) {
+    if (s.status !== 'reconnecting' || s.closing) {
+      continue;
+    }
+    if (s.reconnectTimer !== null) {
+      clearTimeout(s.reconnectTimer);
+      s.reconnectTimer = null;
+    }
+    // Reset back-off so the first attempt after a deliberate kick is
+    // immediate and any subsequent failures start fresh.
+    s.reconnectAttempt = 0;
+    connect(s);
+    dirty = true;
+  }
+  if (dirty) {
+    notify();
+  }
+};
+
 if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', clearActiveAttentionOnVisible);
+  document.addEventListener('visibilitychange', kickReconnectsOnVisible);
 }
 
 const newSession = (cwd: string | null = null, name: string | null = null) => {
@@ -691,6 +742,7 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   s.ws.send(JSON.stringify({ type: 'prompt', blocks }));
 
   s.thinking = true;
+  s.inFlight = true;
   setBusy(s, true);
   if (!s.used) {
     s.used = true;
