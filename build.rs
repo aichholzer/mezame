@@ -58,12 +58,13 @@ fn main() {
     println!("cargo:rustc-env=MEZAME_BUILD_ID={build_id}");
 
     if std::env::var_os("MEZAME_SKIP_UI_BUILD").is_some() {
-        // Leave a minimal dist/ behind: an `index.html` and one hashed
-        // asset under `assets/`. Production code embeds whatever lives
-        // here via rust-embed; the routing tests need real bytes to
-        // serve. The resulting binary is unusable as a UI (no React,
-        // just a stub) but cargo build, cargo test, and the HTTP
-        // integration tests all pass without running Vite.
+        // Leave a minimal dist/ behind: an `index.html`, the service
+        // worker stub, a hashed asset under `assets/`, and a
+        // top-level fixture file. Production code embeds whatever
+        // lives here via rust-embed; the routing tests need real
+        // bytes to serve. The resulting binary is unusable as a UI
+        // (no React, just a stub) but cargo build, cargo test, and
+        // the HTTP integration tests all pass without running Vite.
         std::fs::create_dir_all(dist_dir.join("assets"))
             .unwrap_or_else(|e| panic!("failed to create {}: {e}", dist_dir.display()));
         std::fs::write(
@@ -71,6 +72,15 @@ fn main() {
             "<!doctype html><title>Mezame stub</title>",
         )
         .expect("write stub index.html");
+        std::fs::write(dist_dir.join("sw.js"), "// stub service worker\n")
+            .expect("write stub sw.js");
+        std::fs::write(
+            dist_dir.join("favicon.png"),
+            // Minimal PNG byte sequence; rust-embed only stores the
+            // bytes, the routing tests just need the file to exist.
+            b"\x89PNG\r\n\x1a\n" as &[u8],
+        )
+        .expect("write stub favicon");
         std::fs::write(
             dist_dir.join("assets").join("main.abc123.js"),
             "// stub for tests\n",

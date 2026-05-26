@@ -44,7 +44,7 @@ pub enum TransportConfig {
     // we do not want to pretend it works.
 }
 
-pub(crate) fn config_path() -> Result<PathBuf> {
+pub fn config_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join(".mezame/config.json"))
 }
@@ -57,7 +57,7 @@ pub fn state_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".mezame/state.json"))
 }
 
-pub(crate) fn load_config() -> Result<Config> {
+pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;

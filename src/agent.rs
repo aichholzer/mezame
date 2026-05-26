@@ -215,7 +215,7 @@ impl Drop for Agent {
 ///   2. Stdout reader, newline-delimited JSON decoder that routes
 ///      responses to their pending oneshots and everything else to the
 ///      returned mpsc receiver.
-pub(crate) async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver<Value>)> {
+pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver<Value>)> {
     let mut cmd = Command::new(&cfg.agent_cmd);
     cmd.args(&cfg.agent_args)
         .stdin(Stdio::piped())

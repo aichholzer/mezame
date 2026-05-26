@@ -13,6 +13,25 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.16] - 2026-05-26
+
+### Changed
+
+- New tests covering previously-uncovered surfaces in `config`,
+  `agent::spawn_agent`, and the HTTP asset path. `config_path`,
+  `state_path`, and `load_config` now have a HOME-driven tempdir
+  suite (8 cases). `spawn_agent` is exercised against a real `cat`
+  subprocess, confirming the stdin / stdout / reader-task wiring
+  and the failure path for a missing binary (3 cases). The asset
+  route tests gained the `sw.js` no-cache assertion and a default-
+  short-cache assertion for top-level static files (3 cases). The
+  `build.rs` SPA stub now writes `sw.js` and a `favicon.png` stub
+  so the new tests have real bytes to fetch under
+  `MEZAME_SKIP_UI_BUILD=1`. Three `pub(crate)` items widened to
+  `pub` so integration tests can import them (`config_path`,
+  `load_config`, `spawn_agent`); no behaviour change. Test count
+  went from 70 to 84 Rust tests across 16 files.
+
 ## [0.8.15] - 2026-05-26
 
 ### Fixed

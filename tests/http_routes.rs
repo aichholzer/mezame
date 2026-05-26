@@ -252,3 +252,41 @@ async fn unknown_path_falls_back_to_index_html() {
         "SPA fallback should serve text/html, got `{ct}`"
     );
 }
+
+#[tokio::test]
+async fn get_sw_js_uses_no_cache_headers() {
+    let _g = home_lock().lock().await;
+
+    let req = Request::get("/sw.js").body(Body::empty()).unwrap();
+    let (status, _, headers) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let ct = headers.get("content-type").unwrap().to_str().unwrap();
+    assert!(
+        ct.starts_with("application/javascript"),
+        "sw.js should be served as JS, got `{ct}`"
+    );
+    let cc = headers.get("cache-control").unwrap().to_str().unwrap();
+    // The service worker must not be aggressively cached or the browser
+    // can keep serving an outdated copy that never updates.
+    assert!(cc.contains("no-cache"), "sw.js cache-control was `{cc}`");
+}
+
+#[tokio::test]
+async fn top_level_static_file_uses_short_cache() {
+    let _g = home_lock().lock().await;
+
+    // `favicon.png` lives at dist root, not under `assets/`. It should
+    // get the default short cache, not the year-long immutable one.
+    let req = Request::get("/favicon.png").body(Body::empty()).unwrap();
+    let (status, _, headers) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let ct = headers.get("content-type").unwrap().to_str().unwrap();
+    assert_eq!(ct, "image/png");
+    let cc = headers.get("cache-control").unwrap().to_str().unwrap();
+    assert!(
+        cc.contains("max-age=3600") && !cc.contains("immutable"),
+        "top-level static cache-control was `{cc}`"
+    );
+}
