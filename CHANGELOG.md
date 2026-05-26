@@ -13,6 +13,24 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.19] - 2026-05-26
+
+### Fixed
+
+- CI's `ui-tests` job kept failing on `npm ci` even after the 0.8.13
+  and 0.8.15 lockfile fixes. The cause was finally diagnosed: every
+  release commit was running
+  `npm install --include=optional --package-lock-only` to refresh
+  the lockfile after a version bump, but `--package-lock-only`
+  skips the install step and so never re-resolves the optional
+  dependency tree. Each release silently dropped the cross-platform
+  optional entries the previous full install had recorded; by 0.8.18
+  they were gone. Regenerated the lockfile cleanly with a real
+  install (no `--package-lock-only`) and added a sentinel grep to
+  the pre-commit hook that fails the commit when the lockfile is
+  missing the top-level `@emnapi/core` entry, with an error message
+  pointing at the correct regenerate sequence.
+
 ## [0.8.18] - 2026-05-26
 
 ### Changed
