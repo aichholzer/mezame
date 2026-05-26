@@ -15,7 +15,34 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fenced code blocks render with their language pill and copy button
+  again. The Markdown renderer's switch between fenced and inline code
+  used `className.startsWith('language-')`, but `rehype-highlight`
+  runs first and prepends `hljs` to the className, so fenced blocks
+  arrived as `"hljs language-rust"` and fell through to the inline
+  branch. Switched the test to `/(?:^|\s)language-\w/` which matches
+  the language token wherever it sits in the class list. Side
+  effects: code blocks now show the language pill (top-left), the
+  copy-on-hover button (top-right), and the proper `pre` wrapper
+  styling that was getting skipped before. Caught by the new
+  Markdown smoke tests.
+
 ### Added
+
+- Smoke tests for the `Markdown` renderer. Nine cases under
+  `tests/ui/markdown.test.tsx` lock down the rendering shape across
+  `react-markdown`, `remark-gfm`, `rehype-highlight`, and the small
+  custom code-block wrapper: paragraphs wrap plain text, ATX
+  headings produce `h1`/`h2`, inline code stays inline, fenced
+  blocks carry a `language-*` class on the inner `code`, the
+  language pill text is visible, fenced blocks without a language
+  do not gain a `language-*` class, the copy button appears next
+  to fenced code, GFM pipe tables render as tables with `<th>` and
+  `<td>` populated, and external links land with `target="_blank"`
+  and a `rel` containing `noreferrer`. A future `react-markdown`
+  or `highlight.js` upgrade is gated by these tests passing.
 
 - Pure-formatter tests for `lib/time.ts`. Thirteen cases under
   `tests/ui/time.test.ts` lock the wording `timeAgo` produces at every

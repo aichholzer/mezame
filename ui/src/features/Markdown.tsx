@@ -64,7 +64,12 @@ const FencedCode = ({ className, children, ...props }: ComponentPropsWithoutRef<
 const components: Components = {
   code(props) {
     const className = props.className ?? '';
-    if (className.startsWith('language-')) {
+    // `rehype-highlight` runs first and prepends `hljs` to the
+    // className, so a fenced block arrives here as `"hljs
+    // language-rust"`, not `"language-rust"`. Match anywhere in the
+    // class list. Inline code (single backticks) never carries a
+    // `language-` token, so this is unambiguous.
+    if (/(?:^|\s)language-\w/.test(className)) {
       return <FencedCode {...props} />;
     }
     return <InlineCode {...props} />;
