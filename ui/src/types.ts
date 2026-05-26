@@ -126,6 +126,10 @@ export type LogEntry =
     timestamp: number;
     /** Set once the user picks an option. Presence disables buttons. */
     resolution?: string;
+    /** True when the resolution was auto-applied from a remembered
+     * policy on the session, not from a click. Drives an "(auto)"
+     * indicator in the resolved card. */
+    auto?: boolean;
   }
   | {
     kind: 'mcp_oauth';
@@ -193,6 +197,16 @@ export type Session = {
    * `_kiro.dev/commands/available` notification. */
   commands: SlashCommand[];
   prompts: SlashPrompt[];
+
+  /** Per-session "remember for this session" policies, keyed by the
+   * permission-request title. When the user ticks the box on a
+   * permission card, the chosen option is stored here; subsequent
+   * permission_requests with the same title auto-resolve with the
+   * remembered option and fire the WS reply without UI. Cleared by
+   * the user via the resolved-card button or implicitly on tab
+   * close. Never persisted: this is session-local only.
+   */
+  rememberedPermissions: Record<string, PermissionOption>;
 
   /** Transient wiring. Not visible to render code. */
   ws: WebSocket | null;

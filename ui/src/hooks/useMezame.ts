@@ -253,6 +253,7 @@ const makeSession = (
   currentModelId: null,
   commands: [],
   prompts: [],
+  rememberedPermissions: {},
   ws: null,
   reconnectAttempt: 0,
   reconnectTimer: null,
@@ -328,6 +329,27 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     scheduleSync();
   }
 
+  // After-the-fact side effect for the auto-resolve path: when
+  // `applyServerMessage` saw a permission_request with a remembered
+  // policy, it pushed a pre-resolved entry. We still owe the agent
+  // a WS reply here. Fire-and-forget; if the WS is gone the user
+  // will see a transport error from the next operation.
+  if (msg.type === 'permission_request') {
+    const last = s.log[s.log.length - 1];
+    if (last && last.kind === 'permission' && last.auto && last.requestId === msg.id) {
+      const remembered = s.rememberedPermissions[msg.title];
+      if (remembered) {
+        s.ws?.send(
+          JSON.stringify({
+            type: 'permission_response',
+            id: last.requestId,
+            optionId: remembered.optionId
+          })
+        );
+      }
+    }
+  }
+
   notify();
 };
 
@@ -367,7 +389,28 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         timestamp: Date.now()
       });
       break;
-    case 'permission_request':
+    case 'permission_request': {
+      // If the user previously ticked "remember for this session" for
+      // a permission with this exact title, resolve the new request
+      // immediately with the stored option. The matching `permission_response`
+      // WS frame is sent by `handleMessage` after the reducer runs;
+      // the reducer itself stays free of side effects.
+      const remembered = s.rememberedPermissions[msg.title];
+      if (remembered) {
+        s.log.push({
+          kind: 'permission',
+          id: newLogId(),
+          requestId: msg.id,
+          title: msg.title,
+          options: msg.options,
+          timestamp: Date.now(),
+          resolution: remembered.name || remembered.optionId || 'option',
+          auto: true
+        });
+        // Deliberately no `raiseAttention`: the user already opted in,
+        // so a remembered allow-or-reject should not draw the eye.
+        break;
+      }
       raiseAttention(s, 'permission');
       s.log.push({
         kind: 'permission',
@@ -378,6 +421,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         timestamp: Date.now()
       });
       break;
+    }
     case 'mcp_oauth_request': {
       // De-dupe re-emissions: Kiro keeps sending while the agent waits.
       // Match by `requestId` when present, otherwise by serverName+url.
@@ -665,7 +709,12 @@ const sendCancel = () => {
   notify();
 };
 
-const resolvePermission = (sessionId: string, logEntryId: string, option: PermissionOption) => {
+const resolvePermission = (
+  sessionId: string,
+  logEntryId: string,
+  option: PermissionOption,
+  remember: boolean = false
+) => {
   const s = findSession(sessionId);
   if (!s) {
     return;
@@ -675,6 +724,12 @@ const resolvePermission = (sessionId: string, logEntryId: string, option: Permis
     return;
   }
   entry.resolution = option.name || option.optionId || 'option';
+  if (remember) {
+    s.rememberedPermissions = {
+      ...s.rememberedPermissions,
+      [entry.title]: option
+    };
+  }
   // User answered the prompt: drop any lingering permission attention
   // so the favicon/title badge de-escalates immediately rather than
   // waiting for a turn end or tab switch.
@@ -688,6 +743,22 @@ const resolvePermission = (sessionId: string, logEntryId: string, option: Permis
       optionId: option.optionId
     })
   );
+  notify();
+};
+
+/** Drop every remembered permission policy on the given session.
+ * Surfaced as a small button on resolved cards that landed via auto;
+ * the next matching `permission_request` will then prompt the user
+ * again. Does not change anything already in the log. */
+const clearRememberedPermissions = (sessionId: string) => {
+  const s = findSession(sessionId);
+  if (!s) {
+    return;
+  }
+  if (Object.keys(s.rememberedPermissions).length === 0) {
+    return;
+  }
+  s.rememberedPermissions = {};
   notify();
 };
 
@@ -791,6 +862,7 @@ export const mezameActions = {
   sendPrompt,
   sendCancel,
   resolvePermission,
+  clearRememberedPermissions,
   setPinnedToBottom,
   setMode,
   setModel,

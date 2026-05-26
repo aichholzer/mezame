@@ -84,6 +84,7 @@ const baseSession = (overrides: Partial<Session> = {}): Session => ({
   currentModelId: null,
   commands: [],
   prompts: [],
+  rememberedPermissions: {},
   ws: null,
   reconnectAttempt: 0,
   reconnectTimer: null,

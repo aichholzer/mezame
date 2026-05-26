@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
 import { McpOauthCard } from '@/features/McpOauthCard';
@@ -31,6 +31,14 @@ const PermissionCard = ({
   options: PermissionOption[];
 }) => {
   const resolved = !!entry.resolution;
+  // "Remember for this session" tickbox state. Resets per card because
+  // each is its own React component instance; that's the right scope.
+  const [remember, setRemember] = useState(false);
+  // True if the session currently has any remembered policies, so the
+  // "Forget for this session" button on resolved cards has something
+  // to clear. Re-evaluating from the live session keeps the button
+  // available across all resolved cards as long as the policy is set.
+  const hasRemembered = Object.keys(session.rememberedPermissions).length > 0;
   const optionTone = (opt: PermissionOption) => {
     const kind = (opt.kind || opt.optionId || '').toString();
     if (kind.startsWith('allow')) {
@@ -53,26 +61,55 @@ const PermissionCard = ({
         permission requested: {entry.title}
       </div>
       {resolved ? (
-        <div className="text-xs text-muted-foreground">→ {entry.resolution}</div>
-      ) : (
-        <div className="flex flex-col gap-2 md:flex-row md:flex-wrap md:gap-1.5">
-          {options.map((opt) => (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span>
+            {`\u2192 ${entry.resolution}`}
+            {entry.auto && (
+              <span className="ml-1 rounded-sm bg-muted px-1 py-0.5 text-[10px] uppercase text-muted-foreground">
+                auto
+              </span>
+            )}
+          </span>
+          {hasRemembered && (
             <button
-              key={opt.optionId}
               type="button"
-              onClick={() => mezameActions.resolvePermission(session.id, entry.id, opt)}
-              className={cn(
-                // Stacked on mobile with 44 px minimum height so each
-                // option has a clearly separate hit area; inline on
-                // desktop with the denser sizing.
-                'cursor-pointer rounded-sm border bg-card text-sm md:text-xs transition-colors',
-                'min-h-11 md:min-h-0 px-4 md:px-2.5 py-2.5 md:py-1',
-                optionTone(opt)
-              )}
+              onClick={() => mezameActions.clearRememberedPermissions(session.id)}
+              className="cursor-pointer rounded-sm border border-border px-1.5 py-0.5 text-[11px] hover:bg-accent"
             >
-              {opt.name || opt.optionId || 'option'}
+              Forget for this session
             </button>
-          ))}
+          )}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-2 md:flex-row md:flex-wrap md:gap-1.5">
+            {options.map((opt) => (
+              <button
+                key={opt.optionId}
+                type="button"
+                onClick={() => mezameActions.resolvePermission(session.id, entry.id, opt, remember)}
+                className={cn(
+                  // Stacked on mobile with 44 px minimum height so each
+                  // option has a clearly separate hit area; inline on
+                  // desktop with the denser sizing.
+                  'cursor-pointer rounded-sm border bg-card text-sm md:text-xs transition-colors',
+                  'min-h-11 md:min-h-0 px-4 md:px-2.5 py-2.5 md:py-1',
+                  optionTone(opt)
+                )}
+              >
+                {opt.name || opt.optionId || 'option'}
+              </button>
+            ))}
+          </div>
+          <label className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+              className="size-3 cursor-pointer"
+            />
+            Remember for this session
+          </label>
         </div>
       )}
     </div>

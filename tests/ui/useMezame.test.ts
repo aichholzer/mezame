@@ -28,6 +28,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     currentModelId: null,
     commands: [],
     prompts: [],
+    rememberedPermissions: {},
     ws: null,
     reconnectAttempt: 0,
     reconnectTimer: null,
@@ -140,6 +141,55 @@ describe('applyServerMessage / permission_request', () => {
       expect(entry.requestId).toBe(7);
       expect(entry.title).toBe('Run shell command');
       expect(entry.options).toHaveLength(2);
+      expect(entry.resolution).toBeUndefined();
+      expect(entry.auto).toBeFalsy();
+    }
+    expect(s.attention).toBe('permission');
+  });
+
+  it('auto-resolves a permission_request when a remembered policy matches', () => {
+    const remembered = { optionId: 'allow_once', name: 'Allow once' };
+    const s = makeSession({
+      rememberedPermissions: {
+        'Run shell command': remembered
+      }
+    });
+    applyServerMessage(s, {
+      type: 'permission_request',
+      id: 11,
+      title: 'Run shell command',
+      options: [
+        { optionId: 'allow_once', name: 'Allow once' },
+        { optionId: 'reject', name: 'Reject' }
+      ]
+    });
+    const entry = lastEntry(s);
+    expect(entry?.kind).toBe('permission');
+    if (entry?.kind === 'permission') {
+      expect(entry.resolution).toBe('Allow once');
+      expect(entry.auto).toBe(true);
+    }
+    // Auto-resolved requests do not raise attention; the user is
+    // not waiting on a click.
+    expect(s.attention).toBeNull();
+  });
+
+  it('does not auto-resolve when only the title differs', () => {
+    const s = makeSession({
+      rememberedPermissions: {
+        'Run shell command': { optionId: 'allow_once' }
+      }
+    });
+    applyServerMessage(s, {
+      type: 'permission_request',
+      id: 12,
+      title: 'Read file',
+      options: [{ optionId: 'allow', name: 'Allow' }]
+    });
+    const entry = lastEntry(s);
+    if (entry?.kind === 'permission') {
+      expect(entry.resolution).toBeUndefined();
+      expect(entry.auto).toBeFalsy();
     }
     expect(s.attention).toBe('permission');
   });

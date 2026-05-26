@@ -15,6 +15,21 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Added
+
+- "Remember for this session" tickbox on permission cards. When ticked,
+  the chosen option is stored on the session keyed by the
+  permission-request title; subsequent requests with the same title
+  auto-resolve and fire the WS reply without UI. The auto-resolved
+  card renders an `auto` indicator next to the resolution and a
+  "Forget for this session" button that clears every remembered
+  policy on the tab. Auto-resolutions deliberately do not raise the
+  attention dot or favicon badge: the user already opted in.
+  Session-local; never persisted across browser reloads. Three new
+  reducer tests under `tests/ui/useMezame.test.ts` cover the
+  auto-resolve path, the no-match path, and the existing
+  prompt-the-user path.
+
 ### Fixed
 
 - Fenced code blocks render with their language pill and copy button
