@@ -15,6 +15,15 @@ build-time Vite define.
 
 ## [Unreleased]
 
+### Changed
+
+- Trimmed the published crate. The `exclude` list in `Cargo.toml` now
+  drops `tests/**`, `.github/**`, `utilities/**`, `Dockerfile`,
+  `compose.yaml`, and the Vitest config files. `cargo install mezame`
+  users no longer download integration tests, CI workflows, or dev
+  hooks they will never run. Local development is unaffected: the
+  exclude only changes the published tarball.
+
 ### Fixed
 
 - Composer no longer pins to "Agent is working..." after a long idle

@@ -18,8 +18,16 @@ categories = ["command-line-utilities", "web-programming::websocket"]
 exclude = [
     "ui/node_modules/**",
     "ui/dist/**",
+    "ui/src/__test_setup.ts",
+    "ui/src/__test_utils.tsx",
+    "ui/vitest.config.ts",
+    "tests/**",
+    ".github/**",
+    "utilities/**",
     "assets/**",
     "docs/**",
+    "Dockerfile",
+    "compose.yaml",
     "CHANGELOG.md"
 ]
 
