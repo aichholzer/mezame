@@ -17,6 +17,27 @@ build-time Vite define.
 
 ### Added
 
+- Reducer tests for `useMezame`. Sixteen cases across
+  `tests/ui/useMezame.test.ts` lock down the wire shape the UI
+  expects from every server message: `ready` (with and without
+  resume), `append` (merge by role, no merge across roles),
+  `permission_request`, `mcp_oauth_request` (dedupe by id, fallback
+  by serverName+url), `tool_call` (push and in-place update),
+  `prompt_done`, `error`, `session_info` (full and partial), and
+  `commands` (last-wins on re-emission). Drives a new pure
+  `applyServerMessage(state, msg)` reducer extracted from
+  `handleMessage`; side effects (build-id reload, history fetch)
+  stay in `handleMessage` so the reducer is fully testable.
+
+### Changed
+
+- `useMezame.ts`: extracted the WS message switch into a pure
+  `applyServerMessage` exported function. Production behaviour is
+  unchanged; the change unlocks unit testing without React or a
+  real WebSocket.
+
+### Added
+
 - UI test scaffolding: Vitest 4.1, jsdom 29, @testing-library/react
   16, @testing-library/jest-dom 6 and @testing-library/user-event 14.
   Tests live under `tests/ui/` to match the Rust convention; vitest

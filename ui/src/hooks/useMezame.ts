@@ -308,36 +308,50 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
   } catch {
     return;
   }
+
+  // Side effects that live outside the pure reducer: a stale build id
+  // triggers a full page reload, and `ready { resumed: true }` kicks off
+  // the `/history` rehydration fetch. Both are kept here so
+  // `applyServerMessage` stays free of `window`/`fetch` to keep it
+  // trivially testable.
+  if (msg.type === 'ready' && msg.buildId && msg.buildId !== __MEZAME_BUILD_ID__) {
+    window.location.reload();
+    return;
+  }
+
+  applyServerMessage(s, msg);
+
+  if (msg.type === 'ready') {
+    if (msg.resumed) {
+      void loadHistory(s);
+    }
+    scheduleSync();
+  }
+
+  notify();
+};
+
+/**
+ * Pure reducer that mutates `s` in response to a parsed `ServerMessage`.
+ * No `window`, no `fetch`, no timers; the call site (`handleMessage`)
+ * owns those. Exported so the test suite can drive it directly without
+ * a real WebSocket.
+ *
+ * @internal
+ */
+export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
   switch (msg.type) {
     case 'ready':
-      // Build-id gate: if the server reports a different build id than
-      // the one baked into this UI bundle, the binary was rebuilt and
-      // the browser is serving a stale bundle. Force a full reload so
-      // the user always sees the latest UI without manual intervention.
-      if (msg.buildId && msg.buildId !== __MEZAME_BUILD_ID__) {
-        window.location.reload();
-        return;
-      }
-      // A resume replays history via session/update — clear stale log so
-      // the replay lands in a fresh pane.
+      // A resume replays history via session/update — clear stale log
+      // so the replay (or the /history seed) lands in a fresh pane.
       if (msg.resumed) {
         s.log = [];
         s.pinnedToBottom = true;
-        s.acpSessionId = msg.sessionId;
-        s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
-        s.promptCapabilities = msg.promptCapabilities ?? {};
-        setStatus(s, 'connected');
-        // Seed from /history for real per-turn timestamps. The server
-        // suppresses the ACP replay stream during the resume window, so
-        // this is the single source of truth.
-        void loadHistory(s);
-      } else {
-        s.acpSessionId = msg.sessionId;
-        s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
-        s.promptCapabilities = msg.promptCapabilities ?? {};
-        setStatus(s, 'connected');
       }
-      scheduleSync();
+      s.acpSessionId = msg.sessionId;
+      s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
+      s.promptCapabilities = msg.promptCapabilities ?? {};
+      setStatus(s, 'connected');
       break;
     case 'append':
       // User-role chunks during replay: make sure each one starts on its
@@ -345,7 +359,13 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
       if (msg.role === 'user') {
         ensureTrailingNewline(s);
       }
-      appendLog(s, { kind: 'text', id: newLogId(), role: msg.role, text: msg.text, timestamp: Date.now() });
+      appendLog(s, {
+        kind: 'text',
+        id: newLogId(),
+        role: msg.role,
+        text: msg.text,
+        timestamp: Date.now()
+      });
       break;
     case 'permission_request':
       raiseAttention(s, 'permission');
@@ -434,12 +454,24 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
       ensureTrailingNewline(s);
       // Force a blank line between turns regardless of what the agent's
       // last chunk ended with.
-      appendLog(s, { kind: 'text', id: newLogId(), role: 'sys', text: '\n', timestamp: Date.now() });
+      appendLog(s, {
+        kind: 'text',
+        id: newLogId(),
+        role: 'sys',
+        text: '\n',
+        timestamp: Date.now()
+      });
       setBusy(s, false);
       raiseAttention(s, 'done');
       break;
     case 'error':
-      appendLog(s, { kind: 'text', id: newLogId(), role: 'sys', text: `\n[Error: ${msg.message}]\n`, timestamp: Date.now() });
+      appendLog(s, {
+        kind: 'text',
+        id: newLogId(),
+        role: 'sys',
+        text: `\n[Error: ${msg.message}]\n`,
+        timestamp: Date.now()
+      });
       s.thinking = false;
       setBusy(s, false);
       raiseAttention(s, 'error');
@@ -455,7 +487,6 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
       s.prompts = msg.prompts;
       break;
   }
-  notify();
 };
 
 // ---------- public actions ----------
