@@ -31,6 +31,13 @@ build-time Vite define.
 
 ### Added
 
+- `mezame --version` and `mezame -V` print the version and exit
+  cleanly, instead of falling through to the normal startup path.
+  `mezame --help` and `-h` print a short usage block listing the
+  `init` subcommand, the two flags, and the `MEZAME_DEBUG_ACP` /
+  `MEZAME_SKIP_UI_BUILD` environment variables. Both flags short
+  circuit before any config load or runtime build.
+
 - Smoke tests for the `Markdown` renderer. Nine cases under
   `tests/ui/markdown.test.tsx` lock down the rendering shape across
   `react-markdown`, `remark-gfm`, `rehype-highlight`, and the small

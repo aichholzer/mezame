@@ -37,9 +37,20 @@ pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let sub = args.get(1).map(String::as_str);
 
-    if sub == Some("init") {
-        init_config()?;
-        return Ok(());
+    match sub {
+        Some("--version") | Some("-V") => {
+            println!("mezame {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("--help") | Some("-h") => {
+            print_help();
+            return Ok(());
+        }
+        Some("init") => {
+            init_config()?;
+            return Ok(());
+        }
+        _ => {}
     }
 
     let cfg = if config_path()?.exists() {
@@ -68,4 +79,27 @@ pub fn run() -> Result<()> {
             ),
         }
     })
+}
+
+fn print_help() {
+    println!(
+        "mezame {version} -- ACP client that bridges a local agent to a browser UI
+
+USAGE:
+    mezame [SUBCOMMAND]
+
+SUBCOMMANDS:
+    init        Run interactive setup and write ~/.mezame/config.json
+    (none)      Load the saved config and start serving
+
+FLAGS:
+    -h, --help      Print this message
+    -V, --version   Print the version and exit
+
+ENVIRONMENT:
+    MEZAME_DEBUG_ACP=1     Echo every inbound ACP frame to stderr
+    MEZAME_SKIP_UI_BUILD=1 Skip the Vite build (developer use only)
+",
+        version = env!("CARGO_PKG_VERSION")
+    );
 }
