@@ -777,6 +777,7 @@ const resolvePermission = (
   }
   entry.resolution = option.name || option.optionId || 'option';
   if (remember) {
+    entry.remembered = true;
     s.rememberedPermissions = {
       ...s.rememberedPermissions,
       [entry.title]: option
@@ -795,6 +796,23 @@ const resolvePermission = (
       optionId: option.optionId
     })
   );
+  notify();
+};
+
+/** Drop a single remembered permission policy by title. The next
+ * matching `permission_request` will prompt the user again. Does
+ * not change anything already in the log. */
+const forgetRememberedPermission = (sessionId: string, title: string) => {
+  const s = findSession(sessionId);
+  if (!s) {
+    return;
+  }
+  if (!(title in s.rememberedPermissions)) {
+    return;
+  }
+  const next = { ...s.rememberedPermissions };
+  delete next[title];
+  s.rememberedPermissions = next;
   notify();
 };
 
@@ -914,6 +932,7 @@ export const mezameActions = {
   sendPrompt,
   sendCancel,
   resolvePermission,
+  forgetRememberedPermission,
   clearRememberedPermissions,
   setPinnedToBottom,
   setMode,

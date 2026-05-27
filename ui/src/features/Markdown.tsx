@@ -1,5 +1,5 @@
-import type { ComponentPropsWithoutRef } from 'react';
-import { memo } from 'react';
+import type { ComponentPropsWithoutRef, ReactNode } from 'react';
+import { isValidElement, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
@@ -30,30 +30,73 @@ const InlineCode = ({ className, children, ...props }: ComponentPropsWithoutRef<
   </code>
 );
 
+/**
+ * Recursively flatten a React node into its plain-text content.
+ *
+ * Rehype-highlight wraps highlighted tokens in `<span>` elements, so
+ * by the time the code block reaches our `FencedCode` renderer the
+ * children are a mixed tree of strings (whitespace and punctuation
+ * between tokens) and React elements (the tokens themselves). The
+ * copy button needs the original source, which means walking every
+ * branch.
+ *
+ * Numbers are coerced to strings so `Date.now()` and similar
+ * highlighted literal values still copy. Anything else (booleans,
+ * null, undefined, fragments without children) contributes nothing.
+ */
+const nodeToText = (node: ReactNode): string => {
+  if (node === null || node === undefined || typeof node === 'boolean') {
+    return '';
+  }
+  if (typeof node === 'string') {
+    return node;
+  }
+  if (typeof node === 'number') {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map(nodeToText).join('');
+  }
+  if (isValidElement(node)) {
+    const { children } = node.props as { children?: ReactNode };
+    return nodeToText(children);
+  }
+  return '';
+};
+
 const FencedCode = ({ className, children, ...props }: ComponentPropsWithoutRef<'code'>) => {
   const langMatch = /language-(\w+)/.exec(className ?? '');
   const lang = langMatch?.[1];
-  // children are the source lines as strings / rehype-generated elements;
-  // flatten to string for copy.
-  const raw =
-    typeof children === 'string'
-      ? children
-      : Array.isArray(children)
-        ? children.map((c) => (typeof c === 'string' ? c : '')).join('')
-        : String(children ?? '');
-  const text = raw.replace(/\n$/, '');
+  // The copy button needs the raw text of the code block. After
+  // `rehype-highlight` runs, `children` is a tree of React elements
+  // (highlighted spans like `<span class="hljs-keyword">if</span>`)
+  // interleaved with the raw whitespace and punctuation between
+  // tokens. A flat join of only the string entries silently drops
+  // every highlighted token from the copy buffer; we need to walk
+  // the tree and collect every text node.
+  const text = nodeToText(children).replace(/\n$/, '');
 
+  // Layout: a top gutter row holds the language label (left) and the
+  // copy button (right); the code element sits below it. Previously
+  // the pill and the copy button were absolute-positioned over the
+  // top-left and top-right corners and painted on top of the first
+  // line of code. The flex bar gives them their own space and the
+  // code text always starts cleanly below.
   return (
-    <span className="group relative block">
-      {lang && (
-        <span className="absolute top-1.5 left-2 z-10 rounded-sm bg-card/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-          {lang}
-        </span>
-      )}
-      <CopyButton
-        text={text}
-        className="absolute top-1.5 right-1.5 z-10 opacity-0 transition-opacity group-hover:opacity-100"
-      />
+    <span className="group block">
+      <span className="flex items-center justify-between pb-1">
+        {lang ? (
+          <span className="rounded-sm bg-card/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            {lang}
+          </span>
+        ) : (
+          <span aria-hidden="true" />
+        )}
+        <CopyButton
+          text={text}
+          className="opacity-0 transition-opacity group-hover:opacity-100"
+        />
+      </span>
       <code className={cn('block', className)} {...props}>
         {children}
       </code>

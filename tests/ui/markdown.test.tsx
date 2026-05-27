@@ -4,7 +4,7 @@
 // catch a version bump that quietly changes the rendered output, not
 // to assert the exact HTML.
 
-import { render, screen } from '@/__test_utils';
+import { fireEvent, render, screen } from '@/__test_utils';
 import { Markdown } from '@/features/Markdown';
 
 describe('Markdown', () => {
@@ -56,6 +56,44 @@ describe('Markdown', () => {
     render(<Markdown text={fence} />);
     // CopyButton uses `aria-label="Copy"` by default.
     expect(screen.getByRole('button', { name: /copy/i })).toBeInTheDocument();
+  });
+
+  it('copies the full code body, not just whitespace between highlighted tokens', async () => {
+    // Regression for the bug where `nodeToText` only flattened the
+    // string entries in `children` and silently dropped every
+    // highlighted span (`hljs-*`). On css blocks that meant copy
+    // produced punctuation only: `{: ;: ( - );}` for the input
+    // `.element { width: 100vw; margin-left: calc(50% - 50vw); }`.
+    const css = [
+      '```css',
+      '.element {',
+      '  width: 100vw;',
+      '  margin-left: calc(50% - 50vw);',
+      '}',
+      '```'
+    ].join('\n');
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText }
+    });
+
+    render(<Markdown text={css} />);
+    // The copy button is rendered with `opacity-0` until the group is
+    // hovered, which makes user-event v14 consider it non-pointer-
+    // interactive. `fireEvent.click` skips that check and exercises
+    // the same onClick path the user would trigger on hover.
+    fireEvent.click(screen.getByRole('button', { name: /copy/i }));
+    // The copy handler is async; let the microtask queue drain before
+    // we check the mock.
+    await Promise.resolve();
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const copied = writeText.mock.calls[0][0] as string;
+    expect(copied).toContain('.element');
+    expect(copied).toContain('width: 100vw');
+    expect(copied).toContain('margin-left: calc(50% - 50vw)');
   });
 
   it('renders a GFM pipe table inside a wrapper', () => {

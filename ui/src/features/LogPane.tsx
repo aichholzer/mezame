@@ -34,11 +34,17 @@ const PermissionCard = ({
   // "Remember for this session" tickbox state. Resets per card because
   // each is its own React component instance; that's the right scope.
   const [remember, setRemember] = useState(false);
-  // True if the session currently has any remembered policies, so the
-  // "Forget for this session" button on resolved cards has something
-  // to clear. Re-evaluating from the live session keeps the button
-  // available across all resolved cards as long as the policy is set.
-  const hasRemembered = Object.keys(session.rememberedPermissions).length > 0;
+  // Whether this card is connected to a remembered-policy slot, i.e.
+  // it either set the policy (`remembered`) or was auto-resolved by
+  // it (`auto`). Subsequent auto cards keep the badge until the user
+  // disables the policy on any matching card.
+  const isRememberedCard = entry.remembered || entry.auto;
+  // Active iff the policy is still live (not yet disabled). Looking
+  // it up against the live session state means a click on Disable on
+  // any card with the same title clears the badge on every other
+  // card too, which matches the user's mental model: there is one
+  // policy per title, not one per card.
+  const policyActive = entry.title in session.rememberedPermissions;
   const optionTone = (opt: PermissionOption) => {
     const kind = (opt.kind || opt.optionId || '').toString();
     if (kind.startsWith('allow')) {
@@ -65,19 +71,33 @@ const PermissionCard = ({
           <span>
             {`\u2192 ${entry.resolution}`}
             {entry.auto && (
-              <span className="ml-1 rounded-sm bg-muted px-1 py-0.5 text-[10px] uppercase text-muted-foreground">
+              <span
+                className="ml-1 rounded-sm bg-muted px-1 py-0.5 text-[10px] uppercase text-muted-foreground"
+                title="Resolved automatically by a remembered policy"
+              >
                 auto
               </span>
             )}
           </span>
-          {hasRemembered && (
-            <button
-              type="button"
-              onClick={() => mezameActions.clearRememberedPermissions(session.id)}
-              className="cursor-pointer rounded-sm border border-border px-1.5 py-0.5 text-[11px] hover:bg-accent"
-            >
-              Forget for this session
-            </button>
+          {isRememberedCard && policyActive && (
+            <>
+              <span
+                className="rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                title="Future requests with this title auto-resolve until you disable the policy"
+              >
+                Remembered for this session
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  mezameActions.forgetRememberedPermission(session.id, entry.title)
+                }
+                className="cursor-pointer rounded-sm border border-border px-1.5 py-0.5 text-[11px] hover:bg-accent"
+                title="Stop auto-resolving future requests with this title"
+              >
+                Disable
+              </button>
+            </>
           )}
         </div>
       ) : (
@@ -108,7 +128,7 @@ const PermissionCard = ({
               onChange={(e) => setRemember(e.target.checked)}
               className="size-3 cursor-pointer"
             />
-            Remember for this session
+            Remember my choice and apply automatically next time
           </label>
         </div>
       )}

@@ -13,6 +13,48 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.20] - 2026-05-27
+
+### Fixed
+
+- The copy button on syntax-highlighted code blocks now copies the
+  full source instead of dropping every highlighted token. Bug
+  surfaced on a CSS snippet: `.element { width: 100vw; ... }`
+  pasted as `{: ;: ( - );}`. After `rehype-highlight` runs, the
+  `<code>` element's children are a mix of plain strings (the
+  whitespace and punctuation between tokens) and React elements
+  (the `<span class="hljs-keyword">` tokens themselves). The
+  flattener was joining only the strings, silently dropping every
+  span. New `nodeToText` helper recursively walks the React tree
+  and concatenates every text node. Regression test under
+  `tests/ui/markdown.test.tsx` clicks the copy button and asserts
+  the css source survives the round-trip.
+
+- Markdown code blocks no longer paint the language pill on top of
+  the first line of code. The pill and copy button were
+  absolute-positioned over the top corners of the code area and
+  overlapped both the syntax-highlighted text and (on hover) any
+  long first line. Replaced the absolute positioning with a flex
+  gutter row at the top of the block: language label on the left,
+  copy button on the right, code element underneath. Code blocks
+  without a language render the same gutter (with an empty left
+  slot) so the copy button stays in the same position regardless.
+
+### Changed
+
+- Reworked the remembered-permission affordances on the permission
+  card. The previous "Forget for this session" button appeared on
+  every resolved card whenever any policy was active, with wording
+  that read like a state ("this is forgotten") instead of an action.
+  Now the originating card and any subsequent auto-resolved cards
+  carry a `Remembered for this session` status badge plus a `Disable`
+  button; cards that have nothing to do with a remembered policy
+  stay clean. New per-title `forgetRememberedPermission` action
+  clears just the policy that matches a given card, so Disable on
+  one card no longer wipes every other remembered policy on the
+  tab. Tickbox label rewritten to "Remember my choice and apply
+  automatically next time" so users know what ticking it does.
+
 ## [0.8.19] - 2026-05-26
 
 ### Fixed

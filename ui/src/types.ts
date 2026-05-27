@@ -130,6 +130,12 @@ export type LogEntry =
      * policy on the session, not from a click. Drives an "(auto)"
      * indicator in the resolved card. */
     auto?: boolean;
+    /** True when the user explicitly ticked "Remember for this
+     * session" on this card before picking an option. Distinct from
+     * `auto`: this flag identifies the originating card, `auto`
+     * identifies subsequent auto-resolutions. Both surface the
+     * remembered-policy UI. */
+    remembered?: boolean;
   }
   | {
     kind: 'mcp_oauth';
