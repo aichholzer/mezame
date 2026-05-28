@@ -25,7 +25,16 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::config::{state_path, Config};
+use crate::hub::HubRegistry;
 use crate::ws::ws_upgrade;
+
+/// Shared state for the axum router. Bundles the static `Config` with
+/// the live `HubRegistry` so the WS handler can attach to existing
+/// hubs or create new ones for fresh sessions.
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub hubs: HubRegistry,
+}
 
 /// React UI bundle baked into the binary by `build.rs` + `rust-embed`.
 ///
@@ -44,7 +53,11 @@ struct UiAssets;
 //   https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
 
 pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
-    let app = build_router(Arc::new(cfg));
+    let state = Arc::new(AppState {
+        config: Arc::new(cfg),
+        hubs: HubRegistry::new(),
+    });
+    let app = build_router(state);
 
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("Mezame is listening on: http://{bind}");
@@ -57,7 +70,7 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
 /// Construct the axum router with all production routes wired in. Split
 /// out from `run_cloudflared` so integration tests can drive it via
 /// `tower::ServiceExt::oneshot` without binding a TCP port.
-pub fn build_router(cfg: Arc<Config>) -> Router {
+pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ws", get(ws_upgrade))
         .route("/state", get(get_state).put(put_state))
@@ -66,7 +79,7 @@ pub fn build_router(cfg: Arc<Config>) -> Router {
         // the embedded UI bundle, with index.html as the fallback for
         // client-side routes.
         .fallback(get(serve_ui_asset))
-        .with_state(cfg)
+        .with_state(state)
 }
 
 /// Resolve when the process receives SIGINT (Ctrl+C) or SIGTERM (systemd

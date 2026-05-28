@@ -15,7 +15,8 @@ use std::sync::OnceLock;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use mezame::config::{Config, TransportConfig};
-use mezame::http::build_router;
+use mezame::http::{build_router, AppState};
+use mezame::hub::HubRegistry;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -27,19 +28,22 @@ fn home_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn dummy_config() -> Arc<Config> {
-    Arc::new(Config {
-        transports: vec![TransportConfig::Cloudflared {
-            bind: "127.0.0.1:0".to_string(),
-        }],
-        agent_cmd: "/bin/true".to_string(),
-        agent_args: vec![],
+fn dummy_state() -> Arc<AppState> {
+    Arc::new(AppState {
+        config: Arc::new(Config {
+            transports: vec![TransportConfig::Cloudflared {
+                bind: "127.0.0.1:0".to_string(),
+            }],
+            agent_cmd: "/bin/true".to_string(),
+            agent_args: vec![],
+        }),
+        hubs: HubRegistry::new(),
     })
 }
 
 /// Send a single request through the router and return (status, body).
 async fn run_request(req: Request<Body>) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
-    let app = build_router(dummy_config());
+    let app = build_router(dummy_state());
     let res = app.oneshot(req).await.expect("router did not respond");
     let status = res.status();
     let headers = res.headers().clone();

@@ -19,6 +19,7 @@
 pub mod agent;
 pub mod config;
 pub mod http;
+pub mod hub;
 pub mod session;
 pub mod ws;
 

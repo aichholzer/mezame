@@ -28,8 +28,7 @@ use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::agent::{spawn_agent, Agent};
-use crate::config::Config;
+use crate::agent::Agent;
 use crate::session::{extract_session_info, short_reason, try_load_session};
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -193,19 +192,20 @@ fn spawn_with_error_report(
 pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
     Query(params): Query<HashMap<String, String>>,
-    State(cfg): State<Arc<Config>>,
+    State(state): State<Arc<crate::http::AppState>>,
 ) -> Response {
-    // `/ws?session=<acp-session-id>` asks Mezame to call `session/load` on the
-    // agent instead of `session/new`. Absent = always new session.
-    // `/ws?cwd=<path>` overrides the working directory for this session;
-    // absent or empty = Mezame's own process cwd.
+    // `/ws?session=<acp-session-id>` asks Mezame to attach to an
+    // existing hub or create one with `session/load`. Absent =
+    // always new session.
+    // `/ws?cwd=<path>` overrides the working directory for this
+    // session; absent or empty = Mezame's own process cwd.
     let resume = params.get("session").cloned();
     let cwd_override = params
         .get("cwd")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws(socket, cfg, resume, cwd_override).await {
+        if let Err(e) = handle_ws(socket, state, resume, cwd_override).await {
             eprintln!("WebSocket session ended: {e:?}");
         }
     })
@@ -219,15 +219,18 @@ fn text_msg(value: Value) -> Message {
 
 async fn handle_ws(
     ws: WebSocket,
-    cfg: Arc<Config>,
+    state: Arc<crate::http::AppState>,
     resume_session_id: Option<String>,
     cwd_override: Option<String>,
 ) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
     let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
 
-    // Writer task: drain the outbound channel into the WS sink. Exits when
-    // the channel is closed (all senders dropped) or the sink errors.
+    // Writer task: drain the outbound channel into the WS sink. Exits
+    // when the channel is closed (all senders dropped) or the sink
+    // errors. Same pattern the previous one-WS-per-agent design used;
+    // the only difference is now this task forwards events from a
+    // hub broadcast plus error notices we generate locally.
     let writer = tokio::spawn(async move {
         while let Some(msg) = to_ws_rx.recv().await {
             if sink.send(msg).await.is_err() {
@@ -236,15 +239,19 @@ async fn handle_ws(
         }
     });
 
-    // The browser's sticky status banner shows "connecting..." until the
-    // `ready` message arrives, so we no longer echo a startup line into
-    // the log. This keeps the log free of protocol chatter.
-
-    // If spawn fails (bad agent_cmd, missing binary, ...) tell the browser
-    // and close cleanly. Do NOT return an Err here: the writer task still
-    // needs to drain the error message before we exit.
-    let (agent, mut updates_rx) = match spawn_agent(&cfg).await {
-        Ok((a, rx)) => (Arc::new(a), rx),
+    // Attach to (or create) the hub for the requested session id. On
+    // failure tell the browser and exit cleanly.
+    let attached = match state
+        .hubs
+        .attach_or_create(
+            state.config.clone(),
+            resume_session_id,
+            cwd_override,
+            env!("MEZAME_BUILD_ID"),
+        )
+        .await
+    {
+        Ok(a) => a,
         Err(e) => {
             let _ = to_ws_tx.send(text_msg(
                 json!({ "type": "error", "message": format!("{e}") }),
@@ -255,49 +262,110 @@ async fn handle_ws(
         }
     };
 
-    // ACP handshake, session setup, ready/session_info emission. All
-    // moved to a dedicated helper so it can be exercised by an
-    // integration test driving `Agent::from_io`.
-    let outcome = negotiate_session(
-        &agent,
-        &to_ws_tx,
-        resume_session_id,
-        cwd_override,
-        env!("MEZAME_BUILD_ID"),
-    )
-    .await?;
-    let session_id = outcome.session_id;
+    // Replay the negotiation snapshot to this subscriber so it sees
+    // the same `ready` (and optionally `session_info`) the first
+    // browser saw. Subsequent agent events come in via the broadcast.
+    let _ = to_ws_tx.send(text_msg(attached.snapshot_ready.clone()));
+    if let Some(info) = attached.snapshot_session_info.clone() {
+        let _ = to_ws_tx.send(text_msg(info));
+    }
 
-    // After a successful `session/load`, Kiro replays past messages via
-    // `session/update` notifications. The browser instead fetches the
-    // history via `/history` (with real per-turn timestamps from the
-    // on-disk `.jsonl`), so forwarding Kiro's replay would produce
-    // duplicates. Drop `session/update` events until the first user-sent
-    // prompt after resume; permission/tool requests still flow through.
-    let mut suppress_session_updates = outcome.suppress_session_updates;
+    let mut outbound = attached.outbound.resubscribe();
+    let commands = attached.commands.clone();
 
-    run_select_loop(
-        &mut stream,
-        &to_ws_tx,
-        agent.clone(),
-        &mut updates_rx,
-        &session_id,
-        &mut suppress_session_updates,
-    )
-    .await;
+    // Per-WS attach loop. Mirrors the original `run_select_loop`
+    // shape: WS-frame branch parses browser messages and forwards as
+    // `HubCommand`s; broadcast branch serialises agent events for
+    // this WS sink. Same exhaustive `Option<Result<_,_>>` matching
+    // we settled on in 0.8.7 so peer close, transport error, and
+    // close frame all break the loop.
+    loop {
+        tokio::select! {
+            ws_msg = stream.next() => {
+                let text = match ws_msg {
+                    None => break,
+                    Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Text(t))) => t,
+                    Some(Ok(_)) => continue,
+                };
+                let v: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(cmd) = parse_browser_command(&v) {
+                    if commands.send(cmd).await.is_err() {
+                        // Hub owner gone; nothing more to do.
+                        break;
+                    }
+                }
+            }
+            evt = outbound.recv() => {
+                match evt {
+                    Ok(value) => {
+                        let _ = to_ws_tx.send(text_msg((*value).clone()));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Slow subscriber; let the next recv pick up
+                        // the current head. Nothing to send to the
+                        // browser: the sender already dropped these
+                        // events from the queue, and surfacing a
+                        // "you missed N frames" notice would just
+                        // confuse the user.
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
 
-    // Cooperative shutdown of the agent subprocess. Sends `session/cancel`,
-    // closes stdin, and waits briefly for exit so Kiro can release its
-    // session lock. `kill_on_drop` stays on as a safety net in case the
-    // agent doesn't honour EOF within the timeout.
-    agent.shutdown(Some(&session_id)).await;
-
-    // Closing the outbound channel unblocks the writer task. The agent
-    // child is killed on drop of the `Agent` (see `kill_on_drop(true)` in
-    // `spawn_agent`) if shutdown timed out above.
+    // Drop `attached` first so the counter decrements before we
+    // close the writer. The grace timer arms here if we were the
+    // last subscriber.
+    drop(attached);
     drop(to_ws_tx);
     let _ = writer.await;
     Ok(())
+}
+
+/// Translate a parsed browser-message JSON into a `HubCommand`.
+/// Returns `None` for unknown types or malformed payloads; the
+/// caller treats that as "skip this frame".
+fn parse_browser_command(v: &Value) -> Option<crate::hub::HubCommand> {
+    match v.get("type").and_then(Value::as_str)? {
+        "prompt" => {
+            let blocks: Vec<Value> = if let Some(blocks) =
+                v.get("blocks").and_then(Value::as_array)
+            {
+                blocks.clone()
+            } else if let Some(text) = v.get("text").and_then(Value::as_str) {
+                vec![json!({ "type": "text", "text": text })]
+            } else {
+                return None;
+            };
+            Some(crate::hub::HubCommand::Prompt { blocks })
+        }
+        "permission_response" => {
+            let id = v.get("id").cloned()?;
+            let option_id = v
+                .get("optionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some(crate::hub::HubCommand::PermissionResponse { id, option_id })
+        }
+        "cancel" => Some(crate::hub::HubCommand::Cancel),
+        "set_mode" => {
+            let mode_id = v.get("modeId").and_then(Value::as_str)?.to_string();
+            Some(crate::hub::HubCommand::SetMode { mode_id })
+        }
+        "set_model" => {
+            let model_id = v.get("modelId").and_then(Value::as_str)?.to_string();
+            Some(crate::hub::HubCommand::SetModel { model_id })
+        }
+        _ => None,
+    }
 }
 
 /// Drive the per-session select loop until either the WS stream or the

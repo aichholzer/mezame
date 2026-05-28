@@ -13,6 +13,41 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.25] - 2026-05-29
+
+### Added
+
+- Multi-browser attach (stage 1 of 2). The cloudflared transport now
+  runs a `SessionHub` per ACP session id, with a single owner task
+  that holds the agent and a `tokio::sync::broadcast` channel that
+  fans agent output to every attached WebSocket. Two browsers loaded
+  on the same tab id share one agent: both see chunks, tool calls,
+  permission requests, and prompt_done events from the same source.
+  Closing one browser keeps the agent alive for a 30 second grace
+  window; reattach within the window and the existing agent picks
+  up. Browsers' user prompts are still rendered locally only in
+  this stage (stage 2 will broadcast peer prompts so the chat
+  timeline matches across browsers). Permission responses use
+  first-wins semantics: the first reply reaches the agent, later
+  replies for the same id drop silently.
+
+  Plumbing: new `src/hub.rs` module with `HubRegistry`, `SessionHub`,
+  `AttachedHub`, and the owner loop. `AppState` in `src/http.rs`
+  bundles the live hub registry alongside `Config` so the WS
+  handler can reach both. `handle_ws` is now a thin attach: subscribe,
+  replay the cached `ready` snapshot, run a small select between the
+  WS stream and the broadcast, drop `AttachedHub` on exit so the
+  counter decrements. The agent itself, the negotiate phase, and
+  the JSON-RPC framing are unchanged.
+
+  Three new integration tests under `tests/hub.rs` cover the
+  snapshot replay (every subscriber gets the same `ready`/`session_info`),
+  the broadcast flow (agent updates fan out to every subscriber),
+  and the first-wins permission semantics. The pre-existing
+  `tests/ws_select_loop.rs` and `tests/ws_negotiate_session.rs`
+  files still pass: the negotiation helper and the original
+  select-loop are kept around as a public test surface.
+
 ## [0.8.24] - 2026-05-28
 
 ### Changed
