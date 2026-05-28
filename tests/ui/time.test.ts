@@ -24,29 +24,53 @@ describe('timeAgo', () => {
   });
 
   it('flips to minutes at exactly 60 seconds', () => {
-    expect(timeAgo(NOW - MINUTE, NOW)).toBe('1 min ago');
+    expect(timeAgo(NOW - MINUTE, NOW)).toBe('1 minute ago');
   });
 
-  it('uses the singular wording for one minute (no "1 mins")', () => {
-    const text = timeAgo(NOW - MINUTE, NOW);
-    expect(text).toBe('1 min ago');
-    expect(text).not.toMatch(/mins/);
+  it('uses the singular wording for one minute', () => {
+    expect(timeAgo(NOW - MINUTE, NOW)).toBe('1 minute ago');
   });
 
   it('reports the floor of minutes up to 59', () => {
-    expect(timeAgo(NOW - 59 * MINUTE, NOW)).toBe('59 min ago');
+    expect(timeAgo(NOW - 59 * MINUTE, NOW)).toBe('59 minutes ago');
     // Just under an hour still reads in minutes.
-    expect(timeAgo(NOW - (HOUR - SECOND), NOW)).toBe('59 min ago');
+    expect(timeAgo(NOW - (HOUR - SECOND), NOW)).toBe('59 minutes ago');
   });
 
-  it('flips to hours at exactly one hour', () => {
-    expect(timeAgo(NOW - HOUR, NOW)).toBe('1 h ago');
-    expect(timeAgo(NOW - 23 * HOUR, NOW)).toBe('23 h ago');
+  it('flips to hours at exactly one hour, with proper plural', () => {
+    expect(timeAgo(NOW - HOUR, NOW)).toBe('1 hour ago');
+    expect(timeAgo(NOW - 13 * HOUR, NOW)).toBe('13 hours ago');
+    expect(timeAgo(NOW - 23 * HOUR, NOW)).toBe('23 hours ago');
   });
 
-  it('flips to days at exactly 24 hours', () => {
-    expect(timeAgo(NOW - DAY, NOW)).toBe('1 d ago');
-    expect(timeAgo(NOW - 7 * DAY, NOW)).toBe('7 d ago');
+  it('flips to days at exactly 24 hours, with proper plural', () => {
+    expect(timeAgo(NOW - DAY, NOW)).toBe('1 day ago');
+    expect(timeAgo(NOW - 7 * DAY, NOW)).toBe('7 days ago');
+    // Up to and including 13 days is still reported in days.
+    expect(timeAgo(NOW - 13 * DAY, NOW)).toBe('13 days ago');
+  });
+
+  it('flips to weeks at 14 days, with proper plural', () => {
+    expect(timeAgo(NOW - 14 * DAY, NOW)).toBe('2 weeks ago');
+    expect(timeAgo(NOW - 21 * DAY, NOW)).toBe('3 weeks ago');
+    // Up to 8 weeks still reported in weeks (the boundary just
+    // before the month threshold trips at ~60 days).
+    expect(timeAgo(NOW - 56 * DAY, NOW)).toBe('8 weeks ago');
+  });
+
+  it('flips to months at 9 weeks (~63 days), with proper plural', () => {
+    // The week branch caps at 8 weeks (56 days). The first day past
+    // that, week count would round to 9, so the function falls
+    // through to months. 63 / 30.44 ≈ 2 months.
+    expect(timeAgo(NOW - 63 * DAY, NOW)).toBe('2 months ago');
+    expect(timeAgo(NOW - 6 * 30 * DAY, NOW)).toBe('5 months ago');
+    expect(timeAgo(NOW - 11 * 30 * DAY, NOW)).toBe('10 months ago');
+  });
+
+  it('flips to years at 12 months, with proper plural', () => {
+    // 12 * 30.44 ≈ 365.28 days, just over the year threshold.
+    expect(timeAgo(NOW - 366 * DAY, NOW)).toBe('1 year ago');
+    expect(timeAgo(NOW - 2 * 366 * DAY, NOW)).toBe('2 years ago');
   });
 
   it('clamps future timestamps to "just now" (no negative diff)', () => {

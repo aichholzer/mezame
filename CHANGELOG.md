@@ -13,6 +13,21 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.23] - 2026-05-28
+
+### Changed
+
+- Timestamps spell out their units. The previous compact form
+  (`17 d ago`, `13 h ago`, `1 min ago`) is replaced with full words
+  and proper pluralisation: `just now`, `1 minute ago`,
+  `13 hours ago`, `17 days ago`, `2 weeks ago`, `2 months ago`,
+  `1 year ago`, etc. Unit boundaries: minutes flip to hours at 60,
+  hours to days at 24, days to weeks at 14, weeks to months at 9
+  (about 63 days), months to years at 12. Months and years use the
+  standard 30.44 / 365.25 day approximations. Three new tests
+  under `tests/ui/time.test.ts` cover the new weeks, months, and
+  years thresholds.
+
 ## [0.8.22] - 2026-05-28
 
 ### Changed
