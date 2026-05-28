@@ -76,26 +76,21 @@ const FencedCode = ({ className, children, ...props }: ComponentPropsWithoutRef<
   // the tree and collect every text node.
   const text = nodeToText(children).replace(/\n$/, '');
 
-  // Layout: a top gutter row holds the language label (left) and the
-  // copy button (right); the code element sits below it. Previously
-  // the pill and the copy button were absolute-positioned over the
-  // top-left and top-right corners and painted on top of the first
-  // line of code. The flex bar gives them their own space and the
-  // code text always starts cleanly below.
+  // Layout: a top gutter row holds the copy button and the language
+  // label on the left; the code element sits below it. The copy
+  // button stays permanently visible (no hover gate) so it does not
+  // require a mouse hover to discover, and a tooltip is always
+  // accessible on touch devices that the previous opacity-on-hover
+  // version effectively hid.
   return (
-    <span className="group block">
-      <span className="flex items-center justify-between pb-1">
-        {lang ? (
+    <span className="block">
+      <span className="flex items-center gap-2 pb-1">
+        <CopyButton text={text} />
+        {lang && (
           <span className="rounded-sm bg-card/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
             {lang}
           </span>
-        ) : (
-          <span aria-hidden="true" />
         )}
-        <CopyButton
-          text={text}
-          className="opacity-0 transition-opacity group-hover:opacity-100"
-        />
       </span>
       <code className={cn('block', className)} {...props}>
         {children}

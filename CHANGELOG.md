@@ -13,6 +13,18 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.22] - 2026-05-28
+
+### Changed
+
+- The copy button on code blocks now sits to the left of the
+  language pill and is permanently visible. It used to live in the
+  top-right corner, fading in on hover. Two issues with that:
+  touch-device users had no hover state and could not discover the
+  button at all, and the right-aligned position pushed the button
+  past the code on narrow viewports. Left-of-pill keeps it in the
+  same row regardless of width and surfaces it without ceremony.
+
 ## [0.8.21] - 2026-05-28
 
 ### Added
