@@ -61,6 +61,14 @@
   --mz-safe-bottom: env(safe-area-inset-bottom, 0px);
   --mz-safe-left: env(safe-area-inset-left, 0px);
   --mz-safe-right: env(safe-area-inset-right, 0px);
+
+  /* Typography. Body and chrome use JetBrains Mono; the wordmark uses
+   * Chelsea Market for a single moment of personality. Both come from
+   * the Google Fonts <link> in index.html so the network is the cache;
+   * each falls back to a sensible monospace stack if the font fails to
+   * load. */
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --font-display: 'Chelsea Market', ui-serif, Georgia, serif;
 }
 
 .dark {
@@ -91,7 +99,8 @@
   --radius-md: var(--radius);
   --radius-lg: calc(var(--radius) + 2px);
   --radius-xl: calc(var(--radius) + 4px);
-  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --font-display: 'Chelsea Market', ui-serif, Georgia, serif;
 }
 
 @layer base {

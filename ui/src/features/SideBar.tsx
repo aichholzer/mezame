@@ -10,13 +10,14 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useSidebarWidth } from '@/hooks/useSidebarWidth';
 import { cn } from '@/lib/utils';
 import type { Attention, ClosedEntry, Session } from '@/types';
 
 // Fixed sidebar on desktop, slide-in drawer on mobile.
 //
 // Layout (top to bottom):
-//   - Brand label (目覚め).
+//   - Brand label (MEZAME wordmark, in the display font).
 //   - Action row: History dropdown, New session button.
 //   - Divider.
 //   - Scrollable list of session rows, one tab per row, full width.
@@ -146,6 +147,12 @@ export const SideBar = ({
 }: Props) => {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  // Resizable on desktop. The hook persists the width to localStorage
+  // and clamps to a sensible band (192-480 px) so the sidebar can
+  // never collapse onto the edge or eat the chat pane. On mobile the
+  // sidebar is a fixed-width drawer; the runtime width is ignored
+  // there via the `md:` width override below.
+  const sidebar = useSidebarWidth();
 
   // Keep the active row visible when activation changes programmatically
   // (new session, restore from history, keyboard switch).
@@ -194,25 +201,32 @@ export const SideBar = ({
         className={cn(
           // Base layout: fixed on the left, full height, scrolls its
           // own session list. Desktop always renders at translate-x-0;
-          // mobile slides in from the left. Widths: 14 rem on desktop
-          // (comfortable for a 20-character label with some room),
-          // 16 rem on mobile drawer (touch targets are larger so the
-          // extra width keeps labels legible).
-          'fixed inset-y-0 left-0 z-40 flex w-72 flex-col',
+          // mobile slides in from the left. Width is driven by the
+          // resize hook at runtime (see `style` below); the Tailwind
+          // class only sets a `flex-none`-style hint so grid math
+          // does not reflow weirdly when the inline width updates.
+          'fixed inset-y-0 left-0 z-40 flex flex-col',
           'border-r border-border/40 bg-background/95 backdrop-blur-md',
-          'md:static md:w-64 md:bg-background/70',
-          'transition-transform duration-200 ease-out',
+          'md:static md:bg-background/70',
+          // No transform transition while dragging; the live resize
+          // already updates every frame and the transition would lag
+          // it visibly.
+          !sidebar.dragging && 'transition-transform duration-200 ease-out',
           isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
         )}
         style={{
+          width: `${sidebar.width}px`,
           paddingTop: 'var(--mz-safe-top)',
           paddingBottom: 'var(--mz-safe-bottom)',
           paddingLeft: 'var(--mz-safe-left)'
         }}
       >
         <div className="flex items-center justify-center px-3 pt-6 pb-5">
-          <span className="text-[1.5rem] font-bold tracking-wider text-[color:var(--primary)] select-none">
-            目覚め
+          <span
+            className="text-[1.75rem] tracking-wide text-[color:var(--primary)] select-none"
+            style={{ fontFamily: 'var(--font-display)' }}
+          >
+            MEZAME
           </span>
         </div>
 
@@ -395,6 +409,29 @@ export const SideBar = ({
             );
           })}
         </div>
+
+        {/* Resize handle. A 6 px-wide strip pinned to the right edge
+         * (overlapping the sidebar's own border by half so the cursor
+         * lands on the visible boundary). Desktop-only: on mobile the
+         * sidebar is a drawer and resize would not make sense.
+         * Pointer events are wired to the hook, which owns the drag
+         * lifecycle including document-level move/up listeners. */}
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          onPointerDown={sidebar.beginDrag}
+          className={cn(
+            'absolute inset-y-0 right-0 hidden w-1.5 -mr-0.5 cursor-col-resize md:block',
+            // A subtle hover tint reveals the handle without putting a
+            // permanent line over the existing right border. While
+            // dragging we light it up to make the action feel direct.
+            'transition-colors duration-150',
+            sidebar.dragging
+              ? 'bg-[color:var(--primary)]/40'
+              : 'hover:bg-[color:var(--primary)]/20'
+          )}
+        />
       </aside>
     </>
   );

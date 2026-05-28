@@ -13,6 +13,30 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.21] - 2026-05-28
+
+### Added
+
+- Sidebar is now resizable. Drag the right edge to widen or narrow
+  the panel; the chosen width is persisted to localStorage on a
+  per-browser basis so it survives reloads. Clamped between 192 px
+  (min, so labels stay readable) and 480 px (max, so the chat
+  pane is never crowded). The drag handle is a thin strip pinned
+  to the right edge, hidden on mobile (where the sidebar is a
+  drawer and a resize handle would not make sense). New default
+  width 272 px gives the larger MEZAME wordmark room to breathe.
+
+### Changed
+
+- Typography refresh. Body and chrome now use JetBrains Mono with the
+  same monospace fallback chain we had before; the sidebar wordmark
+  uses Chelsea Market for a single beat of personality. Both fonts
+  ship from Google Fonts via the standard preconnect plus a stylesheet
+  link in `index.html`. The wordmark text changed from the kanji form
+  to a roman `MEZAME` so it renders consistently regardless of the
+  installed font set, with the Japanese form retained on the README
+  banner only.
+
 ## [0.8.20] - 2026-05-27
 
 ### Fixed
