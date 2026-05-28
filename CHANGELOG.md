@@ -13,6 +13,19 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.24] - 2026-05-28
+
+### Changed
+
+- Code-block language pill now matches the copy button's height
+  (24 px) and uses a brighter background. The previous pill was
+  shorter than the copy button (`py-0.5`) and used `bg-card/70`,
+  which was nearly invisible against the pre's `#0d1117` code
+  area. Switched the height to `h-6` with flex centering so the
+  pill and the copy button sit on the same baseline, and the
+  background to `bg-muted` for an unmistakable separation from
+  the code panel.
+
 ## [0.8.23] - 2026-05-28
 
 ### Changed

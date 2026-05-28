@@ -182,11 +182,11 @@ const TextEntry = ({ entry, now }: { entry: Extract<LogEntry, { kind: 'text' }>;
   const cleaned = cleanUserText(entry.text);
   return (
     <div className="mt-10 mb-6 flex justify-end">
-      <div className="max-w-[90%] rounded-2xl rounded-br-sm border border-[color:var(--user-bubble)]/40 bg-[color:var(--user-bubble)]/15 px-4 py-3 sm:max-w-[78%]">
+      <div className="max-w-[90%] rounded rounded-br-[2px] border border-[color:var(--user-bubble)]/40 bg-[color:var(--user-bubble)]/15 px-4 py-3 sm:max-w-[78%]">
         <div className="whitespace-pre-wrap break-words text-foreground">{cleaned}</div>
         <div className="mt-2 flex items-center gap-2.5">
-          <TimestampLabel ts={entry.timestamp} now={now} />
           <CopyButton text={cleaned} title="Copy message" className="size-7" />
+          <TimestampLabel ts={entry.timestamp} now={now} />
         </div>
       </div>
     </div>

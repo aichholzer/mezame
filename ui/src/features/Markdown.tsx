@@ -87,7 +87,20 @@ const FencedCode = ({ className, children, ...props }: ComponentPropsWithoutRef<
       <span className="flex items-center gap-2 pb-1">
         <CopyButton text={text} />
         {lang && (
-          <span className="rounded-sm bg-card/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+          <span
+            className={cn(
+              // Match the copy button's 24 px height with `h-6` plus
+              // flex centering so the two sit on the same baseline.
+              // The previous `py-0.5` produced a slightly shorter
+              // pill that read as a different control class.
+              'inline-flex h-6 items-center rounded-sm px-1.5 text-[10px] text-muted-foreground',
+              // Brighter than the pre's `#0d1117` background. The
+              // previous `bg-card/70` was nearly invisible against
+              // it. Using `bg-muted` (zinc-300 in dark theme) gives
+              // a clear separation from the code area.
+              'bg-muted'
+            )}
+          >
             {lang}
           </span>
         )}
