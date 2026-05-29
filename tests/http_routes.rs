@@ -20,7 +20,7 @@ use mezame::hub::HubRegistry;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tower::ServiceExt;
 
 fn home_lock() -> &'static Mutex<()> {
@@ -29,6 +29,7 @@ fn home_lock() -> &'static Mutex<()> {
 }
 
 fn dummy_state() -> Arc<AppState> {
+    let (state_changes, _) = broadcast::channel(8);
     Arc::new(AppState {
         config: Arc::new(Config {
             transports: vec![TransportConfig::Cloudflared {
@@ -38,6 +39,7 @@ fn dummy_state() -> Arc<AppState> {
             agent_args: vec![],
         }),
         hubs: HubRegistry::new(),
+        state_changes,
     })
 }
 
@@ -107,6 +109,32 @@ async fn put_state_then_get_state_round_trip() {
     let (status, bytes, _) = run_request(req).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&bytes), payload);
+}
+
+#[tokio::test]
+async fn put_state_fires_state_changed_broadcast() {
+    // Two browsers cooperating: the second one is subscribed to the
+    // broadcast and should receive a tick the moment the first writes
+    // a new state. Without this, peer browsers only see another
+    // browser's new session after a manual reload.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let state = dummy_state();
+    let mut rx = state.state_changes.subscribe();
+    let app = build_router(state);
+
+    let payload = json!({ "sessions": [{ "id": "s1", "label": "1" }] });
+    let req = Request::put("/state")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+    let res = app.oneshot(req).await.expect("router responded");
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // The tick must have been queued by the time put_state returned.
+    rx.try_recv().expect("state_changes should have ticked");
 }
 
 // ---------- /history ----------

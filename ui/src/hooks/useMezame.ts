@@ -147,10 +147,14 @@ const doSync = async () => {
     sessions: sessions.map((s) => ({
       id: s.id,
       label: s.label,
-      // Don't persist an acpSessionId until the session has been used;
-      // Kiro only writes to disk on first prompt, so resuming a never-
-      // used session fails noisily.
-      acpSessionId: s.used ? s.acpSessionId : null,
+      // Persist the ACP session id whenever we have one, even on a
+      // session that has not had a first prompt yet. Resuming such a
+      // session is safe now: the hub keeps it warm in the registry,
+      // and if the registry has forgotten it (grace expired) the
+      // server falls back to `session/new` with a sys notice. This
+      // is what makes a "New session" tab on browser A show up on
+      // browser B without a manual reload.
+      acpSessionId: s.acpSessionId,
       cwd: s.cwd
     })),
     closed,
@@ -179,6 +183,91 @@ const fetchState = async (): Promise<Partial<PersistedState> | null> => {
   } catch {
     return null;
   }
+};
+
+// ---------- cross-browser session sync ----------
+//
+// `state.json` is the cross-device store for the session list. Each
+// browser PUTs to `/state` after a local change (new session, rename,
+// close, switch active). To keep two browsers in sync without forcing
+// the user to reload, the server fires a tick on `/state/events` (an
+// SSE stream) every time `state.json` is rewritten. On each tick we
+// refetch `/state` and merge any sessions another browser created
+// into our local list.
+//
+// Merge policy is intentionally additive on the receive side. A
+// session that exists on the server but not locally gets restored;
+// a session that exists locally but not on the server stays put. We
+// do not auto-close tabs from under a user just because another
+// browser closed them: that would be too surprising mid-turn. The
+// next user-driven sync from this browser will overwrite the server
+// view back to "both tabs", and the other browser will see the one
+// it closed reappear. That asymmetry is acceptable for stage 1; if
+// users actually want closes to propagate we can add a softer
+// reconciliation later.
+//
+// The same tick also fires when this browser is the writer, but the
+// merge is a no-op (every server entry already matches a local one).
+// Cheap; not worth a self-suppression dance.
+
+let stateEventSource: EventSource | null = null;
+
+const reconcileFromServer = async () => {
+  const saved = await fetchState();
+  if (!saved?.sessions || !Array.isArray(saved.sessions)) {
+    return;
+  }
+  let dirty = false;
+  for (const entry of saved.sessions) {
+    if (!entry || typeof entry.id !== 'string') {
+      continue;
+    }
+    if (sessions.some((s) => s.id === entry.id)) {
+      continue;
+    }
+    // Only restore sessions that have an `acpSessionId` recorded.
+    // An unused tab on the other browser has no agent session yet;
+    // restoring it here would spawn a separate agent. Once the
+    // other browser sends a first prompt the id lands on the server
+    // and the next tick brings it across.
+    if (typeof entry.acpSessionId !== 'string' || entry.acpSessionId.length === 0) {
+      continue;
+    }
+    restoreSession({
+      id: entry.id,
+      label: typeof entry.label === 'string' ? entry.label : '?',
+      acpSessionId: entry.acpSessionId,
+      cwd: typeof entry.cwd === 'string' ? entry.cwd : null
+    });
+    dirty = true;
+  }
+  // Bump nextLabel so a future `New session` button on this browser
+  // does not collide with a numeric label coined elsewhere.
+  if (typeof saved.nextLabel === 'number' && saved.nextLabel > nextLabel) {
+    nextLabel = saved.nextLabel;
+  }
+  if (dirty) {
+    notify();
+  }
+};
+
+const startStateEventStream = () => {
+  if (typeof EventSource === 'undefined' || stateEventSource !== null) {
+    return;
+  }
+  const es = new EventSource('/state/events');
+  stateEventSource = es;
+  es.addEventListener('state_changed', () => {
+    void reconcileFromServer();
+  });
+  // EventSource auto-reconnects on transport errors with browser
+  // defaults. We only act on errors that look terminal; otherwise
+  // log and let the browser retry.
+  es.addEventListener('error', () => {
+    if (es.readyState === EventSource.CLOSED) {
+      stateEventSource = null;
+    }
+  });
 };
 
 // ---------- history rehydration ----------
@@ -911,6 +1000,9 @@ const init = async () => {
   } else {
     newSession();
   }
+  // Subscribe to cross-browser change notifications so a session
+  // started elsewhere shows up here without a manual reload.
+  startStateEventStream();
 };
 
 // ---------- public hook ----------

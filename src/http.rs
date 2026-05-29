@@ -10,19 +10,25 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::Query,
+    extract::{Query, State},
     http::{header, HeaderValue, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Json, Router,
 };
+use futures_util::stream::Stream;
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 
 use crate::config::{state_path, Config};
 use crate::hub::HubRegistry;
@@ -30,10 +36,19 @@ use crate::ws::ws_upgrade;
 
 /// Shared state for the axum router. Bundles the static `Config` with
 /// the live `HubRegistry` so the WS handler can attach to existing
-/// hubs or create new ones for fresh sessions.
+/// hubs or create new ones for fresh sessions, plus a broadcast
+/// channel that fires whenever `state.json` is rewritten so connected
+/// browsers can re-sync their session list without a manual reload.
 pub struct AppState {
     pub config: Arc<Config>,
     pub hubs: HubRegistry,
+    /// Tick channel: `put_state` fires `()` on every successful
+    /// rename. Browsers subscribed to `/state/events` receive an
+    /// SSE event and refetch `/state`. Receivers that lag behind
+    /// are dropped silently; the next tick brings them back in
+    /// sync. Capacity 64 is plenty given state writes happen at
+    /// human-edit pace.
+    pub state_changes: broadcast::Sender<()>,
 }
 
 /// React UI bundle baked into the binary by `build.rs` + `rust-embed`.
@@ -53,9 +68,11 @@ struct UiAssets;
 //   https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
 
 pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
+    let (state_changes, _) = broadcast::channel(64);
     let state = Arc::new(AppState {
         config: Arc::new(cfg),
         hubs: HubRegistry::new(),
+        state_changes,
     });
     let app = build_router(state);
 
@@ -74,6 +91,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/ws", get(ws_upgrade))
         .route("/state", get(get_state).put(put_state))
+        .route("/state/events", get(state_events))
         .route("/history", get(get_history))
         // SPA fallback: /, /assets/*, and any unknown path resolve against
         // the embedded UI bundle, with index.html as the fallback for
@@ -219,8 +237,14 @@ async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
 }
 
 /// PUT /state — atomically replaces the stored state. Writes to a sibling
-/// `.tmp` then `rename` so readers never see a partial file.
-async fn put_state(Json(body): Json<Value>) -> Result<StatusCode, (StatusCode, String)> {
+/// `.tmp` then `rename` so readers never see a partial file. After a
+/// successful write we fire a tick on the `state_changes` broadcast so
+/// every browser subscribed to `/state/events` knows to refetch and
+/// merge in any new sessions another browser opened.
+async fn put_state(
+    State(app): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, (StatusCode, String)> {
     let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -236,7 +260,46 @@ async fn put_state(Json(body): Json<Value>) -> Result<StatusCode, (StatusCode, S
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    // Send-error here only means no browser is currently subscribed,
+    // which is fine: the next subscriber will fetch /state on connect
+    // and pick up any changes since.
+    let _ = app.state_changes.send(());
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /state/events — Server-Sent Events stream. Emits one
+/// `state_changed` event each time `put_state` writes a new state
+/// file. The browser uses this as a "go refetch /state" signal so
+/// new sessions opened in another browser show up without a manual
+/// reload.
+///
+/// We also emit a periodic keep-alive comment so a Cloudflare Tunnel
+/// or other intermediary does not idle-timeout the stream during a
+/// quiet period.
+async fn state_events(
+    State(app): State<Arc<AppState>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = app.state_changes.subscribe();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(()) => {
+                    return Some((Ok(Event::default().event("state_changed").data("")), rx));
+                }
+                // Lagged: skip and wait for the next message. The
+                // browser will refetch on the next event we deliver.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // All senders dropped: end the stream. In practice
+                // this only happens when the server is shutting down.
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 /// GET /history?session=<id> — returns a compact history reconstructed from

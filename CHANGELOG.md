@@ -13,6 +13,33 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.28] - 2026-05-29
+
+### Fixed
+
+- A new session opened in browser A did not appear in browser B
+  until B reloaded. The session list lives in `state.json`, written
+  by every browser after a local change, but B had no signal that
+  the file had moved on under its feet. Added a server-sent events
+  stream at `/state/events` that ticks once on every `PUT /state`,
+  and a client subscription that refetches `/state` on each tick
+  and merges any sessions the other browser opened into the local
+  list.
+
+  The merge is additive: a tab that exists on the server but not
+  locally gets restored; a tab that exists locally but not on the
+  server stays put. We do not auto-close tabs from under a user
+  just because another browser closed them; that asymmetry is
+  acceptable for stage 1.
+
+  Side effect of the same change: the client now persists
+  `acpSessionId` on every session, including unused ones. The hub
+  keeps unused sessions warm in the registry, and if the registry
+  has forgotten one (grace expired) the existing
+  `session/load` to `session/new` fallback in `negotiate_session`
+  kicks in transparently. Without this, peer-browser reconcile
+  would skip new tabs until the user sent a first prompt.
+
 ## [0.8.27] - 2026-05-29
 
 ### Fixed
