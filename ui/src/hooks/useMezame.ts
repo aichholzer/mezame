@@ -15,7 +15,6 @@ import type {
   PermissionOption,
   PersistedState,
   PromptBlock,
-  Role,
   ServerMessage,
   Session,
   Status,
@@ -402,15 +401,32 @@ const startStateEventStream = () => {
 // its log from `/history?session=<id>`. The server reads Kiro's own JSONL
 // event log and returns compact entries with real per-turn timestamps.
 
-type HistoryEntry = {
-  /** `'user'` and `'agent'` map to text log entries with the
-   * matching role; `'thought'` maps to a thought log entry that
-   * the UI renders as a collapsible reasoning block. */
-  role: Role | 'thought';
-  text: string;
-  /** Unix epoch millis. May be null for turns Kiro didn't stamp. */
-  timestamp: number | null;
-};
+type HistoryEntry =
+  | {
+    /** `'user'` and `'agent'` map to text log entries with the
+     * matching role; `'thought'` maps to a thought log entry that
+     * the UI renders as a collapsible reasoning block. */
+    role: 'user' | 'agent' | 'sys' | 'thought';
+    text: string;
+    /** Unix epoch millis. May be null for turns Kiro didn't stamp. */
+    timestamp: number | null;
+  }
+  | {
+    /** Structured tool call rehydrated from JSONL. Mirrors the
+     * live `tool_call` wire shape so the client can push the same
+     * structured log entry on reload as it does during a live
+     * turn. `status` and `content` are filled in when the
+     * matching `ToolResults` entry is parsed; `null` until then. */
+    role: 'tool_call';
+    toolCallId: string;
+    title: string;
+    status: string | null;
+    kind: string | null;
+    rawInput: unknown;
+    content: unknown;
+    locations: unknown;
+    timestamp: number | null;
+  };
 
 const loadHistory = async (s: Session) => {
   if (!s.acpSessionId) {
@@ -436,6 +452,22 @@ const loadHistory = async (s: Session) => {
         kind: 'thought',
         id: newLogId(),
         text: e.text,
+        timestamp: e.timestamp ?? Date.now()
+      });
+      continue;
+    }
+    if (e.role === 'tool_call') {
+      const locations = Array.isArray(e.locations) ? (e.locations as ToolCallLocation[]) : [];
+      s.log.push({
+        kind: 'tool_call',
+        id: newLogId(),
+        toolCallId: e.toolCallId,
+        title: e.title,
+        status: e.status,
+        toolKind: e.kind,
+        rawInput: e.rawInput,
+        content: e.content,
+        locations,
         timestamp: e.timestamp ?? Date.now()
       });
       continue;

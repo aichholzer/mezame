@@ -261,6 +261,46 @@ async fn get_history_emits_thought_entry_before_agent_text() {
     assert_eq!(entries[2]["text"], "42");
 }
 
+#[tokio::test]
+async fn get_history_rehydrates_tool_calls_and_merges_results() {
+    // Kiro records a toolUse block on the AssistantMessage that
+    // triggered the call, then a ToolResults entry once the agent
+    // returned. The history endpoint should emit one tool_call
+    // history entry per toolUse and patch its `status` and
+    // `content` from the matching ToolResults so the rehydrated
+    // log renders the same card the live stream produced.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let dir = tmp.path().join(".kiro/sessions/cli");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sid = "tools";
+    let jsonl = "\
+{\"kind\":\"Prompt\",\"data\":{\"content\":[{\"kind\":\"text\",\"data\":\"search\"}],\"meta\":{\"timestamp\":1700000000}}}
+{\"kind\":\"AssistantMessage\",\"data\":{\"content\":[{\"kind\":\"toolUse\",\"data\":{\"toolUseId\":\"tu-1\",\"name\":\"web_search\",\"input\":{\"q\":\"x\"}}}]}}
+{\"kind\":\"ToolResults\",\"data\":{\"content\":[{\"kind\":\"toolResult\",\"data\":{\"toolUseId\":\"tu-1\",\"content\":[{\"kind\":\"text\",\"data\":\"result text\"}],\"status\":\"success\"}}]}}
+";
+    std::fs::write(dir.join(format!("{sid}.jsonl")), jsonl).unwrap();
+
+    let req = Request::get(format!("/history?session={sid}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, bytes, _) = run_request(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = json_body(&bytes);
+    let entries = body.get("entries").and_then(Value::as_array).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1]["role"], "tool_call");
+    assert_eq!(entries[1]["toolCallId"], "tu-1");
+    assert_eq!(entries[1]["title"], "web_search");
+    assert_eq!(entries[1]["status"], "success");
+    assert_eq!(entries[1]["rawInput"]["q"], "x");
+    let content_arr = entries[1]["content"].as_array().unwrap();
+    assert_eq!(content_arr[0]["data"], "result text");
+}
+
 // ---------- SPA fallback / asset routing ----------
 
 #[tokio::test]

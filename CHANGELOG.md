@@ -13,6 +13,30 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.38] - 2026-05-29
+
+### Added
+
+- Tool calls now rehydrate from JSONL on page reload, just like
+  reasoning blocks did in 0.8.36. Kiro records each tool invocation
+  as a <code>toolUse</code> content block on the
+  <code>AssistantMessage</code> that triggered it, then a separate
+  <code>ToolResults</code> entry once the tool returned. The
+  history endpoint now emits one structured <code>tool_call</code>
+  entry per <code>toolUse</code> and patches its <code>status</code>
+  and <code>content</code> from the matching <code>ToolResults</code>
+  by <code>toolUseId</code>. The wire shape mirrors the live
+  <code>tool_call</code> event so the client pushes the same
+  log entry on rehydrate as it does during a live turn; the
+  rendered card is identical.
+
+  Title displays the tool's raw <code>name</code> from the JSONL
+  (e.g. <code>web_search</code>) rather than the friendly title
+  the live stream emits (e.g. <code>Searching the web</code>).
+  The friendly title comes from the agent's
+  <code>session/update</code> events at runtime; we do not have it
+  on disk.
+
 ## [0.8.37] - 2026-05-29
 
 ### Fixed

@@ -381,16 +381,22 @@ async fn get_history(
 ///       "content": [
 ///           { "kind": "thinking", "data": { "text": "..." } },
 ///           { "kind": "text", "data": "..." },
+///           { "kind": "toolUse", "data": { "toolUseId": "...", "name": "...", "input": {...} } },
+///           ...
+///       ] } }
+///   { "kind": "ToolResults", "data": {
+///       "content": [
+///           { "kind": "toolResult", "data": { "toolUseId": "...", "content": [...], "status": "..." } },
 ///           ...
 ///       ] } }
 ///
-/// AssistantMessage entries can carry both `thinking` and `text`
+/// AssistantMessage entries can carry thinking, text, and toolUse
 /// blocks; we emit them as separate history entries so the timeline
-/// reads "user → reasoning → answer". Tool-result blocks are still
-/// dropped: the live view renders the structured tool-call cards
-/// for active turns, but replaying them from JSONL would mean
-/// reconstructing per-call status, args, and outputs out of band,
-/// which is more complex than the history view warrants.
+/// reads "user, reasoning, answer, tool call". ToolResults entries
+/// merge into the most recent tool_call with a matching toolUseId,
+/// updating its status and content in place. The wire shape mirrors
+/// the live `tool_call` event so the client can push the same
+/// structured log entry the live stream produces.
 pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     // Timestamp of the most recent Prompt. Persisted in ms for the
@@ -425,11 +431,10 @@ pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
                 }
             }
             "AssistantMessage" => {
-                // Emit reasoning blocks first (before the text reply)
-                // so the rendered order matches what the live stream
-                // produced: prompt, thinking, answer. Each thinking
-                // chunk concatenates into one block; the live path
-                // does the same merging client-side.
+                // Walk content blocks in order, emitting one history
+                // entry per block. thinking/text are aggregated within
+                // their kinds (matching the live merge behaviour);
+                // toolUse blocks become tool_call history entries.
                 if let Some(text) = extract_thinking_blocks(&data) {
                     out.push(json!({
                         "role": "thought",
@@ -444,11 +449,18 @@ pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
                         "timestamp": current_ts_ms
                     }));
                 }
+                emit_tool_use_blocks(&data, current_ts_ms, &mut out);
+            }
+            "ToolResults" => {
+                // Merge tool results back into the matching tool_call
+                // history entry by `toolUseId`. Kiro records results
+                // separately from the toolUse that triggered them, so
+                // we cannot do this in the AssistantMessage branch.
+                merge_tool_results(&data, &mut out);
             }
             _ => {
-                // Ignore ToolResults and any other variants. The live
-                // view renders structured tool-call cards for new
-                // turns; replayed history stays lean.
+                // Ignore any other variants. The live view will render
+                // those for new turns; replayed history stays lean.
             }
         }
     }
@@ -511,5 +523,96 @@ pub fn extract_thinking_blocks(data: &Value) -> Option<String> {
         None
     } else {
         Some(buf)
+    }
+}
+
+/// Push a history entry per `toolUse` block in an `AssistantMessage`.
+///
+/// Kiro records reach toolUse with an id, a name, and an input. The
+/// resulting status and output text live in a separate `ToolResults`
+/// entry that arrives later in the JSONL; we leave them as `null`
+/// here and let `merge_tool_results` patch them in when their
+/// `ToolResults` line is parsed.
+///
+/// The wire shape mirrors the live `tool_call` event so the client
+/// can push the same structured log entry on rehydrate as it does
+/// during a live turn.
+pub fn emit_tool_use_blocks(data: &Value, ts_ms: Option<i64>, out: &mut Vec<Value>) {
+    let Some(content) = data.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("kind").and_then(Value::as_str) != Some("toolUse") {
+            continue;
+        }
+        let inner = block.get("data").cloned().unwrap_or(Value::Null);
+        let tool_use_id = inner.get("toolUseId").cloned().unwrap_or(Value::Null);
+        if tool_use_id.is_null() {
+            continue;
+        }
+        let title = inner
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_string();
+        let raw_input = inner.get("input").cloned().unwrap_or(Value::Null);
+        out.push(json!({
+            "role": "tool_call",
+            "toolCallId": tool_use_id,
+            "title": title,
+            "status": Value::Null,
+            "kind": Value::Null,
+            "rawInput": raw_input,
+            "content": Value::Null,
+            "locations": Value::Null,
+            "timestamp": ts_ms
+        }));
+    }
+}
+
+/// Patch tool_call history entries in `out` with the matching
+/// `ToolResults` block from `data`. Match by `toolUseId`; on a hit,
+/// merge `status` and `content` into the existing entry. Unknown
+/// ids are silently dropped: a tool result without a preceding
+/// toolUse cannot be rendered as a card and is not worth surfacing.
+pub fn merge_tool_results(data: &Value, out: &mut [Value]) {
+    let Some(content) = data.get("content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in content {
+        if block.get("kind").and_then(Value::as_str) != Some("toolResult") {
+            continue;
+        }
+        let inner = block.get("data").cloned().unwrap_or(Value::Null);
+        let Some(target_id) = inner.get("toolUseId") else {
+            continue;
+        };
+        // Reverse iterate: the latest matching toolUse is the right
+        // one. Multiple turns can re-use the same name, but the id is
+        // unique per call; this ordering matches the live merge in
+        // the reducer.
+        for entry in out.iter_mut().rev() {
+            if entry.get("role").and_then(Value::as_str) != Some("tool_call") {
+                continue;
+            }
+            if entry.get("toolCallId") != Some(target_id) {
+                continue;
+            }
+            let map = match entry.as_object_mut() {
+                Some(m) => m,
+                None => continue,
+            };
+            // Map Kiro's coarse status to the live wire's status
+            // string. Kiro emits `success` / `error`; the UI renders
+            // any non-empty string verbatim, so a passthrough works
+            // and keeps the data faithful.
+            if let Some(status) = inner.get("status").cloned() {
+                map.insert("status".into(), status);
+            }
+            if let Some(c) = inner.get("content").cloned() {
+                map.insert("content".into(), c);
+            }
+            break;
+        }
     }
 }
