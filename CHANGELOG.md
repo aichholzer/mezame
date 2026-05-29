@@ -13,6 +13,29 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.32] - 2026-05-29
+
+### Fixed
+
+- Peer browsers did not show the "Agent is working" spinner when
+  another browser sent a request. The reducer treated the user
+  prompt echo as a plain log entry, leaving `thinking`,
+  `inFlight`, and `busy` unchanged on the receiving side.
+
+  Fix: when the live broadcast is an `append { role: 'user' }`,
+  set the same flags the sender sets in `sendPrompt`. The hub's
+  prompt-echo is already the single source of truth for the start
+  of a turn, so peers light up alongside the sender. The existing
+  `prompt_done` arm clears them everywhere, so the spinner falls
+  away in lockstep on every attached browser. History replays go
+  through `/history`, not the live broadcast, so historic user
+  turns do not trigger this branch.
+
+  Side effect: peer browsers now also lock their composer for
+  the duration of a turn. The hub serialises commands anyway, so
+  letting both browsers send concurrently would just queue at the
+  hub; locking is the friendlier signal.
+
 ## [0.8.31] - 2026-05-29
 
 ### Fixed

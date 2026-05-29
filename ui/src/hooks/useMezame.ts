@@ -614,6 +614,19 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       // own line even if the previous chunk ended mid-text.
       if (msg.role === 'user') {
         ensureTrailingNewline(s);
+        // The hub broadcasts a single `append { role: 'user' }` echo
+        // when any browser sends a prompt, so this is also the
+        // signal to peer browsers that a turn just started. Mark
+        // the session busy here so every attached browser shows
+        // the spinner and locks its composer for the duration of
+        // the turn; `prompt_done` clears all three flags. The
+        // sender already set these in `sendPrompt`, so the
+        // assignment is a no-op for them. We skip on history
+        // replays (those land via `loadHistory`, not the live
+        // broadcast, so this branch is only hit on real turns).
+        s.thinking = true;
+        s.inFlight = true;
+        setBusy(s, true);
       }
       appendLog(s, {
         kind: 'text',
