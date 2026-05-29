@@ -13,6 +13,31 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.29] - 2026-05-29
+
+### Fixed
+
+- Two browsers reconnecting at server startup with the same
+  persisted session id raced through the hub registry's slow path:
+  both saw an empty registry, both spawned an agent, both called
+  `session/load` against the same Kiro session id. The second lost
+  on the lockfile with "Session is active in another process",
+  fell back to `session/new`, and ended up in an unrelated session
+  with no history. Both browsers' chats came up empty.
+
+  Fixed by serialising the slow path on the requested session id.
+  `attach_or_create` now acquires (or creates) a per-id mutex
+  before building a hub for a resume request, holds it across
+  `build_hub`, and re-checks the registry after taking the mutex.
+  The first arrival builds the hub and registers it; the second
+  finds it already there and falls into the fast attach path.
+  Fresh-session attaches (no `?session=`) skip the gate entirely
+  since they are independent by definition.
+
+  The per-id mutex is dropped from the auxiliary map as soon as
+  nobody else is waiting on it, so the gate does not leak one
+  mutex per session id ever attached.
+
 ## [0.8.28] - 2026-05-29
 
 ### Fixed

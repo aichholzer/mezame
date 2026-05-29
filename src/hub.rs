@@ -243,9 +243,21 @@ impl Drop for AttachedHub {
 /// Registry of live hubs keyed by ACP session id. Cheap to clone;
 /// `Arc<RwLock>` lets the WS handler do lookups without coordinating
 /// with the owner loop.
+///
+/// `building` serialises slow-path attaches by session id so two
+/// browsers reconnecting at the same time with the same
+/// `?session=<id>` cannot both spawn an agent and race
+/// `session/load` against the same Kiro lockfile (the second loses
+/// with `Session is active in another process` and falls back to a
+/// fresh session, which clobbers the history view). Holding a
+/// per-key mutex across the build window means the second arrival
+/// finds the hub already in the registry on its re-check and takes
+/// the fast path. Fresh attaches (no resume id) don't go through
+/// this gate; they're independent by definition.
 #[derive(Clone, Default)]
 pub struct HubRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<SessionHub>>>>,
+    building: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl HubRegistry {
@@ -279,18 +291,83 @@ impl HubRegistry {
             }
         }
 
-        // Slow path: spawn the agent, run negotiation, register the
-        // hub. Holds the write lock only for the registry insertion;
-        // the spawn and negotiate happen outside the lock so two
-        // browsers attaching at the same time but for different ids
-        // do not serialise.
+        // Slow path with a per-session-id lock. Two browsers arriving
+        // at the same time with the same `?session=<id>` (typical at
+        // server startup) must not both call `build_hub`: only one
+        // agent can hold Kiro's session lockfile, so the second
+        // would fail with "Session is active in another process".
+        // We acquire (or create) a per-key mutex, hold it across the
+        // build, and re-check the registry once we have the key
+        // mutex. The first arrival builds; the second finds the hub
+        // already there and falls into the fast path.
+        //
+        // Fresh attaches (no resume id) skip this gate entirely:
+        // they spawn independent sessions and there is nothing to
+        // serialise.
+        if let Some(sid) = resume_session_id.as_deref() {
+            let key_mutex = {
+                let mut building = self.building.lock().await;
+                building
+                    .entry(sid.to_string())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            let _guard = key_mutex.lock().await;
+
+            // Re-check now that we hold the key mutex; the first
+            // arrival registered the hub before releasing.
+            {
+                let map = self.inner.read().await;
+                if let Some(hub) = map.get(sid).cloned() {
+                    drop(map);
+                    let attached = self.subscribe(hub).await;
+                    self.cleanup_build_slot(sid).await;
+                    return Ok(attached);
+                }
+            }
+
+            let result = self
+                .build_and_register(cfg, Some(sid.to_string()), cwd_override, build_id)
+                .await;
+            self.cleanup_build_slot(sid).await;
+            return result;
+        }
+
+        // Fresh-session attach: no key to coordinate on, just build.
+        self.build_and_register(cfg, None, cwd_override, build_id)
+            .await
+    }
+
+    /// Drop the per-key mutex from `building` once nobody else is
+    /// waiting on it. Cheap garbage collection so the map does not
+    /// grow without bound; the alternative is leaking one mutex per
+    /// session id ever attached.
+    async fn cleanup_build_slot(&self, sid: &str) {
+        let mut building = self.building.lock().await;
+        if let Some(entry) = building.get(sid) {
+            // strong_count == 1 means we are the last holder; safe
+            // to remove. Anything > 1 means another waiter has
+            // cloned the Arc and we leave it for them to clean up
+            // when they're done.
+            if Arc::strong_count(entry) == 1 {
+                building.remove(sid);
+            }
+        }
+    }
+
+    /// Spawn the agent, run negotiation, register the hub, return
+    /// the first subscriber. Used by both the resume slow path (with
+    /// the key mutex held) and the fresh-attach path.
+    async fn build_and_register(
+        &self,
+        cfg: Arc<Config>,
+        resume_session_id: Option<String>,
+        cwd_override: Option<String>,
+        build_id: &str,
+    ) -> Result<AttachedHub> {
         let hub = build_hub(cfg, resume_session_id, cwd_override, build_id, self.clone()).await?;
         let session_id = hub.session_id.clone();
         let mut map = self.inner.write().await;
-        // Two concurrent attaches racing the same negotiation might
-        // leave us with a duplicate; honour the first registration
-        // and drop the second hub, which will be tidied up when its
-        // strong refs go away.
         let entry = map.entry(session_id).or_insert_with(|| Arc::new(hub));
         let hub = entry.clone();
         drop(map);
