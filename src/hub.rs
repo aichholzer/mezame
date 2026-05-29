@@ -938,8 +938,18 @@ async fn update_session_info_field(
     new_id: &str,
 ) -> Option<Value> {
     let mut snap = snapshot.lock().await;
-    let info = snap.session_info.as_mut()?;
+    let info_frame = snap.session_info.as_mut()?;
+    // The cached frame is the full WS-shaped event:
+    //   { "type": "session_info", "info": { "modes": {...}, "models": {...} } }
+    // The mutation target lives inside `info`, not at the top level,
+    // so we walk down one step before poking the `currentModeId` /
+    // `currentModelId` field.
+    let info = info_frame.get_mut("info")?;
     let outer = info.get_mut(outer_field)?.as_object_mut()?;
     outer.insert(current_field.into(), Value::String(new_id.to_string()));
+    // Return only the inner `info` object; the loop wraps it in the
+    // outer `{ "type": "session_info", "info": ... }` envelope so
+    // the broadcast matches what the negotiate-time frame looked
+    // like to the reducer.
     Some(info.clone())
 }

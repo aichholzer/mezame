@@ -13,6 +13,21 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.35] - 2026-05-29
+
+### Fixed
+
+- 0.8.34's hub-side mode/model propagation silently failed because
+  the cached `session_info` is the full WS frame (<code>{ type, info }</code>),
+  and the mutation walked into <code>info.modes.currentModeId</code>,
+  not <code>info.currentModeId</code>. The cached snapshot already
+  carries the wrapping <code>{ type: "session_info", info: ... }</code>
+  envelope, so <code>get_mut("modes")</code> on the outer frame
+  always returned <code>None</code> and the broadcast was a
+  no-op. The fix walks one step into <code>info</code> before
+  poking the field, and returns just the inner object so the
+  loop wraps it in the same envelope on the way out.
+
 ## [0.8.34] - 2026-05-29
 
 ### Fixed
