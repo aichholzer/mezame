@@ -373,17 +373,24 @@ async fn get_history(
 
 /// Parse Kiro's session JSONL into compact browser-facing entries.
 ///
-/// Shape we consume (all other variants ignored):
+/// Shape we consume:
 ///   { "kind": "Prompt", "data": {
 ///       "content": [{ "kind": "text", "data": "..." }, ...],
 ///       "meta": { "timestamp": <unix seconds> } } }
 ///   { "kind": "AssistantMessage", "data": {
-///       "content": [{ "kind": "text", "data": "..." }, ...] } }
+///       "content": [
+///           { "kind": "thinking", "data": { "text": "..." } },
+///           { "kind": "text", "data": "..." },
+///           ...
+///       ] } }
 ///
-/// Any `content` block whose `kind` is not `"text"` is dropped here; we
-/// don't try to reconstruct thinking blocks, tool calls, or tool results
-/// in the history view. If Kiro ever starts emitting verbose tool panels
-/// in the UI, those should come through as structured events separately.
+/// AssistantMessage entries can carry both `thinking` and `text`
+/// blocks; we emit them as separate history entries so the timeline
+/// reads "user → reasoning → answer". Tool-result blocks are still
+/// dropped: the live view renders the structured tool-call cards
+/// for active turns, but replaying them from JSONL would mean
+/// reconstructing per-call status, args, and outputs out of band,
+/// which is more complex than the history view warrants.
 pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     // Timestamp of the most recent Prompt. Persisted in ms for the
@@ -418,6 +425,18 @@ pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
                 }
             }
             "AssistantMessage" => {
+                // Emit reasoning blocks first (before the text reply)
+                // so the rendered order matches what the live stream
+                // produced: prompt, thinking, answer. Each thinking
+                // chunk concatenates into one block; the live path
+                // does the same merging client-side.
+                if let Some(text) = extract_thinking_blocks(&data) {
+                    out.push(json!({
+                        "role": "thought",
+                        "text": text,
+                        "timestamp": current_ts_ms
+                    }));
+                }
                 if let Some(text) = extract_text_blocks(&data) {
                     out.push(json!({
                         "role": "agent",
@@ -427,8 +446,8 @@ pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
                 }
             }
             _ => {
-                // Ignore ToolResults, thinking-only messages, any other
-                // variants. The live view will render those for new
+                // Ignore ToolResults and any other variants. The live
+                // view renders structured tool-call cards for new
                 // turns; replayed history stays lean.
             }
         }
@@ -446,6 +465,39 @@ pub fn extract_text_blocks(data: &Value) -> Option<String> {
     for block in content {
         if block.get("kind").and_then(Value::as_str) == Some("text") {
             if let Some(s) = block.get("data").and_then(Value::as_str) {
+                if !s.is_empty() {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(s);
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
+/// Extract reasoning text from an `AssistantMessage` data blob.
+///
+/// Kiro nests the thinking text one level deeper than plain text
+/// blocks: <code>{ "kind": "thinking", "data": { "text": "..." } }</code>.
+/// We concatenate every thinking block in the message into a single
+/// reasoning entry so the history-view collapsible matches the
+/// live-stream block.
+pub fn extract_thinking_blocks(data: &Value) -> Option<String> {
+    let content = data.get("content")?.as_array()?;
+    let mut buf = String::new();
+    for block in content {
+        if block.get("kind").and_then(Value::as_str) == Some("thinking") {
+            if let Some(s) = block
+                .get("data")
+                .and_then(|d| d.get("text"))
+                .and_then(Value::as_str)
+            {
                 if !s.is_empty() {
                     if !buf.is_empty() {
                         buf.push('\n');

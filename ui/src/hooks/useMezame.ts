@@ -403,7 +403,10 @@ const startStateEventStream = () => {
 // event log and returns compact entries with real per-turn timestamps.
 
 type HistoryEntry = {
-  role: Role;
+  /** `'user'` and `'agent'` map to text log entries with the
+   * matching role; `'thought'` maps to a thought log entry that
+   * the UI renders as a collapsible reasoning block. */
+  role: Role | 'thought';
   text: string;
   /** Unix epoch millis. May be null for turns Kiro didn't stamp. */
   timestamp: number | null;
@@ -428,6 +431,15 @@ const loadHistory = async (s: Session) => {
   // discarded: `/history` is the authoritative view of past turns.
   s.log = [];
   for (const e of entries) {
+    if (e.role === 'thought') {
+      s.log.push({
+        kind: 'thought',
+        id: newLogId(),
+        text: e.text,
+        timestamp: e.timestamp ?? Date.now()
+      });
+      continue;
+    }
     s.log.push({
       kind: 'text',
       id: newLogId(),

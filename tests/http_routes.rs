@@ -225,6 +225,42 @@ async fn get_history_with_fixture_returns_parsed_entries() {
     assert_eq!(entries[1]["timestamp"], 1_700_000_000_000_i64);
 }
 
+#[tokio::test]
+async fn get_history_emits_thought_entry_before_agent_text() {
+    // Reasoning models produce assistant messages with a `thinking`
+    // block followed by a `text` block. The history endpoint must
+    // surface both, in order, so the rehydrated log shows the
+    // collapsible reasoning section above the answer just like the
+    // live broadcast did.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let dir = tmp.path().join(".kiro/sessions/cli");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sid = "thinks";
+    let jsonl = "\
+{\"kind\":\"Prompt\",\"data\":{\"content\":[{\"kind\":\"text\",\"data\":\"why\"}],\"meta\":{\"timestamp\":1700000000}}}
+{\"kind\":\"AssistantMessage\",\"data\":{\"content\":[{\"kind\":\"thinking\",\"data\":{\"text\":\"because\"}},{\"kind\":\"text\",\"data\":\"42\"}]}}
+";
+    std::fs::write(dir.join(format!("{sid}.jsonl")), jsonl).unwrap();
+
+    let req = Request::get(format!("/history?session={sid}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, bytes, _) = run_request(req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body = json_body(&bytes);
+    let entries = body.get("entries").and_then(Value::as_array).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["role"], "user");
+    assert_eq!(entries[1]["role"], "thought");
+    assert_eq!(entries[1]["text"], "because");
+    assert_eq!(entries[2]["role"], "agent");
+    assert_eq!(entries[2]["text"], "42");
+}
+
 // ---------- SPA fallback / asset routing ----------
 
 #[tokio::test]

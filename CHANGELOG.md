@@ -13,6 +13,26 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.36] - 2026-05-29
+
+### Added
+
+- The reasoning blocks now survive a page reload. Kiro records
+  reasoning as a <code>thinking</code> content block inside its
+  <code>AssistantMessage</code> entries; the history endpoint
+  ignored them, so the rehydrated log showed only the answer
+  text. The <code>/history</code> endpoint now extracts thinking
+  blocks alongside text blocks and returns them as a separate
+  entry with role <code>thought</code>, ordered before the
+  agent's text reply for the same turn. The client maps role
+  <code>thought</code> to the same collapsible reasoning block
+  the live broadcast uses.
+
+  Tool-call history is still not reconstructed from JSONL; the
+  live view renders the structured cards for active turns, but
+  replay would mean rebuilding per-call status, args, and outputs
+  out of band.
+
 ## [0.8.35] - 2026-05-29
 
 ### Fixed
