@@ -206,7 +206,7 @@ export const SideBar = ({
           // drawer (no margin) so it can take over the viewport when
           // open.
           'fixed inset-y-0 left-0 z-40 flex flex-col',
-          'bg-card md:rounded-2xl md:shadow-[0_20px_60px_rgba(0,0,0,0.25)] md:border md:border-[color:var(--outline-variant)]',
+          'bg-card md:rounded-2xl md:shadow-[0_5px_10px_rgba(201,103,54,0.35)] md:border md:border-[color:var(--outline-variant)]',
           // Drawer mode (mobile): translate-x animation for show/hide.
           // Disable the transition while resizing so the live width
           // update does not lag visibly.

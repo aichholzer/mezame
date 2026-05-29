@@ -1,4 +1,4 @@
-import { PaperclipIcon, SendIcon, SettingsIcon, XIcon } from 'lucide-react';
+import { PaperclipIcon, SendIcon, SettingsIcon, SquareIcon, XIcon } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
@@ -12,6 +12,7 @@ import { CwdChip } from '@/features/CwdChip';
 import { ModeModelSelectors } from '@/features/ModeModelSelectors';
 import { SlashAutocomplete, type SlashAutocompleteHandle } from '@/features/SlashAutocomplete';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { mezameActions } from '@/hooks/useMezame';
 import {
   attachmentToBlock,
   cleanup,
@@ -302,7 +303,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         // composer rests at `bottom: 1.25rem` (20 px) on desktop,
         // matching the sidebar's outer margin so both bottom edges
         // align.
-        'pointer-events-none absolute left-0 right-5 z-10'
+        'pointer-events-none absolute left-0 right-5 z-10 pt-[12px] bg-[color:var(--background)]'
       )}
       style={{
         bottom: 'calc(1.25rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
@@ -317,9 +318,9 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           // shadow so it stands out on the warm cream surface;
           // primary-tinted ring on focus matches the reference.
           'pointer-events-auto relative rounded-2xl border border-[color:var(--outline-variant)] bg-[color:var(--surface-container-lowest)]',
-          'shadow-[0_12px_32px_rgba(60,40,20,0.08)]',
-          'transition-shadow focus-within:border-[color:var(--primary)]/60 focus-within:shadow-[0_12px_32px_rgba(194,101,42,0.16)]',
-          dragOver && 'ring-2 ring-[color:var(--primary)]/70'
+          'shadow-[0_5px_10px_rgba(201,103,54,0.35)]',
+          'transition-shadow focus-within:border-[color:var(--primary)]/90 focus-within:shadow-[0_5px_10px_rgba(201,103,54,0.35)]',
+          dragOver && 'ring-2 ring-[color:var(--primary)]/85'
         )}
       >
         <SlashAutocomplete
@@ -361,23 +362,42 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           )}
         />
 
-        {/* Top-right: send (desktop only). On mobile the send button
-         * moves to the bottom row so it is within thumb reach. */}
+        {/* Top-right: send or stop (desktop only). While the session
+         * is busy the button becomes a stop control that cancels the
+         * active turn. On mobile it moves to the bottom row. */}
         <div className="absolute right-2 top-2 hidden md:block">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="submit"
-                size="icon"
-                className="size-9 touch-manipulation"
-                disabled={!canSend}
-                aria-label="Send message"
-              >
-                <SendIcon className="size-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="left">Send</TooltipContent>
-          </Tooltip>
+          {busy ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="destructive"
+                  className="size-9 touch-manipulation"
+                  onClick={() => mezameActions.sendCancel()}
+                  aria-label="Stop response"
+                >
+                  <SquareIcon className="size-3.5 fill-current" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="left">Stop</TooltipContent>
+            </Tooltip>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="submit"
+                  size="icon"
+                  className="size-9 touch-manipulation"
+                  disabled={!canSend}
+                  aria-label="Send message"
+                >
+                  <SendIcon className="size-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="left">Send</TooltipContent>
+            </Tooltip>
+          )}
         </div>
 
         {/* Bottom row.
@@ -424,18 +444,29 @@ export const InputRow = ({ session, onSubmit }: Props) => {
             <div className="hidden md:block">
               <ModeModelSelectors session={session} layout="row" />
             </div>
-            {/* Mobile send button, matching the desktop one's disabled
-             * state but positioned in the bottom-right where the thumb
-             * can reach it. */}
-            <Button
-              type="submit"
-              size="icon"
-              className="size-11 md:hidden touch-manipulation"
-              disabled={!canSend}
-              aria-label="Send message"
-            >
-              <SendIcon className="size-4" />
-            </Button>
+            {/* Mobile send/stop button. */}
+            {busy ? (
+              <Button
+                type="button"
+                size="icon"
+                variant="destructive"
+                className="size-11 md:hidden touch-manipulation"
+                onClick={() => mezameActions.sendCancel()}
+                aria-label="Stop response"
+              >
+                <SquareIcon className="size-3.5 fill-current" />
+              </Button>
+            ) : (
+              <Button
+                type="submit"
+                size="icon"
+                className="size-11 md:hidden touch-manipulation"
+                disabled={!canSend}
+                aria-label="Send message"
+              >
+                <SendIcon className="size-4" />
+              </Button>
+            )}
           </div>
         </div>
 
