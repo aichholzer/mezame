@@ -28,7 +28,7 @@ use futures_util::stream::Stream;
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::config::{state_path, Config};
 use crate::hub::HubRegistry;
@@ -49,6 +49,12 @@ pub struct AppState {
     /// sync. Capacity 64 is plenty given state writes happen at
     /// human-edit pace.
     pub state_changes: broadcast::Sender<()>,
+    /// Process-wide shutdown signal. Fired by the SIGINT/SIGTERM
+    /// handler before letting axum's graceful shutdown drain.
+    /// Long-poll handlers (currently just the SSE stream) listen
+    /// on this so they end their futures promptly instead of
+    /// holding the serve loop hostage forever.
+    pub shutdown: Arc<Notify>,
 }
 
 /// React UI bundle baked into the binary by `build.rs` + `rust-embed`.
@@ -69,17 +75,19 @@ struct UiAssets;
 
 pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
     let (state_changes, _) = broadcast::channel(64);
+    let shutdown = Arc::new(Notify::new());
     let state = Arc::new(AppState {
         config: Arc::new(cfg),
         hubs: HubRegistry::new(),
         state_changes,
+        shutdown: shutdown.clone(),
     });
     let app = build_router(state);
 
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("Mezame is listening on: http://{bind}");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown))
         .await?;
     Ok(())
 }
@@ -105,10 +113,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// connections on the returned future, so Mezame exits promptly when its
 /// service manager asks it to.
 ///
+/// Before returning we fire `shutdown` so any long-poll handlers in
+/// flight (the SSE state-events stream) end their futures and let
+/// axum's graceful drain complete instead of waiting on them forever.
+///
 /// Live WebSocket sessions are dropped on shutdown; the agent subprocess
 /// is killed (`kill_on_drop`), which may leave a Kiro session lockfile
 /// behind. The next start self-heals via `steal_stale_session_lock`.
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown: Arc<Notify>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -134,6 +146,11 @@ async fn shutdown_signal() {
         _ = ctrl_c => eprintln!("\nReceived SIGINT, shutting down."),
         _ = terminate => eprintln!("Received SIGTERM, shutting down."),
     }
+    // Wake every long-poll handler so they release their futures
+    // before axum's drain kicks in. `notify_waiters` only wakes
+    // tasks that are currently waiting; long-pollers attached after
+    // this point check the same flag inline before subscribing.
+    shutdown.notify_waiters();
 }
 
 /// Serve a single file from the embedded UI bundle.
@@ -280,18 +297,29 @@ async fn state_events(
     State(app): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = app.state_changes.subscribe();
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+    let shutdown = app.shutdown.clone();
+    let stream = futures_util::stream::unfold((rx, shutdown), |(mut rx, shutdown)| async move {
         loop {
-            match rx.recv().await {
-                Ok(()) => {
-                    return Some((Ok(Event::default().event("state_changed").data("")), rx));
-                }
-                // Lagged: skip and wait for the next message. The
-                // browser will refetch on the next event we deliver.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                // All senders dropped: end the stream. In practice
-                // this only happens when the server is shutting down.
-                Err(broadcast::error::RecvError::Closed) => return None,
+            tokio::select! {
+                // Shutdown wins: end the stream so axum's graceful
+                // drain can finish. Without this, Ctrl+C hangs
+                // because the SSE handler holds a request future
+                // that never resolves.
+                _ = shutdown.notified() => return None,
+                msg = rx.recv() => match msg {
+                    Ok(()) => {
+                        return Some((
+                            Ok(Event::default().event("state_changed").data("")),
+                            (rx, shutdown),
+                        ));
+                    }
+                    // Lagged: skip and wait for the next message. The
+                    // browser will refetch on the next event we deliver.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // All senders dropped: end the stream. In practice
+                    // this only happens when the server is shutting down.
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                },
             }
         }
     });

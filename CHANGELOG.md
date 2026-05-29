@@ -13,6 +13,23 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.31] - 2026-05-29
+
+### Fixed
+
+- Ctrl+C no longer stopped Mezame after the SSE stream landed in
+  0.8.28. axum's `with_graceful_shutdown` waits for every in-flight
+  request to drain, and an SSE long-poll never finishes on its own.
+  The "Received SIGINT, shutting down." line printed because our
+  signal handler ran, but axum then sat waiting on the SSE
+  handlers forever.
+
+  Fixed by threading a `tokio::sync::Notify` through `AppState`.
+  The signal handler fires it before yielding control to axum,
+  the SSE handler races its broadcast receiver against the
+  shutdown notify, and either branch ending closes the stream.
+  Axum's drain then completes promptly.
+
 ## [0.8.30] - 2026-05-29
 
 ### Fixed

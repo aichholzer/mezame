@@ -20,7 +20,7 @@ use mezame::hub::HubRegistry;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 use tower::ServiceExt;
 
 fn home_lock() -> &'static Mutex<()> {
@@ -40,6 +40,7 @@ fn dummy_state() -> Arc<AppState> {
         }),
         hubs: HubRegistry::new(),
         state_changes,
+        shutdown: Arc::new(Notify::new()),
     })
 }
 
