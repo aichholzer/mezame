@@ -284,14 +284,7 @@ impl HubRegistry {
         // the spawn and negotiate happen outside the lock so two
         // browsers attaching at the same time but for different ids
         // do not serialise.
-        let hub = build_hub(
-            cfg,
-            resume_session_id,
-            cwd_override,
-            build_id,
-            self.clone(),
-        )
-        .await?;
+        let hub = build_hub(cfg, resume_session_id, cwd_override, build_id, self.clone()).await?;
         let session_id = hub.session_id.clone();
         let mut map = self.inner.write().await;
         // Two concurrent attaches racing the same negotiation might
@@ -306,12 +299,27 @@ impl HubRegistry {
 
     /// Subscribe a fresh `AttachedHub` to an existing hub. Internal
     /// helper used by both the fast and slow attach paths.
+    ///
+    /// The snapshot's `ready.resumed` field is rewritten to `true` for
+    /// every attach. With the hub model, an attach is always a join
+    /// to an existing conversation: even the very first browser to
+    /// reach a hub is, in effect, "resuming" the agent's perspective
+    /// that already exists from the negotiation handshake. The
+    /// client uses `resumed: true` to mean "clear any stale local
+    /// log and fetch /history to seed yourself", which is what we
+    /// want on every attach including reloads. The original
+    /// `session/new`-vs-`session/load` distinction matters to the
+    /// hub's negotiation phase, not to the attached browser.
     async fn subscribe(&self, hub: Arc<SessionHub>) -> AttachedHub {
         hub.counter.increment().await;
+        let mut snapshot_ready = hub.snapshot.ready.clone();
+        if let Some(map) = snapshot_ready.as_object_mut() {
+            map.insert("resumed".into(), Value::Bool(true));
+        }
         AttachedHub {
             commands: hub.commands.clone(),
             outbound: hub.outbound.subscribe(),
-            snapshot_ready: hub.snapshot.ready.clone(),
+            snapshot_ready,
             snapshot_session_info: hub.snapshot.session_info.clone(),
             session_id: hub.session_id.clone(),
             counter: hub.counter.clone(),
@@ -529,8 +537,7 @@ async fn run_hub_loop(state: HubLoopState) {
     // into an mpsc; we run a side-channel mpsc here, parse each frame
     // back into JSON, and broadcast to subscribers. Two extra
     // serde calls per message; cheap given the typical event volume.
-    let (relay_tx, mut relay_rx) =
-        mpsc::unbounded_channel::<axum::extract::ws::Message>();
+    let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<axum::extract::ws::Message>();
 
     // Track pending permission ids so duplicate replies from a second
     // browser drop silently. This is the stage-1 simplification of
@@ -553,6 +560,7 @@ async fn run_hub_loop(state: HubLoopState) {
                         c,
                         &suppress_replay,
                         &mut answered_permissions,
+                        &outbound,
                     ).await,
                     None => break, // all senders dropped: nobody can reach us
                 }
@@ -627,6 +635,7 @@ async fn handle_command(
     cmd: HubCommand,
     suppress_replay: &Mutex<bool>,
     answered: &mut std::collections::HashSet<String>,
+    outbound: &broadcast::Sender<Arc<Value>>,
 ) {
     match cmd {
         HubCommand::Prompt { blocks } => {
@@ -637,6 +646,23 @@ async fn handle_command(
             // session/update events. From here on everything the
             // agent emits is real.
             *suppress_replay.lock().await = false;
+
+            // Echo the user prompt to every attached browser via the
+            // broadcast. Including the sender: the client used to
+            // append the user's text locally, but with multi-attach
+            // that approach hides the prompt from peer browsers and
+            // produces inconsistent timelines. Now the hub is the
+            // single source of truth for "what was said in this
+            // session"; clients render only what the broadcast emits.
+            let echo_text = extract_user_text(&blocks);
+            if !echo_text.is_empty() {
+                let _ = outbound.send(Arc::new(json!({
+                    "type": "append",
+                    "role": "user",
+                    "text": format!("> {echo_text}\n")
+                })));
+            }
+
             // Fire-and-forget; the agent's response (chunks, tool
             // calls, prompt_done) will arrive on the updates
             // channel and broadcast naturally.
@@ -711,3 +737,25 @@ async fn handle_command(
 }
 
 // (imports at the top of the file)
+
+/// Pull the user's plain text out of an ACP prompt-block array. Used
+/// by the broadcast echo so peer browsers see what the sender typed.
+/// Image and resource blocks are dropped from the echo because the
+/// existing client only renders the text portion of user turns; the
+/// agent still sees the full block payload via `session/prompt`.
+fn extract_user_text(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            if block.get("type").and_then(Value::as_str)? == "text" {
+                block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}

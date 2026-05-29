@@ -13,6 +13,41 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.26] - 2026-05-29
+
+### Fixed
+
+- Multi-browser attach (stage 1) had three reachable bugs that
+  shipped in 0.8.25 and surfaced as soon as we drove a real two-
+  browser scenario.
+
+  Browser B joining an existing session saw an empty chat. The hub
+  cached the `ready` event from the first attach with `resumed: false`
+  (the first browser was the one that ran `session/new`); subsequent
+  attaches replayed that snapshot, so the client never took the
+  `resumed: true` branch that fetches `/history`. Fixed by always
+  rewriting `ready.resumed` to `true` when subscribing to a hub:
+  every attach is functionally a join to a conversation that
+  already exists from the agent's perspective, regardless of how
+  the hub was first created. The `session/new`-vs-`session/load`
+  distinction stays inside the negotiation phase where it matters.
+
+  The same root cause meant a reload (in either browser) lost
+  history: after the WS dropped, the new attach landed on the
+  cached snapshot with `resumed: false` and the client never
+  rehydrated. Same fix covers it.
+
+  Browser B's typed prompt did not show up in browser A. The hub
+  broadcast only carried agent output; the sender's prompt was
+  rendered locally from `sendPrompt` and never reached peers. Fixed
+  by having the hub echo every `Prompt` command back through the
+  broadcast as an `append { role: user }` frame, and dropping the
+  local `appendLog` from `sendPrompt` so the broadcast echo is the
+  single source of truth. Sender and peers now see the same text
+  in the same order. The round-trip is microseconds (broadcast in
+  process, WS sink is local) so the sender notices no perceptible
+  delay.
+
 ## [0.8.25] - 2026-05-29
 
 ### Added

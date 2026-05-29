@@ -722,13 +722,17 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   }
   ensureTrailingNewline(s);
 
-  // Local echo in the log: text on its own line, attachments as a
-  // compact "[attached: N item(s)]" suffix. The agent will see the
-  // full blocks; we avoid spamming the chat with base64.
-  const echo = attachments.length > 0
-    ? `> ${text}\n  [attached: ${attachments.length} item${attachments.length === 1 ? '' : 's'}]\n`
-    : `> ${text}\n`;
-  appendLog(s, { kind: 'text', id: newLogId(), role: 'user', text: echo, timestamp: Date.now() });
+  // The user prompt is no longer rendered locally on send; the hub
+  // echoes it back as an `append { role: user }` broadcast frame so
+  // every attached browser (sender included) sees the same text in
+  // its timeline. Local-render-only would hide our prompt from peer
+  // browsers and produce inconsistent timelines after multi-attach.
+  // The round-trip is microseconds in practice (broadcast in-process,
+  // WS sink is local), so the sender sees no perceptible delay.
+  //
+  // Attachments are still part of the wire payload but the echo
+  // shows only the text portion; agents that surface uploaded files
+  // do so via tool calls in their own time.
 
   // Build the ACP-shaped prompt. Text always comes first when present.
   // Attachments preserve the order the user added them.
