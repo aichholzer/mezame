@@ -13,6 +13,40 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.42] - 2026-05-29
+
+### Changed
+
+- Reskinned the UI to a warm cream and terracotta light theme.
+  The dark zinc + green palette is gone; the new look reads as a
+  calmer, more editorial surface while keeping JetBrains Mono
+  throughout and Chelsea Market for the wordmark.
+
+  Highlights:
+
+  - Warm cream surface ladder with a saturated terracotta primary
+    that carries through to the user bubble, send button, sidebar
+    accent bar, and the active session row.
+  - Sidebar floats as a card on desktop with rounded corners, a
+    dark soft shadow, and 20/10/20/20 px margins. The active
+    session row gets a primary border to stand off the surface.
+  - Message bubbles are solid-fill speech-bubble shapes with one
+    squared corner on the speaker side: terracotta for the user,
+    cream-secondary for the agent. Agent bubbles show a
+    placeholder avatar to their left with a copy button below it.
+  - The "thinking" indicator is now the avatar with a bouncing
+    dots bubble that transitions seamlessly into the streamed
+    response.
+  - Tool-call cards, thought blocks, permission cards, and MCP
+    OAuth cards are indented to align with the agent bubble edge.
+  - The floating composer is a white card with a warm shadow that
+    lights up in primary on focus; consistent 20 px spacing
+    around the viewport edges.
+  - Timestamps removed from under bubbles; copy button removed
+    from user messages (agent copy stays in the avatar column).
+
+  No wire protocol changes.
+
 ## [0.8.41] - 2026-05-29
 
 ### Changed

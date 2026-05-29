@@ -116,5 +116,18 @@ export const useSidebarWidth = (): SidebarWidthState => {
     };
   }, [dragging, width]);
 
+  // Mirror the live width onto a root CSS variable so other regions
+  // (the main chat column) can reserve matching left padding without
+  // prop-drilling. The sidebar floats on `position: fixed` at desktop
+  // widths so it does not push the main column itself; the variable
+  // is the bridge that keeps the two columns visually aligned. The
+  // value is wrapped with `px` for direct use in calc() expressions.
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    document.documentElement.style.setProperty('--mz-sidebar-width', `${width}px`);
+  }, [width]);
+
   return { width, beginDrag, dragging };
 };

@@ -1,3 +1,4 @@
+import { BotIcon } from 'lucide-react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
@@ -6,7 +7,6 @@ import { ToolCallCard } from '@/features/ToolCallCard';
 import { mezameActions } from '@/hooks/useMezame';
 import { useKeyboardInsetValue } from '@/hooks/useKeyboardInset';
 import { useTick } from '@/hooks/useTick';
-import { formatAbsolute, timeAgo } from '@/lib/time';
 import { cn } from '@/lib/utils';
 import type { LogEntry, PermissionOption, Session } from '@/types';
 
@@ -14,12 +14,6 @@ type Props = {
   session: Session;
   isActive: boolean;
 };
-
-const TimestampLabel = ({ ts, now }: { ts: number; now: number }) => (
-  <span className="text-[11px] text-muted-foreground select-none" title={formatAbsolute(ts)}>
-    {timeAgo(ts, now)}
-  </span>
-);
 
 const PermissionCard = ({
   session,
@@ -140,6 +134,20 @@ const PermissionCard = ({
  * the store prepends/appends. Neither belongs in a chat bubble. */
 const cleanUserText = (text: string): string => text.replace(/^> /, '').trimEnd();
 
+/** Placeholder avatar shown to the left of every agent bubble. The
+ * design intentionally keeps this generic until we decide whether
+ * sessions get distinct avatars (per-agent? per-model?). For now, a
+ * flat primary-tinted disc with a small bot glyph is enough to give
+ * the bubble its anchor point matching the reference design. */
+const AgentAvatar = () => (
+  <div
+    aria-hidden="true"
+    className="flex size-12 shrink-0 items-center justify-center rounded-full bg-[color:var(--agent-bubble)] text-[color:var(--agent-bubble-foreground)]"
+  >
+    <BotIcon className="size-6" />
+  </div>
+);
+
 const ThoughtCard = ({ entry }: { entry: Extract<LogEntry, { kind: 'thought' }> }) => {
   const trimmed = entry.text.trim();
   if (!trimmed) {
@@ -163,15 +171,9 @@ const ThoughtCard = ({ entry }: { entry: Extract<LogEntry, { kind: 'thought' }> 
 
 const TextEntry = ({
   entry,
-  now,
   isStreaming
 }: {
   entry: Extract<LogEntry, { kind: 'text' }>;
-  now: number;
-  /** True when this entry is the last agent text entry of the
-   * current turn AND the session is still streaming. The footer
-   * meta (copy button, timestamp) is hidden in that state since
-   * neither the text nor the timestamp is final yet. */
   isStreaming: boolean;
 }) => {
   if (entry.role === 'sys') {
@@ -201,14 +203,18 @@ const TextEntry = ({
   if (entry.role === 'agent') {
     const copyText = entry.text.trim();
     return (
-      <div className="my-3">
-        <Markdown text={entry.text} />
-        {!isStreaming && (
-          <div className="mt-2 flex items-center gap-2.5">
+      <div className="my-5 flex items-start justify-start gap-2">
+        <div className="flex flex-col items-center gap-2">
+          <AgentAvatar />
+          {!isStreaming && (
             <CopyButton text={copyText} title="Copy message" className="size-7" />
-            <TimestampLabel ts={entry.timestamp} now={now} />
+          )}
+        </div>
+        <div className="min-w-0 max-w-[88%] sm:max-w-[78%]">
+          <div className="rounded-2xl rounded-tl-[0px] bg-[color:var(--agent-bubble)] px-4 py-4 text-[color:var(--agent-bubble-foreground)] shadow-sm">
+            <Markdown text={entry.text} />
           </div>
-        )}
+        </div>
       </div>
     );
   }
@@ -216,12 +222,10 @@ const TextEntry = ({
   // User
   const cleaned = cleanUserText(entry.text);
   return (
-    <div className="mt-10 mb-6 flex justify-end">
-      <div className="max-w-[90%] rounded rounded-br-[2px] border border-[color:var(--user-bubble)]/40 bg-[color:var(--user-bubble)]/15 px-4 py-3 sm:max-w-[78%]">
-        <div className="whitespace-pre-wrap break-words text-foreground">{cleaned}</div>
-        <div className="mt-2 flex items-center gap-2.5">
-          <CopyButton text={cleaned} title="Copy message" className="size-7" />
-          <TimestampLabel ts={entry.timestamp} now={now} />
+    <div className="my-5 flex justify-end">
+      <div className="max-w-[88%] sm:max-w-[78%]">
+        <div className="rounded-2xl rounded-br-[0px] bg-[color:var(--user-bubble)] px-4 py-4 text-[color:var(--user-bubble-foreground)] shadow-sm">
+          <div className="whitespace-pre-wrap break-words">{cleaned}</div>
         </div>
       </div>
     </div>
@@ -233,9 +237,6 @@ export const LogPane = ({ session, isActive }: Props) => {
   const lastScrollHeight = useRef(0);
   const tick = useTick();
   const kbInset = useKeyboardInsetValue();
-  // Relative-time label refresh needs an actual `now` snapshot. tick just
-  // forces this component (and children) to re-render.
-  const now = Date.now();
   void tick;
 
   // Index of the last agent text entry. Used to gate the
@@ -333,30 +334,36 @@ export const LogPane = ({ session, isActive }: Props) => {
           // already final, so they keep their footer.
           const isStreaming =
             session.thinking && entry.role === 'agent' && idx === lastAgentTextIndex;
-          return <TextEntry key={entry.id} entry={entry} now={now} isStreaming={isStreaming} />;
+          return <TextEntry key={entry.id} entry={entry} isStreaming={isStreaming} />;
         }
         if (entry.kind === 'thought') {
-          return <ThoughtCard key={entry.id} entry={entry} />;
+          return <div key={entry.id} className="ml-14"><ThoughtCard entry={entry} /></div>;
         }
         if (entry.kind === 'tool_call') {
-          return <ToolCallCard key={entry.id} entry={entry} />;
+          return <div key={entry.id} className="ml-14"><ToolCallCard entry={entry} /></div>;
         }
         if (entry.kind === 'mcp_oauth') {
-          return <McpOauthCard key={entry.id} session={session} entry={entry} />;
+          return <div key={entry.id} className="ml-14"><McpOauthCard session={session} entry={entry} /></div>;
         }
         return (
-          <PermissionCard key={entry.id} session={session} entry={entry} options={entry.options} />
+          <div key={entry.id} className="ml-14"><PermissionCard session={session} entry={entry} options={entry.options} /></div>
         );
       })}
 
       {showThinking && (
-        <div className="my-3 inline-flex items-center gap-2 rounded-md border border-[color:var(--primary)]/30 bg-[color:var(--primary)]/10 px-2.5 py-1.5 text-xs text-muted-foreground">
-          <span
+        <div className="my-3 flex items-start gap-2">
+          <AgentAvatar />
+          <div
+            className="rounded-2xl rounded-tl-[0px] bg-[color:var(--agent-bubble)] px-4 py-4 shadow-sm"
             role="status"
-            aria-label="Thinking..."
-            className="inline-block size-2.5 animate-spin rounded-full border-2 border-[color:var(--primary)] border-t-transparent"
-          />
-          thinking
+            aria-label="Agent is thinking"
+          >
+            <span className="inline-flex items-center gap-0.5 text-sm font-bold text-[color:var(--outline)] leading-normal">
+              <span className="animate-bounce" style={{ animationDelay: '0ms' }}>.</span>
+              <span className="animate-bounce" style={{ animationDelay: '150ms' }}>.</span>
+              <span className="animate-bounce" style={{ animationDelay: '300ms' }}>.</span>
+            </span>
+          </div>
         </div>
       )}
     </div>

@@ -1,0 +1,262 @@
+<!DOCTYPE html><html class="light" lang="en" style=""><head>
+<meta charset="utf-8">
+<meta content="width=device-width, initial-scale=1.0" name="viewport">
+<title>Nexus Chat - Main Interface</title>
+<script type="text/javascript" nonce="" src="https://contribution.usercontent.google.com/eQiAKwwtNUFJEKexcsGLdhX_DVkfwejJSry_6OYG00vbhUQ__Ze7T5iVIMUvhJSMkmF-cHJe7Yy8TYRVbWiTorK6dwPQwdxhNejk8RxY10m2cqqMyFKJ3P_d_Qaw3b5eW8dRIAF9te9j8lL68zmcgums3oXuX28xFGp7QDzrxVXcagw0SsoSAAbP6aSssJTaojjIKAqf1l3H2FKttB0r_DRiuOnIAEnUFIwBx4UCQhyNL62AeUjdwg2RX9Smqr8qS4oPgfK9W3CYgole0yewhTSl5WWzm90S0CCMJJbNOIsT8Fe-Dgdp7LMMA83y_JqzKK58wpEK9A1SlKxFfGI3Sz2vfkKx0CII7uuuUYPHtJIVi8aOORfPbkd-1-Gg_WY4dft6N7uX1Us_sYtZvyqoSrGwjubYaByrVuInIOqE-Wkflm4UNMOcG5nK1oBlyQ9cDSonBpYRPQZ413z3jdXhvU_ggTGfBGBFaFuoEZifHEeuKhacee8DXbCrSesSoLPqMOdU-tTWypza19JZTuBZ-BhzYAvT_7denFGs0OjgiaEwZBJ3aSz11OWwe1f2I1N2P2IGrGMhMjo_Tt62TOUFQxgzp8_NwwZO0fDomv_8uLwHOKHjVZ_QsiL840gMq5U9Y6eKOHhK6mupDP_i14M7f5ijMlvIOHB28Hr-opESwa39pWVCz51p4eWI5N67CMhRr9rzbGf7RUwqeexLsSQmy0rUzqwG_4x9dBita7Y7X6zuXREZcmvED3YKgAWeyfyuiC9SWbhJF243acsfvbPJDfc-0ZRhaESHuEq67vWJ"></script><script nonce="" src="https://contribution.usercontent.google.com/Vl6Ok1TXBPOI5kW_gbDAqYsAz-L0oM8bvdSYmLHiLxVn2wnd0hE8-wQGRr1vob8sHu4wfWIEObTxPP55v4IDDjfrXYcoavUpY8-KUtCE2lVvAOQIPt3qGTQhp0C_TJNNfbaTo-PkYQscpREgHrjoiSgMgdrbLPafNxA0TLXq75Lx39TEhBNa5_MnvCBdoloabMz_y3g6_5piBqK5PZScikCwL_WjUnKv9F1jW-NhIytIM8dmFsEhmKFTpfYWVGTdKzWIEZajtaBiHIYNMyz9dKJcwy4b0LrhFbr_wttkOlNWj-1RyNHJ95kl6mqJKclD32HT0evMrWxNgmvH_A4UmWJqZXD1urxztWpQvi5_YhS0hNyXkw9X4X4pvYv8Urxg9mOlwYwHfgOuzityTOfDrdFbfCyX90AUwR5x5enEECyZpzmBIufUuTa1_kRmOthUteEYzJ_prf-b2_VePWhoAylpqgqxy8NugfllkaR02uPSpIQy3o4RbF4EZglxgHyZ1QUlZ1NeLvX44E8cGNslzyNx4G-BaxhPXY_1rktVLYr5PDiEZX0WvDQ7PqCIKD4nBURz-ZziJM91RuY8Rf7OwBkfyouGXWXMl4AmxsT-RFOJk0wAF1jeXxNPAIkMUdprx3jnoFGiafTvnLn_GAtrg6p2Equwkrkq3FkpqN2pYUVHeuUxXd6nVeynAUEe98nbm-FGUXzVrfWdiY3MvcPW1NT3vkH5cAnutHfgGHjprC19V4H_y9hKKWErQNnTUrwuN_SzV-wFptRxYhFEZrHYFQsl-Zqs-T9vOxPM0Zya" type="text/javascript"></script><script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;500;600;700&amp;family=Manrope:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "primary-fixed-dim": "#f0a878",
+                        "surface-variant": "#ece6dc",
+                        "surface-container-lowest": "#ffffff",
+                        "on-tertiary-fixed": "#2e1515",
+                        "on-secondary-fixed-variant": "#504840",
+                        "inverse-surface": "#3a302a",
+                        "on-primary": "#ffffff",
+                        "on-primary-fixed": "#401a08",
+                        "on-primary-fixed-variant": "#8a4518",
+                        "tertiary": "#8c3c3c",
+                        "tertiary-container": "#d47070",
+                        "surface-container": "#f2ece4",
+                        "primary": "#c2652a",
+                        "on-primary-container": "#fbe8d8",
+                        "surface-bright": "#faf5ee",
+                        "primary-fixed": "#fbe8d8",
+                        "secondary-container": "#eae2da",
+                        "secondary": "#78706a",
+                        "on-secondary": "#ffffff",
+                        "inverse-primary": "#f0a878",
+                        "secondary-fixed": "#eae2da",
+                        "tertiary-fixed-dim": "#e8a0a0",
+                        "outline": "#9a9088",
+                        "on-tertiary-container": "#3a2020",
+                        "error-container": "#fce4e0",
+                        "surface-container-low": "#f6f0e8",
+                        "on-secondary-container": "#605850",
+                        "tertiary-fixed": "#fce0e0",
+                        "on-surface-variant": "#605850",
+                        "on-background": "#3a302a",
+                        "surface-container-highest": "#e6e0d6",
+                        "error": "#c0392b",
+                        "surface": "#faf5ee",
+                        "on-surface": "#3a302a",
+                        "secondary-fixed-dim": "#cec6be",
+                        "primary-container": "#e08850",
+                        "surface-tint": "#c2652a",
+                        "inverse-on-surface": "#faf5ee",
+                        "surface-container-high": "#ece6dc",
+                        "on-error-container": "#7a1a10",
+                        "on-secondary-fixed": "#2a2420",
+                        "on-tertiary-fixed-variant": "#6e3030",
+                        "on-error": "#ffffff",
+                        "on-tertiary": "#ffffff",
+                        "outline-variant": "#d8d0c8",
+                        "surface-dim": "#dcd6cc",
+                        "background": "#faf5ee"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.5rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                    "spacing": {
+                        "container-padding": "24px",
+                        "sidebar-margin": "12px",
+                        "stack-lg": "16px",
+                        "stack-sm": "4px",
+                        "message-gap": "16px",
+                        "sidebar-width": "280px",
+                        "stack-md": "8px"
+                    },
+                    "fontFamily": {
+                        "headline-sm": ["EB Garamond", "serif"],
+                        "body-lg": ["Manrope", "sans-serif"],
+                        "headline-md": ["EB Garamond", "serif"],
+                        "display-sm": ["EB Garamond", "serif"],
+                        "body-md": ["Manrope", "sans-serif"],
+                        "label-md": ["Manrope", "sans-serif"],
+                        "label-sm": ["Manrope", "sans-serif"]
+                    },
+                    "fontSize": {
+                        "headline-sm": ["20px", { "lineHeight": "28px", "fontWeight": "600" }],
+                        "body-lg": ["16px", { "lineHeight": "24px", "fontWeight": "400" }],
+                        "headline-md": ["24px", { "lineHeight": "32px", "letterSpacing": "-0.01em", "fontWeight": "600" }],
+                        "display-sm": ["30px", { "lineHeight": "38px", "letterSpacing": "-0.02em", "fontWeight": "700" }],
+                        "body-md": ["14px", { "lineHeight": "20px", "fontWeight": "400" }],
+                        "label-md": ["12px", { "lineHeight": "16px", "letterSpacing": "0.01em", "fontWeight": "500" }],
+                        "label-sm": ["11px", { "lineHeight": "14px", "fontWeight": "600" }]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        .scrollbar-hide::-webkit-scrollbar {
+            display: none;
+        }
+        .scrollbar-hide {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+    </style>
+</head>
+<body class="font-body-md text-on-surface h-screen overflow-hidden flex bg-background">
+<!-- Floating Sidebar (SideNavBar) -->
+<aside class="bg-surface dark:bg-inverse-surface fixed left-0 top-0 bottom-0 m-sidebar-margin w-sidebar-width flex flex-col p-4 gap-stack-lg z-10 border border-outline-variant/30 rounded-2xl shadow-[0px_20px_60px_rgba(0,0,0,0.35)]">
+<!-- Header -->
+<div class="flex items-center gap-3 px-2 mb-4">
+<div class="w-10 h-10 rounded-full bg-primary-container flex items-center justify-center shrink-0">
+<span class="material-symbols-outlined text-on-primary-container" style="font-variation-settings: 'FILL' 1;">chat_bubble</span>
+</div>
+<div class="flex flex-col">
+<span class="font-headline-sm text-headline-sm font-bold text-primary dark:text-inverse-primary">Nexus Chat</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant">Deep Work Mode</span>
+</div>
+</div>
+<!-- Action Buttons -->
+<nav class="flex flex-col gap-1 w-full">
+<!-- New Chat (Active/Primary Action visually distinct) -->
+<button class="flex items-center gap-3 px-3 py-2 rounded-lg bg-primary text-on-primary w-full text-left transition-transform active:scale-95 cursor-pointer font-label-md text-label-md">
+<span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">add_comment</span>
+<span class="">New Chat</span>
+</button>
+<!-- Search -->
+<button class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant transparent hover:bg-surface-container-low transition-colors duration-200 w-full text-left cursor-pointer active:scale-95 font-label-md text-label-md">
+<span class="material-symbols-outlined">search</span>
+<span class="">Search</span>
+</button>
+</nav>
+<div class="h-px bg-outline-variant/30 w-full my-2"></div>
+<div class="px-2 mb-2">
+<h3 class="font-label-sm text-label-sm text-outline uppercase tracking-wider">Direct Messages</h3>
+</div>
+<!-- Conversation List -->
+<div class="flex-1 overflow-y-auto scrollbar-hide flex flex-col gap-2 w-full pr-1">
+<!-- Active Conversation Card -->
+<div class="flex items-center gap-3 p-3 rounded-lg bg-surface-container-lowest shadow-[0px_4px_20px_rgba(100,116,139,0.08)] cursor-pointer relative border-l-4 border-primary">
+<img alt="Avatar" class="w-10 h-10 rounded-full object-cover shrink-0" data-alt="A close up portrait of a professional woman with a calm expression. She is in a bright, modern corporate environment with soft, diffused light mode lighting. The overall color palette features high-key whites, light slates, and subtle skin tones, reflecting a sophisticated and minimal aesthetic." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBZbZSWyexGWXVeYT4jSyNjpuTHUO72lPCQX8WuBtrJisc8CeHJyk0odO74dwswDTB6PiwodA2sF4FiEgQwEBWMTUx-AHL9U7bXR3oij7azquL6QtwFMQa3mghbds4m_1KkSMo5Tw0r3fTHamSC2PDQBuBfy6B9wXHoxW501PBnij98j8PZ36ivlWND59Sqr6caKqXnn67R0Ue0xjdWVIGZJ5lwX98y7QWsAdkwWNFInWvc5lEPOxWqU7Jx9JidJg7sm84Zz4KVR33W">
+<div class="flex-1 min-w-0">
+<div class="flex justify-between items-baseline mb-0.5">
+<span class="font-label-md text-label-md text-on-surface truncate pr-2">Sarah Jenkins</span>
+<span class="font-label-sm text-label-sm text-primary shrink-0">10:42 AM</span>
+</div>
+<p class="font-body-md text-body-md text-on-surface-variant truncate">The Q3 report looks solid. Let's review the final numbers.</p>
+</div>
+</div>
+<!-- Inactive Conversation Card -->
+<div class="flex items-center gap-3 p-3 rounded-lg bg-transparent hover:bg-surface-container-low transition-colors duration-200 cursor-pointer">
+<img alt="Avatar" class="w-10 h-10 rounded-full object-cover shrink-0" data-alt="A portrait of a male professional looking thoughtfully slightly off-camera. The lighting is clean, bright, and flat, typical of a modern light-mode corporate headshot. The background is an out of focus modern office space with subtle grey and white tones, matching a minimalist design language." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDw05chRA4bh7gZI8oU2oDc_lgFXgcz20BfGNHu7mSZ9H9Z8EM1v40qRLKoLIFBTQSbMT9EIlawA-zKh6fJFkuOliaSVqs_zDP4C15UXqGaxCgi0Xkef767itvuYx1BbLvEJ5vR7brfJQg3XsHUiTDRv839H-ZOfC8v2YBp30a_pLbf7CbWPx8jMNS0w0MnFMqqsI4V8IAn0-IjY7TUpl_SzPOUvDTP_fL9EEz5glWJjui0UYvGbjPiWEUBJA6ZqryeK9NLzFxG_V_n">
+<div class="flex-1 min-w-0">
+<div class="flex justify-between items-baseline mb-0.5">
+<span class="font-label-md text-label-md text-on-surface truncate pr-2">Michael Chen</span>
+<span class="font-label-sm text-label-sm text-outline shrink-0">Yesterday</span>
+</div>
+<p class="font-body-md text-body-md text-outline truncate">Can you send over the updated design assets when you have a moment?</p>
+</div>
+</div>
+<!-- Inactive Conversation Card -->
+<div class="flex items-center gap-3 p-3 rounded-lg bg-transparent hover:bg-surface-container-low transition-colors duration-200 cursor-pointer">
+<div class="w-10 h-10 rounded-full bg-secondary-container flex items-center justify-center shrink-0">
+<span class="font-label-md text-label-md text-on-secondary-container">ED</span>
+</div>
+<div class="flex-1 min-w-0">
+<div class="flex justify-between items-baseline mb-0.5">
+<span class="font-label-md text-label-md text-on-surface truncate pr-2">Engineering Dept</span>
+<span class="font-label-sm text-label-sm text-outline shrink-0">Tuesday</span>
+</div>
+<p class="font-body-md text-body-md text-outline truncate">Deployment scheduled for 02:00 UTC.</p>
+</div>
+</div>
+</div>
+<!-- Footer Actions -->
+<div class="mt-auto pt-4 border-t border-outline-variant/30 flex flex-col gap-1 w-full">
+<button class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant transparent hover:bg-surface-container-low transition-colors duration-200 w-full text-left cursor-pointer active:scale-95 font-label-md text-label-md">
+<span class="material-symbols-outlined">archive</span>
+<span class="">Archive</span>
+</button>
+<!-- Settings -->
+<button class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant transparent hover:bg-surface-container-low transition-colors duration-200 w-full text-left cursor-pointer active:scale-95 font-label-md text-label-md">
+<span class="material-symbols-outlined">settings</span>
+<span class="">Settings</span>
+</button>
+<button class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant transparent hover:bg-surface-container-low transition-colors duration-200 w-full text-left cursor-pointer active:scale-95 font-label-md text-label-md">
+<span class="material-symbols-outlined">help_outline</span>
+<span class="">Help</span>
+</button>
+</div>
+</aside>
+<!-- Main Content Area -->
+<main class="ml-[304px] flex-1 flex flex-col h-full relative p-6">
+<!-- TopAppBar Context (Integrated into main view) -->
+<!-- Message Thread Canvas -->
+<div class="flex-1 overflow-y-auto scrollbar-hide flex flex-col gap-message-gap pb-24 px-2">
+<!-- Date Divider -->
+<div class="flex justify-center my-4">
+</div>
+<!-- Received Message Group -->
+<div class="flex flex-col gap-stack-sm items-start max-w-[70%]">
+<div class="flex items-end gap-2">
+<img alt="Avatar" class="w-8 h-8 rounded-full object-cover shrink-0 mb-1" data-alt="A close up portrait of a professional woman with a calm expression. She is in a bright, modern corporate environment with soft, diffused light mode lighting. The overall color palette features high-key whites, light slates, and subtle skin tones, reflecting a sophisticated and minimal aesthetic." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDyLyEBmF5UaZYM12LIV-B9x9EKtlnceDLUBMI-DCV2d6BeixN1PdMSdXh5Y59xKt16I5ttYYcV2pNaK7ZQOW2LsipE4fjv75D3Oxb-dItfRV1vbREave4CB91rATN68c9V1dBMJJ7zMnNeVAVthqGzp5S7AI-tJkOTgiqxJjTpX9anOqr5yjMdLIiyum0H63zhmT7DIJnH4K140NnijADftXZlpf-hNQncNs_BtaHP2MA3LLmAcgJTcoCnw2fT6J3z86hJY7m87ay1">
+<div class="bg-secondary-container text-on-secondary-container p-3 rounded-xl rounded-bl-sm font-body-lg text-body-lg shadow-sm">
+                        Morning! Did you get a chance to review the Q3 report draft I sent over last night?
+                    </div>
+</div>
+<div class="flex items-end gap-2 ml-10">
+<div class="bg-secondary-container text-on-secondary-container p-3 rounded-xl rounded-tl-sm rounded-bl-sm font-body-lg text-body-lg shadow-sm">
+                        I think the revenue projections on slide 14 might need a slight adjustment based on the new EU regulations.
+                    </div>
+</div>
+<span class="font-label-sm text-label-sm text-outline ml-10 mt-1">09:32 AM</span>
+</div>
+<!-- Sent Message Group -->
+<div class="flex flex-col gap-stack-sm items-end self-end max-w-[70%] mt-4">
+<div class="bg-primary text-on-primary p-3 rounded-xl rounded-br-sm font-body-lg text-body-lg shadow-sm">
+                    Hi Sarah. Yes, I'm looking at it right now.
+                </div>
+<div class="bg-primary text-on-primary p-3 rounded-xl rounded-tr-sm rounded-br-sm font-body-lg text-body-lg shadow-sm">
+                    You're right about slide 14. Let's schedule a quick 15-minute sync this afternoon to iron out those specific numbers. The rest of the report looks solid. Let's review the final numbers.
+                </div>
+<div class="flex items-center gap-1 mt-1 mr-1">
+<span class="font-label-sm text-label-sm text-outline">10:42 AM</span>
+<span class="material-symbols-outlined text-[14px] text-primary">done_all</span>
+</div>
+</div>
+<!-- Typing Indicator -->
+<div class="flex items-end gap-2 mt-4">
+<img alt="Avatar" class="w-8 h-8 rounded-full object-cover shrink-0 mb-1" data-alt="A close up portrait of a professional woman with a calm expression. She is in a bright, modern corporate environment with soft, diffused light mode lighting. The overall color palette features high-key whites, light slates, and subtle skin tones, reflecting a sophisticated and minimal aesthetic." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBT1It64Hzg7lc4CbIkypLUU5nUvMzKVTahcbWulcqYKyBr8cvsytqjPuM_8rKJJGbO1MnyTAkqbRCSFFYbT-hP1e6cfql5tuuS_4KNtLkf3LUmunlr8xqd_z-YiklZa4l-bK-vGgz7DdMJkBZ7EFd-slDEea_MyXFEHbO4y-pkdB9T2oFTWh18xqIpeJE9sdWHLRkg1Ulh_s7DNQS0cqq_4jE8_ZWny_HCp0eLIRK_CZ80g9BUWgNHIRCBB4jGZaBplJUEYl8iEGgT">
+<div class="bg-surface-container-highest p-3 rounded-xl rounded-bl-sm flex gap-1 items-center h-10 w-16">
+<div class="w-1.5 h-1.5 bg-outline rounded-full animate-bounce" style="animation-delay: 0ms;"></div>
+<div class="w-1.5 h-1.5 bg-outline rounded-full animate-bounce" style="animation-delay: 150ms;"></div>
+<div class="w-1.5 h-1.5 bg-outline rounded-full animate-bounce" style="animation-delay: 300ms;"></div>
+</div>
+</div>
+</div>
+<!-- Floating Input Field -->
+<div class="absolute bottom-6 left-6 right-6 z-20">
+<div class="bg-surface-container-lowest rounded-xl shadow-[0px_12px_32px_rgba(100,116,139,0.12)] border border-outline-variant/50 p-2 flex items-end gap-2 transition-all focus-within:border-primary/50 focus-within:shadow-[0px_12px_32px_rgba(79,70,229,0.15)]">
+<button class="p-2 text-on-surface-variant hover:text-primary transition-colors rounded-lg shrink-0 mb-0.5">
+<span class="material-symbols-outlined">add_circle</span>
+</button>
+<div class="flex-1 relative">
+<textarea class="w-full bg-transparent border-none focus:ring-0 resize-none font-body-lg text-body-lg text-on-surface placeholder:text-outline py-2.5 max-h-32 scrollbar-hide outline-none" placeholder="Type a message..." rows="1" style="min-height: 44px;"></textarea>
+</div>
+<div class="flex items-center gap-1 shrink-0 mb-0.5">
+<button class="p-2 text-on-surface-variant hover:text-primary transition-colors rounded-lg">
+<span class="material-symbols-outlined">mood</span>
+</button>
+<button class="p-2 bg-primary text-on-primary rounded-lg hover:bg-primary-fixed-variant transition-colors ml-1 shadow-sm flex items-center justify-center">
+<span class="material-symbols-outlined text-[20px]">send</span>
+</button>
+</div>
+</div>
+</div>
+</main>
+
+
+</body></html>

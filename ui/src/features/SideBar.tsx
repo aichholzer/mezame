@@ -88,9 +88,9 @@ const tabVisualState = (s: Session, isActive: boolean): TabVisualState => {
 const tabVisualClass: Record<TabVisualState, string> = {
   connecting: 'border-[color:var(--attn-permission)]/60 text-foreground',
   connected:
-    'bg-[color:var(--attn-done)]/18 border-[color:var(--attn-done)]/45 text-foreground hover:bg-[color:var(--attn-done)]/28',
+    'bg-[color:var(--surface-container-low)] border-transparent text-foreground hover:bg-[color:var(--surface-container)]',
   error:
-    'bg-[color:var(--attn-error)]/20 border-[color:var(--attn-error)]/55 text-foreground hover:bg-[color:var(--attn-error)]/30',
+    'bg-[color:var(--attn-error)]/12 border-[color:var(--attn-error)]/45 text-foreground hover:bg-[color:var(--attn-error)]/18',
   // No Tailwind bg/border utilities here: the `tab-busy-border` class
   // owns them via a layered background (inner fill + conic gradient
   // around the border). See index.css.
@@ -199,23 +199,26 @@ export const SideBar = ({
 
       <aside
         className={cn(
-          // Base layout: fixed on the left, full height, scrolls its
-          // own session list. Desktop always renders at translate-x-0;
-          // mobile slides in from the left. Width is driven by the
-          // resize hook at runtime (see `style` below); the Tailwind
-          // class only sets a `flex-none`-style hint so grid math
-          // does not reflow weirdly when the inline width updates.
+          // Floating panel on desktop: 12 px margin all round, big
+          // soft shadow, fully rounded corners. The reference design
+          // makes the sidebar look like a card hovering over the
+          // background. On mobile it falls back to a full-height
+          // drawer (no margin) so it can take over the viewport when
+          // open.
           'fixed inset-y-0 left-0 z-40 flex flex-col',
-          'border-r border-border/40 bg-background/95 backdrop-blur-md',
-          'md:static md:bg-background/70',
-          // No transform transition while dragging; the live resize
-          // already updates every frame and the transition would lag
-          // it visibly.
+          'bg-card md:rounded-2xl md:shadow-[0_20px_60px_rgba(0,0,0,0.25)] md:border md:border-[color:var(--outline-variant)]',
+          // Drawer mode (mobile): translate-x animation for show/hide.
+          // Disable the transition while resizing so the live width
+          // update does not lag visibly.
           !sidebar.dragging && 'transition-transform duration-200 ease-out',
           isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
         )}
         style={{
           width: `${sidebar.width}px`,
+          marginTop: '20px',
+          marginRight: '10px',
+          marginBottom: '20px',
+          marginLeft: '20px',
           paddingTop: 'var(--mz-safe-top)',
           paddingBottom: 'var(--mz-safe-bottom)',
           paddingLeft: 'var(--mz-safe-left)'
@@ -230,7 +233,7 @@ export const SideBar = ({
           </span>
         </div>
 
-        <div className="flex items-center gap-2 px-3 pb-2">
+        <div className="flex items-center gap-1.5 px-3 pb-3">
           <DropdownMenu>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -238,7 +241,7 @@ export const SideBar = ({
                   <Button
                     size="icon"
                     variant="outline"
-                    className="size-8 text-[color:var(--primary)]"
+                    className="size-9 rounded-lg text-[color:var(--primary)]"
                     aria-label="History"
                   >
                     <HistoryIcon className="size-4" />
@@ -288,8 +291,8 @@ export const SideBar = ({
             <TooltipTrigger asChild>
               <Button
                 size="icon"
-                variant="outline"
-                className="size-8 text-[color:var(--primary)]"
+                variant="default"
+                className="size-9 rounded-lg"
                 onClick={onNewTab}
                 aria-label="New session"
               >
@@ -304,7 +307,7 @@ export const SideBar = ({
           <Button
             size="icon"
             variant="ghost"
-            className="size-8 ml-auto md:hidden"
+            className="size-9 ml-auto md:hidden"
             onClick={onRequestClose}
             aria-label="Close sidebar"
           >
@@ -312,7 +315,11 @@ export const SideBar = ({
           </Button>
         </div>
 
-        <div className="mx-3 border-t border-[color:var(--primary)]/30" />
+        <div className="px-3 pb-1.5">
+          <span className="text-[11px] uppercase tracking-wider text-[color:var(--outline)]">
+            Sessions
+          </span>
+        </div>
 
         <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto scrollbar-thin px-3 py-2">
           {sessions.map((s) => {
@@ -337,13 +344,20 @@ export const SideBar = ({
                   <div
                     data-tab-id={s.id}
                     className={cn(
-                      // Full-width row. h-9 (36 px) on desktop, h-11
-                      // (44 px) on touch for thumb-friendly targets.
-                      // Left padding reserves space for the active
-                      // accent bar so content doesn't shift between
-                      // states.
-                      'group relative flex h-9 touch:h-11 w-full cursor-pointer items-center gap-2 rounded-sm border pl-3 pr-2 text-xs touch:text-[13px] select-none touch-manipulation',
-                      visualClass
+                      // Card-style row matching the reference. Solid
+                      // background, soft shadow when active, left
+                      // accent bar in primary. Touch targets stay 44
+                      // px on coarse pointers.
+                      'group relative flex h-10 touch:h-12 w-full cursor-pointer items-center gap-2 rounded-lg border pl-3 pr-2 text-[13px] select-none touch-manipulation',
+                      visualClass,
+                      // Active row: primary border so the white card
+                      // is distinguishable from the sidebar's own
+                      // light surface, plus a soft shadow for depth.
+                      // Overrides the `border-transparent` set by
+                      // the connected visual class via Tailwind's
+                      // last-class-wins ordering.
+                      isActive &&
+                        'bg-[color:var(--surface-container-lowest)] border-[color:var(--primary)] shadow-[0_4px_18px_rgba(60,40,20,0.06)]'
                     )}
                     style={tabVisualStyle[visual]}
                     onClick={() => !isRenaming && handleActivate(s.id)}
@@ -353,12 +367,12 @@ export const SideBar = ({
                       setRenameValue(s.label);
                     }}
                   >
-                    {/* Active-row accent bar: sits inside the row's
-                     * left padding so it never pushes content. */}
+                    {/* Active-row accent bar: 4 px wide, solid primary,
+                     * hugs the left edge. */}
                     {isActive && (
                       <span
                         aria-hidden="true"
-                        className="absolute inset-y-1 left-0.5 w-[3px] rounded-full bg-[color:var(--primary)]"
+                        className="absolute inset-y-1.5 left-0 w-[3px] rounded-r-sm bg-[color:var(--primary)]"
                       />
                     )}
 
@@ -381,15 +395,22 @@ export const SideBar = ({
                             setRenameValue('');
                           }
                         }}
-                        className="h-6 flex-1 rounded-sm bg-transparent px-1 text-base md:text-xs outline-hidden"
+                        className="h-6 flex-1 rounded-sm bg-transparent px-1 text-base md:text-[13px] outline-hidden"
                       />
                     ) : (
-                      <span className="min-w-0 flex-1 truncate">{s.label}</span>
+                      <span
+                        className={cn(
+                          'min-w-0 flex-1 truncate',
+                          isActive && 'font-medium'
+                        )}
+                      >
+                        {s.label}
+                      </span>
                     )}
 
                     <button
                       type="button"
-                      className="cursor-pointer rounded-sm p-0.5 touch:p-1.5 text-muted-foreground/60 hover:text-[color:var(--attn-error)]"
+                      className="cursor-pointer rounded-sm p-0.5 touch:p-1.5 text-muted-foreground/70 hover:text-[color:var(--attn-error)]"
                       aria-label="Close session"
                       onClick={(ev) => {
                         ev.stopPropagation();

@@ -300,10 +300,10 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         // `--mz-safe-bottom` so it clears the home indicator on iOS.
         // Both custom properties default to 0 on desktop, so the
         // composer rests at `bottom: 0.75rem` as before.
-        'pointer-events-none absolute inset-x-3 z-10'
+        'pointer-events-none absolute inset-x-4 z-10'
       )}
       style={{
-        bottom: 'calc(0.75rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
+        bottom: 'calc(1rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
       }}
     >
       <div
@@ -311,11 +311,12 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         className={cn(
-          // The card itself: takes pointer events, floats, and blurs
-          // whatever log content slides under it. Border tint matches
-          // the send button's primary accent so the card reads as a
-          // first-class control, not a stray panel.
-          'pointer-events-auto relative rounded-xl border border-[color:var(--primary)]/60 bg-background/70 shadow-lg shadow-black/30 backdrop-blur-md',
+          // Floating card. Solid white-ish background with a soft
+          // shadow so it stands out on the warm cream surface;
+          // primary-tinted ring on focus matches the reference.
+          'pointer-events-auto relative rounded-2xl border border-[color:var(--outline-variant)] bg-[color:var(--surface-container-lowest)]',
+          'shadow-[0_12px_32px_rgba(60,40,20,0.08)]',
+          'transition-shadow focus-within:border-[color:var(--primary)]/60 focus-within:shadow-[0_12px_32px_rgba(194,101,42,0.16)]',
           dragOver && 'ring-2 ring-[color:var(--primary)]/70'
         )}
       >

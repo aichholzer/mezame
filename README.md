@@ -18,8 +18,6 @@ A small bridge that puts a browser-based chat UI in front of a locally running A
 
 The name is Japanese for "awakening" (**目覚め**), the moment your agent comes back online from across town.
 
-> **Not affiliated with AWS or the Kiro product.** Mezame is an independent, third-party open-source client. "Kiro" and "Kiro CLI" are used here only to identify the agent Mezame talks to; any use of those marks is purely nominative. Mezame is not built, endorsed, or reviewed by Amazon Web Services.
-
 ## What it does
 
 Mezame is an **ACP client**. It spawns your configured agent binary as a child process, speaks `JSON-RPC 2.0` with it over `stdio`, and bridges the conversation to a browser over WebSockets.
@@ -193,6 +191,8 @@ RTFM, then RTFC... If you are still stuck or just need an additional feature, fi
 Kiro&trade; is a trademark of Amazon.com, Inc. or its affiliates. All other product and company names referenced in this documentation (Claude, Gemini, Codex, Cloudflare, and others) are trademarks or registered trademarks of their respective owners. Use of these names is for identification purposes only and does not imply endorsement.
 
 Mezame is an independent, third-party open-source project and is not affiliated with, endorsed by, sponsored by, or reviewed by Amazon Web Services, Inc., Amazon.com, Inc., or any of their affiliates.
+
+> **Not affiliated with AWS or the Kiro product.** Mezame is an independent, third-party open-source client. "Kiro" and "Kiro CLI" are used here only to identify the agent Mezame talks to; any use of those marks is purely nominative. Mezame is not built, endorsed, or reviewed by Amazon Web Services.
 
 <div align="center">
 ✌🏼
