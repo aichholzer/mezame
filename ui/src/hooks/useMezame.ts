@@ -135,6 +135,10 @@ const raiseAttention = (s: Session, level: NonNullable<Attention>) => {
 let syncTimer: number | null = null;
 
 const scheduleSync = () => {
+  if (suppressNextSync) {
+    suppressNextSync = false;
+    return;
+  }
   if (syncTimer !== null) {
     clearTimeout(syncTimer);
   }
@@ -147,14 +151,14 @@ const doSync = async () => {
     sessions: sessions.map((s) => ({
       id: s.id,
       label: s.label,
-      // Persist the ACP session id whenever we have one, even on a
-      // session that has not had a first prompt yet. Resuming such a
-      // session is safe now: the hub keeps it warm in the registry,
-      // and if the registry has forgotten it (grace expired) the
-      // server falls back to `session/new` with a sys notice. This
-      // is what makes a "New session" tab on browser A show up on
-      // browser B without a manual reload.
-      acpSessionId: s.acpSessionId,
+      // Only persist the ACP session id once the session has been
+      // used. Kiro writes the on-disk JSONL only on first prompt;
+      // persisting a never-used id makes a future `session/load`
+      // fail with "Session not found". Peer browsers therefore
+      // only see a fresh tab from us after the first prompt; that
+      // tradeoff is preferable to a noisy storm of load failures
+      // every time someone reloads.
+      acpSessionId: s.used ? s.acpSessionId : null,
       cwd: s.cwd
     })),
     closed,
@@ -189,35 +193,50 @@ const fetchState = async (): Promise<Partial<PersistedState> | null> => {
 //
 // `state.json` is the cross-device store for the session list. Each
 // browser PUTs to `/state` after a local change (new session, rename,
-// close, switch active). To keep two browsers in sync without forcing
-// the user to reload, the server fires a tick on `/state/events` (an
-// SSE stream) every time `state.json` is rewritten. On each tick we
-// refetch `/state` and merge any sessions another browser created
-// into our local list.
+// close, switch active). The server is the source of truth: when a
+// tick lands on `/state/events` the browser refetches and reconciles
+// its local list against the server snapshot.
 //
-// Merge policy is intentionally additive on the receive side. A
-// session that exists on the server but not locally gets restored;
-// a session that exists locally but not on the server stays put. We
-// do not auto-close tabs from under a user just because another
-// browser closed them: that would be too surprising mid-turn. The
-// next user-driven sync from this browser will overwrite the server
-// view back to "both tabs", and the other browser will see the one
-// it closed reappear. That asymmetry is acceptable for stage 1; if
-// users actually want closes to propagate we can add a softer
-// reconciliation later.
+// Reconciliation is a two-way merge:
 //
-// The same tick also fires when this browser is the writer, but the
-// merge is a no-op (every server entry already matches a local one).
-// Cheap; not worth a self-suppression dance.
+// - Sessions present locally but not on the server were closed
+//   somewhere else; we close them here too. Without this, a close
+//   on browser A could never propagate to browser B because B's
+//   own next PUT would overwrite the server view back to "all
+//   four sessions" and A would see them reappear.
+// - Sessions present on the server but not locally were opened
+//   somewhere else; we restore them.
+// - Sessions present on both keep their local instance (its WS,
+///   log, busy state, etc.) but pick up label changes from the
+//   server.
+//
+// The active session is preserved when possible: if the server's
+// activeId is different but our active is still in the merged list,
+// we keep our active. If our active was removed by the merge, we
+// fall back to the server's activeId, then to whatever is left.
+//
+// To avoid a "ping-pong" where this browser's reconcile triggers
+// another PUT that triggers another tick, the reconciled state is
+// applied without scheduling a sync. The server already has the
+// snapshot we just merged from; there is nothing to push back.
 
 let stateEventSource: EventSource | null = null;
+let suppressNextSync = false;
 
 const reconcileFromServer = async () => {
   const saved = await fetchState();
   if (!saved?.sessions || !Array.isArray(saved.sessions)) {
     return;
   }
+  const serverIds = new Set<string>();
+  for (const entry of saved.sessions) {
+    if (entry && typeof entry.id === 'string') {
+      serverIds.add(entry.id);
+    }
+  }
   let dirty = false;
+
+  // Restore sessions present on the server but not locally.
   for (const entry of saved.sessions) {
     if (!entry || typeof entry.id !== 'string') {
       continue;
@@ -225,11 +244,11 @@ const reconcileFromServer = async () => {
     if (sessions.some((s) => s.id === entry.id)) {
       continue;
     }
-    // Only restore sessions that have an `acpSessionId` recorded.
-    // An unused tab on the other browser has no agent session yet;
-    // restoring it here would spawn a separate agent. Once the
-    // other browser sends a first prompt the id lands on the server
-    // and the next tick brings it across.
+    // Only restore sessions that have an `acpSessionId` recorded;
+    // a fresh-but-unused tab on another browser has no on-disk
+    // Kiro session yet, so attaching here would spawn a separate
+    // agent. Once that browser sends a first prompt the id lands
+    // on the server and the next tick brings it across.
     if (typeof entry.acpSessionId !== 'string' || entry.acpSessionId.length === 0) {
       continue;
     }
@@ -241,13 +260,117 @@ const reconcileFromServer = async () => {
     });
     dirty = true;
   }
+
+  // Close sessions present locally but missing on the server.
+  // Iterate over a copy because we mutate `sessions` in the loop.
+  const toClose: string[] = [];
+  for (const s of sessions) {
+    if (serverIds.has(s.id)) {
+      continue;
+    }
+    // Skip sessions we created but that have not yet synced their
+    // own ACP id back. Without this, a brand new tab on this
+    // browser would be auto-closed by an SSE tick that fired
+    // before our first PUT landed. The next reconcile after our
+    // PUT will see ourselves on the server and leave us alone.
+    if (!s.used) {
+      continue;
+    }
+    toClose.push(s.id);
+  }
+  for (const id of toClose) {
+    closeSessionLocal(id);
+    dirty = true;
+  }
+
+  // Pick up label changes for sessions present on both sides.
+  for (const entry of saved.sessions) {
+    if (!entry || typeof entry.id !== 'string') {
+      continue;
+    }
+    const local = sessions.find((s) => s.id === entry.id);
+    if (!local) {
+      continue;
+    }
+    const newLabel = typeof entry.label === 'string' ? entry.label : null;
+    if (newLabel && newLabel !== local.label) {
+      local.label = newLabel;
+      dirty = true;
+    }
+  }
+
   // Bump nextLabel so a future `New session` button on this browser
   // does not collide with a numeric label coined elsewhere.
   if (typeof saved.nextLabel === 'number' && saved.nextLabel > nextLabel) {
     nextLabel = saved.nextLabel;
   }
+
+  // Closed-history list: server view wins. The dropdown is
+  // already a "best effort" archive (capped at HISTORY_MAX); using
+  // the server snapshot means the most-recently-closed entries
+  // stay consistent across browsers without ping-ponging.
+  if (Array.isArray(saved.closed)) {
+    const next = saved.closed.slice(0, HISTORY_MAX);
+    if (JSON.stringify(next) !== JSON.stringify(closed)) {
+      closed = next;
+      dirty = true;
+    }
+  }
+
+  // If our active was removed, fall back to the server's active or
+  // the first remaining session.
+  if (activeId && !sessions.some((s) => s.id === activeId)) {
+    if (saved.activeId && sessions.some((s) => s.id === saved.activeId)) {
+      activeId = saved.activeId;
+    } else if (sessions.length > 0) {
+      activeId = sessions[0].id;
+    } else {
+      activeId = null;
+    }
+    dirty = true;
+  }
+
   if (dirty) {
+    // Suppress the next scheduleSync: we have just applied the
+    // server's view, there is nothing to push back. Cancel any
+    // pending push from before the reconcile too, so we do not
+    // overwrite the server with the now-stale local snapshot.
+    if (syncTimer !== null) {
+      clearTimeout(syncTimer);
+      syncTimer = null;
+    }
+    suppressNextSync = true;
     notify();
+  }
+};
+
+/** Local-only session removal used by reconcile. Mirrors the
+ * non-persistence side effects of `closeSession` (cancel timer,
+ * close socket, fall back to a fresh activeId, archive in `closed`)
+ * but does NOT call `scheduleSync` because the caller is reacting
+ * to a server snapshot the server already knows about. */
+const closeSessionLocal = (id: string) => {
+  const i = sessions.findIndex((x) => x.id === id);
+  if (i < 0) {
+    return;
+  }
+  const s = sessions[i];
+  s.closing = true;
+  if (s.reconnectTimer !== null) {
+    clearTimeout(s.reconnectTimer);
+    s.reconnectTimer = null;
+  }
+  try {
+    s.ws?.close();
+  } catch {
+    // Already disconnected: fine.
+  }
+  // We do NOT push to `closed` here: the other browser already
+  // recorded the close in its own history list and we are about
+  // to receive that history via the server snapshot.
+  sessions.splice(i, 1);
+  if (activeId === id) {
+    activeId = sessions.length > 0 ? sessions[Math.max(0, i - 1)].id : null;
   }
 };
 
@@ -261,8 +384,11 @@ const startStateEventStream = () => {
     void reconcileFromServer();
   });
   // EventSource auto-reconnects on transport errors with browser
-  // defaults. We only act on errors that look terminal; otherwise
-  // log and let the browser retry.
+  // defaults. On a fresh connect we proactively reconcile so a
+  // browser that missed ticks while offline catches up.
+  es.addEventListener('open', () => {
+    void reconcileFromServer();
+  });
   es.addEventListener('error', () => {
     if (es.readyState === EventSource.CLOSED) {
       stateEventSource = null;

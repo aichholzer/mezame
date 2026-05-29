@@ -13,6 +13,48 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.30] - 2026-05-29
+
+### Fixed
+
+- Closing a session on browser A did not propagate to browser B,
+  and vice versa. Worse, after a few rounds the closed sessions
+  would reappear on both browsers, making it effectively impossible
+  to close anything when two browsers were open.
+
+  Root cause: 0.8.28's reconcile was additive only. When B closed
+  sessions 1 to 3, B's PUT held only [4]. A's reconcile saw 4
+  already locally and did nothing; A's own next PUT then wrote
+  [1, 2, 3, 4] back to the server, and B saw the closed sessions
+  reappear on the next tick.
+
+  Fix: reconcile is now authoritative. The server snapshot is the
+  source of truth: sessions present locally but missing on the
+  server get closed locally; sessions present on the server but
+  missing locally get restored; sessions present on both keep
+  their local instance (its WebSocket, log, busy flags) but pick
+  up label changes. Newly-created local sessions that have not
+  yet had a chance to round-trip through `/state` are exempt from
+  the close so a fresh tab is not auto-killed by an SSE tick that
+  fired before our first PUT landed.
+
+  Also: cancel any pending sync after a reconcile, otherwise our
+  pre-reconcile snapshot would clobber the server view we just
+  applied. The closed-history list also follows the server now,
+  so the recent-sessions dropdown stays consistent across
+  browsers.
+
+  Also: reverted the 0.8.28 change that persisted `acpSessionId`
+  for unused sessions. That change caused a storm of "Session not
+  found" errors at startup whenever Kiro had not yet written the
+  session JSONL. Peer browsers now see a fresh tab from elsewhere
+  only after the first prompt; the tradeoff is fewer log errors
+  and a cleaner restart story.
+
+  Also: reconcile on EventSource open, so a browser that missed
+  ticks while offline catches up the moment the SSE stream
+  reconnects.
+
 ## [0.8.29] - 2026-05-29
 
 ### Fixed
