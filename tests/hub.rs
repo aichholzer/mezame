@@ -16,10 +16,18 @@ use tokio::time::timeout;
 
 const SESSION_ID: &str = "test-session";
 
-/// Build an `Agent` from a duplex pipe plus a fake server that reads
-/// every JSON-RPC line we send, then writes back whatever the test
-/// harness pushes. Returns the agent, the updates receiver, and a
-/// channel the test uses to inject "agent → mezame" frames.
+/// Build an `Agent` from a duplex pipe plus a fake server. The
+/// returned channels mirror what mezame sees in production:
+///
+/// - The reader task parses every line mezame writes to the agent's
+///   stdin. For requests (those carrying an `id` and a `method`)
+///   it auto-replies with a stub `result: {}` so the hub's pending
+///   oneshot resolves and prompt-task continuations can fire (e.g.
+///   the broadcast of `prompt_done` in the new prompt path).
+///   Notifications (no `id`) are ignored, matching cat-style
+///   behaviour for one-way messages.
+/// - The `inject_tx` channel pushes "agent → mezame" frames the
+///   tests want the hub to react to (e.g. `session/update`).
 fn make_fake_agent() -> (
     Agent,
     mpsc::UnboundedReceiver<Value>,
@@ -30,19 +38,40 @@ fn make_fake_agent() -> (
     let (agent, updates_rx) = from_io(server_to_agent, server_reader);
 
     let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<Value>();
+    // Internal channel: reader → writer carries auto-reply requests
+    // so we keep all stdout writes serialised through one task.
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
 
-    // Reader: discards everything coming from the hub side. We do not
-    // assert on the wire shape here; the agent_jsonrpc tests cover that.
+    // Reader: parses every request line, queues a stub reply.
     tokio::spawn(async move {
         let mut lines = BufReader::new(agent_stdin).lines();
-        while let Ok(Some(_)) = lines.next_line().await {}
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            // Notifications carry a method but no id; ignore them.
+            // Requests carry an id and a method; auto-reply.
+            if value.get("id").is_some() && value.get("method").is_some() {
+                let _ = reply_tx.send(json!({
+                    "jsonrpc": "2.0",
+                    "id": value["id"].clone(),
+                    "result": {}
+                }));
+            }
+        }
     });
 
-    // Writer: forwards injected JSON values to the hub's update reader
-    // as newline-delimited JSON.
+    // Writer: drains both the inject channel (test-driven) and the
+    // reply channel (auto-replies for anything the reader saw),
+    // serialised to a single tokio::io::write_all call per frame.
     tokio::spawn(async move {
         let mut stdout = agent_stdout;
-        while let Some(value) = inject_rx.recv().await {
+        loop {
+            let frame = tokio::select! {
+                v = inject_rx.recv() => v,
+                v = reply_rx.recv() => v,
+            };
+            let Some(value) = frame else { break };
             let line = format!("{value}\n");
             if stdout.write_all(line.as_bytes()).await.is_err() {
                 break;
@@ -196,5 +225,66 @@ async fn first_permission_response_wins_silently() {
     assert!(
         a.outbound.try_recv().is_err(),
         "no error event should be broadcast"
+    );
+}
+
+#[tokio::test]
+async fn prompt_done_is_broadcast_after_session_prompt_resolves() {
+    // Regression for the multi-attach bug where a sender's `busy`
+    // flag never cleared because the hub forgot to emit
+    // `prompt_done` after the agent's `session/prompt` request
+    // completed. Without this event the composer reads "Agent is
+    // working" indefinitely on the sender (and on any peer browser
+    // that subsequently reads the broadcast for cancel / take-over
+    // purposes).
+    // Send a prompt through the hub. The fixture's reader auto-
+    // replies with a stub result, so the hub's pending oneshot for
+    // `session/prompt` resolves immediately and the prompt task's
+    // continuation broadcasts `prompt_done`.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, _inject) = make_fake_agent();
+    let mut attached = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![json!({ "type": "text", "text": "hi" })],
+        })
+        .await
+        .expect("send Prompt");
+
+    // Drain broadcast events and assert the user-prompt echo lands
+    // first, followed by `prompt_done` once the agent's stub reply
+    // resolves.
+    let mut saw_user_echo = false;
+    let mut saw_done = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), attached.outbound.recv()).await {
+            Ok(Ok(event)) => {
+                let event_type = (*event)["type"].as_str().unwrap_or("");
+                if event_type == "append" && (*event)["role"] == "user" {
+                    saw_user_echo = true;
+                }
+                if event_type == "prompt_done" {
+                    saw_done = true;
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(saw_user_echo, "should broadcast the user-prompt echo");
+    assert!(
+        saw_done,
+        "hub must emit prompt_done after the agent reply so sender busy clears"
     );
 }

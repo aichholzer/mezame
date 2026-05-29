@@ -335,8 +335,7 @@ async fn handle_ws(
 fn parse_browser_command(v: &Value) -> Option<crate::hub::HubCommand> {
     match v.get("type").and_then(Value::as_str)? {
         "prompt" => {
-            let blocks: Vec<Value> = if let Some(blocks) =
-                v.get("blocks").and_then(Value::as_array)
+            let blocks: Vec<Value> = if let Some(blocks) = v.get("blocks").and_then(Value::as_array)
             {
                 blocks.clone()
             } else if let Some(text) = v.get("text").and_then(Value::as_str) {

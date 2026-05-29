@@ -663,18 +663,31 @@ async fn handle_command(
                 })));
             }
 
-            // Fire-and-forget; the agent's response (chunks, tool
-            // calls, prompt_done) will arrive on the updates
-            // channel and broadcast naturally.
+            // Fire the agent request, then broadcast `prompt_done` (or
+            // an `error` event on failure). The previous implementation
+            // forgot to emit either, so the sender's `busy`/`inFlight`
+            // flags never cleared and the composer stayed locked at
+            // "Agent is working" indefinitely. We broadcast to every
+            // attached browser; peers that did not send will already
+            // have `busy: false` so the broadcast is a no-op clear for
+            // them, and the sender flips back to a free composer.
             let agent = Arc::clone(agent);
             let sid = session_id.to_string();
+            let outbound_clone = outbound.clone();
             tokio::spawn(async move {
-                let _ = agent
+                let res = agent
                     .request(
                         "session/prompt",
                         json!({ "sessionId": sid, "prompt": blocks }),
                     )
                     .await;
+                if let Err(e) = res {
+                    let _ = outbound_clone.send(Arc::new(json!({
+                        "type": "error",
+                        "message": format!("{e}")
+                    })));
+                }
+                let _ = outbound_clone.send(Arc::new(json!({ "type": "prompt_done" })));
             });
         }
         HubCommand::PermissionResponse { id, option_id } => {

@@ -13,6 +13,27 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.27] - 2026-05-29
+
+### Fixed
+
+- Sender's composer stayed locked at "Agent is working" after a
+  multi-attach turn finished. The hub's prompt path fired
+  `session/prompt` as fire-and-forget and never broadcast a
+  `prompt_done` (or `error`) once the agent's reply resolved, so
+  the sender's `busy`/`inFlight` flags, which only clear on those
+  events, never flipped back. Peer browsers were unaffected because
+  they had not entered the busy state in the first place.
+
+  Fixed by awaiting the agent request inside the prompt's spawned
+  task and broadcasting `prompt_done` to every attached subscriber
+  on completion (and an additional `error` event on failure
+  ahead of the `prompt_done`). Peers that were not busy receive a
+  no-op clear; the sender unlocks. Covered by a regression test
+  that drives a fake agent which auto-replies to any request line
+  and asserts both the user-prompt echo and `prompt_done` appear
+  on the broadcast channel.
+
 ## [0.8.26] - 2026-05-29
 
 ### Fixed
