@@ -64,8 +64,6 @@ Mezame deliberately does less than either. It is an **ACP pipe**, nothing more:
 
 ## Features
 
-## Features
-
 - Multiple concurrent sessions per browser, each backed by its own agent.
 - Share a session across devices: open the same conversation on your phone, laptop, and desktop. Everything stays in sync.
 - Model and mode switches propagate to every connected browser.
@@ -74,7 +72,6 @@ Mezame deliberately does less than either. It is an **ACP pipe**, nothing more:
 - Sessions persist across reloads and restarts; stale lockfiles are recovered automatically.
 - Recently-closed history with one-click restore.
 - Per-session working directory override via `?cwd=<path>`.
-- Cancel the active turn from any connected browser.
 - Auto-reconnect with exponential back-off on WebSocket drops.
 
 ## Install
