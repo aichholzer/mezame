@@ -299,11 +299,13 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         // rides above the virtual keyboard on mobile, and
         // `--mz-safe-bottom` so it clears the home indicator on iOS.
         // Both custom properties default to 0 on desktop, so the
-        // composer rests at `bottom: 0.75rem` as before.
-        'pointer-events-none absolute inset-x-4 z-10'
+        // composer rests at `bottom: 1.25rem` (20 px) on desktop,
+        // matching the sidebar's outer margin so both bottom edges
+        // align.
+        'pointer-events-none absolute inset-x-5 z-10'
       )}
       style={{
-        bottom: 'calc(1rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
+        bottom: 'calc(1.25rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
       }}
     >
       <div
