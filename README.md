@@ -65,6 +65,12 @@ Mezame deliberately does less than either. It is an **ACP pipe**, nothing more:
 ## Features
 
 - Multiple concurrent sessions as browser tabs, each backed by its own agent.
+- **Multi-browser shared sessions.** Open the same session in two (or more) browsers; prompts, responses, tool calls, and permissions stay in sync across all of them in real time. One browser can pick up where another left off without reloading.
+- **Cross-browser session sync.** Creating, closing, or renaming a tab in one browser propagates to every other browser within moments via server-sent events.
+- **Model and mode propagation.** Switching the model or agent mode in one browser updates every other browser attached to the same session.
+- **Reasoning visibility.** When a reasoning model thinks before answering, the thought process streams into a collapsible block you can expand to read the full chain of thought. Persists across reloads.
+- **Tool-call cards with live output.** Tool invocations (web search, file reads, etc.) render as expandable cards showing arguments, status, and result content. Output backfills automatically once the agent flushes it to disk.
+- **Permission targeting.** Permission prompts appear only on the browser that started the turn, not on every attached peer.
 - Session persistence across browser reloads and server restarts.
 - Cross-device state sync. Any browser hitting the same Mezame instance sees the same tabs and recently-closed history.
 - Recently-closed history (up to 20 entries) with one-click restore.
@@ -72,6 +78,7 @@ Mezame deliberately does less than either. It is an **ACP pipe**, nothing more:
 - Per-session working directory override (`?cwd=<abs-path>`), so different tabs can target different directories.
 - Cooperative cancel of the active turn.
 - Auto-reconnect with exponential back-off on WebSocket drops.
+- Warm cream and terracotta light theme with floating sidebar, speech-bubble message layout, and a bot avatar anchoring agent responses.
 
 ## Install
 
