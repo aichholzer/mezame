@@ -13,6 +13,25 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.39] - 2026-05-29
+
+### Added
+
+- Tool-call output is now visible in the live timeline as soon as
+  the result lands on disk, not just on reload. Some tools
+  (notably web search) only stream a status flip on the live wire;
+  the result body lands in the on-disk JSONL once Kiro finalises
+  the turn. The browser now polls a new <code>GET /tool-result</code>
+  endpoint after a <code>tool_call_update</code> arrives with a
+  final status (<code>completed</code> / <code>failed</code> /
+  <code>cancelled</code>) and no streamed content. The endpoint
+  scans the same JSONL the history view uses and returns the
+  matching <code>{ status, content }</code>; the client patches it
+  into the existing log entry. Five attempts at 250 ms intervals
+  cover Kiro's flush delay; if the result still is not on disk
+  after that, a manual reload picks it up via the regular
+  rehydration path.
+
 ## [0.8.38] - 2026-05-29
 
 ### Added

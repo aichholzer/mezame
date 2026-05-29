@@ -301,6 +301,53 @@ async fn get_history_rehydrates_tool_calls_and_merges_results() {
     assert_eq!(content_arr[0]["data"], "result text");
 }
 
+// ---------- /tool-result ----------
+
+#[tokio::test]
+async fn get_tool_result_returns_status_and_content_for_known_id() {
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let dir = tmp.path().join(".kiro/sessions/cli");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sid = "results";
+    let jsonl = "\
+{\"kind\":\"AssistantMessage\",\"data\":{\"content\":[{\"kind\":\"toolUse\",\"data\":{\"toolUseId\":\"tu-9\",\"name\":\"web_search\",\"input\":{\"q\":\"hi\"}}}]}}
+{\"kind\":\"ToolResults\",\"data\":{\"content\":[{\"kind\":\"toolResult\",\"data\":{\"toolUseId\":\"tu-9\",\"content\":[{\"kind\":\"text\",\"data\":\"answer\"}],\"status\":\"success\"}}]}}
+";
+    std::fs::write(dir.join(format!("{sid}.jsonl")), jsonl).unwrap();
+
+    let req = Request::get(format!("/tool-result?session={sid}&id=tu-9"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, bytes, _) = run_request(req).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json_body(&bytes);
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["content"][0]["data"], "answer");
+}
+
+#[tokio::test]
+async fn get_tool_result_returns_404_when_id_not_found() {
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let dir = tmp.path().join(".kiro/sessions/cli");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sid = "results-nope";
+    // File exists but has no matching toolResult yet (write delay
+    // between live status flip and JSONL flush).
+    std::fs::write(dir.join(format!("{sid}.jsonl")), "").unwrap();
+
+    let req = Request::get(format!("/tool-result?session={sid}&id=missing"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ---------- SPA fallback / asset routing ----------
 
 #[tokio::test]

@@ -101,6 +101,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/state", get(get_state).put(put_state))
         .route("/state/events", get(state_events))
         .route("/history", get(get_history))
+        .route("/tool-result", get(get_tool_result))
         // SPA fallback: /, /assets/*, and any unknown path resolve against
         // the embedded UI bundle, with index.html as the fallback for
         // client-side routes.
@@ -369,6 +370,94 @@ async fn get_history(
 
     let entries = parse_kiro_history(&raw);
     Ok(Json(json!({ "entries": entries })))
+}
+
+/// GET /tool-result?session=<id>&id=<toolUseId> — returns the result
+/// content for a single tool call from Kiro's session JSONL.
+///
+/// Live `session/update` events for `tool_call_update` flip status
+/// to `completed` or `failed` but do not stream the result content
+/// for some tools (e.g. web search). The data does land on disk in
+/// the `ToolResults` JSONL entry once Kiro finalises the turn. The
+/// client polls this endpoint after a status flip so the user can
+/// see the result without reloading the page.
+///
+/// Response shape mirrors the equivalent fields the live wire would
+/// have carried: `{ "status": <string|null>, "content": <Value|null> }`.
+/// Missing entry returns 404 so the client can decide to retry or
+/// give up gracefully.
+async fn get_tool_result(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let Some(sid) = params.get("session") else {
+        return Err((StatusCode::BAD_REQUEST, "missing ?session=<id>".into()));
+    };
+    let Some(tool_use_id) = params.get("id") else {
+        return Err((StatusCode::BAD_REQUEST, "missing ?id=<toolUseId>".into()));
+    };
+    if sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "invalid session id".into()));
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "HOME not set".into()));
+    };
+    let path = PathBuf::from(home).join(format!(".kiro/sessions/cli/{sid}.jsonl"));
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err((StatusCode::NOT_FOUND, "session not found".into()));
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
+    };
+
+    let Some(found) = find_tool_result(&raw, tool_use_id) else {
+        return Err((StatusCode::NOT_FOUND, "tool result not found".into()));
+    };
+    Ok(Json(found))
+}
+
+/// Scan a Kiro JSONL document for the most recent `toolResult` block
+/// matching `tool_use_id` and return its `status` and `content` as
+/// the live wire would have carried them. Returns `None` when the
+/// JSONL has no matching result yet.
+pub fn find_tool_result(raw: &str, tool_use_id: &str) -> Option<Value> {
+    // Reverse iteration: a turn that re-runs the same tool keeps the
+    // earlier id in the file too, but the later one is the one the
+    // browser is asking about. Walk backwards so the first match wins.
+    for line in raw.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry.get("kind").and_then(Value::as_str) != Some("ToolResults") {
+            continue;
+        }
+        let Some(content) = entry
+            .get("data")
+            .and_then(|d| d.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for block in content {
+            if block.get("kind").and_then(Value::as_str) != Some("toolResult") {
+                continue;
+            }
+            let Some(inner) = block.get("data") else {
+                continue;
+            };
+            if inner.get("toolUseId").and_then(Value::as_str) != Some(tool_use_id) {
+                continue;
+            }
+            return Some(json!({
+                "status": inner.get("status").cloned().unwrap_or(Value::Null),
+                "content": inner.get("content").cloned().unwrap_or(Value::Null)
+            }));
+        }
+    }
+    None
 }
 
 /// Parse Kiro's session JSONL into compact browser-facing entries.

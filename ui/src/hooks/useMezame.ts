@@ -617,7 +617,80 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     }
   }
 
+  // Tool calls that finish without streamed content: the agent
+  // flipped status to `completed` / `failed` over the live wire
+  // but the result text only landed on disk in the JSONL. Pull
+  // it back via `/tool-result` so the user can expand the card
+  // and read the output without reloading the page. Web search
+  // is the canonical example: Kiro emits the status update but
+  // not the search result body.
+  if (msg.type === 'tool_call') {
+    const finalStatuses = new Set(['completed', 'failed', 'cancelled']);
+    const status = typeof msg.status === 'string' ? msg.status : null;
+    if (status && finalStatuses.has(status)) {
+      const entry = s.log.find(
+        (e) => e.kind === 'tool_call' && e.toolCallId === msg.toolCallId
+      );
+      if (entry && entry.kind === 'tool_call' && entry.content === null) {
+        void backfillToolResult(s, entry.toolCallId);
+      }
+    }
+  }
+
   notify();
+};
+
+// ---------- tool result backfill ----------
+//
+// Kiro writes the JSONL asynchronously: the live status flip can
+// land before the on-disk `ToolResults` entry. Poll a few times
+// with brief backoff before giving up. Five tries spaced 250ms
+// apart covers the typical write delay; if the result still is
+// not there after that, the user can reload to pick it up via
+// the regular history rehydration path.
+
+const backfillToolResult = async (s: Session, toolCallId: string): Promise<void> => {
+  if (!s.acpSessionId) {
+    return;
+  }
+  const sessionId = s.acpSessionId;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    let payload: { status?: string | null; content?: unknown } | null = null;
+    try {
+      const url = `/tool-result?session=${encodeURIComponent(sessionId)}&id=${encodeURIComponent(toolCallId)}`;
+      const res = await fetch(url);
+      if (res.status === 404) {
+        continue;
+      }
+      if (!res.ok) {
+        return;
+      }
+      payload = (await res.json()) as { status?: string | null; content?: unknown };
+    } catch {
+      return;
+    }
+    if (!payload || payload.content === null || payload.content === undefined) {
+      continue;
+    }
+    // Find the entry again: the log may have grown but `id` matching
+    // by toolCallId is still the contract. If the user closed the
+    // session between the dispatch and the result landing, drop it.
+    const entry = s.log.find(
+      (e) => e.kind === 'tool_call' && e.toolCallId === toolCallId
+    );
+    if (!entry || entry.kind !== 'tool_call') {
+      return;
+    }
+    entry.content = payload.content;
+    if (typeof payload.status === 'string' && payload.status.length > 0) {
+      entry.status = payload.status;
+    }
+    notify();
+    return;
+  }
 };
 
 /**
