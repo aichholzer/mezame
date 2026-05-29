@@ -13,6 +13,28 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.40] - 2026-05-29
+
+### Fixed
+
+- 0.8.39's tool-result backfill missed when Kiro flushed the
+  result body only after the agent's whole turn completed,
+  which is exactly what <code>web_search</code> does. The 1.25s
+  poll window after the status flip ran out before the JSONL
+  even existed for that block. Two changes:
+
+  - The post-status poll window expands to ~5s (10 attempts at
+    500ms), so a tool whose result lands a couple of seconds
+    after the status flip still backfills mid-turn.
+  - On <code>prompt_done</code> we now sweep every
+    <code>tool_call</code> entry in the session that still has
+    no content and try once more. By that point Kiro has
+    flushed the JSONL for the whole turn, so this is the
+    deterministic backstop for slow-flushing tools.
+
+  Combined, fast tools backfill within seconds; slow ones land
+  no later than the spinner clearing on the sender.
+
 ## [0.8.39] - 2026-05-29
 
 ### Added

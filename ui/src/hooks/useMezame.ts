@@ -637,59 +637,112 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     }
   }
 
+  // End-of-turn sweep: some tools (web_search again) only flush
+  // their result body to disk once the agent's whole response is
+  // done. By the time `prompt_done` lands, Kiro has written the
+  // JSONL for the entire turn, so a sweep over any tool_call
+  // entries still missing content is the deterministic backstop
+  // for the mid-turn polling window.
+  if (msg.type === 'prompt_done') {
+    void sweepToolResultsOnPromptDone(s);
+  }
+
   notify();
 };
 
 // ---------- tool result backfill ----------
 //
 // Kiro writes the JSONL asynchronously: the live status flip can
-// land before the on-disk `ToolResults` entry. Poll a few times
-// with brief backoff before giving up. Five tries spaced 250ms
-// apart covers the typical write delay; if the result still is
-// not there after that, the user can reload to pick it up via
-// the regular history rehydration path.
+// land long before the on-disk `ToolResults` entry. Some tools
+// (notably web_search) only flush their result body once the
+// agent's overall turn finishes, so a tight poll window after the
+// status flip can miss the write entirely.
+//
+// Two-stage approach:
+//
+// 1. After a `tool_call_update` flips to a final status, poll for
+//    up to ~5s with 500ms cadence. Catches fast tools so the
+//    output appears mid-turn without waiting for `prompt_done`.
+// 2. On `prompt_done`, sweep every tool_call entry in the session
+//    that still has no content and try once more. By then Kiro
+//    has flushed its JSONL for the turn, so this is the
+//    deterministic backstop.
+
+const FINAL_BACKFILL_ATTEMPTS = 10;
+const FINAL_BACKFILL_INTERVAL_MS = 500;
 
 const backfillToolResult = async (s: Session, toolCallId: string): Promise<void> => {
   if (!s.acpSessionId) {
     return;
   }
   const sessionId = s.acpSessionId;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < FINAL_BACKFILL_ATTEMPTS; attempt += 1) {
     if (attempt > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await new Promise((resolve) => setTimeout(resolve, FINAL_BACKFILL_INTERVAL_MS));
     }
-    let payload: { status?: string | null; content?: unknown } | null = null;
-    try {
-      const url = `/tool-result?session=${encodeURIComponent(sessionId)}&id=${encodeURIComponent(toolCallId)}`;
-      const res = await fetch(url);
-      if (res.status === 404) {
-        continue;
-      }
-      if (!res.ok) {
-        return;
-      }
-      payload = (await res.json()) as { status?: string | null; content?: unknown };
-    } catch {
+    if (await tryFetchToolResult(s, sessionId, toolCallId)) {
       return;
     }
-    if (!payload || payload.content === null || payload.content === undefined) {
-      continue;
+  }
+};
+
+/** One-shot pull, used by the prompt_done sweep. Returns true if a
+ * result landed and was applied; false otherwise. The caller
+ * decides whether to retry. */
+const tryFetchToolResult = async (
+  s: Session,
+  sessionId: string,
+  toolCallId: string
+): Promise<boolean> => {
+  let payload: { status?: string | null; content?: unknown } | null = null;
+  try {
+    const url = `/tool-result?session=${encodeURIComponent(sessionId)}&id=${encodeURIComponent(toolCallId)}`;
+    const res = await fetch(url);
+    if (res.status === 404) {
+      return false;
     }
-    // Find the entry again: the log may have grown but `id` matching
-    // by toolCallId is still the contract. If the user closed the
-    // session between the dispatch and the result landing, drop it.
-    const entry = s.log.find(
-      (e) => e.kind === 'tool_call' && e.toolCallId === toolCallId
-    );
-    if (!entry || entry.kind !== 'tool_call') {
-      return;
+    if (!res.ok) {
+      return false;
     }
-    entry.content = payload.content;
-    if (typeof payload.status === 'string' && payload.status.length > 0) {
-      entry.status = payload.status;
-    }
-    notify();
+    payload = (await res.json()) as { status?: string | null; content?: unknown };
+  } catch {
+    return false;
+  }
+  if (!payload || payload.content === null || payload.content === undefined) {
+    return false;
+  }
+  // The log may have grown but `toolCallId` is the contract. If
+  // the user closed the session between the dispatch and the
+  // result landing, drop the patch.
+  const entry = s.log.find(
+    (e) => e.kind === 'tool_call' && e.toolCallId === toolCallId
+  );
+  if (!entry || entry.kind !== 'tool_call') {
+    return false;
+  }
+  entry.content = payload.content;
+  if (typeof payload.status === 'string' && payload.status.length > 0) {
+    entry.status = payload.status;
+  }
+  notify();
+  return true;
+};
+
+/** End-of-turn sweep: walk every tool_call entry that is still
+ * missing content and pull once. By `prompt_done` Kiro has
+ * flushed its JSONL for the turn, so this is the deterministic
+ * backstop for tools whose result was not on disk during the
+ * mid-turn polling window. */
+const sweepToolResultsOnPromptDone = async (s: Session): Promise<void> => {
+  if (!s.acpSessionId) {
     return;
+  }
+  const sessionId = s.acpSessionId;
+  const ids = s.log
+    .filter((e) => e.kind === 'tool_call' && e.content === null)
+    .map((e) => (e as Extract<LogEntry, { kind: 'tool_call' }>).toolCallId);
+  for (const id of ids) {
+    await tryFetchToolResult(s, sessionId, id);
   }
 };
 
