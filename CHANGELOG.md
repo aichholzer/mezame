@@ -13,6 +13,33 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.37] - 2026-05-29
+
+### Fixed
+
+- Permission and OAuth requests landed on every attached browser,
+  not just the one that started the turn. A user on browser A
+  would see a permission card pop up because B asked the agent
+  to do a web search; A had no useful action to take but had to
+  dismiss the card or watch the resolved-state appear after B
+  clicked.
+
+  The hub now stamps a `_target` field on permission and oauth
+  request broadcasts with the attach id of the originating
+  prompter; peer browsers' WS write loop drops events whose
+  `_target` does not match their own attach id. Other event
+  types (text, tool calls, thoughts, append echoes) stay
+  untargeted and broadcast to everyone, since those are the
+  shared timeline of the session.
+
+  Each `AttachedHub` now carries a process-unique `attach_id`
+  generated from a static `AtomicU64`. The hub tracks the
+  current prompter behind an `Arc<Mutex<Option<u64>>>` shared
+  with the spawned `session/prompt` task; the task clears the
+  field once the request resolves so out-of-turn permission
+  events (rare, e.g. a background MCP refresh) don't get
+  mis-attributed to the previous sender.
+
 ## [0.8.36] - 2026-05-29
 
 ### Added

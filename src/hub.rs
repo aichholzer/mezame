@@ -41,6 +41,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +58,12 @@ use crate::ws::handle_agent_message;
 /// browser is going to come back from a transient drop, it will do
 /// so well within this window.
 const GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// Process-static attach id counter. Bumped on every successful
+/// `subscribe`. Wraps eventually but the attach lifetimes never
+/// overlap a u64 worth of attaches, so equality checks against the
+/// "current prompter" id stay sound.
+static NEXT_ATTACH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Capacity of the outbound broadcast channel. Has to be high enough
 /// that a slow subscriber falling 1024 events behind is genuinely a
@@ -82,8 +89,12 @@ const COMMAND_CAPACITY: usize = 256;
 pub enum HubCommand {
     /// Send a prompt to the agent. `blocks` is the ACP-shaped block
     /// list (text, image, resource, etc.). The hub forwards as
-    /// `session/prompt`.
-    Prompt { blocks: Vec<Value> },
+    /// `session/prompt`. `attach_id` identifies the originating
+    /// attach so the loop can stamp permission and oauth requests
+    /// with a `_target` field that filters them to the sender on
+    /// the WS side. Out-of-band messages (events with no target)
+    /// still broadcast to every browser.
+    Prompt { blocks: Vec<Value>, attach_id: u64 },
     /// Reply to a `session/request_permission` we previously broadcast.
     /// `id` matches the JSON-RPC id the agent sent. First reply wins;
     /// later replies for the same id are dropped silently.
@@ -229,6 +240,10 @@ pub struct AttachedHub {
     pub snapshot_ready: Value,
     pub snapshot_session_info: Option<Value>,
     pub session_id: String,
+    /// Process-unique id for this attach. Used by the WS handler
+    /// to filter targeted broadcasts (permission and oauth
+    /// requests) so peers do not see prompts that were not theirs.
+    pub attach_id: u64,
     counter: Arc<Counter>,
 }
 
@@ -406,6 +421,7 @@ impl HubRegistry {
             snapshot_ready,
             snapshot_session_info,
             session_id: hub.session_id.clone(),
+            attach_id: NEXT_ATTACH_ID.fetch_add(1, Ordering::Relaxed),
             counter: hub.counter.clone(),
         }
     }
@@ -638,6 +654,14 @@ async fn run_hub_loop(state: HubLoopState) {
     let mut answered_permissions: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // Most-recent prompter's attach id. Set by the `Prompt` arm in
+    // `handle_command`; cleared when the spawned `session/prompt`
+    // task resolves (success or error). Used to stamp permission
+    // and oauth request broadcasts with a `_target` field so peer
+    // browsers do not see a permission card they were not asked to
+    // answer.
+    let current_prompter: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+
     let mut grace_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
 
     loop {
@@ -653,6 +677,7 @@ async fn run_hub_loop(state: HubLoopState) {
                         &mut answered_permissions,
                         &outbound,
                         &snapshot,
+                        &current_prompter,
                     ).await,
                     None => break, // all senders dropped: nobody can reach us
                 }
@@ -666,7 +691,42 @@ async fn run_hub_loop(state: HubLoopState) {
                 handle_agent_message(&relay_tx, msg, suppress).await;
                 while let Ok(frame) = relay_rx.try_recv() {
                     if let axum::extract::ws::Message::Text(text) = frame {
-                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                        if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+                            let event_type = value
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            // Stamp targeted broadcasts so the WS
+                            // handler can drop them on peer
+                            // browsers. Permission and oauth
+                            // requests are user-input prompts; only
+                            // the browser that started the turn
+                            // should see them. Plain text/tool/
+                            // thought events stay untargeted and
+                            // broadcast to everyone.
+                            let target = *current_prompter.lock().await;
+                            if let Some(target) = target {
+                                if matches!(
+                                    event_type.as_str(),
+                                    "permission_request" | "mcp_oauth_request"
+                                ) {
+                                    if let Some(map) = value.as_object_mut() {
+                                        map.insert(
+                                            "_target".into(),
+                                            Value::Number(target.into()),
+                                        );
+                                    }
+                                }
+                            }
+                            // End of a turn clears the prompter so
+                            // any out-of-turn permission requests
+                            // (rare, e.g. background MCP refreshes)
+                            // are not mis-attributed to the previous
+                            // sender.
+                            if event_type == "prompt_done" {
+                                *current_prompter.lock().await = None;
+                            }
                             // Broadcast errors only mean no subscribers
                             // are listening yet; that is fine, the
                             // ready/session_info snapshot covers them.
@@ -721,6 +781,7 @@ async fn run_hub_loop(state: HubLoopState) {
     registry.remove(&session_id).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
     agent: &Arc<Agent>,
     session_id: &str,
@@ -729,12 +790,17 @@ async fn handle_command(
     answered: &mut std::collections::HashSet<String>,
     outbound: &broadcast::Sender<Arc<Value>>,
     snapshot: &Arc<Mutex<NegotiationSnapshot>>,
+    current_prompter: &Arc<Mutex<Option<u64>>>,
 ) {
     match cmd {
-        HubCommand::Prompt { blocks } => {
+        HubCommand::Prompt { blocks, attach_id } => {
             if blocks.is_empty() {
                 return;
             }
+            // Track the prompter so any permission / oauth requests
+            // raised during this turn get stamped with their attach
+            // id and only land on the originating browser.
+            *current_prompter.lock().await = Some(attach_id);
             // First live prompt after a resume: stop hiding Kiro's
             // session/update events. From here on everything the
             // agent emits is real.
@@ -767,6 +833,7 @@ async fn handle_command(
             let agent = Arc::clone(agent);
             let sid = session_id.to_string();
             let outbound_clone = outbound.clone();
+            let prompter_clone = current_prompter.clone();
             tokio::spawn(async move {
                 let res = agent
                     .request(
@@ -780,6 +847,10 @@ async fn handle_command(
                         "message": format!("{e}")
                     })));
                 }
+                // Clear the prompter so any out-of-turn permission
+                // requests (rare, e.g. background MCP refreshes)
+                // are not mis-attributed to the previous sender.
+                *prompter_clone.lock().await = None;
                 let _ = outbound_clone.send(Arc::new(json!({ "type": "prompt_done" })));
             });
         }

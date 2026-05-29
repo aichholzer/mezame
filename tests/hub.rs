@@ -24,11 +24,18 @@ const SESSION_ID: &str = "test-session";
 ///   it auto-replies with a stub `result: {}` so the hub's pending
 ///   oneshot resolves and prompt-task continuations can fire (e.g.
 ///   the broadcast of `prompt_done` in the new prompt path).
+///   `session/prompt` is auto-replied only when
+///   `auto_reply_prompt` is true. Tests that need to drive a
+///   mid-turn event (like a permission request) before the prompt
+///   resolves should set this to false and let the prompt sit
+///   open across the injected event.
 ///   Notifications (no `id`) are ignored, matching cat-style
 ///   behaviour for one-way messages.
 /// - The `inject_tx` channel pushes "agent → mezame" frames the
 ///   tests want the hub to react to (e.g. `session/update`).
-fn make_fake_agent() -> (
+fn make_fake_agent_with(
+    auto_reply_prompt: bool,
+) -> (
     Agent,
     mpsc::UnboundedReceiver<Value>,
     mpsc::UnboundedSender<Value>,
@@ -42,16 +49,17 @@ fn make_fake_agent() -> (
     // so we keep all stdout writes serialised through one task.
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Value>();
 
-    // Reader: parses every request line, queues a stub reply.
     tokio::spawn(async move {
         let mut lines = BufReader::new(agent_stdin).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            // Notifications carry a method but no id; ignore them.
-            // Requests carry an id and a method; auto-reply.
             if value.get("id").is_some() && value.get("method").is_some() {
+                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "session/prompt" && !auto_reply_prompt {
+                    continue;
+                }
                 let _ = reply_tx.send(json!({
                     "jsonrpc": "2.0",
                     "id": value["id"].clone(),
@@ -80,6 +88,17 @@ fn make_fake_agent() -> (
     });
 
     (agent, updates_rx, inject_tx)
+}
+
+/// Default fixture: auto-replies to every request including
+/// `session/prompt`. Used by tests that just need the prompt path
+/// to resolve cleanly.
+fn make_fake_agent() -> (
+    Agent,
+    mpsc::UnboundedReceiver<Value>,
+    mpsc::UnboundedSender<Value>,
+) {
+    make_fake_agent_with(true)
 }
 
 fn ready_event() -> Value {
@@ -257,6 +276,7 @@ async fn prompt_done_is_broadcast_after_session_prompt_resolves() {
         .commands
         .send(HubCommand::Prompt {
             blocks: vec![json!({ "type": "text", "text": "hi" })],
+            attach_id: attached.attach_id,
         })
         .await
         .expect("send Prompt");
@@ -286,5 +306,88 @@ async fn prompt_done_is_broadcast_after_session_prompt_resolves() {
     assert!(
         saw_done,
         "hub must emit prompt_done after the agent reply so sender busy clears"
+    );
+}
+
+#[tokio::test]
+async fn permission_request_is_targeted_at_the_prompter() {
+    // Regression for the multi-attach bug where a permission
+    // request showed up on every browser, not just the one that
+    // started the turn. The hub now stamps targeted broadcasts
+    // (permission and oauth requests) with `_target` carrying the
+    // attach id of the sender; peer browsers drop them in the WS
+    // write loop.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, inject) = make_fake_agent_with(false);
+    let mut sender = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+    let _peer = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("hub registered");
+
+    // Open a turn so the hub records the sender as the current
+    // prompter. Drain the user-echo event so the assertion below
+    // looks at the next emission.
+    sender
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![json!({ "type": "text", "text": "search" })],
+            attach_id: sender.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    // Drain the user-echo broadcast.
+    let _ = timeout(Duration::from_millis(200), sender.outbound.recv()).await;
+
+    // Inject a session/request_permission JSON-RPC request from
+    // the agent. This is a top-level method, not a session/update
+    // sub-kind. The hub forwards it as `permission_request` to the
+    // browser.
+    inject
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": { "title": "Allow web search?" },
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"}
+                ]
+            }
+        }))
+        .expect("inject");
+
+    // Wait for the permission_request broadcast and assert it
+    // carries `_target` equal to the sender's attach id. Skip the
+    // user-echo and prompt_done frames.
+    let mut saw_targeted = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), sender.outbound.recv()).await {
+            Ok(Ok(event)) => {
+                if (*event)["type"] == "permission_request" {
+                    let target = (*event)["_target"]
+                        .as_u64()
+                        .expect("permission targets are stamped");
+                    assert_eq!(target, sender.attach_id);
+                    saw_targeted = true;
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_targeted,
+        "hub must stamp permission_request with the prompter's attach id"
     );
 }

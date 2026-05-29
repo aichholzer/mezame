@@ -293,7 +293,7 @@ async fn handle_ws(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if let Some(cmd) = parse_browser_command(&v) {
+                if let Some(cmd) = parse_browser_command(&v, attached.attach_id) {
                     if commands.send(cmd).await.is_err() {
                         // Hub owner gone; nothing more to do.
                         break;
@@ -303,6 +303,19 @@ async fn handle_ws(
             evt = outbound.recv() => {
                 match evt {
                     Ok(value) => {
+                        // Drop targeted broadcasts that are not for
+                        // this attach. The hub stamps `_target` on
+                        // permission and oauth requests with the
+                        // attach id of the originating browser; peer
+                        // browsers receive the broadcast but skip it
+                        // here so they do not see a permission card
+                        // they were not asked to answer. Untargeted
+                        // events fall through to the WS sink.
+                        if let Some(target) = value.get("_target").and_then(Value::as_u64) {
+                            if target != attached.attach_id {
+                                continue;
+                            }
+                        }
                         let _ = to_ws_tx.send(text_msg((*value).clone()));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -332,7 +345,7 @@ async fn handle_ws(
 /// Translate a parsed browser-message JSON into a `HubCommand`.
 /// Returns `None` for unknown types or malformed payloads; the
 /// caller treats that as "skip this frame".
-fn parse_browser_command(v: &Value) -> Option<crate::hub::HubCommand> {
+fn parse_browser_command(v: &Value, attach_id: u64) -> Option<crate::hub::HubCommand> {
     match v.get("type").and_then(Value::as_str)? {
         "prompt" => {
             let blocks: Vec<Value> = if let Some(blocks) = v.get("blocks").and_then(Value::as_array)
@@ -343,7 +356,7 @@ fn parse_browser_command(v: &Value) -> Option<crate::hub::HubCommand> {
             } else {
                 return None;
             };
-            Some(crate::hub::HubCommand::Prompt { blocks })
+            Some(crate::hub::HubCommand::Prompt { blocks, attach_id })
         }
         "permission_response" => {
             let id = v.get("id").cloned()?;
