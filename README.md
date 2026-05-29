@@ -70,7 +70,6 @@ Mezame deliberately does less than either. It is an **ACP pipe**, nothing more:
 - Model and mode switches propagate to every attached browser.
 - Reasoning models show their thought process in a collapsible block. Survives page reloads.
 - Tool calls (web search, file reads, etc.) render as expandable cards with arguments and output.
-- Permission prompts land only on the browser that triggered the turn.
 - Sessions persist across reloads and server restarts; stale lockfiles are recovered automatically.
 - Per-session working directory override via `?cwd=<path>`.
 - Cancel the active turn from any attached browser.
