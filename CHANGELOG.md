@@ -13,6 +13,23 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.41] - 2026-05-29
+
+### Changed
+
+- The copy button and timestamp under an agent message now appear
+  only after the response is complete. While Kiro is streaming
+  the trailing agent text entry, both fields would be referencing
+  partial text and a still-changing timestamp; hiding them keeps
+  the visual quieter and matches what users expect from a chat UI.
+  Earlier agent entries in the same turn (interleaved with tool
+  calls) are already final and keep their footer.
+
+  The signal is the session's <code>thinking</code> flag combined
+  with "this is the last agent text entry" so only one footer is
+  ever suppressed per turn. <code>prompt_done</code> clears
+  <code>thinking</code> and the meta lights up.
+
 ## [0.8.40] - 2026-05-29
 
 ### Fixed

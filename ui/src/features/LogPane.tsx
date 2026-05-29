@@ -152,10 +152,7 @@ const ThoughtCard = ({ entry }: { entry: Extract<LogEntry, { kind: 'thought' }> 
     <details className="my-3 group">
       <summary className="cursor-pointer list-none inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-card/40 px-2.5 py-1 text-[11px] italic text-muted-foreground hover:bg-card/60 transition">
         <span className="inline-block size-1.5 rounded-full bg-[color:var(--primary)]/70 group-open:bg-[color:var(--primary)]" />
-        Reasoning
-        <span className="ml-1 text-[10px] not-italic text-muted-foreground/60 group-open:hidden">
-          (click to expand)
-        </span>
+        Thought process
       </summary>
       <div className="mt-2 ml-2 border-l-2 border-border/50 pl-3 text-xs whitespace-pre-wrap break-words text-muted-foreground">
         {trimmed}
@@ -164,7 +161,19 @@ const ThoughtCard = ({ entry }: { entry: Extract<LogEntry, { kind: 'thought' }> 
   );
 };
 
-const TextEntry = ({ entry, now }: { entry: Extract<LogEntry, { kind: 'text' }>; now: number }) => {
+const TextEntry = ({
+  entry,
+  now,
+  isStreaming
+}: {
+  entry: Extract<LogEntry, { kind: 'text' }>;
+  now: number;
+  /** True when this entry is the last agent text entry of the
+   * current turn AND the session is still streaming. The footer
+   * meta (copy button, timestamp) is hidden in that state since
+   * neither the text nor the timestamp is final yet. */
+  isStreaming: boolean;
+}) => {
   if (entry.role === 'sys') {
     // Pure-whitespace glue (trailing newlines used to enforce terminal
     // spacing) is dropped entirely in the bubble layout.
@@ -194,10 +203,12 @@ const TextEntry = ({ entry, now }: { entry: Extract<LogEntry, { kind: 'text' }>;
     return (
       <div className="my-3">
         <Markdown text={entry.text} />
-        <div className="mt-2 flex items-center gap-2.5">
-          <CopyButton text={copyText} title="Copy message" className="size-7" />
-          <TimestampLabel ts={entry.timestamp} now={now} />
-        </div>
+        {!isStreaming && (
+          <div className="mt-2 flex items-center gap-2.5">
+            <CopyButton text={copyText} title="Copy message" className="size-7" />
+            <TimestampLabel ts={entry.timestamp} now={now} />
+          </div>
+        )}
       </div>
     );
   }
@@ -226,6 +237,21 @@ export const LogPane = ({ session, isActive }: Props) => {
   // forces this component (and children) to re-render.
   const now = Date.now();
   void tick;
+
+  // Index of the last agent text entry. Used to gate the
+  // copy-and-timestamp meta footer: while the session is streaming,
+  // the trailing agent entry is in flux and its meta should stay
+  // hidden until prompt_done lands. Earlier agent entries within
+  // the same turn (interleaved with tool calls) are already final
+  // and keep their footer.
+  let lastAgentTextIndex = -1;
+  for (let i = session.log.length - 1; i >= 0; i -= 1) {
+    const e = session.log[i];
+    if (e.kind === 'text' && e.role === 'agent') {
+      lastAgentTextIndex = i;
+      break;
+    }
+  }
 
   // Auto-scroll when new content arrives if the user is pinned to the
   // bottom. useLayoutEffect so the scroll happens in the same frame as
@@ -297,9 +323,17 @@ export const LogPane = ({ session, isActive }: Props) => {
           'calc(13rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
       }}
     >
-      {session.log.map((entry) => {
+      {session.log.map((entry, idx) => {
         if (entry.kind === 'text') {
-          return <TextEntry key={entry.id} entry={entry} now={now} />;
+          // Streaming meta-suppression: hide the copy button and
+          // timestamp on the last agent text entry while the
+          // session is still thinking; both will appear once
+          // `prompt_done` clears the flag. Earlier agent entries
+          // in the same turn (interleaved with tool calls) are
+          // already final, so they keep their footer.
+          const isStreaming =
+            session.thinking && entry.role === 'agent' && idx === lastAgentTextIndex;
+          return <TextEntry key={entry.id} entry={entry} now={now} isStreaming={isStreaming} />;
         }
         if (entry.kind === 'thought') {
           return <ThoughtCard key={entry.id} entry={entry} />;
@@ -319,7 +353,7 @@ export const LogPane = ({ session, isActive }: Props) => {
         <div className="my-3 inline-flex items-center gap-2 rounded-md border border-[color:var(--primary)]/30 bg-[color:var(--primary)]/10 px-2.5 py-1.5 text-xs text-muted-foreground">
           <span
             role="status"
-            aria-label="thinking"
+            aria-label="Thinking..."
             className="inline-block size-2.5 animate-spin rounded-full border-2 border-[color:var(--primary)] border-t-transparent"
           />
           thinking
