@@ -64,15 +64,17 @@ Mezame deliberately does less than either. It is an **ACP pipe**, nothing more:
 
 ## Features
 
-- Run multiple agent sessions side by side as browser tabs.
-- Share a session across browsers: open the same conversation on your phone, laptop, and desktop simultaneously. Prompts, responses, and tool calls stay in sync.
-- Session list propagates in real time: open, close, or rename a tab anywhere and every other browser follows.
-- Model and mode switches propagate to every attached browser.
-- Reasoning models show their thought process in a collapsible block. Survives page reloads.
-- Tool calls (web search, file reads, etc.) render as expandable cards with arguments and output.
-- Sessions persist across reloads and server restarts; stale lockfiles are recovered automatically.
+## Features
+
+- Multiple concurrent sessions per browser, each backed by its own agent.
+- Share a session across devices: open the same conversation on your phone, laptop, and desktop. Everything stays in sync.
+- Model and mode switches propagate to every connected browser.
+- Reasoning models show their thought process in a collapsible block. Survives reloads.
+- Tool calls render as expandable cards with arguments and output.
+- Sessions persist across reloads and restarts; stale lockfiles are recovered automatically.
+- Recently-closed history with one-click restore.
 - Per-session working directory override via `?cwd=<path>`.
-- Cancel the active turn from any attached browser.
+- Cancel the active turn from any connected browser.
 - Auto-reconnect with exponential back-off on WebSocket drops.
 
 ## Install
