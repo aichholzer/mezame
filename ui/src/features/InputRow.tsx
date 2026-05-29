@@ -302,7 +302,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         // composer rests at `bottom: 1.25rem` (20 px) on desktop,
         // matching the sidebar's outer margin so both bottom edges
         // align.
-        'pointer-events-none absolute inset-x-5 z-10'
+        'pointer-events-none absolute left-0 right-5 z-10'
       )}
       style={{
         bottom: 'calc(1.25rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
