@@ -17,6 +17,7 @@ export type ServerMessage =
   | { type: 'session_info'; info: SessionInfo }
   | { type: 'commands'; commands: SlashCommand[]; prompts: SlashPrompt[] }
   | { type: 'append'; role: Role; text: string }
+  | { type: 'thought'; text: string }
   | { type: 'tool_call'; toolCallId: string; title?: string | null; status?: string | null; kind?: string | null; rawInput?: unknown; content?: unknown; locations?: unknown }
   | { type: 'permission_request'; id: number | string; title: string; options: PermissionOption[] }
   | { type: 'mcp_oauth_request'; id: number | string | null; serverName: string; url: string }
@@ -117,6 +118,15 @@ export type ToolCallStatus = 'pending' | 'in_progress' | 'completed' | 'failed' 
  */
 export type LogEntry =
   | { kind: 'text'; id: string; role: Role; text: string; timestamp: number }
+  | {
+    kind: 'thought';
+    id: string;
+    /** Aggregated reasoning text. Chunks are merged into the latest
+     * `thought` entry until the turn ends (`prompt_done` / `error`),
+     * after which the next thought chunk starts a fresh entry. */
+    text: string;
+    timestamp: number;
+  }
   | {
     kind: 'permission';
     id: string;
@@ -225,6 +235,11 @@ export type Session = {
    * cleared on `prompt_done` or `error`. Idle sessions therefore do
    * not get pinned to "Agent is working..." across an idle drop. */
   inFlight: boolean;
+  /** True while the agent is streaming reasoning tokens for the
+   * current turn. Subsequent `thought` chunks merge into the
+   * trailing thought log entry. Cleared on `prompt_done` /
+   * `error` so the next turn opens a fresh thought block. */
+  thoughtOpen: boolean;
 };
 
 export type ClosedEntry = {

@@ -13,6 +13,24 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.33] - 2026-05-29
+
+### Changed
+
+- Reasoning tokens (Kiro's `agent_thought_chunk`) are no longer
+  rendered as a stream of `(thinking) word` sys lines. The server
+  now emits a dedicated `thought` wire event, the browser
+  aggregates chunks into a single log entry per turn, and the UI
+  renders the result as a small collapsible "Reasoning" block,
+  collapsed by default. Click to expand and see the model's
+  thought process; turn boundaries (`prompt_done` / `error`) start
+  a fresh block on the next turn's first chunk.
+
+  No backwards compatibility for the old shape: any reasoning
+  agent talking to a 0.8.33 server will produce the new event;
+  older browsers viewing a 0.8.33 server would silently drop
+  unknown events. Refresh the page after upgrading.
+
 ## [0.8.32] - 2026-05-29
 
 ### Fixed

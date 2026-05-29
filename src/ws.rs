@@ -709,15 +709,19 @@ pub async fn handle_agent_message(
                     }
                 }
                 "agent_thought_chunk" => {
-                    // Reasoning tokens. Kiro does not currently emit these,
-                    // but leave the handler in place so reasoning-model
-                    // agents light up the UI with `(thinking)` lines.
+                    // Reasoning tokens. Forwarded as a dedicated
+                    // `thought` event so the browser can aggregate
+                    // chunks into a collapsible block instead of
+                    // rendering one log line per token.
                     if let Some(text) = update
                         .get("content")
                         .and_then(|c| c.get("text"))
                         .and_then(Value::as_str)
                     {
-                        let _ = tx.send(text_msg(json!({ "type": "append", "role": "sys", "text": format!("(thinking) {text}") })));
+                        let _ = tx.send(text_msg(json!({
+                            "type": "thought",
+                            "text": text
+                        })));
                     }
                 }
                 "tool_call" | "tool_call_update" => {

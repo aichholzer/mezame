@@ -90,7 +90,7 @@ async fn user_message_chunk_emits_append_with_user_role_and_prefix() {
 }
 
 #[tokio::test]
-async fn agent_thought_chunk_emits_sys_with_thinking_prefix() {
+async fn agent_thought_chunk_emits_thought_event() {
     let msg = json!({
         "method": "session/update",
         "params": {
@@ -102,13 +102,8 @@ async fn agent_thought_chunk_emits_sys_with_thinking_prefix() {
     });
     let mut rx = dispatch(msg, false).await;
     let event = recv_event(&mut rx);
-    assert_eq!(event["type"], "append");
-    assert_eq!(event["role"], "sys");
-    let text = event["text"].as_str().expect("text is a string");
-    assert!(
-        text.starts_with("(thinking)"),
-        "thought chunk should be prefixed, got {text:?}"
-    );
+    assert_eq!(event["type"], "thought");
+    assert_eq!(event["text"], "considering options");
 }
 
 // ---------- tool_call ----------

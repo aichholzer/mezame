@@ -95,7 +95,7 @@ const PermissionCard = ({
                 className="cursor-pointer rounded-sm border border-border px-1.5 py-0.5 text-[11px] hover:bg-accent"
                 title="Stop auto-resolving future requests with this title"
               >
-                Disable
+                Forget
               </button>
             </>
           )}
@@ -139,6 +139,30 @@ const PermissionCard = ({
 /** Strip the legacy terminal-prompt glyph and trailing whitespace that
  * the store prepends/appends. Neither belongs in a chat bubble. */
 const cleanUserText = (text: string): string => text.replace(/^> /, '').trimEnd();
+
+const ThoughtCard = ({ entry }: { entry: Extract<LogEntry, { kind: 'thought' }> }) => {
+  const trimmed = entry.text.trim();
+  if (!trimmed) {
+    return null;
+  }
+  // Native <details> keeps the open/closed state local to the DOM,
+  // so React never has to thread a per-entry expansion flag through
+  // the store.
+  return (
+    <details className="my-3 group">
+      <summary className="cursor-pointer list-none inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-card/40 px-2.5 py-1 text-[11px] italic text-muted-foreground hover:bg-card/60 transition">
+        <span className="inline-block size-1.5 rounded-full bg-[color:var(--primary)]/70 group-open:bg-[color:var(--primary)]" />
+        Reasoning
+        <span className="ml-1 text-[10px] not-italic text-muted-foreground/60 group-open:hidden">
+          (click to expand)
+        </span>
+      </summary>
+      <div className="mt-2 ml-2 border-l-2 border-border/50 pl-3 text-xs whitespace-pre-wrap break-words text-muted-foreground">
+        {trimmed}
+      </div>
+    </details>
+  );
+};
 
 const TextEntry = ({ entry, now }: { entry: Extract<LogEntry, { kind: 'text' }>; now: number }) => {
   if (entry.role === 'sys') {
@@ -276,6 +300,9 @@ export const LogPane = ({ session, isActive }: Props) => {
       {session.log.map((entry) => {
         if (entry.kind === 'text') {
           return <TextEntry key={entry.id} entry={entry} now={now} />;
+        }
+        if (entry.kind === 'thought') {
+          return <ThoughtCard key={entry.id} entry={entry} />;
         }
         if (entry.kind === 'tool_call') {
           return <ToolCallCard key={entry.id} entry={entry} />;

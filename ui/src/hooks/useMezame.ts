@@ -473,7 +473,8 @@ const makeSession = (
   reconnectAttempt: 0,
   reconnectTimer: null,
   closing: false,
-  inFlight: false
+  inFlight: false,
+  thoughtOpen: false
 });
 
 const connect = (s: Session) => {
@@ -636,6 +637,24 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         timestamp: Date.now()
       });
       break;
+    case 'thought': {
+      // Reasoning tokens stream as many small chunks. Merge into a
+      // single `thought` log entry per turn so the UI renders one
+      // collapsible block, not a torrent of one-token rows.
+      const last = s.log.at(-1);
+      if (s.thoughtOpen && last && last.kind === 'thought') {
+        last.text += msg.text;
+      } else {
+        s.log.push({
+          kind: 'thought',
+          id: newLogId(),
+          text: msg.text,
+          timestamp: Date.now()
+        });
+        s.thoughtOpen = true;
+      }
+      break;
+    }
     case 'permission_request': {
       // If the user previously ticked "remember for this session" for
       // a permission with this exact title, resolve the new request
@@ -743,6 +762,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
     case 'prompt_done':
       s.thinking = false;
       s.inFlight = false;
+      s.thoughtOpen = false;
       ensureTrailingNewline(s);
       // Force a blank line between turns regardless of what the agent's
       // last chunk ended with.
@@ -766,6 +786,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       });
       s.thinking = false;
       s.inFlight = false;
+      s.thoughtOpen = false;
       setBusy(s, false);
       raiseAttention(s, 'error');
       break;
