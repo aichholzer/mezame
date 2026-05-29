@@ -13,6 +13,25 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.34] - 2026-05-29
+
+### Fixed
+
+- Mode and model selections did not propagate across browsers
+  attached to the same session. A user picking Sonnet in browser
+  B left browser A still showing Opus, and the next attach saw
+  whichever value was current at first negotiation. The hub now
+  awaits the agent's response to `session/set_mode` and
+  `session/set_model`, mutates the cached `session_info` half of
+  its snapshot, and broadcasts the updated `session_info` event
+  to every attached browser. Future attaches read the latest
+  selection from the snapshot, so a fresh page load also picks
+  up the correct value.
+
+  When the agent rejects a mode or model change, the hub
+  broadcasts a sys-line error notice so peers see the failure
+  rather than a silent revert mismatch.
+
 ## [0.8.33] - 2026-05-29
 
 ### Changed

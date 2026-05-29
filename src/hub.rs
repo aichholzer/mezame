@@ -119,7 +119,11 @@ pub struct SessionHub {
     /// are not replayed.
     outbound: broadcast::Sender<Arc<Value>>,
     /// `ready` and `session_info` snapshots. Replayed on every attach.
-    snapshot: NegotiationSnapshot,
+    /// Behind a `Mutex` because mode/model changes mutate the
+    /// `session_info` half so a late-attaching browser sees the
+    /// latest selection rather than what was current at first
+    /// negotiation.
+    snapshot: Arc<Mutex<NegotiationSnapshot>>,
     /// The ACP session id this hub owns. Cached so callers can read it
     /// without going through the snapshot.
     session_id: String,
@@ -389,15 +393,18 @@ impl HubRegistry {
     /// hub's negotiation phase, not to the attached browser.
     async fn subscribe(&self, hub: Arc<SessionHub>) -> AttachedHub {
         hub.counter.increment().await;
-        let mut snapshot_ready = hub.snapshot.ready.clone();
+        let snapshot = hub.snapshot.lock().await;
+        let mut snapshot_ready = snapshot.ready.clone();
         if let Some(map) = snapshot_ready.as_object_mut() {
             map.insert("resumed".into(), Value::Bool(true));
         }
+        let snapshot_session_info = snapshot.session_info.clone();
+        drop(snapshot);
         AttachedHub {
             commands: hub.commands.clone(),
             outbound: hub.outbound.subscribe(),
             snapshot_ready,
-            snapshot_session_info: hub.snapshot.session_info.clone(),
+            snapshot_session_info,
             session_id: hub.session_id.clone(),
             counter: hub.counter.clone(),
         }
@@ -428,15 +435,15 @@ impl HubRegistry {
         let (grace_tx, grace_rx) = mpsc::channel::<GraceEvent>(8);
         let counter = Arc::new(Counter::new(grace_tx));
         let suppress_replay = Arc::new(Mutex::new(false));
-        let snapshot = NegotiationSnapshot {
+        let snapshot = Arc::new(Mutex::new(NegotiationSnapshot {
             ready,
             session_info,
-        };
+        }));
 
         let hub = SessionHub {
             commands: cmd_tx,
             outbound: out_tx.clone(),
-            snapshot,
+            snapshot: snapshot.clone(),
             session_id: session_id.clone(),
             counter: counter.clone(),
         };
@@ -451,6 +458,7 @@ impl HubRegistry {
             counter,
             grace_rx,
             registry: self.clone(),
+            snapshot,
         }));
 
         let mut map = self.inner.write().await;
@@ -548,10 +556,10 @@ async fn build_hub(
     let (grace_tx, grace_rx) = mpsc::channel::<GraceEvent>(8);
     let counter = Arc::new(Counter::new(grace_tx));
 
-    let snapshot = NegotiationSnapshot {
+    let snapshot = Arc::new(Mutex::new(NegotiationSnapshot {
         ready,
         session_info,
-    };
+    }));
 
     // Use the ACP session id from negotiation for naming, but the
     // hub itself only cares about its own slot in the registry. The
@@ -575,6 +583,7 @@ async fn build_hub(
         counter,
         grace_rx,
         registry,
+        snapshot,
     }));
 
     Ok(hub)
@@ -592,6 +601,10 @@ struct HubLoopState {
     counter: Arc<Counter>,
     grace_rx: mpsc::Receiver<GraceEvent>,
     registry: HubRegistry,
+    /// Shared with `SessionHub::snapshot` so the loop can mutate the
+    /// `session_info` half on successful set_mode / set_model and
+    /// every future attach picks up the latest selection.
+    snapshot: Arc<Mutex<NegotiationSnapshot>>,
 }
 
 /// Owner loop: serialises browser commands and broadcasts agent
@@ -608,6 +621,7 @@ async fn run_hub_loop(state: HubLoopState) {
         counter,
         mut grace_rx,
         registry,
+        snapshot,
     } = state;
 
     // Adapter: `handle_agent_message` writes WS-shaped Text frames
@@ -638,6 +652,7 @@ async fn run_hub_loop(state: HubLoopState) {
                         &suppress_replay,
                         &mut answered_permissions,
                         &outbound,
+                        &snapshot,
                     ).await,
                     None => break, // all senders dropped: nobody can reach us
                 }
@@ -713,6 +728,7 @@ async fn handle_command(
     suppress_replay: &Mutex<bool>,
     answered: &mut std::collections::HashSet<String>,
     outbound: &broadcast::Sender<Arc<Value>>,
+    snapshot: &Arc<Mutex<NegotiationSnapshot>>,
 ) {
     match cmd {
         HubCommand::Prompt { blocks } => {
@@ -802,25 +818,79 @@ async fn handle_command(
         HubCommand::SetMode { mode_id } => {
             let agent = Arc::clone(agent);
             let sid = session_id.to_string();
+            let outbound_clone = outbound.clone();
+            let snapshot = snapshot.clone();
             tokio::spawn(async move {
-                let _ = agent
+                let res = agent
                     .request(
                         "session/set_mode",
                         json!({ "sessionId": sid, "modeId": mode_id }),
                     )
                     .await;
+                if res.is_err() {
+                    // Agent rejected the change; broadcast a sys
+                    // notice so peers know the optimistic update on
+                    // the sender does not match reality. The sender
+                    // already shows the new mode in its UI; the
+                    // notice tells everyone the change failed.
+                    if let Err(e) = res {
+                        let _ = outbound_clone.send(Arc::new(json!({
+                            "type": "append",
+                            "role": "sys",
+                            "text": format!("\n[set_mode failed: {e}]\n")
+                        })));
+                    }
+                    return;
+                }
+                // Mutate the snapshot's `session_info` so a future
+                // attach sees the latest mode, then broadcast the
+                // current `session_info` so peers update too.
+                let next =
+                    update_session_info_field(snapshot.clone(), "modes", "currentModeId", &mode_id)
+                        .await;
+                if let Some(info) = next {
+                    let _ = outbound_clone.send(Arc::new(json!({
+                        "type": "session_info",
+                        "info": info
+                    })));
+                }
             });
         }
         HubCommand::SetModel { model_id } => {
             let agent = Arc::clone(agent);
             let sid = session_id.to_string();
+            let outbound_clone = outbound.clone();
+            let snapshot = snapshot.clone();
             tokio::spawn(async move {
-                let _ = agent
+                let res = agent
                     .request(
                         "session/set_model",
                         json!({ "sessionId": sid, "modelId": model_id }),
                     )
                     .await;
+                if res.is_err() {
+                    if let Err(e) = res {
+                        let _ = outbound_clone.send(Arc::new(json!({
+                            "type": "append",
+                            "role": "sys",
+                            "text": format!("\n[set_model failed: {e}]\n")
+                        })));
+                    }
+                    return;
+                }
+                let next = update_session_info_field(
+                    snapshot.clone(),
+                    "models",
+                    "currentModelId",
+                    &model_id,
+                )
+                .await;
+                if let Some(info) = next {
+                    let _ = outbound_clone.send(Arc::new(json!({
+                        "type": "session_info",
+                        "info": info
+                    })));
+                }
             });
         }
     }
@@ -848,4 +918,28 @@ fn extract_user_text(blocks: &[Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Update the snapshot's cached `session_info` so a future attach
+/// sees the latest mode/model and return the updated value for the
+/// loop to broadcast to currently-attached peers. The
+/// `outer_field` selects which sub-object to mutate (`"modes"` for
+/// the mode toggle, `"models"` for the model toggle); the
+/// `current_field` is the corresponding `currentModeId` or
+/// `currentModelId` key.
+///
+/// Returns `None` when the hub never received a `session_info` at
+/// negotiation; in that case there is nothing to mutate or
+/// broadcast (the agent advertised neither modes nor models).
+async fn update_session_info_field(
+    snapshot: Arc<Mutex<NegotiationSnapshot>>,
+    outer_field: &str,
+    current_field: &str,
+    new_id: &str,
+) -> Option<Value> {
+    let mut snap = snapshot.lock().await;
+    let info = snap.session_info.as_mut()?;
+    let outer = info.get_mut(outer_field)?.as_object_mut()?;
+    outer.insert(current_field.into(), Value::String(new_id.to_string()));
+    Some(info.clone())
 }
