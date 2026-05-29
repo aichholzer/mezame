@@ -316,7 +316,7 @@ export const LogPane = ({ session, isActive }: Props) => {
         // `--mz-kb-inset` lifts the reserved area above the virtual
         // keyboard when it is open, and `--mz-safe-bottom` clears
         // the iOS home indicator. Both vars default to 0 on desktop.
-        'flex-1 overflow-y-auto px-3 pt-3 break-words scrollbar-thin',
+        'flex-1 overflow-y-auto pt-3 break-words scrollbar-thin',
         !isActive && 'hidden'
       )}
       style={{
@@ -337,16 +337,16 @@ export const LogPane = ({ session, isActive }: Props) => {
           return <TextEntry key={entry.id} entry={entry} isStreaming={isStreaming} />;
         }
         if (entry.kind === 'thought') {
-          return <div key={entry.id} className="ml-14"><ThoughtCard entry={entry} /></div>;
+          return <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><ThoughtCard entry={entry} /></div>;
         }
         if (entry.kind === 'tool_call') {
-          return <div key={entry.id} className="ml-14"><ToolCallCard entry={entry} /></div>;
+          return <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><ToolCallCard entry={entry} /></div>;
         }
         if (entry.kind === 'mcp_oauth') {
-          return <div key={entry.id} className="ml-14"><McpOauthCard session={session} entry={entry} /></div>;
+          return <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><McpOauthCard session={session} entry={entry} /></div>;
         }
         return (
-          <div key={entry.id} className="ml-14"><PermissionCard session={session} entry={entry} options={entry.options} /></div>
+          <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><PermissionCard session={session} entry={entry} options={entry.options} /></div>
         );
       })}
 
