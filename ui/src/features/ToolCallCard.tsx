@@ -118,7 +118,7 @@ export const ToolCallCard = ({ entry }: Props) => {
   return (
     <div
       className={cn(
-        'my-2 rounded-sm border border-l-[3px] bg-card/40 text-sm',
+        'my-2 rounded-sm border border-l-[3px] bg-card/40 text-sm min-w-0',
         tone
       )}
     >
