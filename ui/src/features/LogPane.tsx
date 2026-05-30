@@ -142,9 +142,9 @@ const cleanUserText = (text: string): string => text.replace(/^> /, '').trimEnd(
 const AgentAvatar = () => (
   <div
     aria-hidden="true"
-    className="flex size-12 shrink-0 items-center justify-center rounded-full bg-[color:var(--agent-bubble)]"
+    className="flex size-12 shrink-0 items-center justify-center rounded-full"
   >
-    <BotIcon className="size-8" />
+    <BotIcon className="size-12" />
   </div>
 );
 

@@ -104,7 +104,7 @@
    * the supplied reference, but the project's identity is the
    * mono-throughout look that pre-dates the reskin. Keeping the warm
    * palette but reverting fonts. */
-  --font-display: 'Chelsea Market', ui-serif, Georgia, serif;
+  --font-display: 'Gugi', ui-serif, Georgia, serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
   --font-body: var(--font-mono);
 }
