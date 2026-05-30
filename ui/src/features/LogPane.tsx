@@ -1,4 +1,3 @@
-import { BotIcon } from 'lucide-react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
@@ -142,9 +141,9 @@ const cleanUserText = (text: string): string => text.replace(/^> /, '').trimEnd(
 const AgentAvatar = () => (
   <div
     aria-hidden="true"
-    className="flex size-12 shrink-0 items-center justify-center rounded-full bg-[color:var(--agent-bubble)] text-[color:var(--agent-bubble-foreground)]"
+    className="flex size-12 shrink-0 items-center justify-center rounded-full bg-[color:var(--agent-bubble)]"
   >
-    <BotIcon className="size-6" />
+    <img src="/favicon.png" alt="" className="size-8" />
   </div>
 );
 
