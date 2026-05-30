@@ -226,7 +226,7 @@ export const SideBar = ({
       >
         <div className="flex items-center justify-center px-3 pt-6 pb-5">
           <span
-            className="text-[1.75rem] tracking-wide text-[color:var(--primary)] select-none"
+            className="text-[2rem] tracking-wide text-[color:var(--primary)] select-none mb-2"
             style={{ fontFamily: 'var(--font-display)' }}
           >
             MEZAME

@@ -20,10 +20,11 @@ build-time Vite define.
 - Reskinned the UI to a warm cream and terracotta light theme.
   The dark zinc + green palette is gone; the new look reads as a
   calmer, more editorial surface while keeping JetBrains Mono
-  throughout and Chelsea Market for the wordmark.
+  throughout and Gugi for the wordmark.
 
   Highlights:
 
+  - New image & avatar.
   - Warm cream surface ladder with a saturated terracotta primary
     that carries through to the user bubble, send button, sidebar
     accent bar, and the active session row.
