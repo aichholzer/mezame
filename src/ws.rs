@@ -351,10 +351,9 @@ fn parse_browser_command(v: &Value, attach_id: u64) -> Option<crate::hub::HubCom
             let blocks: Vec<Value> = if let Some(blocks) = v.get("blocks").and_then(Value::as_array)
             {
                 blocks.clone()
-            } else if let Some(text) = v.get("text").and_then(Value::as_str) {
-                vec![json!({ "type": "text", "text": text })]
             } else {
-                return None;
+                let text = v.get("text").and_then(Value::as_str)?;
+                vec![json!({ "type": "text", "text": text })]
             };
             Some(crate::hub::HubCommand::Prompt { blocks, attach_id })
         }
