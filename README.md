@@ -1,4 +1,4 @@
-![Mezame](https://github.com/aichholzer/mezame/blob/1e7610c7d345279ff32cc8eebbd0eef35bb5a2b7/assets/Mezame.png)
+![Mezame](https://github.com/aichholzer/mezame/blob/1e7610c7d345279ff32cc8eebbd0eef35bb5a2b7/assets/mezame.png)
 
 # Mezame!
 

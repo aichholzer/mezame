@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { BotIcon } from '@/components/BotIcon';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
 import { McpOauthCard } from '@/features/McpOauthCard';
@@ -143,7 +144,7 @@ const AgentAvatar = () => (
     aria-hidden="true"
     className="flex size-12 shrink-0 items-center justify-center rounded-full bg-[color:var(--agent-bubble)]"
   >
-    <img src="/favicon.png" alt="" className="size-8" />
+    <BotIcon className="size-8" />
   </div>
 );
 
