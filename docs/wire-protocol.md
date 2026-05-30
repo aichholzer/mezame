@@ -29,6 +29,7 @@ Mezame speaks two protocols: JSON text frames to the browser over `/ws`, and ACP
                        "kind": "...", "rawInput": {...}, "content": [...], "locations": [...] }
 { "type": "prompt_done" }
 { "type": "permission_request", "id": <original id>, "title": "...", "options": [...] }
+{ "type": "mcp_oauth_request", "id": <dedupe id>, "serverName": "...", "url": "https://..." }
 { "type": "error", "message": "..." }
 ```
 
@@ -40,11 +41,16 @@ Details:
 - `append` is the ACP streaming path for a live turn. During a resume window the server suppresses these so the browser's `/history`-seeded log doesn't get duplicated.
 - `tool_call` carries the full ACP tool-call payload (arguments, content, file locations). Updates for the same `toolCallId` merge into the existing UI row in place rather than appending.
 - `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which Mezame forwards to the agent to unblock it.
+- `mcp_oauth_request` renders an inline card with an Open button when an MCP server needs out-of-band authorisation. Carries `serverName`, `url`, and a dedupe `id` (Kiro re-emits while waiting). Dropped silently when no `url` is present.
 - `cancel` triggers `session/cancel` on the agent.
 
 ## Cross-device UI state
 
 `GET` / `PUT /state` persists the open-tabs list, recently-closed history, active tab, and numeric label counter. Backing file is `~/.mezame/state.json`. Any browser hitting this Mezame sees the same list, useful when moving between devices behind the same tunnel. Actual conversation content stays with the agent (Kiro at `~/.kiro/sessions/cli/`); Mezame only stores labels, cwds, and ACP session ids.
+
+`GET /state/events` is a Server-Sent Events stream that emits a `state_changed` event each time `PUT /state` writes a new file. Browsers use it as a "go refetch `/state`" signal so a session opened in another browser shows up without a manual reload. A periodic keep-alive comment keeps intermediaries from idle-timing out the stream.
+
+`GET /tool-result?session=<id>&id=<toolUseId>` returns the result content for a single tool call from Kiro's session JSONL. Some tools (e.g. web search) flip status to `completed`/`failed` over the live wire without streaming their output; the client polls this endpoint after a status flip to fill in the result. Response shape is `{ "status": <string|null>, "content": <Value|null> }`; a missing entry returns 404.
 
 ## Mezame to agent (stdio, ACP JSON-RPC 2.0)
 

@@ -14,7 +14,7 @@ flowchart LR
   mezame --- transport
 ```
 
-- One browser WebSocket connection = one Mezame session = one freshly spawned agent subprocess = one ACP session.
+- One ACP session = one agent subprocess, owned by a hub. Many browser WebSockets can attach to the same hub at once, so the same conversation stays in sync across phone, laptop, and desktop. The agent is spawned when the first browser attaches and stays warm for a short grace window (30s) after the last browser detaches, so a reload or transient drop reattaches to the running agent rather than respawning it. See `src/hub.rs`.
 - Mezame binds loopback by default; `mezame init` also offers `0.0.0.0` for trusted-LAN setups. Public reachability can be delegated to an existing Cloudflare Tunnel on your network.
 - The web UI is a React + Tailwind v4 app under `ui/`. The `build.rs` step runs the Vite build; the compiled bundle is baked into the binary via `rust-embed` so the release binary stays self-contained.
 
@@ -30,12 +30,15 @@ Mezame/
 ├── assets/                     # logo (Mezame.png) and source artwork (Mezame.af)
 ├── docs/                       # long-form documentation (wire protocol, etc.)
 ├── src/
-│   ├── main.rs                 # entry, module wiring, transport dispatch
+│   ├── main.rs                 # thin CLI shim; calls mezame::run()
+│   ├── lib.rs                  # CLI entry (run/help/version), module wiring, transport dispatch
 │   ├── config.rs               # on-disk config and interactive setup
 │   ├── agent.rs                # ACP subprocess wrapper and JSON-RPC framing
 │   ├── session.rs              # session resume and stale-lock recovery
+│   ├── hub.rs                  # multi-attach session hub: one agent, many browsers
 │   ├── http.rs                 # cloudflared transport, UI assets, /state, /history
-│   └── ws.rs                   # per-WS session loop and agent-message dispatch
+│   ├── ws.rs                   # per-WS attach loop and agent-message dispatch
+│   └── unix.rs                 # tiny Unix FFI helpers (kill, setsid)
 ├── ui/                         # React UI (Vite, TS, Tailwind v4, shadcn)
 │   ├── index.html
 │   ├── package.json            # UI version lives here
@@ -46,8 +49,8 @@ Mezame/
 │       ├── index.css
 │       ├── types.ts            # wire-protocol and state types
 │       ├── hooks/useMezame.ts   # store, WS lifecycle, state sync
-│       ├── features/           # TabBar, LogPane, InputRow, ...
-│       ├── components/         # CopyButton + shadcn primitives
+│       ├── features/           # SideBar, LogPane, InputRow, ...
+│       ├── components/         # CopyButton, BotIcon + shadcn primitives
 │       └── lib/                # utils, time helpers
 ```
 
