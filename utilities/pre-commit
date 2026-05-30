@@ -34,8 +34,11 @@ else
 fi
 
 # Check 2: Cargo clippy (linting)
+# `--all-targets` matches CI: it lints the library, integration tests,
+# and the lib-test target so lints that only fire under cfg(test) (e.g.
+# clippy::question_mark in test-only code paths) are caught here too.
 print_section "Checking lints..."
-if cargo clippy -- -D warnings; then
+if MEZAME_SKIP_UI_BUILD=1 cargo clippy --all-targets -- -D warnings; then
     echo -e " ${GREEN}• Pass${RESET}"
 else
     echo -e " ${RED}• Fail${RESET}"
@@ -45,7 +48,7 @@ fi
 
 # Check 3: Cargo check (compilation)
 print_section "Checking compilation..."
-if cargo check; then
+if MEZAME_SKIP_UI_BUILD=1 cargo check; then
     echo -e " ${GREEN}• Pass${RESET}"
 else
     echo -e " ${RED}• Fail${RESET}"

@@ -61,7 +61,7 @@ echo -e " ${WHITE}Pre-commit hook setup complete!${RESET}"
 echo
 echo -e "${YELLOW} The hook will now run these checks before each commit:${RESET}"
 echo -e " - ${WHITE}cargo fmt -- --check${RESET} (code formatting)"
-echo -e " - ${WHITE}cargo clippy -- -D warnings${RESET} (linting)"
+echo -e " - ${WHITE}cargo clippy --all-targets -- -D warnings${RESET} (linting)"
 echo -e " - ${WHITE}cargo check${RESET} (compilation)"
 echo
 echo -e " To test the hook manually, run: ${WHITE}${TARGET_HOOK}${RESET}"
