@@ -45,6 +45,11 @@ let sessions: Session[] = [];
 let closed: ClosedEntry[] = [];
 let activeId: string | null = null;
 let nextLabel = 1;
+// User's last picks. Persisted to /state and replayed onto fresh
+// sessions in the `session_info` handler, so opening a new tab no
+// longer drops the user back onto the agent's defaults.
+let lastModeId: string | null = null;
+let lastModelId: string | null = null;
 
 let version = 0;
 let snapshot: Snapshot = { sessions, closed, activeId, version };
@@ -162,7 +167,9 @@ const doSync = async () => {
     })),
     closed,
     activeId,
-    nextLabel
+    nextLabel,
+    lastModeId,
+    lastModelId
   };
   try {
     await fetch(STATE_URL, {
@@ -965,6 +972,29 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       s.currentModeId = msg.info.modes?.currentModeId ?? null;
       s.models = msg.info.models?.availableModels ?? [];
       s.currentModelId = msg.info.models?.currentModelId ?? null;
+      // For fresh (never-prompted, not-resumed) sessions, replay the
+      // user's last picks over the agent's reported defaults when the
+      // option is still advertised. Resumed sessions (s.used = true)
+      // keep whatever they were last set to: overriding their mode or
+      // model mid-thread would be surprising.
+      if (!s.used) {
+        if (
+          lastModeId !== null &&
+          lastModeId !== s.currentModeId &&
+          s.modes.some((m) => m.id === lastModeId)
+        ) {
+          s.ws?.send(JSON.stringify({ type: 'set_mode', modeId: lastModeId }));
+          s.currentModeId = lastModeId;
+        }
+        if (
+          lastModelId !== null &&
+          lastModelId !== s.currentModelId &&
+          s.models.some((m) => m.modelId === lastModelId)
+        ) {
+          s.ws?.send(JSON.stringify({ type: 'set_model', modelId: lastModelId }));
+          s.currentModelId = lastModelId;
+        }
+      }
       break;
     case 'commands':
       s.commands = msg.commands;
@@ -1264,6 +1294,9 @@ const setMode = (modeId: string) => {
   // Optimistic: update local state straight away. If the server rejects,
   // we'll get an `error` message and the log will surface it.
   s.currentModeId = modeId;
+  // Remember the pick so future fresh sessions start with it.
+  lastModeId = modeId;
+  scheduleSync();
   notify();
 };
 
@@ -1274,6 +1307,8 @@ const setModel = (modelId: string) => {
   }
   s.ws.send(JSON.stringify({ type: 'set_model', modelId }));
   s.currentModelId = modelId;
+  lastModelId = modelId;
+  scheduleSync();
   notify();
 };
 
@@ -1318,6 +1353,15 @@ const init = async () => {
   const saved = await fetchState();
   if (saved?.closed && Array.isArray(saved.closed)) {
     closed = saved.closed.slice(0, HISTORY_MAX);
+  }
+  // Restore user's last picks regardless of whether any sessions were
+  // persisted: the very first new session of a fresh client should
+  // still benefit from a previously-recorded preference.
+  if (saved?.lastModeId !== undefined) {
+    lastModeId = saved.lastModeId;
+  }
+  if (saved?.lastModelId !== undefined) {
+    lastModelId = saved.lastModelId;
   }
   if (saved?.sessions && Array.isArray(saved.sessions) && saved.sessions.length > 0) {
     nextLabel = saved.nextLabel ?? saved.sessions.length + 1;
