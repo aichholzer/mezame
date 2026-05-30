@@ -260,3 +260,197 @@ async fn permission_response_is_forwarded_to_agent_stdin() {
     agent.shutdown(Some("session-perm")).await;
     assert!(agent.shutdown_complete());
 }
+
+// ---------- browser-command branches ----------
+//
+// The tests above cover the loop's exit paths (stream close, transport
+// error, agent exit) and the permission-response forward. The block
+// below exercises the remaining browser-message arms in the WS-frame
+// branch: `prompt` (both the `blocks` and legacy `text` shapes),
+// `cancel`, `set_mode`, and `set_model`. Each arm spawns a task that
+// writes a JSON-RPC frame to the agent's stdin; we drive one browser
+// message followed by a Close frame, let the loop exit, then read the
+// frame the spawned task wrote and assert its method and params.
+
+/// Drive a single browser message through the loop, then a Close frame
+/// so the loop exits cleanly, and return the first JSON-RPC frame the
+/// loop's spawned task wrote to the agent's stdin.
+///
+/// `_agent_stdout` is held for the lifetime of the call: dropping it
+/// would signal EOF to the `from_io` reader, which could fire the
+/// `updates_rx` `None => break` arm before the browser message is
+/// processed. Keeping it alive guarantees the WS-frame branch wins.
+async fn first_agent_frame_for(browser_msg: Message) -> Value {
+    use tokio::io::AsyncReadExt;
+
+    let (agent, mut updates_rx, mut agent_stdin, _agent_stdout) = build_loop_pieces().await;
+    let (browser_tx, browser_rx) = mpsc::unbounded_channel();
+    let (to_ws_tx, _to_ws_rx) = mpsc::unbounded_channel();
+
+    browser_tx.send(browser_msg).unwrap();
+    browser_tx
+        .send(Message::Close(Some(CloseFrame {
+            code: 1000,
+            reason: "bye".into(),
+        })))
+        .unwrap();
+    drop(browser_tx);
+
+    let mut stream = channel_stream(browser_rx);
+    let mut suppress = false;
+    let agent_for_loop = agent.clone();
+    timeout(
+        Duration::from_secs(2),
+        run_select_loop(
+            &mut stream,
+            &to_ws_tx,
+            agent_for_loop,
+            &mut updates_rx,
+            "session-cmd",
+            &mut suppress,
+        ),
+    )
+    .await
+    .expect("loop did not exit");
+
+    let mut buf = vec![0u8; 4096];
+    let n = timeout(Duration::from_secs(1), agent_stdin.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .expect("read failed");
+    let written = std::str::from_utf8(&buf[..n]).expect("utf8");
+    let line = written.lines().next().expect("at least one line");
+    let parsed = serde_json::from_str(line).expect("agent stdin was not valid JSON");
+
+    agent.shutdown(Some("session-cmd")).await;
+    parsed
+}
+
+#[tokio::test]
+async fn prompt_with_text_is_forwarded_as_session_prompt() {
+    let msg = Message::Text(
+        serde_json::json!({ "type": "prompt", "text": "what's the time" }).to_string(),
+    );
+    let frame = first_agent_frame_for(msg).await;
+
+    assert_eq!(frame["method"], "session/prompt");
+    assert_eq!(frame["params"]["sessionId"], "session-cmd");
+    // The legacy `text` shape is wrapped into a single text block.
+    assert_eq!(frame["params"]["prompt"][0]["type"], "text");
+    assert_eq!(frame["params"]["prompt"][0]["text"], "what's the time");
+}
+
+#[tokio::test]
+async fn prompt_with_blocks_array_is_forwarded_verbatim() {
+    let blocks = serde_json::json!([
+        { "type": "text", "text": "look at this" },
+        { "type": "image", "mimeType": "image/png", "data": "abc" }
+    ]);
+    let msg = Message::Text(
+        serde_json::json!({ "type": "prompt", "blocks": blocks.clone() }).to_string(),
+    );
+    let frame = first_agent_frame_for(msg).await;
+
+    assert_eq!(frame["method"], "session/prompt");
+    // The blocks array passes through untouched, attachments included.
+    assert_eq!(frame["params"]["prompt"], blocks);
+}
+
+#[tokio::test]
+async fn cancel_message_sends_session_cancel_notification() {
+    let msg = Message::Text(serde_json::json!({ "type": "cancel" }).to_string());
+    let frame = first_agent_frame_for(msg).await;
+
+    assert_eq!(frame["method"], "session/cancel");
+    assert_eq!(frame["params"]["sessionId"], "session-cmd");
+    // A notification carries no id.
+    assert!(frame.get("id").is_none(), "cancel must be a notification");
+}
+
+#[tokio::test]
+async fn set_mode_message_is_forwarded_with_mode_id() {
+    let msg = Message::Text(
+        serde_json::json!({ "type": "set_mode", "modeId": "kiro_planner" }).to_string(),
+    );
+    let frame = first_agent_frame_for(msg).await;
+
+    assert_eq!(frame["method"], "session/set_mode");
+    assert_eq!(frame["params"]["sessionId"], "session-cmd");
+    assert_eq!(frame["params"]["modeId"], "kiro_planner");
+}
+
+#[tokio::test]
+async fn set_model_message_is_forwarded_with_model_id() {
+    let msg = Message::Text(
+        serde_json::json!({ "type": "set_model", "modelId": "claude-3-5-sonnet" }).to_string(),
+    );
+    let frame = first_agent_frame_for(msg).await;
+
+    assert_eq!(frame["method"], "session/set_model");
+    assert_eq!(frame["params"]["sessionId"], "session-cmd");
+    assert_eq!(frame["params"]["modelId"], "claude-3-5-sonnet");
+}
+
+#[tokio::test]
+async fn agent_update_is_forwarded_to_the_browser_sink() {
+    // Exercises the `Some(msg) => handle_agent_message` arm of the
+    // agent-updates branch (the existing tests only cover the agent-exit
+    // `None => break` path). We write a `session/update` frame to the
+    // agent's stdout; the loop pulls it off the updates channel, runs it
+    // through `handle_agent_message`, and emits an `append` event to the
+    // browser sink.
+    use tokio::io::AsyncWriteExt;
+
+    let (agent, mut updates_rx, _agent_stdin, mut agent_stdout) = build_loop_pieces().await;
+    let (browser_tx, browser_rx) = mpsc::unbounded_channel();
+    let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel();
+
+    // Inject an agent notification.
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "text": "hi there" }
+            }
+        }
+    });
+    agent_stdout
+        .write_all(format!("{frame}\n").as_bytes())
+        .await
+        .expect("write agent frame");
+
+    let mut stream = channel_stream(browser_rx);
+    let mut suppress = false;
+    let agent_for_loop = agent.clone();
+    let loop_handle = tokio::spawn(async move {
+        run_select_loop(
+            &mut stream,
+            &to_ws_tx,
+            agent_for_loop,
+            &mut updates_rx,
+            "session-fwd",
+            &mut suppress,
+        )
+        .await;
+    });
+
+    // The forwarded event should land on the browser sink.
+    let event = timeout(Duration::from_secs(2), to_ws_rx.recv())
+        .await
+        .expect("event within 2s")
+        .expect("channel open");
+    let Message::Text(text) = event else {
+        panic!("expected a text frame");
+    };
+    let value: Value = serde_json::from_str(&text).expect("valid JSON");
+    assert_eq!(value["type"], "append");
+    assert_eq!(value["role"], "agent");
+    assert_eq!(value["text"], "hi there");
+
+    // Close the browser so the loop exits and the spawned task joins.
+    drop(browser_tx);
+    let _ = timeout(Duration::from_secs(2), loop_handle).await;
+    agent.shutdown(Some("session-fwd")).await;
+}

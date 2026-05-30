@@ -1,6 +1,4 @@
-![Mezame](https://github.com/aichholzer/mezame/blob/22baf1d84cc80c0e75b7b0b15c3bb3bd27e422a0/assets/Mezame.png)
-
-# Mezame!
+![Mezame](https://github.com/aichholzer/mezame/blob/06cd603a6cc025be3058441a32a47cd212a8967b/assets/Mezame.png)
 
 [![Tests](https://github.com/aichholzer/mezame/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aichholzer/mezame/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/aichholzer/mezame/graph/badge.svg?token=UV3BE0RQ0U)](https://codecov.io/gh/aichholzer/mezame)

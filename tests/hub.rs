@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mezame::agent::{from_io, Agent};
+use mezame::config::{Config, TransportConfig};
 use mezame::hub::{HubCommand, HubRegistry};
 use serde_json::{json, Value};
 use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -390,4 +391,392 @@ async fn permission_request_is_targeted_at_the_prompter() {
         saw_targeted,
         "hub must stamp permission_request with the prompter's attach id"
     );
+}
+
+#[tokio::test]
+async fn cancel_command_forwards_session_cancel_to_agent() {
+    // The hub's Cancel arm fires a `session/cancel` notification on
+    // the agent. We verify the forwarding by parsing the line that
+    // mezame writes to the agent's stdin and checking the method.
+    let registry = HubRegistry::new();
+    let (server_to_agent, agent_stdin) = tokio::io::duplex(8 * 1024);
+    let (agent_stdout, server_reader) = tokio::io::duplex(8 * 1024);
+    let (agent, updates_rx) = from_io(server_to_agent, server_reader);
+    drop(agent_stdout); // we never inject anything
+
+    // Capture the first line written to the agent's stdin.
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_stdin).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = line_tx.send(line);
+        }
+    });
+
+    let attached = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Cancel)
+        .await
+        .expect("send Cancel");
+
+    // Wait for the cancel notification to land on the agent's stdin.
+    let line = timeout(Duration::from_secs(2), line_rx.recv())
+        .await
+        .expect("cancel within 2s")
+        .expect("channel still open");
+    let value: Value = serde_json::from_str(&line).expect("valid JSON");
+    assert_eq!(value["method"], "session/cancel");
+    assert_eq!(value["params"]["sessionId"], SESSION_ID);
+}
+
+#[tokio::test]
+async fn set_mode_broadcasts_updated_session_info() {
+    // The hub awaits the agent reply, mutates the cached session_info
+    // snapshot, and re-broadcasts it. Peers see the new currentModeId
+    // immediately even though they did not initiate the change.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, _inject) = make_fake_agent();
+    let session_info = Some(json!({
+        "type": "session_info",
+        "info": {
+            "modes": {
+                "currentModeId": "kiro_default",
+                "availableModes": [
+                    { "id": "kiro_default", "name": "Default" },
+                    { "id": "kiro_planner", "name": "Planner" }
+                ]
+            }
+        }
+    }));
+
+    let mut peer = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            session_info,
+        )
+        .await;
+    let sender = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("hub registered");
+
+    sender
+        .commands
+        .send(HubCommand::SetMode {
+            mode_id: "kiro_planner".into(),
+        })
+        .await
+        .expect("send SetMode");
+
+    // The peer should see a session_info broadcast carrying the new
+    // currentModeId. Drain a few frames since the snapshot replay
+    // lands first on attach.
+    let mut saw_update = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), peer.outbound.recv()).await {
+            Ok(Ok(event)) => {
+                if (*event)["type"] == "session_info"
+                    && (*event)["info"]["modes"]["currentModeId"] == "kiro_planner"
+                {
+                    saw_update = true;
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(saw_update, "peer should see updated session_info");
+}
+
+#[tokio::test]
+async fn set_model_broadcasts_updated_session_info() {
+    // Symmetric to set_mode but for the models half.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, _inject) = make_fake_agent();
+    let session_info = Some(json!({
+        "type": "session_info",
+        "info": {
+            "models": {
+                "currentModelId": "claude-3-5-haiku",
+                "availableModels": [
+                    { "modelId": "claude-3-5-haiku", "name": "Haiku" },
+                    { "modelId": "claude-3-5-sonnet", "name": "Sonnet" }
+                ]
+            }
+        }
+    }));
+
+    let mut peer = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            session_info,
+        )
+        .await;
+    let sender = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("hub registered");
+
+    sender
+        .commands
+        .send(HubCommand::SetModel {
+            model_id: "claude-3-5-sonnet".into(),
+        })
+        .await
+        .expect("send SetModel");
+
+    let mut saw_update = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), peer.outbound.recv()).await {
+            Ok(Ok(event)) => {
+                if (*event)["type"] == "session_info"
+                    && (*event)["info"]["models"]["currentModelId"] == "claude-3-5-sonnet"
+                {
+                    saw_update = true;
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(saw_update, "peer should see updated session_info");
+}
+
+#[tokio::test]
+async fn empty_prompt_blocks_are_silently_ignored() {
+    // The Prompt arm short-circuits when blocks is empty: no echo,
+    // no agent request, no prompt_done. This guards against an
+    // accidental empty submit from the client.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, _inject) = make_fake_agent();
+    let mut attached = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+
+    // Wait briefly to give the hub a chance to broadcast something.
+    // It should not.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        attached.outbound.try_recv().is_err(),
+        "empty prompt must not produce any broadcast"
+    );
+}
+
+#[tokio::test]
+async fn oauth_request_is_targeted_at_the_prompter() {
+    // OAuth requests follow the same targeting rule as permission
+    // requests: only the browser that started the turn sees them.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, inject) = make_fake_agent_with(false);
+    let mut sender = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    sender
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![json!({ "type": "text", "text": "auth" })],
+            attach_id: sender.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    // Drain user-echo.
+    let _ = timeout(Duration::from_millis(200), sender.outbound.recv()).await;
+
+    inject
+        .send(json!({
+            "jsonrpc": "2.0",
+            "method": "_kiro.dev/mcp/oauth_request",
+            "params": {
+                "serverName": "github",
+                "url": "https://example.com/oauth"
+            }
+        }))
+        .expect("inject");
+
+    let mut saw_targeted = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), sender.outbound.recv()).await {
+            Ok(Ok(event)) => {
+                if (*event)["type"] == "mcp_oauth_request" {
+                    let target = (*event)["_target"]
+                        .as_u64()
+                        .expect("oauth targets are stamped");
+                    assert_eq!(target, sender.attach_id);
+                    saw_targeted = true;
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_targeted,
+        "hub must stamp mcp_oauth_request with the prompter's attach id"
+    );
+}
+
+/// Minimal config for the `attach_or_create` fast path. The fast path
+/// returns before the config is ever read (it only matters when a new
+/// hub has to be built via `spawn_agent`), so the values here are
+/// placeholders that never get exercised.
+fn dummy_config() -> Arc<Config> {
+    Arc::new(Config {
+        transports: vec![TransportConfig::Cloudflared {
+            bind: "127.0.0.1:0".into(),
+        }],
+        agent_cmd: "cat".into(),
+        agent_args: vec![],
+    })
+}
+
+#[tokio::test]
+async fn attach_or_create_fast_path_reuses_registered_hub() {
+    // A hub is already registered for SESSION_ID (via the test helper).
+    // `attach_or_create` with that same id as the resume key must take
+    // the fast path: look the hub up, subscribe, and return without
+    // spawning a fresh agent. We then prove the returned attach shares
+    // the live hub by injecting an agent message and seeing it on both
+    // the original and the fast-path subscriber.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, inject) = make_fake_agent();
+
+    let mut original = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    let mut fast = registry
+        .attach_or_create(dummy_config(), Some(SESSION_ID.into()), None, "test-build")
+        .await
+        .expect("fast path attach");
+
+    assert_eq!(fast.session_id, SESSION_ID);
+    // Snapshot replay marks every attach as resumed=true.
+    assert_eq!(fast.snapshot_ready["resumed"], true);
+
+    inject
+        .send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "text": "shared" }
+                }
+            }
+        }))
+        .expect("inject");
+
+    let on_original = timeout(Duration::from_secs(2), original.outbound.recv())
+        .await
+        .expect("original sees event")
+        .expect("channel open");
+    let on_fast = timeout(Duration::from_secs(2), fast.outbound.recv())
+        .await
+        .expect("fast-path subscriber sees event")
+        .expect("channel open");
+    assert_eq!((*on_original)["text"], "shared");
+    assert_eq!(*on_original, *on_fast);
+}
+
+#[tokio::test]
+async fn detach_to_zero_then_reattach_exercises_grace_counter() {
+    // Drives the subscriber-count lifecycle: the last detach drops the
+    // count to zero (Counter::decrement → GraceEvent::Empty → the hub
+    // arms its grace timer via install_cancel), and a fresh attach
+    // inside the window climbs back above zero (Counter::increment
+    // fires the cancel one-shot and GraceEvent::Refilled, disarming the
+    // timer). We assert the hub is still live afterwards by injecting an
+    // agent message and seeing it on the re-attached subscriber.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, inject) = make_fake_agent();
+
+    let first = registry
+        .register_for_test(
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    // Drop the only subscriber. The Drop impl spawns the decrement, so
+    // give the runtime a moment to run it and let the hub loop process
+    // the resulting GraceEvent::Empty and install its cancel handle.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Re-attach inside the grace window. The hub is still registered
+    // (the grace timer has not fired), so this climbs the count back to
+    // one and cancels the pending shutdown.
+    let mut second = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("hub still registered inside grace window");
+
+    inject
+        .send(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "text": "still alive" }
+                }
+            }
+        }))
+        .expect("inject");
+
+    let event = timeout(Duration::from_secs(2), second.outbound.recv())
+        .await
+        .expect("re-attached subscriber sees event")
+        .expect("channel open");
+    assert_eq!((*event)["text"], "still alive");
 }

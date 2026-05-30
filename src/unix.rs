@@ -41,3 +41,50 @@ pub fn send_signal(pid: i32, sig: i32) -> i32 {
 pub(crate) unsafe fn new_session() -> i32 {
     setsid()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" {
+        fn fork() -> i32;
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    }
+
+    /// Exercise `new_session` in a forked child, the only context where
+    /// calling `setsid` is safe: a freshly forked child is never a
+    /// process-group leader, so `setsid` succeeds and the new session is
+    /// confined to the throwaway child. Calling it directly in the test
+    /// process would detach the test runner from its controlling
+    /// terminal, and the real production path (inside `Command::pre_exec`)
+    /// runs between fork and exec where llvm-cov cannot observe it.
+    ///
+    /// The child exits via `std::process::exit` (not `_exit`) so the
+    /// coverage profile flushes before the child goes; the lib unit-test
+    /// binary has no other tests, so the fork happens with effectively
+    /// one active thread and the usual fork-without-exec hazards do not
+    /// bite.
+    #[test]
+    fn new_session_succeeds_in_a_forked_child() {
+        unsafe {
+            let pid = fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                // Child: setsid must return a valid (non-negative) session
+                // id. Map success to exit code 0, failure to 1.
+                let sid = new_session();
+                std::process::exit(if sid >= 0 { 0 } else { 1 });
+            }
+            // Parent: reap the child and assert it exited cleanly.
+            let mut status: i32 = 0;
+            let reaped = waitpid(pid, &mut status as *mut i32, 0);
+            assert_eq!(reaped, pid, "waitpid did not reap our child");
+            let exited_normally = (status & 0x7f) == 0;
+            let exit_code = (status >> 8) & 0xff;
+            assert!(
+                exited_normally && exit_code == 0,
+                "child setsid failed: raw status {status}"
+            );
+        }
+    }
+}
