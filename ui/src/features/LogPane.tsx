@@ -222,7 +222,7 @@ const TextEntry = ({
   // User
   const cleaned = cleanUserText(entry.text);
   return (
-    <div className="my-5 flex justify-end">
+    <div className="my-5 flex justify-end pr-3">
       <div className="max-w-[88%] sm:max-w-[78%]">
         <div className="rounded-2xl rounded-br-[0px] bg-[color:var(--user-bubble)] px-4 py-4 text-[color:var(--user-bubble-foreground)] shadow-sm">
           <div className="whitespace-pre-wrap break-words">{cleaned}</div>
@@ -316,7 +316,7 @@ export const LogPane = ({ session, isActive }: Props) => {
         // `--mz-kb-inset` lifts the reserved area above the virtual
         // keyboard when it is open, and `--mz-safe-bottom` clears
         // the iOS home indicator. Both vars default to 0 on desktop.
-        'flex-1 overflow-y-auto pt-3 break-words scrollbar-thin',
+        'flex-1 overflow-y-auto pt-3 break-words scrollbar-thin min-w-0',
         !isActive && 'hidden'
       )}
       style={{

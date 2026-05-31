@@ -75,7 +75,7 @@ export const App = () => {
        * `useSidebarWidth` while the user drags. Mobile keeps the
        * full width since the sidebar is a drawer there. */}
       <main
-        className="relative flex min-h-0 flex-1 flex-col"
+        className="relative flex min-h-0 min-w-0 flex-1 flex-col"
         style={{
           paddingTop: 'calc(20px + var(--mz-safe-top))',
           paddingRight: '20px',

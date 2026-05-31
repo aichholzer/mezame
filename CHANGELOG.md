@@ -13,6 +13,12 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.43] - 2026-05-31
+
+### Fixed
+
+- Broken UI
+
 ## [0.8.42] - 2026-05-29
 
 ### Changed
