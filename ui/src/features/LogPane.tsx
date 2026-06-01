@@ -204,7 +204,10 @@ const TextEntry = ({
     const copyText = entry.text.trim();
     return (
       <div className="my-5 flex items-start justify-start gap-2">
-        <div className="flex flex-col items-center gap-2">
+        {/* Avatar + copy live in a left rail on desktop. On mobile the
+         * avatar is hidden to reclaim horizontal width and the copy
+         * button moves below the bubble (rendered after it). */}
+        <div className="hidden md:flex flex-col items-center gap-2">
           <AgentAvatar />
           {!isStreaming && (
             <CopyButton text={copyText} title="Copy message" className="size-7" />
@@ -214,6 +217,12 @@ const TextEntry = ({
           <div className="rounded-2xl rounded-tl-[0px] bg-[color:var(--agent-bubble)] px-4 py-4 text-[color:var(--agent-bubble-foreground)] shadow-sm">
             <Markdown text={entry.text} />
           </div>
+          {/* Mobile-only copy control, sitting below the response. */}
+          {!isStreaming && (
+            <div className="mt-1.5 md:hidden">
+              <CopyButton text={copyText} title="Copy message" className="size-7" />
+            </div>
+          )}
         </div>
       </div>
     );
@@ -337,22 +346,24 @@ export const LogPane = ({ session, isActive }: Props) => {
           return <TextEntry key={entry.id} entry={entry} isStreaming={isStreaming} />;
         }
         if (entry.kind === 'thought') {
-          return <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><ThoughtCard entry={entry} /></div>;
+          return <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><ThoughtCard entry={entry} /></div>;
         }
         if (entry.kind === 'tool_call') {
-          return <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><ToolCallCard entry={entry} /></div>;
+          return <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><ToolCallCard entry={entry} /></div>;
         }
         if (entry.kind === 'mcp_oauth') {
-          return <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><McpOauthCard session={session} entry={entry} /></div>;
+          return <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><McpOauthCard session={session} entry={entry} /></div>;
         }
         return (
-          <div key={entry.id} className="ml-14 max-w-[88%] sm:max-w-[78%]"><PermissionCard session={session} entry={entry} options={entry.options} /></div>
+          <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><PermissionCard session={session} entry={entry} options={entry.options} /></div>
         );
       })}
 
       {showThinking && (
         <div className="my-3 flex items-start gap-2">
-          <AgentAvatar />
+          <div className="hidden md:block">
+            <AgentAvatar />
+          </div>
           <div
             className="rounded-2xl rounded-tl-[0px] bg-[color:var(--agent-bubble)] px-4 py-4 shadow-sm"
             role="status"
