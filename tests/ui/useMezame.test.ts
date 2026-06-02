@@ -3,7 +3,7 @@
 // `Session` and assert the resulting log + flags. No React, no real
 // WebSocket, no fetch.
 
-import { applyServerMessage, shouldCloseAbsentSession } from '@/hooks/useMezame';
+import { applyServerMessage, deriveLabel, shouldCloseAbsentSession } from '@/hooks/useMezame';
 import type { LogEntry, ServerMessage, Session } from '@/types';
 
 /** Build a session with the same defaults the production factory uses. */
@@ -485,5 +485,54 @@ describe('shouldCloseAbsentSession', () => {
   it('keeps an unused (never-prompted) session regardless of closed history', () => {
     const s = { used: false, acpSessionId: 'acp-1' };
     expect(shouldCloseAbsentSession(s, closedIds('acp-1'))).toBe(false);
+  });
+});
+
+// ---------- deriveLabel ----------
+//
+// Pure heuristic that turns a session's first prompt into a short tab
+// label. No network, no model. Returns null when the prompt is not a
+// useful label so the caller keeps the numeric placeholder.
+
+describe('deriveLabel', () => {
+  it('returns null for empty or whitespace-only text', () => {
+    expect(deriveLabel('')).toBeNull();
+    expect(deriveLabel('   ')).toBeNull();
+  });
+
+  it('returns null for slash commands', () => {
+    expect(deriveLabel('/clear')).toBeNull();
+  });
+
+  it('returns null when the first sentence is shorter than two chars', () => {
+    expect(deriveLabel('a')).toBeNull();
+    expect(deriveLabel('...')).toBeNull();
+  });
+
+  it('uses a short prompt verbatim', () => {
+    expect(deriveLabel('Fix the login bug')).toBe('Fix the login bug');
+    expect(deriveLabel('Hi')).toBe('Hi');
+  });
+
+  it('collapses runs of whitespace', () => {
+    expect(deriveLabel('   Add   dark   mode   toggle   ')).toBe('Add dark mode toggle');
+  });
+
+  it('keeps only the first sentence', () => {
+    expect(deriveLabel('Refactor the parser. Then add tests.')).toBe('Refactor the parser');
+  });
+
+  it('caps the label at ten words', () => {
+    expect(
+      deriveLabel('one two three four five six seven eight nine ten eleven twelve')
+    ).toBe('one two three four five six seven eight nine ten');
+  });
+
+  it('strips fenced code blocks before deriving', () => {
+    expect(deriveLabel('Look at ```const x = 1``` please')).toBe('Look at please');
+  });
+
+  it('strips URLs before deriving', () => {
+    expect(deriveLabel('Check https://example.com/foo now')).toBe('Check now');
   });
 });

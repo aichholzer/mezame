@@ -1254,7 +1254,7 @@ const forgetHistory = (acpSessionId: string) => {
 // Returns null when the prompt isn't useful as a label (empty, slash
 // command, attachments-only). The caller leaves the original label in
 // that case.
-const deriveLabel = (text: string): string | null => {
+export const deriveLabel = (text: string): string | null => {
   const cleaned = text
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/https?:\/\/\S+/g, ' ')
