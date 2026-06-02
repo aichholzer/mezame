@@ -1,6 +1,7 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@/App';
+import { bootTheme } from '@/hooks/useTheme';
 import 'highlight.js/styles/github-dark.css';
 import 'katex/dist/katex.min.css';
 import '@/index.css';
@@ -9,6 +10,10 @@ const container = document.getElementById('root');
 if (!container) {
   throw new Error('#root not found');
 }
+
+// Apply the persisted theme before the first paint so the app never
+// flashes light then snaps to dark once settings hydrate.
+bootTheme();
 
 createRoot(container).render(
   <StrictMode>

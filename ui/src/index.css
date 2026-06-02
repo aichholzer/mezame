@@ -109,6 +109,45 @@
   --font-body: var(--font-mono);
 }
 
+/* Night mode — "warm espresso". Overrides only the source tokens that
+ * `:root` sets as literals; everything mapped through `var(--token)`
+ * (the shadcn aliases, role colours, bubbles) re-tints automatically.
+ * The hue (~70, warm brown) and the brightened terracotta primary
+ * keep Mezame's identity instead of going neutral-grey. Applied by
+ * toggling `.dark` on <html> (see hooks/useTheme.ts). */
+.dark {
+  --background: oklch(0.19 0.010 70);
+  --surface-bright: oklch(0.24 0.012 70);
+  --surface-container-lowest: oklch(0.16 0.010 70);
+  --surface-container-low: oklch(0.22 0.011 70);
+  --surface-container: oklch(0.24 0.012 70);
+  --surface-container-high: oklch(0.275 0.013 70);
+  --surface-container-highest: oklch(0.30 0.014 70);
+
+  --foreground: oklch(0.92 0.010 80);
+  --on-surface-variant: oklch(0.74 0.012 70);
+  --outline: oklch(0.55 0.012 70);
+  --outline-variant: oklch(0.34 0.012 70);
+
+  --border: oklch(0.34 0.012 70);
+
+  /* Brightened terracotta: lifted L so it stays vivid on dark without
+   * glowing, dark foreground so text on the primary fill stays legible. */
+  --primary: oklch(0.70 0.13 45);
+  --primary-foreground: oklch(0.18 0.02 45);
+  --primary-container: oklch(0.50 0.12 45);
+  --primary-fixed: oklch(0.35 0.07 50);
+  --on-primary-fixed: oklch(0.90 0.04 60);
+
+  --destructive: oklch(0.62 0.18 28);
+  --ring: oklch(0.70 0.13 45);
+
+  --attn-done: oklch(0.72 0.13 145);
+  --attn-permission: oklch(0.80 0.12 75);
+
+  --agent-bubble: oklch(0.275 0.013 70);
+}
+
 /* Desktop layout: promote the chat column's left margin to clear the
  * floating sidebar. Tailwind's `md:` breakpoint is 768 px; matching
  * that here keeps the in-app `md:static` overrides on the sidebar
@@ -248,6 +287,29 @@
 .tab-busy-border:hover {
   background:
     linear-gradient(oklch(0.97 0.018 70), oklch(0.97 0.018 70)) padding-box,
+    conic-gradient(from var(--busy-border-angle),
+      transparent 0deg,
+      transparent 280deg,
+      rgba(194, 101, 42, 0.9) 325deg,
+      transparent 360deg) border-box;
+}
+
+/* Night mode: the inner fill is a literal white above so it reads as a
+ * floating chip on the cream sidebar. On dark that white pill is wrong;
+ * swap it to the dark card surface so only the terracotta border glows. */
+.dark .tab-busy-border {
+  background:
+    linear-gradient(oklch(0.16 0.010 70), oklch(0.16 0.010 70)) padding-box,
+    conic-gradient(from var(--busy-border-angle),
+      transparent 0deg,
+      transparent 280deg,
+      rgba(194, 101, 42, 0.85) 325deg,
+      transparent 360deg) border-box;
+}
+
+.dark .tab-busy-border:hover {
+  background:
+    linear-gradient(oklch(0.22 0.011 70), oklch(0.22 0.011 70)) padding-box,
     conic-gradient(from var(--busy-border-angle),
       transparent 0deg,
       transparent 280deg,
