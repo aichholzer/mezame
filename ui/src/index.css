@@ -156,6 +156,22 @@
     height: 100%;
   }
 
+  /* Never let the document scroll horizontally. The chat column and
+   * the floating composer are width-constrained per-region, but a
+   * single wide child (an absolutely-positioned composer pinned with
+   * `right`, a long unbroken token, a wide tool-call card) must not be
+   * able to make the whole viewport scroll sideways. Without this,
+   * such overflow shifts the fixed composer off-screen on mobile so
+   * only its right portion is visible. `overflow-x: clip` contains the
+   * overflow without creating a scroll container (so sticky/!fixed
+   * descendants and the keyboard-inset math keep working, which
+   * `overflow: hidden` would break). */
+  html,
+  body {
+    overflow-x: clip;
+    max-width: 100%;
+  }
+
   body {
     font-family: var(--font-body);
     font-size: 14px;

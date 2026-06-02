@@ -13,6 +13,50 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.44] - 2026-06-02
+
+### Fixed
+
+- Session pointers are no longer destroyed when a resume fails. When
+  `session/load` failed (for example resuming a session created on
+  another machine over the shared SMB folder, a stale lock, or an
+  agent restart), Mezame fell back to a fresh `session/new` and the
+  browser overwrote the tab's stored session id with the throwaway
+  id. On the next restart the original was gone, so tabs silently
+  ratcheted onto empty sessions while real conversations orphaned on
+  disk. The server now reports `resumeFailedFor` on the `ready` frame
+  and the client keeps the durable session id pinned, using a
+  separate transient id for the fallback connection. A failed resume
+  now shows an empty pane and can be retried later instead of losing
+  the conversation.
+- Sessions no longer vanish from `state.json` during cross-device
+  reconcile. A session absent from another browser's last-writer-wins
+  snapshot is only closed locally when the server's closed-history
+  corroborates a deliberate close; an unverified omission (a clobber
+  or init race) keeps the session and heals on the next sync.
+- The composer no longer sends a second prompt while a turn is in
+  flight, which the agent rejected with an "already received this
+  request" error. `sendPrompt` now refuses when the session is busy.
+- The page no longer reloads repeatedly mid-chat. The stale-bundle
+  reload is latched to once per server build id, so a persistent
+  bundle/id mismatch (e.g. a cached asset) can no longer loop a
+  reload on every WebSocket reconnect.
+
+### Fixed (mobile)
+
+- The composer no longer overflows the viewport. A global
+  horizontal-overflow guard plus a min-width fix on the chat column
+  stop a wide child from making the whole page scroll sideways.
+- The composer and chat column now use a symmetric 8 px gutter on
+  mobile (left, right, and bottom) instead of a desktop-sized 20 px
+  inset that was flush on the left and gapped on the right.
+- The sidebar drawer hides completely when collapsed. Its
+  desktop floating-card margins were applied on all viewports, and
+  the left margin survived the slide-out transform, leaving a sliver
+  overlapping the composer. The margins are now desktop-only.
+- On mobile the agent avatar is hidden and the copy button moves
+  below the response, reclaiming horizontal space for the bubble.
+
 ## [0.8.43] - 2026-05-31
 
 ### Fixed

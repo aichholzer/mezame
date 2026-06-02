@@ -207,6 +207,14 @@ export const SideBar = ({
           // open.
           'fixed inset-y-0 left-0 z-40 flex flex-col',
           'bg-card md:rounded-2xl md:shadow-[0_5px_10px_rgba(201,103,54,0.35)] md:border md:border-[color:var(--outline-variant)]',
+          // Desktop floating-card margins. On mobile the drawer must
+          // have NO margin: a left margin would survive the
+          // `-translate-x-full` hide (translate shifts the border box
+          // by its own width but leaves the margin behind), leaving a
+          // sliver of the panel on-screen overlapping the composer.
+          // Top/right/bottom margins would also inset the full-height
+          // drawer. So all four are `md:`-only.
+          'md:mt-5 md:mr-2.5 md:mb-5 md:ml-5',
           // Drawer mode (mobile): translate-x animation for show/hide.
           // Disable the transition while resizing so the live width
           // update does not lag visibly.
@@ -215,10 +223,6 @@ export const SideBar = ({
         )}
         style={{
           width: `${sidebar.width}px`,
-          marginTop: '20px',
-          marginRight: '10px',
-          marginBottom: '20px',
-          marginLeft: '20px',
           paddingTop: 'var(--mz-safe-top)',
           paddingBottom: 'var(--mz-safe-bottom)',
           paddingLeft: 'var(--mz-safe-left)'

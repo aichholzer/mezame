@@ -13,6 +13,11 @@ export type ServerMessage =
     cwd?: string;
     promptCapabilities?: PromptCapabilities;
     buildId?: string;
+    /** Present only when a requested resume failed and the server fell
+     * back to a fresh session. Carries the id the browser asked to
+     * resume so the client can keep it pinned (and retry later)
+     * instead of overwriting it with the throwaway fallback id. */
+    resumeFailedFor?: string;
   }
   | { type: 'session_info'; info: SessionInfo }
   | { type: 'commands'; commands: SlashCommand[]; prompts: SlashPrompt[] }
@@ -184,6 +189,16 @@ export type Session = {
   label: string;
   /** ACP session id returned by `session/new` or `session/load`. */
   acpSessionId: string | null;
+  /** The agent session actually backing THIS connection. Equals
+   * `acpSessionId` normally, but diverges after a failed resume: when
+   * `session/load` fails the server falls back to a fresh
+   * `session/new`, and that fresh id lands here while `acpSessionId`
+   * stays pinned to the original the user asked to resume. Live-turn
+   * operations (tool-result backfill, history) use this; persistence
+   * and the reconnect `?session=` use `acpSessionId` so a transient
+   * load failure never overwrites the durable pointer to a real
+   * conversation. Not persisted; recomputed on each connect. */
+  liveSessionId: string | null;
   /** Optional working directory override passed via `?cwd=`. */
   cwd: string | null;
   /** Actual cwd the agent session was opened with, reported by the

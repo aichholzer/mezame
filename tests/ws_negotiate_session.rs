@@ -222,6 +222,14 @@ async fn resume_failure_falls_back_to_new_session_and_emits_sys_notice() {
     let ready = frames.iter().find(|f| f["type"] == "ready").expect("ready");
     assert_eq!(ready["sessionId"], "fallback-sid");
     assert_eq!(ready["resumed"], false);
+    // The ready frame must carry the id the browser asked to resume so
+    // the client keeps it pinned rather than overwriting its durable
+    // pointer with the throwaway fallback id. This is the server half
+    // of the fix for the vanishing/overwritten-session bug.
+    assert_eq!(
+        ready["resumeFailedFor"], "missing-sid",
+        "fallback ready must report the original id the resume was for"
+    );
 }
 
 #[tokio::test]

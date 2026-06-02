@@ -44,7 +44,7 @@ export const App = () => {
 
   return (
     <div
-      className="flex h-full h-[100dvh] min-h-0"
+      className="flex h-full h-[100dvh] min-h-0 w-full max-w-full overflow-x-clip"
       style={{
         // Top/left/right safe-area padding on the shell is handled
         // per-region: the sidebar owns its own top/bottom/left safe
@@ -75,11 +75,9 @@ export const App = () => {
        * `useSidebarWidth` while the user drags. Mobile keeps the
        * full width since the sidebar is a drawer there. */}
       <main
-        className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+        className="relative flex min-h-0 min-w-0 flex-1 flex-col pl-2 pr-2 pb-2 md:pl-0 md:pr-5 md:pb-5"
         style={{
           paddingTop: 'calc(20px + var(--mz-safe-top))',
-          paddingRight: '20px',
-          paddingBottom: '20px',
           marginLeft: 'var(--mz-main-left, 0)'
         }}
       >

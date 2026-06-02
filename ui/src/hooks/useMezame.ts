@@ -222,6 +222,11 @@ const fetchState = async (): Promise<Partial<PersistedState> | null> => {
 let stateEventSource: EventSource | null = null;
 let suppressNextSync = false;
 
+// Fallback one-shot latch for the stale-bundle reload when
+// sessionStorage is unavailable (private mode, storage disabled).
+// Prevents the reload-on-every-reconnect loop in that environment.
+let reloadLatched = false;
+
 const reconcileFromServer = async () => {
   const saved = await fetchState();
   if (!saved?.sessions || !Array.isArray(saved.sessions)) {
@@ -260,22 +265,45 @@ const reconcileFromServer = async () => {
     dirty = true;
   }
 
-  // Close sessions present locally but missing on the server.
+  // Close sessions present locally but missing on the server, but
+  // ONLY when we have positive evidence the disappearance was a
+  // deliberate close, not a clobber. Each browser PUTs its own full
+  // session list last-writer-wins, so "absent from the latest server
+  // snapshot" is ambiguous: it can mean "closed on another device"
+  // OR "another device just overwrote the list with a partial view
+  // that happened to omit this session" (an init race, a restore
+  // that didn't carry every tab, etc.). Treating the ambiguous case
+  // as a close is what made live sessions vanish from state.json
+  // with no trace.
+  //
+  // A deliberate close records the session in the server's `closed`
+  // history (see `closeSession`). A clobber does not. So we only
+  // close locally when the session's acp id shows up in the server's
+  // `closed` list; otherwise we keep it, and our next sync re-adds it
+  // to the server snapshot, healing the omission.
+  //
+  // Tradeoff: if a deliberate close is later evicted from the capped
+  // `closed` history (HISTORY_MAX) before this browser reconciles, we
+  // will keep a tab that was actually closed elsewhere. That is a
+  // benign stale-tab lingering, self-corrects on the next close, and
+  // is vastly preferable to silently dropping a live session.
+  const serverClosedAcpIds = new Set<string>();
+  if (Array.isArray(saved.closed)) {
+    for (const entry of saved.closed) {
+      if (entry && typeof entry.acpSessionId === 'string') {
+        serverClosedAcpIds.add(entry.acpSessionId);
+      }
+    }
+  }
   // Iterate over a copy because we mutate `sessions` in the loop.
   const toClose: string[] = [];
   for (const s of sessions) {
     if (serverIds.has(s.id)) {
       continue;
     }
-    // Skip sessions we created but that have not yet synced their
-    // own ACP id back. Without this, a brand new tab on this
-    // browser would be auto-closed by an SSE tick that fired
-    // before our first PUT landed. The next reconcile after our
-    // PUT will see ourselves on the server and leave us alone.
-    if (!s.used) {
-      continue;
+    if (shouldCloseAbsentSession(s, serverClosedAcpIds)) {
+      toClose.push(s.id);
     }
-    toClose.push(s.id);
   }
   for (const id of toClose) {
     closeSessionLocal(id);
@@ -341,6 +369,36 @@ const reconcileFromServer = async () => {
     suppressNextSync = true;
     notify();
   }
+};
+
+/** Decide whether a local session that is absent from the server's
+ * latest `sessions` snapshot should be closed locally during
+ * reconcile.
+ *
+ * Absence is ambiguous under the last-writer-wins `state.json` model:
+ * it can mean "closed deliberately on another device" or "another
+ * device clobbered the list with a partial view that omitted this
+ * session". We only treat it as a close when the server's `closed`
+ * history corroborates it; otherwise we keep the session and let the
+ * next sync restore it. Pure and exported so the regression test for
+ * the vanishing-session bug can drive it without `fetch`.
+ *
+ * @internal
+ */
+export const shouldCloseAbsentSession = (
+  session: Pick<Session, 'used' | 'acpSessionId'>,
+  serverClosedAcpIds: Set<string>
+): boolean => {
+  // Never auto-close a tab that has not synced its acp id yet: it may
+  // simply predate our first PUT.
+  if (!session.used) {
+    return false;
+  }
+  // Require positive evidence of a deliberate close.
+  if (!session.acpSessionId) {
+    return false;
+  }
+  return serverClosedAcpIds.has(session.acpSessionId);
 };
 
 /** Local-only session removal used by reconcile. Mirrors the
@@ -429,12 +487,17 @@ type HistoryEntry =
   };
 
 const loadHistory = async (s: Session) => {
-  if (!s.acpSessionId) {
+  // History reflects the agent session actually backing this
+  // connection. On a clean resume that equals `acpSessionId`; the
+  // distinction only matters defensively. Fall back to the durable
+  // id when the live id has not been set yet.
+  const sessionId = s.liveSessionId ?? s.acpSessionId;
+  if (!sessionId) {
     return;
   }
   let entries: HistoryEntry[] = [];
   try {
-    const res = await fetch(`/history?session=${encodeURIComponent(s.acpSessionId)}`);
+    const res = await fetch(`/history?session=${encodeURIComponent(sessionId)}`);
     if (!res.ok) {
       return;
     }
@@ -496,6 +559,7 @@ const makeSession = (
   id,
   label,
   acpSessionId,
+  liveSessionId: null,
   cwd,
   effectiveCwd: cwd,
   promptCapabilities: {},
@@ -583,8 +647,40 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
   // `applyServerMessage` stays free of `window`/`fetch` to keep it
   // trivially testable.
   if (msg.type === 'ready' && msg.buildId && msg.buildId !== __MEZAME_BUILD_ID__) {
-    window.location.reload();
-    return;
+    // Reload at most once per served build id. `ready` fires on every
+    // WS (re)connect, and macOS / idle sockets reconnect often, so an
+    // unconditional reload here turns a single bundle/binary mismatch
+    // (e.g. a tunnel caching a stale asset) into a reload-on-every-
+    // reconnect loop: reload, load the same mismatching bundle, get
+    // `ready` again, reload again. The latch breaks that loop: if a
+    // reload does not resolve the mismatch, we surface it once and
+    // stop fighting the user. A genuinely new deploy carries a new
+    // server buildId, which is a fresh latch key, so real upgrades
+    // still trigger exactly one reload.
+    let alreadyTried = false;
+    try {
+      const key = `mezame.reloadedFor.${msg.buildId}`;
+      alreadyTried = sessionStorage.getItem(key) === '1';
+      if (!alreadyTried) {
+        sessionStorage.setItem(key, '1');
+      }
+    } catch {
+      // sessionStorage unavailable (private mode, disabled): fall
+      // back to a module-level latch so we still never loop.
+      alreadyTried = reloadLatched;
+      reloadLatched = true;
+    }
+    if (!alreadyTried) {
+      window.location.reload();
+      return;
+    }
+    // Mismatch persisted across a reload. Stop reloading; let the
+    // session continue on the bundle we have rather than thrashing.
+    // eslint-disable-next-line no-console
+    console.warn(
+      `Mezame UI build ${__MEZAME_BUILD_ID__} does not match server ${msg.buildId}; ` +
+        'a reload did not resolve it (stale cache?). Continuing without further reloads.'
+    );
   }
 
   applyServerMessage(s, msg);
@@ -672,10 +768,13 @@ const FINAL_BACKFILL_ATTEMPTS = 10;
 const FINAL_BACKFILL_INTERVAL_MS = 500;
 
 const backfillToolResult = async (s: Session, toolCallId: string): Promise<void> => {
-  if (!s.acpSessionId) {
+  // Tool results live under the agent session actually running the
+  // turn (the live id), which diverges from `acpSessionId` only after
+  // a failed-resume fallback.
+  const sessionId = s.liveSessionId ?? s.acpSessionId;
+  if (!sessionId) {
     return;
   }
-  const sessionId = s.acpSessionId;
   for (let attempt = 0; attempt < FINAL_BACKFILL_ATTEMPTS; attempt += 1) {
     if (attempt > 0) {
       await new Promise((resolve) => setTimeout(resolve, FINAL_BACKFILL_INTERVAL_MS));
@@ -734,10 +833,10 @@ const tryFetchToolResult = async (
  * backstop for tools whose result was not on disk during the
  * mid-turn polling window. */
 const sweepToolResultsOnPromptDone = async (s: Session): Promise<void> => {
-  if (!s.acpSessionId) {
+  const sessionId = s.liveSessionId ?? s.acpSessionId;
+  if (!sessionId) {
     return;
   }
-  const sessionId = s.acpSessionId;
   const ids = s.log
     .filter((e) => e.kind === 'tool_call' && e.content === null)
     .map((e) => (e as Extract<LogEntry, { kind: 'tool_call' }>).toolCallId);
@@ -763,7 +862,21 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         s.log = [];
         s.pinnedToBottom = true;
       }
-      s.acpSessionId = msg.sessionId;
+      // The agent session actually backing this connection. Always the
+      // id the server just negotiated, whether that was a clean resume,
+      // a fresh new session, or a fallback after a failed resume.
+      s.liveSessionId = msg.sessionId;
+      // Durable identity. Only advance it when this was NOT a
+      // fallback-after-failed-resume. On a clean resume `msg.sessionId`
+      // equals the id we asked for, so this is a no-op; on a brand-new
+      // tab it adopts the freshly minted id. But when the server tells
+      // us the resume failed (`resumeFailedFor`), we keep the original
+      // id pinned so a transient failure (wrong host for an SMB-shared
+      // session, stale lock, agent restart) never overwrites the
+      // pointer to a real conversation with a throwaway empty session.
+      if (!msg.resumeFailedFor) {
+        s.acpSessionId = msg.sessionId;
+      }
       s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
       s.promptCapabilities = msg.promptCapabilities ?? {};
       // After a resume, clear any in-flight markers we set when the
@@ -1137,6 +1250,16 @@ const forgetHistory = (acpSessionId: string) => {
 const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   const s = currentSession();
   if (!s || !s.ws || s.ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  // Refuse to open a second turn while one is in flight. ACP allows
+  // only one outstanding `session/prompt` per session; a second one
+  // comes back as an "already received this request" error. The
+  // composer is already `readOnly` while busy, but guarding here too
+  // closes the races that bypass the textarea: a multi-attach peer
+  // having started the turn, an Enter fired in the gap before busy
+  // propagated, or a stuck readOnly.
+  if (s.busy || s.inFlight) {
     return;
   }
   ensureTrailingNewline(s);

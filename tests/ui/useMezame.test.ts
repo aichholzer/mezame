@@ -3,7 +3,7 @@
 // `Session` and assert the resulting log + flags. No React, no real
 // WebSocket, no fetch.
 
-import { applyServerMessage } from '@/hooks/useMezame';
+import { applyServerMessage, shouldCloseAbsentSession } from '@/hooks/useMezame';
 import type { LogEntry, ServerMessage, Session } from '@/types';
 
 /** Build a session with the same defaults the production factory uses. */
@@ -12,6 +12,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     id: 's1',
     label: '1',
     acpSessionId: null,
+    liveSessionId: null,
     cwd: null,
     effectiveCwd: null,
     promptCapabilities: {},
@@ -116,6 +117,34 @@ describe('applyServerMessage / ready', () => {
     expect(s.busy).toBe(false);
     expect(s.thinking).toBe(false);
     expect(s.inFlight).toBe(false);
+  });
+
+  it('advances the durable acpSessionId on a clean resume', () => {
+    const s = makeSession({ acpSessionId: 'real-id' });
+    applyServerMessage(s, {
+      type: 'ready',
+      sessionId: 'real-id',
+      resumed: true
+    });
+    expect(s.acpSessionId).toBe('real-id');
+    expect(s.liveSessionId).toBe('real-id');
+  });
+
+  it('keeps acpSessionId pinned when a resume failed and fell back', () => {
+    // Regression for the vanishing/overwritten-session bug: a failed
+    // resume must NOT overwrite the durable pointer with the throwaway
+    // fallback id. The live id tracks the fallback for this connection;
+    // acpSessionId (persisted + used for the next ?session=) stays on
+    // the original so a later restart can retry the real conversation.
+    const s = makeSession({ acpSessionId: 'real-id', used: true });
+    applyServerMessage(s, {
+      type: 'ready',
+      sessionId: 'fallback-empty-id',
+      resumed: false,
+      resumeFailedFor: 'real-id'
+    });
+    expect(s.acpSessionId).toBe('real-id');
+    expect(s.liveSessionId).toBe('fallback-empty-id');
   });
 });
 
@@ -419,5 +448,42 @@ describe('applyServerMessage / commands', () => {
     });
     expect(s.commands).toHaveLength(2);
     expect(s.prompts).toHaveLength(0);
+  });
+});
+
+// ---------- reconcile: vanishing-session guard ----------
+//
+// Regression for the bug where a live session silently disappeared
+// from state.json. Reconcile must only close a local session that is
+// absent from the server's `sessions` snapshot when the server's
+// `closed` history corroborates a deliberate close. An unverified
+// omission (another browser clobbered the list with a partial view)
+// must NOT close the session.
+
+describe('shouldCloseAbsentSession', () => {
+  const closedIds = (...ids: string[]) => new Set(ids);
+
+  it('closes a used session whose acp id is in the server closed history', () => {
+    const s = { used: true, acpSessionId: 'acp-1' };
+    expect(shouldCloseAbsentSession(s, closedIds('acp-1'))).toBe(true);
+  });
+
+  it('keeps a used session absent from the snapshot but NOT in closed history', () => {
+    // The clobber case: another browser PUT a partial list that
+    // omitted this session. No closed-history corroboration, so we
+    // must keep it rather than erase it.
+    const s = { used: true, acpSessionId: 'acp-1' };
+    expect(shouldCloseAbsentSession(s, closedIds('acp-other'))).toBe(false);
+    expect(shouldCloseAbsentSession(s, closedIds())).toBe(false);
+  });
+
+  it('keeps a used session that has no acp id yet', () => {
+    const s = { used: true, acpSessionId: null };
+    expect(shouldCloseAbsentSession(s, closedIds('acp-1'))).toBe(false);
+  });
+
+  it('keeps an unused (never-prompted) session regardless of closed history', () => {
+    const s = { used: false, acpSessionId: 'acp-1' };
+    expect(shouldCloseAbsentSession(s, closedIds('acp-1'))).toBe(false);
   });
 });

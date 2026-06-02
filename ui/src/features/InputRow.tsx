@@ -303,11 +303,15 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         // composer rests at `bottom: 1.25rem` (20 px) on desktop,
         // matching the sidebar's outer margin so both bottom edges
         // align.
-        'pointer-events-none absolute left-0 right-5 z-10 pt-[12px] bg-[color:var(--background)]'
+        'pointer-events-none absolute left-2 right-2 md:left-0 md:right-5 z-10 pt-[12px] bg-[color:var(--background)]',
+        // Bottom gap matches the side gutters: 8px on mobile, 20px on
+        // desktop. The `--mz-kb-inset` term lifts the composer above the
+        // virtual keyboard, and `--mz-safe-bottom` clears the iOS home
+        // indicator; both default to 0. Expressed as responsive classes
+        // rather than an inline style so the `md:` breakpoint applies.
+        'bottom-[calc(0.5rem+var(--mz-kb-inset)+var(--mz-safe-bottom))]',
+        'md:bottom-[calc(1.25rem+var(--mz-kb-inset)+var(--mz-safe-bottom))]'
       )}
-      style={{
-        bottom: 'calc(1.25rem + var(--mz-kb-inset) + var(--mz-safe-bottom))'
-      }}
     >
       <div
         onDrop={handleDrop}

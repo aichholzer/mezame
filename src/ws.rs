@@ -111,9 +111,9 @@ pub async fn negotiate_session(
         None => std::env::current_dir()?.to_string_lossy().to_string(),
     };
 
-    let (session_id, resumed, session_info) = match resume_session_id {
+    let (session_id, resumed, session_info, resume_failed_for) = match resume_session_id {
         Some(sid) => match try_load_session(agent, &sid, &cwd_str).await {
-            Ok(value) => (sid, true, extract_session_info(&value)),
+            Ok(value) => (sid, true, extract_session_info(&value), None),
             Err(err_str) => {
                 eprintln!("Session load failed: {err_str}. Falling back to a new session.");
                 let _ = to_ws_tx.send(text_msg(json!({
@@ -124,13 +124,19 @@ pub async fn negotiate_session(
                         short_reason(&err_str)
                     )
                 })));
-                let (sid, info) = start_new_session(agent, &cwd_str).await?;
-                (sid, false, info)
+                let (new_sid, info) = start_new_session(agent, &cwd_str).await?;
+                // Carry the id the browser asked to resume so the
+                // client can keep it pinned rather than overwriting
+                // its durable pointer with this throwaway fallback id.
+                // A transient load failure (wrong cwd, stale lock,
+                // agent restart) must not destroy the mapping to a
+                // real conversation on disk.
+                (new_sid, false, info, Some(sid))
             }
         },
         None => {
             let (sid, info) = start_new_session(agent, &cwd_str).await?;
-            (sid, false, info)
+            (sid, false, info, None)
         }
     };
 
@@ -147,7 +153,8 @@ pub async fn negotiate_session(
         "resumed": resumed,
         "cwd": cwd_str,
         "promptCapabilities": prompt_capabilities,
-        "buildId": build_id
+        "buildId": build_id,
+        "resumeFailedFor": resume_failed_for
     })));
 
     // Send the `modes` and `models` payload (if present in either
