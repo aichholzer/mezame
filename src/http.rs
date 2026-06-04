@@ -85,11 +85,34 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
     let app = build_router(state);
 
     let listener = TcpListener::bind(&bind).await?;
+    enable_tcp_keepalive(&listener);
     eprintln!("Mezame is listening on: http://{bind}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(shutdown))
         .await?;
     Ok(())
+}
+
+/// Enable TCP keepalive on the listening socket as a kernel-level
+/// backstop to the application heartbeat in `src/ws.rs`. Accepted
+/// connections inherit the listener's keepalive setting on Linux, so
+/// a half-open socket the kernel can detect (no ACKs for the probes)
+/// is eventually torn down even if the app-level ping task were to
+/// wedge. The app heartbeat is the primary defence (it also catches
+/// peers that ACK at the TCP layer but have stopped reading); this
+/// just ensures the kernel does not hold a truly dead socket
+/// `ESTABLISHED` forever. Best-effort: a failure here is logged and
+/// ignored rather than aborting startup. See GitHub issue #4.
+fn enable_tcp_keepalive(listener: &TcpListener) {
+    use socket2::{SockRef, TcpKeepalive};
+
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(20));
+    let sock = SockRef::from(listener);
+    if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
+        eprintln!("Could not enable TCP keepalive on the listener: {e}");
+    }
 }
 
 /// Construct the axum router with all production routes wired in. Split

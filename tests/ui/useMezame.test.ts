@@ -18,6 +18,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     promptCapabilities: {},
     used: false,
     log: [],
+    hydrated: false,
     status: 'connecting',
     busy: false,
     thinking: false,
@@ -62,8 +63,9 @@ describe('applyServerMessage / ready', () => {
     expect(s.status).toBe('connected');
   });
 
-  it('clears the existing log when resuming', () => {
+  it('clears the existing log when resuming on first hydrate', () => {
     const s = makeSession({
+      hydrated: false,
       log: [
         {
           kind: 'text',
@@ -81,6 +83,26 @@ describe('applyServerMessage / ready', () => {
     });
     expect(s.log).toEqual([]);
     expect(s.pinnedToBottom).toBe(true);
+    expect(s.hydrated).toBe(true);
+  });
+
+  it('preserves the in-memory log on a reconnect (already hydrated)', () => {
+    // Regression for the "browser reloads every so often" report: the
+    // hub stamps resumed=true on every attach, so a transient
+    // reconnect must NOT wipe the log and refetch history. Only the
+    // first hydrate clears; subsequent resumed readies keep the log.
+    const liveLog: LogEntry[] = [
+      { kind: 'text', id: 'a', role: 'user', text: '> hi\n', timestamp: 1 },
+      { kind: 'text', id: 'b', role: 'agent', text: 'hello', timestamp: 2 }
+    ];
+    const s = makeSession({ hydrated: true, log: [...liveLog] });
+    applyServerMessage(s, {
+      type: 'ready',
+      sessionId: 'abc',
+      resumed: true
+    });
+    expect(s.log).toEqual(liveLog);
+    expect(s.hydrated).toBe(true);
   });
 
   it('clears busy / thinking / inFlight on resume so the composer unsticks', () => {

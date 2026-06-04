@@ -565,6 +565,7 @@ const makeSession = (
   promptCapabilities: {},
   used: acpSessionId !== null,
   log: [],
+  hydrated: false,
   status: 'connecting',
   busy: false,
   thinking: false,
@@ -641,6 +642,10 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     return;
   }
 
+  // Capture hydration state before the reducer flips it, so the
+  // `/history` seed below can tell a first load from a reconnect.
+  const wasHydrated = s.hydrated;
+
   // Side effects that live outside the pure reducer: a stale build id
   // triggers a full page reload, and `ready { resumed: true }` kicks off
   // the `/history` rehydration fetch. Both are kept here so
@@ -686,7 +691,12 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
   applyServerMessage(s, msg);
 
   if (msg.type === 'ready') {
-    if (msg.resumed) {
+    // Seed from /history only on the tab's first hydrate. `wasHydrated`
+    // is captured before `applyServerMessage` flips the flag, so a
+    // transient reconnect (which arrives as `resumed: true` from the
+    // hub) does not refetch history and rebuild the log underneath the
+    // user. The in-memory log from the live session is kept as-is.
+    if (msg.resumed && !wasHydrated) {
       void loadHistory(s);
     }
     scheduleSync();
@@ -856,12 +866,19 @@ const sweepToolResultsOnPromptDone = async (s: Session): Promise<void> => {
 export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
   switch (msg.type) {
     case 'ready':
-      // A resume replays history via session/update — clear stale log
-      // so the replay (or the /history seed) lands in a fresh pane.
-      if (msg.resumed) {
+      // Seed the pane from history ONLY on this tab's first `ready`.
+      // The hub stamps `resumed: true` on every attach (an attach is
+      // always a join to a live hub), so keying the wipe on `resumed`
+      // alone cleared the log and refetched `/history` on every
+      // transient reconnect, which looked exactly like the browser
+      // reloading mid-chat and could drop an in-flight reply. A
+      // reconnect of an already-hydrated tab keeps its in-memory log;
+      // only a genuine first load (fresh page, reopened tab) hydrates.
+      if (msg.resumed && !s.hydrated) {
         s.log = [];
         s.pinnedToBottom = true;
       }
+      s.hydrated = true;
       // The agent session actually backing this connection. Always the
       // id the server just negotiated, whether that was a clean resume,
       // a fresh new session, or a fallback after a failed resume.

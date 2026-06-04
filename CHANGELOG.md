@@ -13,6 +13,28 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.8.45] - 2026-06-04
+
+### Fixed
+
+- Agent subprocesses no longer leak on half-open WebSockets. A browser
+  that vanished without a TCP close (laptop sleep, Wi-Fi drop, or a
+  reverse proxy silently dropping an idle upstream) left an
+  `ESTABLISHED` socket that yielded nothing, so the per-attach loop
+  blocked forever, the hub never tore down, and its `kiro-cli` agent
+  tree was never reaped, growing memory unbounded on a long-lived
+  deployment. The server now sends a WebSocket ping every 20s and
+  evicts a peer after 60s of total silence, which runs the existing
+  cooperative shutdown and reaps the agent. TCP keepalive is also set
+  on the listener as a kernel-level backstop. Reported in #4.
+- The chat no longer appears to reload mid-conversation on a transient
+  reconnect. The hub stamps `resumed: true` on every attach, and the
+  client treated that as "wipe the log and refetch history", so every
+  WebSocket reconnect (common on macOS across idle/sleep) cleared and
+  rebuilt the timeline and could drop an in-flight reply. The client
+  now seeds from history only on a tab's first connect; reconnects
+  keep the in-memory log.
+
 ## [0.8.44] - 2026-06-02
 
 ### Fixed

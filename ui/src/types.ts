@@ -214,6 +214,15 @@ export type Session = {
 
   /** UI state. None of these survive a reload. */
   log: LogEntry[];
+  /** True once this tab has seeded its log for the current page
+   * session, either from a fresh connect or a `/history` hydrate.
+   * Gates the destructive wipe-and-reseed in the `ready` handler so a
+   * transient WebSocket reconnect (macOS idle/sleep drops, network
+   * blips) does NOT clear the in-memory log and refetch history. Only
+   * the first `ready` of a tab hydrates; reconnects keep the log they
+   * already have. Resets only on a real page load (it is not
+   * persisted). */
+  hydrated: boolean;
   status: Status;
   busy: boolean;
   thinking: boolean;

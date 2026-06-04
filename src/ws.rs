@@ -27,9 +27,30 @@ use axum::{
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
 use crate::agent::Agent;
 use crate::session::{extract_session_info, short_reason, try_load_session};
+
+/// How often the server sends a WebSocket `Ping` to each attached
+/// browser. A live peer answers with a `Pong` (or sends any other
+/// frame), which resets the liveness clock.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long a socket may go with no inbound frame at all before we
+/// treat it as dead and break the attach loop. Must be a comfortable
+/// multiple of `HEARTBEAT_INTERVAL` so a single dropped pong or a brief
+/// network stall does not evict a live browser. At 60s a dead peer is
+/// reaped after ~2-3 missed pings; combined with the hub's 30s grace
+/// window the agent tree is gone ~90s after the peer vanishes.
+///
+/// This is the fix for half-open sockets (laptop sleep, Wi-Fi drop, a
+/// reverse proxy silently dropping an idle upstream): such a socket
+/// stays `ESTABLISHED` forever and `stream.next()` yields nothing, so
+/// without a heartbeat the attach loop blocks indefinitely, the
+/// `AttachedHub` never drops, the grace timer never arms, and the
+/// agent subprocess tree leaks. See GitHub issue #4.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 const PROTOCOL_VERSION: u32 = 1;
 
@@ -277,18 +298,78 @@ async fn handle_ws(
         let _ = to_ws_tx.send(text_msg(info));
     }
 
-    let mut outbound = attached.outbound.resubscribe();
+    let outbound = attached.outbound.resubscribe();
     let commands = attached.commands.clone();
+    let attach_id = attached.attach_id;
 
-    // Per-WS attach loop. Mirrors the original `run_select_loop`
-    // shape: WS-frame branch parses browser messages and forwards as
-    // `HubCommand`s; broadcast branch serialises agent events for
-    // this WS sink. Same exhaustive `Option<Result<_,_>>` matching
-    // we settled on in 0.8.7 so peer close, transport error, and
-    // close frame all break the loop.
+    run_attach_loop(
+        &mut stream,
+        &to_ws_tx,
+        outbound,
+        commands,
+        attach_id,
+        HEARTBEAT_INTERVAL,
+        HEARTBEAT_TIMEOUT,
+    )
+    .await;
+
+    // Drop `attached` first so the counter decrements before we
+    // close the writer. The grace timer arms here if we were the
+    // last subscriber.
+    drop(attached);
+    drop(to_ws_tx);
+    let _ = writer.await;
+    Ok(())
+}
+
+/// The per-WebSocket attach loop, extracted from `handle_ws` so it can
+/// be driven by integration tests with a fake stream (in particular a
+/// silent one, to prove the half-open eviction path runs). Generic over
+/// the stream so tests can supply an mpsc-backed or a never-yielding
+/// stream without a real socket.
+///
+/// Mirrors the original `run_select_loop` shape: the WS-frame branch
+/// parses browser messages and forwards them as `HubCommand`s; the
+/// broadcast branch serialises agent events to this WS sink. The
+/// heartbeat branch pings the peer and breaks the loop when it has been
+/// silent past `heartbeat_timeout`, which is the only thing that ends
+/// the loop for a half-open socket. Returns when any branch decides the
+/// connection is over; the caller runs cooperative shutdown.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_attach_loop<S, E>(
+    stream: &mut S,
+    to_ws_tx: &mpsc::UnboundedSender<Message>,
+    mut outbound: tokio::sync::broadcast::Receiver<Arc<Value>>,
+    commands: mpsc::Sender<crate::hub::HubCommand>,
+    attach_id: u64,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
+) where
+    S: Stream<Item = std::result::Result<Message, E>> + Unpin,
+{
+    // Heartbeat: ping the browser on an interval and evict the socket
+    // if it goes silent past `heartbeat_timeout`. `last_seen` is bumped
+    // by ANY inbound frame (text, pong, ping, binary), so a chatty live
+    // browser is never evicted and an idle-but-alive one is kept up by
+    // its pong replies. A half-open socket sends nothing, so it trips
+    // the timeout and we break into the cooperative-shutdown path in
+    // the caller, which decrements the subscriber count and ultimately
+    // reaps the agent. See issue #4.
+    let mut heartbeat = interval(heartbeat_interval);
+    // If a tick is missed (e.g. the task was busy), fire once and
+    // realign rather than burst-firing to catch up.
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick completes immediately; skip it so we do not ping
+    // before the connection has had a chance to settle.
+    heartbeat.tick().await;
+    let mut last_seen = Instant::now();
+
     loop {
         tokio::select! {
             ws_msg = stream.next() => {
+                // Any inbound frame proves the peer is alive.
+                last_seen = Instant::now();
                 let text = match ws_msg {
                     None => break,
                     Some(Err(_)) => break,
@@ -300,11 +381,28 @@ async fn handle_ws(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                if let Some(cmd) = parse_browser_command(&v, attached.attach_id) {
+                if let Some(cmd) = parse_browser_command(&v, attach_id) {
                     if commands.send(cmd).await.is_err() {
                         // Hub owner gone; nothing more to do.
                         break;
                     }
+                }
+            }
+            _ = heartbeat.tick() => {
+                // Evict a peer that has been silent too long: a
+                // half-open socket never yields on `stream.next()`,
+                // so this arm is the only thing that ends the loop
+                // for it.
+                if last_seen.elapsed() >= heartbeat_timeout {
+                    break;
+                }
+                // Otherwise prod it. A live peer answers with a Pong
+                // (handled by the stream arm above, which bumps
+                // `last_seen`). The send goes through the writer task;
+                // if that channel is gone the connection is already
+                // tearing down.
+                if to_ws_tx.send(Message::Ping(Vec::new())).is_err() {
+                    break;
                 }
             }
             evt = outbound.recv() => {
@@ -319,7 +417,7 @@ async fn handle_ws(
                         // they were not asked to answer. Untargeted
                         // events fall through to the WS sink.
                         if let Some(target) = value.get("_target").and_then(Value::as_u64) {
-                            if target != attached.attach_id {
+                            if target != attach_id {
                                 continue;
                             }
                         }
@@ -339,14 +437,6 @@ async fn handle_ws(
             }
         }
     }
-
-    // Drop `attached` first so the counter decrements before we
-    // close the writer. The grace timer arms here if we were the
-    // last subscriber.
-    drop(attached);
-    drop(to_ws_tx);
-    let _ = writer.await;
-    Ok(())
 }
 
 /// Translate a parsed browser-message JSON into a `HubCommand`.
