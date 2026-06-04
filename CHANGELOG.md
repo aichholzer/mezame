@@ -13,6 +13,20 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.9.0] - 2026-06-04
+
+### Added
+
+- New sessions now auto-label from their first prompt. A short label is
+  derived by a pure client-side heuristic (strip code fences and URLs,
+  take the first sentence via `Intl.Segmenter`, soft-cap at 10 words),
+  so a tab reads as its topic instead of a bare number after the first
+  turn. No network or model is involved. Only the numeric placeholder
+  is overwritten; names set in the new-session dialog or via rename are
+  left untouched, and slash-command or attachments-only prompts leave
+  the label numeric. Works across scripts, including CJK and accented
+  Latin. Thanks to @zoucet (#1).
+
 ## [0.8.45] - 2026-06-04
 
 ### Fixed
