@@ -7,13 +7,30 @@
 
 export type NotificationPreference = 'unset' | 'pending' | 'on' | 'off';
 
+/** Theme preference. `system` follows the OS via `prefers-color-scheme`
+ * (and tracks live changes, so an OS day/night schedule flips the app
+ * automatically); `light`/`dark` are explicit overrides. */
+export type ThemePreference = 'system' | 'light' | 'dark';
+
 type Settings = {
   notifications: NotificationPreference;
+  theme: ThemePreference;
 };
 
 const DEFAULTS: Settings = {
-  notifications: 'unset'
+  notifications: 'unset',
+  theme: 'system'
 };
+
+// Theme is mirrored to localStorage (in addition to the /state round
+// trip the rest of the settings use) so it can be read synchronously
+// before first paint — see `bootTheme` in hooks/useTheme.ts. Without
+// this the app would paint light then flip to dark once /state
+// resolves, a jarring flash for a night-mode feature.
+const THEME_KEY = 'mezame.theme';
+
+const isThemePreference = (v: unknown): v is ThemePreference =>
+  v === 'system' || v === 'light' || v === 'dark';
 
 const STATE_URL = '/state';
 
@@ -49,12 +66,48 @@ export const setNotificationPreference = (next: NotificationPreference): void =>
   void persist();
 };
 
+export const getThemePreference = (): ThemePreference => current.theme;
+
+export const setThemePreference = (next: ThemePreference): void => {
+  if (current.theme === next) {
+    return;
+  }
+  current = { ...current, theme: next };
+  writeThemeToStorage(next);
+  notify();
+  void persist();
+};
+
+/** Synchronous read of the persisted theme for pre-paint boot. Falls
+ * back to the default when storage is empty or unavailable. */
+export const readThemeFromStorage = (): ThemePreference => {
+  try {
+    const v = window.localStorage.getItem(THEME_KEY);
+    return isThemePreference(v) ? v : DEFAULTS.theme;
+  } catch {
+    return DEFAULTS.theme;
+  }
+};
+
+const writeThemeToStorage = (next: ThemePreference): void => {
+  try {
+    window.localStorage.setItem(THEME_KEY, next);
+  } catch {
+    // Private mode / storage disabled: the /state round trip still
+    // persists; only the pre-paint fast path is lost.
+  }
+};
+
 /** Hydrate from /state on app boot. Idempotent. */
 export const initSettings = async (): Promise<void> => {
   if (initStarted) {
     return;
   }
   initStarted = true;
+  // Seed theme from the synchronous localStorage mirror so the
+  // in-memory snapshot agrees with what `bootTheme` already painted,
+  // before the (slower, authoritative) /state read below.
+  current = { ...current, theme: readThemeFromStorage() };
   try {
     const res = await fetch(STATE_URL);
     if (!res.ok) {
@@ -70,6 +123,12 @@ export const initSettings = async (): Promise<void> => {
         pref === 'off'
       ) {
         current = { ...current, notifications: pref };
+        notify();
+      }
+      const theme = body.settings.theme;
+      if (isThemePreference(theme) && theme !== current.theme) {
+        current = { ...current, theme };
+        writeThemeToStorage(theme);
         notify();
       }
     }
@@ -126,4 +185,9 @@ export const __resetSettingsForTests = (): void => {
     persistTimer = null;
   }
   listeners.clear();
+  try {
+    window.localStorage.removeItem(THEME_KEY);
+  } catch {
+    // ignore
+  }
 };

@@ -9,6 +9,7 @@ import { SideBar } from '@/features/SideBar';
 import { useAttentionBadge } from '@/hooks/useAttentionBadge';
 import { useKeyboardInset } from '@/hooks/useKeyboardInset';
 import { useNotifications } from '@/hooks/useNotifications';
+import { useApplyTheme } from '@/hooks/useTheme';
 import { mezameActions, useMezame } from '@/hooks/useMezame';
 import { initSettings } from '@/lib/settings';
 
@@ -23,6 +24,7 @@ export const App = () => {
   useAttentionBadge();
   useKeyboardInset();
   useNotifications();
+  useApplyTheme();
 
   // Mirror the browser tab's visibility onto
   // `<html data-visibility="visible|hidden">` so CSS can pause

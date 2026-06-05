@@ -13,6 +13,19 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.10.0] - 2026-06-05
+
+### Added
+
+- Night mode. A theme picker in the bottom-left of the sidebar
+  switches between System, Light, and Dark. "System" follows the
+  operating system's `prefers-color-scheme` and tracks it live, so an
+  OS configured to go dark on a schedule flips Mezame with it. The
+  dark palette is a warm "espresso" scheme that keeps the terracotta
+  accent rather than going neutral grey. The choice persists across
+  reloads and is applied before first paint to avoid a flash of the
+  light theme.
+
 ## [0.9.0] - 2026-06-04
 
 ### Added
