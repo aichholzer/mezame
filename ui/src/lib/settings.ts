@@ -15,11 +15,18 @@ export type ThemePreference = 'system' | 'light' | 'dark';
 type Settings = {
   notifications: NotificationPreference;
   theme: ThemePreference;
+  autoAllowPermissions: boolean;
 };
 
 const DEFAULTS: Settings = {
   notifications: 'unset',
-  theme: 'system'
+  theme: 'system',
+  // Auto-allow all tool permissions. Off by default: a new install
+  // always prompts for each tool call until the user opts in via the
+  // Settings pane. Read server-side per permission request (see
+  // `read_auto_allow_permissions` in the Rust core), so flipping it
+  // here takes effect on the next request without a reconnect.
+  autoAllowPermissions: false
 };
 
 // Theme is mirrored to localStorage (in addition to the /state round
@@ -78,6 +85,18 @@ export const setThemePreference = (next: ThemePreference): void => {
   void persist();
 };
 
+export const getAutoAllowPermissions = (): boolean =>
+  current.autoAllowPermissions;
+
+export const setAutoAllowPermissions = (next: boolean): void => {
+  if (current.autoAllowPermissions === next) {
+    return;
+  }
+  current = { ...current, autoAllowPermissions: next };
+  notify();
+  void persist();
+};
+
 /** Synchronous read of the persisted theme for pre-paint boot. Falls
  * back to the default when storage is empty or unavailable. */
 export const readThemeFromStorage = (): ThemePreference => {
@@ -129,6 +148,11 @@ export const initSettings = async (): Promise<void> => {
       if (isThemePreference(theme) && theme !== current.theme) {
         current = { ...current, theme };
         writeThemeToStorage(theme);
+        notify();
+      }
+      const autoAllow = body.settings.autoAllowPermissions;
+      if (typeof autoAllow === 'boolean' && autoAllow !== current.autoAllowPermissions) {
+        current = { ...current, autoAllowPermissions: autoAllow };
         notify();
       }
     }

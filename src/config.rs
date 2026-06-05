@@ -57,6 +57,41 @@ pub fn state_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".mezame/state.json"))
 }
 
+/// Read the durable "auto-allow all tool permissions" preference from
+/// the UI state store (`state.json`). The flag is written by the
+/// browser Settings pane through the existing `PUT /state` endpoint and
+/// read here on demand whenever the agent raises
+/// `session/request_permission`. Reads are rare (human-paced) so the
+/// per-request file read is negligible and always reflects the latest
+/// toggle without a restart. Any failure — missing file, malformed
+/// JSON, absent field — resolves to the safe default `false`, so a
+/// permission request falls back to prompting the human.
+pub async fn read_auto_allow_permissions() -> bool {
+    let Ok(path) = state_path() else {
+        return false;
+    };
+    let Ok(raw) = tokio::fs::read_to_string(&path).await else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    auto_allow_from_state(&value)
+}
+
+/// Pure extraction of the auto-allow flag from a parsed `state.json`
+/// value. Split from the IO in `read_auto_allow_permissions` so the
+/// lookup can be unit-tested without touching the filesystem. Defaults
+/// to `false` when `settings.autoAllowPermissions` is missing or not a
+/// boolean.
+pub fn auto_allow_from_state(state: &serde_json::Value) -> bool {
+    state
+        .get("settings")
+        .and_then(|s| s.get("autoAllowPermissions"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     let raw =

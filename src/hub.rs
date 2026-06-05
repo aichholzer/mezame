@@ -687,6 +687,44 @@ async fn run_hub_loop(state: HubLoopState) {
                 let Some(msg) = agent_msg else {
                     break; // agent stdout reader exited
                 };
+                // Auto-allow: when the user has enabled "auto-allow all
+                // permissions" in Settings (persisted in state.json), we
+                // answer `session/request_permission` ourselves with an
+                // allow option instead of forwarding a card to the
+                // browser. The flag is read on demand (see
+                // `read_auto_allow_permissions`); the read runs only for
+                // permission requests, which are rare and human-paced, so
+                // the per-message fast path below is untouched. The
+                // separate `tool_call` / `tool_call_update` notifications
+                // still stream, so the user sees the tool run and its
+                // result even though no prompt appeared.
+                if msg.get("method").and_then(Value::as_str)
+                    == Some("session/request_permission")
+                    && crate::config::read_auto_allow_permissions().await
+                {
+                    if let (Some(id), Some(option_id)) =
+                        (msg.get("id").cloned(), pick_allow_option(&msg))
+                    {
+                        let agent = Arc::clone(&agent);
+                        tokio::spawn(async move {
+                            let _ = agent
+                                .respond(
+                                    id,
+                                    json!({
+                                        "outcome": {
+                                            "outcome": "selected",
+                                            "optionId": option_id
+                                        }
+                                    }),
+                                )
+                                .await;
+                        });
+                        continue; // card suppressed; never reaches a browser
+                    }
+                    // No option could be positively identified as an
+                    // allow: fall through and prompt the human as normal.
+                    // We never auto-select a reject on the user's behalf.
+                }
                 let suppress = *suppress_replay.lock().await;
                 handle_agent_message(&relay_tx, msg, suppress).await;
                 while let Ok(frame) = relay_rx.try_recv() {
@@ -967,7 +1005,32 @@ async fn handle_command(
     }
 }
 
-// (imports at the top of the file)
+/// Choose the option to auto-select for a `session/request_permission`
+/// request when auto-allow is enabled. Mirrors the convention used by
+/// other ACP clients: prefer an option whose `kind` is `allow_once` or
+/// `allow_always`; when an option carries no `kind`, fall back to its
+/// human name containing "allow". Returns `None` when no option can be
+/// positively identified as an allow — the caller then prompts the
+/// human rather than guessing, so a malformed or reject-only option set
+/// never results in an unintended auto-answer.
+pub fn pick_allow_option(msg: &Value) -> Option<String> {
+    let options = msg.pointer("/params/options")?.as_array()?;
+    options
+        .iter()
+        .find(|opt| {
+            let kind = opt.get("kind").and_then(Value::as_str);
+            match kind {
+                Some("allow_once") | Some("allow_always") => true,
+                Some(_) => false,
+                None => opt
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.to_lowercase().contains("allow")),
+            }
+        })
+        .and_then(|opt| opt.get("optionId").and_then(Value::as_str))
+        .map(str::to_string)
+}
 
 /// Pull the user's plain text out of an ACP prompt-block array. Used
 /// by the broadcast echo so peer browsers see what the sender typed.
