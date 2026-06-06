@@ -1,5 +1,5 @@
 import { PaperclipIcon, SendIcon, SettingsIcon, SquareIcon, XIcon } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -22,7 +22,8 @@ import {
   MAX_TOTAL_BYTES,
   type Attachment
 } from '@/lib/attachments';
-import { cn } from '@/lib/utils';
+import { getSettingsSnapshot, subscribeToSettings } from '@/lib/settings';
+import { cn, isMac } from '@/lib/utils';
 import type { PromptBlock, Session } from '@/types';
 
 // Floating composer pinned to the bottom of the chat pane. The log
@@ -72,6 +73,14 @@ export const InputRow = ({ session, onSubmit }: Props) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const slashRef = useRef<SlashAutocompleteHandle>(null);
+
+  // Reactive read of the send-on-Enter preference. Drives both the key
+  // handler and the textarea placeholder hint below.
+  const sendOnEnter = useSyncExternalStore(
+    subscribeToSettings,
+    () => getSettingsSnapshot().sendOnEnter,
+    () => getSettingsSnapshot().sendOnEnter
+  );
 
   const caps = session?.promptCapabilities ?? {};
   const canAttachAnything = !!(caps.image || caps.embeddedContext);
@@ -141,6 +150,12 @@ export const InputRow = ({ session, onSubmit }: Props) => {
   const busy = !!session?.busy;
   const disabled = !session || busy;
   const canSend = !disabled && (value.trim().length > 0 || attachments.length > 0);
+
+  // Placeholder hint mirrors the active submit chord and the platform's
+  // modifier glyph.
+  const sendHint = sendOnEnter
+    ? 'Enter to send, Shift+Enter for newline'
+    : `${isMac() ? '\u2318' : 'Ctrl'}+Enter to send, Enter for newline`;
 
   /** Stage a single file: classify, quota-check, append. Returns false
    * when rejected so caller can stop at the first failure. */
@@ -226,7 +241,21 @@ export const InputRow = ({ session, onSubmit }: Props) => {
     if (slashRef.current?.onKeyDown(e)) {
       return;
     }
-    if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (e.key !== 'Enter') {
+      return;
+    }
+    if (sendOnEnter) {
+      // Classic mode: a bare Enter submits. Any modifier (Shift for a
+      // newline, or Cmd/Ctrl/Alt) falls through to the textarea default.
+      if (!e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        void submit();
+      }
+      return;
+    }
+    // Modifier mode: Cmd/Ctrl+Enter submits; a bare Enter inserts a
+    // newline (textarea default), so we only intercept the chord.
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       void submit();
     }
@@ -351,7 +380,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           onPaste={handlePaste}
           disabled={!session}
           readOnly={busy}
-          placeholder={busy ? 'The agent is working...' : 'Message... (Enter to send, Shift+Enter for newline)'}
+          placeholder={busy ? 'The agent is working...' : `Message... (${sendHint})`}
           rows={minRows}
           autoFocus
           className={cn(

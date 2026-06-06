@@ -30,6 +30,11 @@ build-time Vite define.
   the next request without a reconnect. Reject options are never chosen
   automatically: if no option can be identified as an allow, Mezame
   falls back to prompting.
+- Send-message shortcut. A toggle in the Settings pane chooses whether a
+  bare Enter sends the message (the default, with Shift+Enter inserting a
+  newline) or inserts a newline — in which case ⌘+Enter on macOS, or
+  Ctrl+Enter on Windows/Linux, sends. Persists across all sessions and
+  devices like the other preferences.
 
 ## [0.10.0] - 2026-06-05
 
