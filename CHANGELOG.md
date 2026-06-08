@@ -13,6 +13,21 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.12.2] - 2026-06-08
+
+### Fixed
+
+- Auto-allow-permissions (and the other preferences) no longer reset
+  themselves. The session-sync write path PUT only the session fields to
+  `/state` without reading first, clobbering the `settings` block the
+  settings store had written; any session event (open/rename/close, tab
+  switch, first-prompt id record, cross-browser reconcile) silently
+  reverted `autoAllowPermissions` to its default and re-prompted the
+  user. The sync now reads-then-merges, preserving fields it does not
+  own, mirroring how the settings store already persists. The Rust
+  enforcement added in the original feature was correct; only the UI
+  write path dropped the field.
+
 ## [0.12.1] - 2026-06-08
 
 ### Fixed
