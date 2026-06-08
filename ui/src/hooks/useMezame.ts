@@ -144,9 +144,9 @@ const scheduleSync = () => {
   syncTimer = window.setTimeout(doSync, 400);
 };
 
-const doSync = async () => {
+export const doSync = async () => {
   syncTimer = null;
-  const body: PersistedState = {
+  const owned: PersistedState = {
     sessions: sessions.map((s) => ({
       id: s.id,
       label: s.label,
@@ -165,6 +165,16 @@ const doSync = async () => {
     nextLabel
   };
   try {
+    // Read-then-merge: `/state` is a shared blob with more than one
+    // writer. We own the session fields above; the settings store
+    // (`lib/settings.ts`) owns `settings`. A blind PUT of only our
+    // fields would clobber `settings` on every session event (open,
+    // rename, close, tab switch, first-prompt id record, cross-browser
+    // reconcile), silently resetting e.g. `autoAllowPermissions` so the
+    // user gets re-prompted. Carry across whatever we do not own,
+    // mirroring how `settings.ts` persist() preserves our fields.
+    const existing = await fetchState();
+    const body = { ...(existing ?? {}), ...owned };
     await fetch(STATE_URL, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
