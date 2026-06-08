@@ -40,13 +40,15 @@ Details:
 - `commands` forwards Kiro's `_kiro.dev/commands/available` catalogue (commands + prompts only; the massive tool catalogue is stripped on the server to keep WS frames light). Drives the `/` autocomplete.
 - `append` is the ACP streaming path for a live turn. During a resume window the server suppresses these so the browser's `/history`-seeded log doesn't get duplicated.
 - `tool_call` carries the full ACP tool-call payload (arguments, content, file locations). Updates for the same `toolCallId` merge into the existing UI row in place rather than appending.
-- `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which Mezame forwards to the agent to unblock it.
+- `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which Mezame forwards to the agent to unblock it. When the "auto-allow all permissions" setting is on (see Cross-device UI state), the server answers `session/request_permission` itself with an allow option and suppresses the card; the tool still streams its `tool_call` updates so the run stays visible.
 - `mcp_oauth_request` renders an inline card with an Open button when an MCP server needs out-of-band authorisation. Carries `serverName`, `url`, and a dedupe `id` (Kiro re-emits while waiting). Dropped silently when no `url` is present.
 - `cancel` triggers `session/cancel` on the agent.
 
 ## Cross-device UI state
 
 `GET` / `PUT /state` persists the open-tabs list, recently-closed history, active tab, and numeric label counter. Backing file is `~/.mezame/state.json`. Any browser hitting this Mezame sees the same list, useful when moving between devices behind the same tunnel. Actual conversation content stays with the agent (Kiro at `~/.kiro/sessions/cli/`); Mezame only stores labels, cwds, and ACP session ids.
+
+The same file carries a `settings` object for app-wide preferences (theme, notifications, and `autoAllowPermissions`). The server reads `settings.autoAllowPermissions` on each `session/request_permission` to decide whether to auto-allow; the rest are client-only.
 
 `GET /state/events` is a Server-Sent Events stream that emits a `state_changed` event each time `PUT /state` writes a new file. Browsers use it as a "go refetch `/state`" signal so a session opened in another browser shows up without a manual reload. A periodic keep-alive comment keeps intermediaries from idle-timing out the stream.
 

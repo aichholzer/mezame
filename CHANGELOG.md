@@ -13,6 +13,24 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.11.0] - 2026-06-05
+
+### Added
+
+- Settings pane. A cog button in the bottom-left of the sidebar, beside
+  the theme picker, opens a dialog for app-wide preferences that persist
+  across all sessions and devices.
+- Auto-allow all permissions. A toggle in the new Settings pane makes
+  Mezame answer every agent permission request automatically with an
+  allow option instead of showing an approval card, so tool calls run
+  without interruption. Off by default; a new install always prompts
+  until the user opts in. Enforced server-side (the hub reads the
+  preference on each `session/request_permission`), so it applies to
+  every attached device and to unattended sessions, and takes effect on
+  the next request without a reconnect. Reject options are never chosen
+  automatically: if no option can be identified as an allow, Mezame
+  falls back to prompting.
+
 ## [0.10.0] - 2026-06-05
 
 ### Added

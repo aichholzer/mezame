@@ -10,6 +10,7 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { SettingsDialog } from '@/features/SettingsDialog';
 import { ThemeToggle } from '@/features/ThemeToggle';
 import { useSidebarWidth } from '@/hooks/useSidebarWidth';
 import { cn } from '@/lib/utils';
@@ -440,6 +441,7 @@ export const SideBar = ({
          * scrollable session list and above the resize handle. */}
         <div className="flex items-center gap-2 border-t border-[color:var(--outline-variant)] px-3 py-3">
           <ThemeToggle />
+          <SettingsDialog />
         </div>
 
         {/* Resize handle. A 6 px-wide strip pinned to the right edge
