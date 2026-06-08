@@ -13,6 +13,18 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.12.1] - 2026-06-08
+
+### Fixed
+
+- Reap the agent's whole session on teardown. MCP servers spawned by the
+  agent through `npx`/`npm` place themselves in their own process groups,
+  so the existing `kill(-pgid)` process-group kill never reached them; on
+  shutdown they orphaned to PID 1 and accumulated until the service cgroup
+  was throttled (systemd `MemoryHigh`) and Mezame became unresponsive after
+  a few days. Shutdown now also walks the agent's session and SIGKILLs every
+  process still in it, catching those escapees.
+
 ## [0.12.0] - 2026-06-08
 
 ### Added
