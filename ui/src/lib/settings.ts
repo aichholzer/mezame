@@ -16,6 +16,7 @@ type Settings = {
   notifications: NotificationPreference;
   theme: ThemePreference;
   autoAllowPermissions: boolean;
+  sendOnEnter: boolean;
 };
 
 const DEFAULTS: Settings = {
@@ -26,7 +27,14 @@ const DEFAULTS: Settings = {
   // Settings pane. Read server-side per permission request (see
   // `read_auto_allow_permissions` in the Rust core), so flipping it
   // here takes effect on the next request without a reconnect.
-  autoAllowPermissions: false
+  autoAllowPermissions: false,
+  // Send-on-Enter. True (default) keeps the classic chat behaviour:
+  // a bare Enter submits and Shift+Enter inserts a newline. False
+  // flips it — Enter inserts a newline and the platform modifier
+  // (Cmd on macOS, Ctrl elsewhere) plus Enter submits. Purely a UI
+  // affordance: unlike autoAllowPermissions the Rust core never reads
+  // it, so it rides the generic /state blob with no server change.
+  sendOnEnter: true
 };
 
 // Theme is mirrored to localStorage (in addition to the /state round
@@ -97,6 +105,17 @@ export const setAutoAllowPermissions = (next: boolean): void => {
   void persist();
 };
 
+export const getSendOnEnter = (): boolean => current.sendOnEnter;
+
+export const setSendOnEnter = (next: boolean): void => {
+  if (current.sendOnEnter === next) {
+    return;
+  }
+  current = { ...current, sendOnEnter: next };
+  notify();
+  void persist();
+};
+
 /** Synchronous read of the persisted theme for pre-paint boot. Falls
  * back to the default when storage is empty or unavailable. */
 export const readThemeFromStorage = (): ThemePreference => {
@@ -153,6 +172,11 @@ export const initSettings = async (): Promise<void> => {
       const autoAllow = body.settings.autoAllowPermissions;
       if (typeof autoAllow === 'boolean' && autoAllow !== current.autoAllowPermissions) {
         current = { ...current, autoAllowPermissions: autoAllow };
+        notify();
+      }
+      const sendOnEnter = body.settings.sendOnEnter;
+      if (typeof sendOnEnter === 'boolean' && sendOnEnter !== current.sendOnEnter) {
+        current = { ...current, sendOnEnter };
         notify();
       }
     }

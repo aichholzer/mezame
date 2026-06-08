@@ -13,6 +13,16 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.12.0] - 2026-06-08
+
+### Added
+
+- Send-message shortcut. A toggle in the Settings pane chooses whether a
+  bare Enter sends the message (the default, with Shift+Enter inserting a
+  newline) or inserts a newline; in that case ⌘+Enter on macOS, or
+  Ctrl+Enter on Windows/Linux, sends. Persists across all sessions and
+  devices like the other preferences.
+
 ## [0.11.0] - 2026-06-05
 
 ### Added

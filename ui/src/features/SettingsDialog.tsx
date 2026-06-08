@@ -14,6 +14,7 @@ import { cn } from '@/lib/utils';
 import {
   getSettingsSnapshot,
   setAutoAllowPermissions,
+  setSendOnEnter,
   subscribeToSettings
 } from '@/lib/settings';
 
@@ -37,6 +38,14 @@ const useAutoAllowPermissions = (): boolean =>
     subscribeToSettings,
     () => getSettingsSnapshot().autoAllowPermissions,
     () => getSettingsSnapshot().autoAllowPermissions
+  );
+
+/** Reactive read of the send-on-Enter preference from the settings store. */
+const useSendOnEnter = (): boolean =>
+  useSyncExternalStore(
+    subscribeToSettings,
+    () => getSettingsSnapshot().sendOnEnter,
+    () => getSettingsSnapshot().sendOnEnter
   );
 
 /** Accessible on/off switch. No checkbox primitive ships in the UI kit,
@@ -74,6 +83,7 @@ const Switch = ({
 
 export const SettingsDialog = () => {
   const autoAllow = useAutoAllowPermissions();
+  const sendOnEnter = useSendOnEnter();
 
   return (
     <Dialog>
@@ -110,6 +120,19 @@ export const SettingsDialog = () => {
               checked={autoAllow}
               onChange={setAutoAllowPermissions}
               label="Auto-allow all permissions"
+            />
+          </div>
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-sm text-foreground">Send message shortcut</span>
+              <span className="text-xs text-muted-foreground">
+                Choose if enter sends message or creates new line
+              </span>
+            </div>
+            <Switch
+              checked={sendOnEnter}
+              onChange={setSendOnEnter}
+              label="Send message shortcut"
             />
           </div>
         </div>
