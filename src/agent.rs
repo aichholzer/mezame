@@ -55,6 +55,15 @@ pub struct Agent {
     /// there is no real subprocess (tests).
     #[cfg(unix)]
     pgid: i32,
+    /// Session ID (Unix only). Equal to `pgid` at spawn because `setsid`
+    /// makes the child both a session and process-group leader, but it is
+    /// the session — not the group — that MCP servers spawned via
+    /// `npx`/`npm` inherit (they fork into their own process groups). The
+    /// session sweep in `shutdown` uses this to reap those escapees that
+    /// the `kill(-pgid)` cannot reach. 0 when there is no real subprocess
+    /// (tests).
+    #[cfg(unix)]
+    sid: i32,
     /// Set to true once `shutdown()` has finished. Tests read this to
     /// confirm cooperative shutdown ran. Not serialised; relaxed
     /// ordering is fine for the read-after-write that tests perform.
@@ -132,6 +141,11 @@ impl Agent {
     ///      idempotent: if the agent and its children already exited, the
     ///      kill is a no-op. If `kiro-cli` exited cleanly but left its MCP
     ///      server grandchildren alive (the common case), this reaps them.
+    ///   5. Sweep the agent's whole session. MCP servers launched through
+    ///      `npx`/`npm` put themselves in their own process groups, so the
+    ///      group kill in step 4 never reaches them; they only inherit the
+    ///      agent's session. Without this they orphan to PID 1 and pile up
+    ///      until the service cgroup is throttled. See `unix::reap_session`.
     pub async fn shutdown(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
             let _ = self
@@ -154,6 +168,9 @@ impl Agent {
         // exited, otherwise reaps any orphaned MCP servers / npm wrappers
         // that kiro-cli did not clean up.
         self.kill_process_group();
+        // The group kill misses MCP servers that forked into their own
+        // process groups; sweep the whole session to catch those escapees.
+        self.reap_session();
         self.shutdown_done.store(true, Ordering::Relaxed);
     }
 
@@ -178,6 +195,22 @@ impl Agent {
     fn kill_process_group(&self) {
         // Non-unix: fall through to kill_on_drop for the direct child.
     }
+
+    /// SIGKILL every process still in the agent's session. Catches MCP
+    /// servers that forked into their own process groups and so escaped
+    /// the `kill(-pgid)` group kill. No-op for test-built agents
+    /// (`sid == 0`) and guarded against sweeping our own session.
+    #[cfg(unix)]
+    fn reap_session(&self) {
+        if self.sid > 0 {
+            crate::unix::reap_session(self.sid);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn reap_session(&self) {
+        // Non-unix: no procfs to walk; the group kill is the only teardown.
+    }
 }
 
 /// Safety net: if the Agent is dropped without a prior `shutdown()` call
@@ -185,11 +218,20 @@ impl Agent {
 /// so grandchildren do not leak. `kill_on_drop(true)` on the Child only
 /// kills the direct child; this covers the rest of the tree. No-op for
 /// test-built agents because `pgid == 0`.
+///
+/// When `shutdown()` already ran, the group kill and session sweep are
+/// done, so we skip the (relatively heavy) `/proc` walk and only repeat
+/// the cheap group kill. On the early-return/panic path `shutdown()` did
+/// not run, so we also sweep the session to catch MCP servers that
+/// escaped the group via their own process groups.
 #[cfg(unix)]
 impl Drop for Agent {
     fn drop(&mut self) {
         if self.pgid > 0 {
             crate::unix::send_signal(-self.pgid, 9);
+        }
+        if !self.shutdown_done.load(Ordering::Relaxed) {
+            self.reap_session();
         }
     }
 }
@@ -251,6 +293,11 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
 
     #[cfg(unix)]
     let pgid = child.id().map(|id| id as i32).unwrap_or(0);
+    // `setsid` in pre_exec makes the child a session leader as well, so the
+    // session id equals the child pid (== pgid). Tracked separately because
+    // the session — not the group — is what MCP servers inherit.
+    #[cfg(unix)]
+    let sid = pgid;
 
     let stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -311,6 +358,8 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
             child: Some(Mutex::new(child)),
             #[cfg(unix)]
             pgid,
+            #[cfg(unix)]
+            sid,
             shutdown_done: Arc::new(AtomicBool::new(false)),
         },
         updates_rx,
@@ -363,6 +412,8 @@ pub fn from_io(
             child: None,
             #[cfg(unix)]
             pgid: 0,
+            #[cfg(unix)]
+            sid: 0,
             shutdown_done: Arc::new(AtomicBool::new(false)),
         },
         updates_rx,
