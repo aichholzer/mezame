@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::config::Config;
+use crate::config::AgentConfig;
 
 /// Type-erased writer the JSON-RPC framing helpers send into. In
 /// production this wraps `ChildStdin`; tests pass in a `tokio::io::duplex`
@@ -257,9 +257,10 @@ impl Drop for Agent {
 ///   2. Stdout reader, newline-delimited JSON decoder that routes
 ///      responses to their pending oneshots and everything else to the
 ///      returned mpsc receiver.
-pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver<Value>)> {
-    let mut cmd = Command::new(&cfg.agent_cmd);
-    cmd.args(&cfg.agent_args)
+pub async fn spawn_agent(agent: &AgentConfig) -> Result<(Agent, mpsc::UnboundedReceiver<Value>)> {
+    let mut cmd = Command::new(&agent.command);
+    cmd.args(&agent.args)
+        .envs(&agent.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -289,7 +290,7 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("Failed to spawn `{}`", cfg.agent_cmd))?;
+        .with_context(|| format!("Failed to spawn `{}`", agent.command))?;
 
     #[cfg(unix)]
     let pgid = child.id().map(|id| id as i32).unwrap_or(0);

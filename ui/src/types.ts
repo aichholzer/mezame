@@ -201,6 +201,12 @@ export type Session = {
   liveSessionId: string | null;
   /** Optional working directory override passed via `?cwd=`. */
   cwd: string | null;
+  /** Which configured agent backs this session, sent as the `?agent=`
+   * WS param. `null` means the server's default agent (first configured).
+   * Fixed for the session's lifetime and re-sent on every reconnect,
+   * because the session lives in this agent's own session store and
+   * cannot be resumed against a different agent. Persisted. */
+  agent: string | null;
   /** Actual cwd the agent session was opened with, reported by the
    * server on `ready`. Equals `cwd` when the user supplied an override,
    * otherwise the server's own process cwd. Display-only. */
@@ -271,11 +277,12 @@ export type ClosedEntry = {
   label: string;
   acpSessionId: string;
   cwd: string | null;
+  agent: string | null;
   closedAt: number;
 };
 
 export type PersistedState = {
-  sessions: Array<Pick<Session, 'id' | 'label' | 'acpSessionId' | 'cwd'>>;
+  sessions: Array<Pick<Session, 'id' | 'label' | 'acpSessionId' | 'cwd' | 'agent'>>;
   closed: ClosedEntry[];
   activeId: string | null;
   nextLabel: number;

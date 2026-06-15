@@ -5,6 +5,7 @@
 //! reshuffling. Transports live in a list (`TransportConfig`) internally
 //! tagged on `kind`; see the README Configuration reference and todo #19.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
@@ -26,9 +27,105 @@ pub const DEFAULT_PORT: u16 = 9510;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub transports: Vec<TransportConfig>,
-    pub agent_cmd: String,
+    /// Agents the user can choose between when opening a new session.
+    /// Each is spawned on demand; the agent backing a session is fixed
+    /// for that session's lifetime (a session is tied to one agent's
+    /// own session store, so it cannot be re-bound to another agent on
+    /// resume — see `?agent=` in the wire protocol). The first entry is
+    /// the default for new sessions.
     #[serde(default)]
+    pub agents: Vec<AgentConfig>,
+    /// Legacy single-agent fields, kept so configs written before the
+    /// multi-agent schema keep loading. `normalize` folds these into
+    /// `agents` at load time; nothing reads them afterwards, and they
+    /// are not re-serialised once `agents` is populated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_args: Vec<String>,
+}
+
+/// One configurable ACP agent. `mezame init` writes a single entry;
+/// users add more (e.g. the Claude Code ACP bridge) by hand-editing
+/// `~/.mezame/config.json`. See the README configuration reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Stable identifier shown in the new-session picker and echoed back
+    /// as the `?agent=` WS query param. Expected to be unique within
+    /// `agents`; the first match wins if not.
+    pub name: String,
+    /// Binary to spawn, resolved against `$PATH` or given as an absolute
+    /// path.
+    pub command: String,
+    /// Arguments passed on every spawn (e.g. `["acp"]` for Kiro CLI).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the agent subprocess, merged onto
+    /// Mezame's own environment. The Claude Code ACP bridge needs
+    /// `ANTHROPIC_API_KEY` (or a logged-in Claude session); Kiro needs
+    /// none. Kept out of `args` so secrets do not surface in process
+    /// listings.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+impl Config {
+    /// Fold legacy single-agent fields into `agents`. Idempotent: a
+    /// config already using the `agents` list is left untouched aside
+    /// from clearing the legacy fields. Called once after
+    /// deserialisation so the rest of the code only ever deals with the
+    /// list form.
+    pub fn normalize(&mut self) {
+        if self.agents.is_empty() {
+            if let Some(cmd) = self.agent_cmd.take().filter(|c| !c.trim().is_empty()) {
+                let name = legacy_agent_name(&cmd);
+                self.agents.push(AgentConfig {
+                    name,
+                    command: cmd,
+                    args: std::mem::take(&mut self.agent_args),
+                    env: BTreeMap::new(),
+                });
+            }
+        }
+        // Drop any leftover legacy fields so they never round-trip.
+        self.agent_cmd = None;
+        self.agent_args.clear();
+    }
+
+    /// The agent a new session uses when the browser names none: the
+    /// first configured agent. `None` only when `agents` is empty.
+    pub fn default_agent(&self) -> Option<&AgentConfig> {
+        self.agents.first()
+    }
+
+    /// Resolve the agent for a new session. `name` comes from the
+    /// browser's `?agent=` param; `None` falls back to the default.
+    /// Errors when a named agent is not configured, or when no agents
+    /// are configured at all.
+    pub fn resolve_agent(&self, name: Option<&str>) -> Result<&AgentConfig> {
+        match name {
+            Some(n) => self
+                .agents
+                .iter()
+                .find(|a| a.name == n)
+                .with_context(|| format!("No agent named `{n}` in config.json")),
+            None => self
+                .default_agent()
+                .context("No agents configured. Re-run `mezame init`."),
+        }
+    }
+}
+
+/// Derive a picker name for a migrated legacy agent from its command,
+/// e.g. `/usr/bin/kiro-cli` -> `kiro-cli`. Falls back to `default` when
+/// the command has no usable file-name component.
+fn legacy_agent_name(cmd: &str) -> String {
+    std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 /// Transport entries are internally tagged by `kind`, so each variant can
@@ -96,7 +193,8 @@ pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     let raw =
         std::fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;
-    let cfg: Config = serde_json::from_str(&raw).context("Parsing config.json")?;
+    let mut cfg: Config = serde_json::from_str(&raw).context("Parsing config.json")?;
+    cfg.normalize();
     Ok(cfg)
 }
 
@@ -186,8 +284,18 @@ pub(crate) fn init_config() -> Result<Config> {
 
     let cfg = Config {
         transports: vec![TransportConfig::Cloudflared { bind }],
-        agent_cmd,
-        agent_args,
+        // `mezame init` writes a single agent; multi-agent configs are
+        // assembled by hand-editing config.json (see the README
+        // configuration reference). The name is derived from the
+        // command so the new-session picker has a stable label.
+        agents: vec![AgentConfig {
+            name: legacy_agent_name(&agent_cmd),
+            command: agent_cmd,
+            args: agent_args,
+            env: BTreeMap::new(),
+        }],
+        agent_cmd: None,
+        agent_args: Vec::new(),
     };
 
     let path = config_path()?;
@@ -220,9 +328,13 @@ const KNOWN_AGENTS: &[KnownAgent] = &[
         bin: "kiro-cli",
         default_args: &["acp"],
     },
+    // Claude Code does not speak ACP itself; it is driven through the
+    // Claude Code ACP bridge (npm `@agentclientprotocol/claude-agent-acp`,
+    // bin `claude-agent-acp`). Install it globally to surface it here, or
+    // run it via `npx` by typing the command at the "Other" prompt.
     KnownAgent {
-        display: "Claude Agent CLI",
-        bin: "claude",
+        display: "Claude Code (ACP bridge)",
+        bin: "claude-agent-acp",
         default_args: &[],
     },
     KnownAgent {

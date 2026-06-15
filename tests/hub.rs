@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mezame::agent::{from_io, Agent};
-use mezame::config::{Config, TransportConfig};
+use mezame::config::{AgentConfig, Config, TransportConfig};
 use mezame::hub::{HubCommand, HubRegistry};
 use serde_json::{json, Value};
 use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -665,7 +665,13 @@ fn dummy_config() -> Arc<Config> {
         transports: vec![TransportConfig::Cloudflared {
             bind: "127.0.0.1:0".into(),
         }],
-        agent_cmd: "cat".into(),
+        agents: vec![AgentConfig {
+            name: "cat".into(),
+            command: "cat".into(),
+            args: vec![],
+            env: Default::default(),
+        }],
+        agent_cmd: None,
         agent_args: vec![],
     })
 }
@@ -692,7 +698,13 @@ async fn attach_or_create_fast_path_reuses_registered_hub() {
         .await;
 
     let mut fast = registry
-        .attach_or_create(dummy_config(), Some(SESSION_ID.into()), None, "test-build")
+        .attach_or_create(
+            dummy_config(),
+            Some(SESSION_ID.into()),
+            None,
+            None,
+            "test-build",
+        )
         .await
         .expect("fast path attach");
 

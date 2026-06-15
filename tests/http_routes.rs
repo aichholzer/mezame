@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use mezame::config::{Config, TransportConfig};
+use mezame::config::{AgentConfig, Config, TransportConfig};
 use mezame::http::{build_router, AppState};
 use mezame::hub::HubRegistry;
 use serde_json::{json, Value};
@@ -35,7 +35,13 @@ fn dummy_state() -> Arc<AppState> {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
             }],
-            agent_cmd: "/bin/true".to_string(),
+            agents: vec![AgentConfig {
+                name: "true".into(),
+                command: "/bin/true".to_string(),
+                args: vec![],
+                env: Default::default(),
+            }],
+            agent_cmd: None,
             agent_args: vec![],
         }),
         hubs: HubRegistry::new(),
@@ -71,6 +77,23 @@ fn set_home(p: &Path) {
 
 fn unset_home() {
     std::env::remove_var("HOME");
+}
+
+// ---------- /agents ----------
+
+#[tokio::test]
+async fn get_agents_lists_configured_names_and_default() {
+    // `dummy_state` configures a single agent named "true". The endpoint
+    // exposes only names (no command/args/env) plus the default, which
+    // is the first entry.
+    let req = Request::get("/agents").body(Body::empty()).unwrap();
+    let (status, bytes, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json_body(&bytes),
+        json!({ "agents": ["true"], "default": "true" })
+    );
 }
 
 // ---------- /state ----------

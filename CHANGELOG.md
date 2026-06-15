@@ -13,6 +13,31 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.13.0] - 2026-06-15
+
+### Added
+
+- Multiple AI agents, selectable per session. `~/.mezame/config.json`
+  now carries an `agents` list (each with `name`, `command`, `args`, and
+  an optional `env` map) instead of a single `agent_cmd`/`agent_args`.
+  The new-session dialog shows an agent picker when more than one is
+  configured; the choice is fixed for that session's lifetime and
+  re-sent on reconnect (a session lives in its agent's own session
+  store and cannot be resumed against a different agent). The first
+  configured agent is the default. A new `GET /agents` endpoint exposes
+  the configured names (never the commands or env) to the UI.
+- Claude Code support, via the Claude Code ACP bridge
+  (`@agentclientprotocol/claude-agent-acp`, binary `claude-agent-acp`).
+  Claude does not speak ACP natively; install the bridge as a
+  prerequisite and configure it as an agent with `ANTHROPIC_API_KEY` in
+  its `env`. `mezame init` now probes for the bridge binary.
+
+### Changed
+
+- Legacy single-agent configs (`agent_cmd` / `agent_args`) are migrated
+  to the `agents` list automatically on load, so existing
+  `config.json` files keep working without edits.
+
 ## [0.12.2] - 2026-06-08
 
 ### Fixed

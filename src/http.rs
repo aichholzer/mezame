@@ -123,6 +123,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ws", get(ws_upgrade))
         .route("/state", get(get_state).put(put_state))
         .route("/state/events", get(state_events))
+        .route("/agents", get(get_agents))
         .route("/history", get(get_history))
         .route("/tool-result", get(get_tool_result))
         // SPA fallback: /, /assets/*, and any unknown path resolve against
@@ -260,6 +261,18 @@ pub fn mime_for(path: &str) -> &'static str {
         .find(|(k, _)| ext.eq_ignore_ascii_case(k))
         .map(|(_, v)| *v)
         .unwrap_or("application/octet-stream")
+}
+
+/// GET /agents — lists the configured agents the new-session picker can
+/// choose between. Returns `{ "agents": ["kiro-cli", ...], "default":
+/// "kiro-cli" }` where `default` is the first entry (the agent used when
+/// the browser names none). Only names are exposed; commands, args, and
+/// env (which may hold secrets) stay server-side. `default` is null only
+/// when no agents are configured.
+async fn get_agents(State(app): State<Arc<AppState>>) -> Json<Value> {
+    let names: Vec<&str> = app.config.agents.iter().map(|a| a.name.as_str()).collect();
+    let default = app.config.default_agent().map(|a| a.name.as_str());
+    Json(json!({ "agents": names, "default": default }))
 }
 
 /// GET /state — returns the persisted browser state as JSON, or `{}` if the
