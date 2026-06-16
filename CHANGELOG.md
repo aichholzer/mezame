@@ -13,6 +13,19 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.13.0] - 2026-06-16
+
+### Added
+
+- Idle session suspend/resume. A session left idle in the sidebar past
+  a configurable quiet period now drops its WebSocket so the server
+  tears down its agent and MCP fleet, reclaiming the memory those
+  processes hold. The tab stays in place, greyed out, and transparently
+  reconnects (resuming the agent session) the moment you interact with
+  it again. The active tab is only suspended while the browser tab is
+  hidden. A new Settings control sets the idle threshold (1-60 minutes,
+  default 15).
+
 ## [0.12.2] - 2026-06-08
 
 ### Fixed

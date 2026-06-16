@@ -228,6 +228,12 @@ export type Session = {
   thinking: boolean;
   attention: Attention;
   pinnedToBottom: boolean;
+  /** Epoch ms of the last activity on this session: a turn finishing
+   * (`prompt_done`/`error`), a prompt being sent, the tab being activated,
+   * or a (re)connect completing. Anchors the idle timer that suspends a
+   * session after the user-configured quiet period (see
+   * `shouldSuspendIdle`). Not persisted; seeded on construct. */
+  lastActivityAt: number;
   /** Agent modes / models reported by `session_info`. */
   modes: ModeEntry[];
   currentModeId: string | null;
@@ -253,6 +259,12 @@ export type Session = {
   reconnectAttempt: number;
   reconnectTimer: number | null;
   closing: boolean;
+  /** True while the session is intentionally suspended to free its agent
+   * + MCP fleet after an idle period. Distinct from `closing`: a suspended
+   * session stays in the sidebar (rendered grey) and its socket is dropped
+   * WITHOUT auto-reconnect, letting the server's grace timer reap the
+   * agent. It reconnects (resume) on the next interaction. Not persisted. */
+  suspended: boolean;
   /** Whether a `session/prompt` request is currently in flight. Used
    * by the WS close handler to decide whether to re-flag the session
    * as `busy` while reconnecting. Set when the user sends a prompt,
