@@ -13,6 +13,23 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.12.3] - 2026-06-17
+
+### Fixed
+
+- A session could disappear from the sidebar when switching devices. The
+  cross-device session list at `/state` is last-writer-wins, and a
+  browser whose live `/state/events` stream had fallen behind (a
+  backgrounded mobile tab, a device just switched to) would overwrite the
+  shared list with its own stale view, dropping a session another device
+  still had open. The conversation was never lost — Kiro keeps it on disk
+  — but its entry vanished from Mezame and had to be re-added by hand. The
+  session sync now merges in sessions only the server knows about,
+  skipping any it can prove were deliberately closed, so a stale writer
+  can no longer clobber a live session out of the list. Complements the
+  read-side reconcile guard that already prevented the same loss on
+  refetch.
+
 ## [0.12.2] - 2026-06-08
 
 ### Fixed
