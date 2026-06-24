@@ -2,6 +2,7 @@
 
 [![Tests](https://github.com/aichholzer/mezame/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aichholzer/mezame/actions/workflows/test.yml)
 [![codecov](https://codecov.io/gh/aichholzer/mezame/graph/badge.svg?token=UV3BE0RQ0U)](https://codecov.io/gh/aichholzer/mezame)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/aichholzer/mezame?utm_source=badge)
 [![Latest version](https://img.shields.io/crates/v/mezame.svg)](https://crates.io/crates/mezame)
 ![License](https://img.shields.io/crates/l/mezame.svg)<br />
 ![macOS](https://img.shields.io/badge/-macOS-black)

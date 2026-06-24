@@ -28,7 +28,8 @@ exclude = [
     "docs/**",
     "Dockerfile",
     "compose.yaml",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "benches/**"
 ]
 
 [dependencies]
@@ -51,3 +52,8 @@ strip = true
 tokio = { version = "1.43.0", features = ["test-util"] }
 tempfile = "3.13"
 tower = { version = "0.5", features = ["util"] }
+divan = { version = "5.0.0", package = "codspeed-divan-compat" }
+
+[[bench]]
+name = "http_parsing"
+harness = false
