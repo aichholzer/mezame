@@ -1,0 +1,47 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # `workflow_dispatch` lets CodSpeed trigger backtest performance
+  # analysis to generate initial data.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # for OpenID Connect authentication with CodSpeed
+
+env:
+  CARGO_TERM_COLOR: always
+  # Skip the Vite build: the benchmarks only exercise pure Rust helpers,
+  # and build.rs leaves a minimal dist/ behind so rust-embed still
+  # resolves. Matches the test workflow.
+  MEZAME_SKIP_UI_BUILD: "1"
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: simulation
+          run: cargo codspeed run
