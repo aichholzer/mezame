@@ -288,3 +288,72 @@ async fn omitted_prompt_capabilities_default_to_empty_object() {
         "default promptCapabilities should be an empty object"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn resume_of_live_locked_session_refuses_instead_of_clobbering() {
+    // session/load keeps returning the stale-lock error and the lock
+    // cannot be stolen (no dead PID to reap, and no lockfile for this
+    // fixture id), so try_load_session exhausts its retry budget and
+    // surfaces "active in another process". negotiate_session must NOT
+    // paper over that by starting a fresh session -- that would discard
+    // the live one -- it returns an error so the client can reconnect
+    // once the owner releases the lock.
+    let mut replies = vec![FakeReply::Ok(json!({
+        "agentCapabilities": { "promptCapabilities": {} }
+    }))];
+    // One reply per load attempt in try_load_session's retry budget.
+    for _ in 0..6 {
+        replies.push(FakeReply::Err(
+            "Session is active in another process (pid 999999)".into(),
+        ));
+    }
+    let agent = spawn_fake_agent(replies);
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let res = timeout(
+        Duration::from_secs(5),
+        negotiate_session(
+            &agent,
+            &tx,
+            Some("live-elsewhere-sid".into()),
+            Some("/tmp".into()),
+            BUILD_ID,
+        ),
+    )
+    .await
+    .expect("negotiate within 5s");
+
+    let err = match res {
+        Ok(_) => panic!("resume of a live-locked session must not succeed via a new session"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("active in another process"),
+        "error should explain the session is held elsewhere: {err}"
+    );
+    assert!(
+        err.contains("live-elsewhere-sid"),
+        "error should name the contended session id: {err}"
+    );
+
+    // No fresh session started: no `ready`, no `session_info`, and no
+    // "Starting a new one" fallback notice.
+    let frames = drain_outbound(&mut rx);
+    assert!(
+        frames.iter().all(|f| f["type"] != "ready"),
+        "no ready frame on a refused resume: {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|f| f["type"] != "session_info"),
+        "no session_info on a refused resume: {frames:?}"
+    );
+    let has_fallback_notice = frames.iter().any(|f| {
+        f["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("Starting a new one"))
+    });
+    assert!(
+        !has_fallback_notice,
+        "must not emit the fallback notice: {frames:?}"
+    );
+}
