@@ -87,7 +87,8 @@ Then point a browser at `http://127.0.0.1:9510` (or whatever IP and port you set
 
 - **Rust** toolchain, stable. [rustup][rustup] or your distro's package manager.
 - **Node.js** 22 or newer with `npm` on `PATH`. Installing Mezame builds the embedded React UI as part of `build.rs`; the install fails fast if `node`/`npm` are missing.
-- **An ACP-capable agent** on `PATH`: Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, etc. `mezame init` probes for known CLIs and offers them in a menu.
+- **An ACP-capable agent** on `PATH`: Kiro CLI, Gemini CLI, Codex, etc. `mezame init` probes for known CLIs and offers them in a menu. You can configure several and pick between them per session (the new-session dialog shows a picker when more than one is set up); see the [configuration reference](./docs/architecture.md).
+- **For Claude Code**, additionally install the [Claude Code ACP bridge](https://github.com/agentclientprotocol/claude-agent-acp) — Claude does not speak ACP itself. `npm i -g @agentclientprotocol/claude-agent-acp` (binary `claude-agent-acp`), or run it via `npx`. It needs `ANTHROPIC_API_KEY` in the agent's `env`, or a Claude session you logged into separately.
 
 [rustup]: https://rustup.rs
 [nvm]: https://github.com/nvm-sh/nvm
@@ -161,7 +162,7 @@ None of these ship today, and none block the core loop.
 ## Troubleshooting
 
 **`failed to spawn kiro-cli`**
-`agent_cmd` not on `$PATH`. Use `which kiro-cli` and put the absolute path in `~/.mezame/config.json`.
+The agent's `command` is not on `$PATH`. Use `which kiro-cli` and put the absolute path in the matching `agents[].command` in `~/.mezame/config.json`.
 
 **`cargo build` fails with "npm not found"**
 `build.rs` requires `node` and `npm`. Install Node.js and retry. `MEZAME_SKIP_UI_BUILD=1` lets the Rust build complete without Node, but the resulting binary will be missing its UI.

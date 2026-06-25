@@ -79,8 +79,9 @@ export const CwdChip = ({ session }: Props) => {
       return;
     }
     // Spawn a sibling tab. The store places new tabs leftmost and
-    // activates them automatically.
-    mezameActions.newSession(next);
+    // activates them automatically. Carry the current session's agent
+    // across so changing directory keeps the same agent.
+    mezameActions.newSession(next, null, session.agent);
     cancel();
   };
   if (editing) {

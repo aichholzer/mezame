@@ -4,6 +4,12 @@ Mezame speaks two protocols: JSON text frames to the browser over `/ws`, and ACP
 
 ## Browser to Mezame (JSON text frames over `/ws`)
 
+The browser opens the WebSocket at `/ws` with optional query params:
+
+- `?session=<acp-session-id>` — attach to (or recreate via `session/load`) an existing session. Absent = a fresh `session/new`.
+- `?cwd=<path>` — working directory for a new session. Absent or empty = Mezame's own process cwd.
+- `?agent=<name>` — which configured agent (by `agents[].name`) backs this session. Absent = the server's default (first configured agent). The agent is fixed for the session's lifetime, so the browser re-sends this on every reconnect; a session cannot be resumed against a different agent than the one that owns its session store.
+
 ```json
 { "type": "prompt", "text": "hello" }
 { "type": "prompt", "blocks": [{ "type": "text", "text": "look at this" },
@@ -53,6 +59,8 @@ The same file carries a `settings` object for app-wide preferences (theme, notif
 `GET /state/events` is a Server-Sent Events stream that emits a `state_changed` event each time `PUT /state` writes a new file. Browsers use it as a "go refetch `/state`" signal so a session opened in another browser shows up without a manual reload. A periodic keep-alive comment keeps intermediaries from idle-timing out the stream.
 
 `GET /tool-result?session=<id>&id=<toolUseId>` returns the result content for a single tool call from Kiro's session JSONL. Some tools (e.g. web search) flip status to `completed`/`failed` over the live wire without streaming their output; the client polls this endpoint after a status flip to fill in the result. Response shape is `{ "status": <string|null>, "content": <Value|null> }`; a missing entry returns 404.
+
+`GET /agents` lists the configured agents the new-session picker chooses between: `{ "agents": ["kiro", "claude"], "default": "kiro" }`. Only `name`s are exposed; the command, args, and env (which may hold secrets such as `ANTHROPIC_API_KEY`) stay server-side. `default` is the first configured agent, or `null` when none are configured. The browser sends the chosen name back as the `?agent=` WS param.
 
 ## Mezame to agent (stdio, ACP JSON-RPC 2.0)
 

@@ -158,7 +158,8 @@ export const doSync = async () => {
       // tradeoff is preferable to a noisy storm of load failures
       // every time someone reloads.
       acpSessionId: s.used ? s.acpSessionId : null,
-      cwd: s.cwd
+      cwd: s.cwd,
+      agent: s.agent
     })),
     closed,
     activeId,
@@ -270,7 +271,8 @@ const reconcileFromServer = async () => {
       id: entry.id,
       label: typeof entry.label === 'string' ? entry.label : '?',
       acpSessionId: entry.acpSessionId,
-      cwd: typeof entry.cwd === 'string' ? entry.cwd : null
+      cwd: typeof entry.cwd === 'string' ? entry.cwd : null,
+      agent: typeof entry.agent === 'string' ? entry.agent : null
     });
     dirty = true;
   }
@@ -564,13 +566,15 @@ const makeSession = (
   id: string,
   label: string,
   acpSessionId: string | null,
-  cwd: string | null
+  cwd: string | null,
+  agent: string | null = null
 ): Session => ({
   id,
   label,
   acpSessionId,
   liveSessionId: null,
   cwd,
+  agent,
   effectiveCwd: cwd,
   promptCapabilities: {},
   used: acpSessionId !== null,
@@ -604,6 +608,12 @@ const connect = (s: Session) => {
   }
   if (s.cwd) {
     params.set('cwd', s.cwd);
+  }
+  // Re-send the chosen agent on every (re)connect. A resumed session
+  // must reattach to the same agent that owns its session store; the
+  // server falls back to its default when this is absent.
+  if (s.agent) {
+    params.set('agent', s.agent);
   }
   const query = params.toString();
   const url = query ? `${proto}//${location.host}/ws?${query}` : `${proto}//${location.host}/ws`;
@@ -1174,10 +1184,14 @@ if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', kickReconnectsOnVisible);
 }
 
-const newSession = (cwd: string | null = null, name: string | null = null) => {
+const newSession = (
+  cwd: string | null = null,
+  name: string | null = null,
+  agent: string | null = null
+) => {
   const id = newId();
   const label = name && name.length > 0 ? name : String(nextLabel++);
-  const s = makeSession(id, label, null, cwd);
+  const s = makeSession(id, label, null, cwd, agent);
   // New sessions appear leftmost, right after the fixed `+` button, so
   // the freshly-created tab is closest to the control that spawned it.
   sessions.unshift(s);
@@ -1185,8 +1199,14 @@ const newSession = (cwd: string | null = null, name: string | null = null) => {
   activate(id);
 };
 
-const restoreSession = (saved: { id: string; label: string; acpSessionId: string | null; cwd: string | null }) => {
-  const s = makeSession(saved.id, saved.label, saved.acpSessionId, saved.cwd);
+const restoreSession = (saved: {
+  id: string;
+  label: string;
+  acpSessionId: string | null;
+  cwd: string | null;
+  agent: string | null;
+}) => {
+  const s = makeSession(saved.id, saved.label, saved.acpSessionId, saved.cwd, saved.agent);
   // Init-time restore: preserve the order captured in persisted state by
   // appending. The UI's leftmost-insertion rule only applies to user-
   // initiated new sessions.
@@ -1228,6 +1248,7 @@ const closeSession = (id: string) => {
       label: s.label,
       acpSessionId: s.acpSessionId,
       cwd: s.cwd,
+      agent: s.agent,
       closedAt: Date.now()
     });
     if (closed.length > HISTORY_MAX) {
@@ -1255,7 +1276,7 @@ const restoreFromHistory = (acpSessionId: string) => {
     return;
   }
   const entry = closed.splice(i, 1)[0];
-  const s = makeSession(entry.id, entry.label, entry.acpSessionId, entry.cwd);
+  const s = makeSession(entry.id, entry.label, entry.acpSessionId, entry.cwd, entry.agent);
   // Restoring is user-initiated; place the tab leftmost alongside
   // freshly-created ones for consistency.
   sessions.unshift(s);

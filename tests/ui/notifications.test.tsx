@@ -69,6 +69,7 @@ const baseSession = (overrides: Partial<Session> = {}): Session => ({
   label: '1',
   acpSessionId: null,
   cwd: null,
+  agent: null,
   effectiveCwd: null,
   promptCapabilities: {},
   used: false,

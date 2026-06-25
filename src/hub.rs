@@ -296,6 +296,7 @@ impl HubRegistry {
         cfg: Arc<Config>,
         resume_session_id: Option<String>,
         cwd_override: Option<String>,
+        agent_name: Option<String>,
         build_id: &str,
     ) -> Result<AttachedHub> {
         // Fast path: if the resume id matches an existing hub, attach
@@ -346,14 +347,20 @@ impl HubRegistry {
             }
 
             let result = self
-                .build_and_register(cfg, Some(sid.to_string()), cwd_override, build_id)
+                .build_and_register(
+                    cfg,
+                    Some(sid.to_string()),
+                    cwd_override,
+                    agent_name,
+                    build_id,
+                )
                 .await;
             self.cleanup_build_slot(sid).await;
             return result;
         }
 
         // Fresh-session attach: no key to coordinate on, just build.
-        self.build_and_register(cfg, None, cwd_override, build_id)
+        self.build_and_register(cfg, None, cwd_override, agent_name, build_id)
             .await
     }
 
@@ -382,9 +389,18 @@ impl HubRegistry {
         cfg: Arc<Config>,
         resume_session_id: Option<String>,
         cwd_override: Option<String>,
+        agent_name: Option<String>,
         build_id: &str,
     ) -> Result<AttachedHub> {
-        let hub = build_hub(cfg, resume_session_id, cwd_override, build_id, self.clone()).await?;
+        let hub = build_hub(
+            cfg,
+            resume_session_id,
+            cwd_override,
+            agent_name,
+            build_id,
+            self.clone(),
+        )
+        .await?;
         let session_id = hub.session_id.clone();
         let mut map = self.inner.write().await;
         let entry = map.entry(session_id).or_insert_with(|| Arc::new(hub));
@@ -502,10 +518,16 @@ async fn build_hub(
     cfg: Arc<Config>,
     resume_session_id: Option<String>,
     cwd_override: Option<String>,
+    agent_name: Option<String>,
     build_id: &str,
     registry: HubRegistry,
 ) -> Result<SessionHub> {
-    let (agent, updates_rx) = spawn_agent(&cfg).await?;
+    // Resolve which configured agent backs this session before spawning.
+    // The choice is fixed for the hub's lifetime: a session lives in the
+    // chosen agent's own session store, so a later resume must reuse the
+    // same agent (the browser re-sends `?agent=` on reconnect).
+    let agent_cfg = cfg.resolve_agent(agent_name.as_deref())?;
+    let (agent, updates_rx) = spawn_agent(agent_cfg).await?;
     let agent = Arc::new(agent);
 
     // Run the negotiation phase and collect the outbound events into a

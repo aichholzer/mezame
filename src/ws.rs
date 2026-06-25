@@ -227,13 +227,21 @@ pub(crate) async fn ws_upgrade(
     // always new session.
     // `/ws?cwd=<path>` overrides the working directory for this
     // session; absent or empty = Mezame's own process cwd.
+    // `/ws?agent=<name>` selects which configured agent backs this
+    // session; absent = the first configured agent (the default). The
+    // browser re-sends it on reconnect so a resumed session reattaches
+    // to the same agent that owns its session store.
     let resume = params.get("session").cloned();
     let cwd_override = params
         .get("cwd")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let agent_name = params
+        .get("agent")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws(socket, state, resume, cwd_override).await {
+        if let Err(e) = handle_ws(socket, state, resume, cwd_override, agent_name).await {
             eprintln!("WebSocket session ended: {e:?}");
         }
     })
@@ -250,6 +258,7 @@ async fn handle_ws(
     state: Arc<crate::http::AppState>,
     resume_session_id: Option<String>,
     cwd_override: Option<String>,
+    agent_name: Option<String>,
 ) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
     let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
@@ -275,6 +284,7 @@ async fn handle_ws(
             state.config.clone(),
             resume_session_id,
             cwd_override,
+            agent_name,
             env!("MEZAME_BUILD_ID"),
         )
         .await

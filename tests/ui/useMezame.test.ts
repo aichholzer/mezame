@@ -14,6 +14,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     acpSessionId: null,
     liveSessionId: null,
     cwd: null,
+    agent: null,
     effectiveCwd: null,
     promptCapabilities: {},
     used: false,

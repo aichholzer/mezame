@@ -112,7 +112,7 @@ export const App = () => {
       <NewSessionDialog
         open={newSessionOpen}
         onOpenChange={setNewSessionOpen}
-        onCreate={(cwd, name) => mezameActions.newSession(cwd, name)}
+        onCreate={(cwd, name, agent) => mezameActions.newSession(cwd, name, agent)}
       />
       <NotificationsPrompt />
     </div>

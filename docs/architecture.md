@@ -61,12 +61,23 @@ Mezame/
 ```json
 {
   "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }],
-  "agent_cmd": "kiro-cli",
-  "agent_args": ["acp"]
+  "agents": [
+    { "name": "kiro", "command": "kiro-cli", "args": ["acp"] },
+    {
+      "name": "claude",
+      "command": "claude-agent-acp",
+      "env": { "ANTHROPIC_API_KEY": "sk-ant-..." }
+    }
+  ]
 }
 ```
 
 - `transports`: list of transport entries. Each entry is internally tagged by `kind`. Only `"cloudflared"` is implemented today; running more than one entry at once is not yet supported, so keep the list at a single element. The list shape is future-proofing for adding Telegram and others later (see Roadmap).
 - `transports[].kind = "cloudflared"`: serves HTTP + WebSocket on `bind`, for an external tunnel.
 - `transports[].bind` (cloudflared only): local bind address. Default is loopback; `mezame init` offers `0.0.0.0:9510` if you want LAN reach. Mezame has no auth of its own today, so anything non-loopback relies on Cloudflare Access, or your LAN being trusted.
-- `agent_cmd`: command to launch the ACP agent. Either a bare name, resolved via `$PATH`, or an absolute path. For Kiro use `kiro-cli` with args `["acp"]`.
+- `agents`: list of selectable ACP agents. `mezame init` writes a single entry; add more by hand-editing this file. The browser's new-session dialog offers a picker when more than one is configured (it shows `name`s only), and the **first entry is the default** for new sessions. The agent backing a session is fixed for that session's lifetime: a session lives in its agent's own session store, so it cannot be resumed against a different agent.
+  - `agents[].name`: identifier shown in the picker and sent back as the `?agent=` WS param. Keep it unique within the list.
+  - `agents[].command`: binary to launch the ACP agent. Either a bare name resolved via `$PATH`, or an absolute path. For Kiro use `kiro-cli`; for Claude Code use the bridge binary `claude-agent-acp` (or `npx @agentclientprotocol/claude-agent-acp`).
+  - `agents[].args`: arguments passed on every spawn. Kiro needs `["acp"]`; the Claude Code bridge needs none.
+  - `agents[].env`: extra environment variables merged onto Mezame's own environment for that agent's subprocess. The Claude Code bridge needs `ANTHROPIC_API_KEY` (or a Claude session you logged into separately); Kiro needs none. Kept out of `args` so secrets do not surface in process listings.
+- Legacy `agent_cmd` / `agent_args` (single-agent) configs from before the `agents` list still load: they are migrated into a single agent at load time. New configs should use `agents`.
