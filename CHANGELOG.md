@@ -13,6 +13,20 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.13.2] - 2026-06-26
+
+### Fixed
+
+- Resuming a session held by a live process no longer destroys it.
+  Mezame already steals a stale lock whose PID is dead and rides out the
+  sub-second browser-reload race, but when the lock was held by a
+  genuinely live owner (a local agent still finishing a turn, or, with
+  a synced `~/.kiro`, an agent on another device) the resume fell
+  through to starting a brand-new session, abandoning the in-flight turn
+  and dropping the browser onto an empty throwaway. Mezame now refuses
+  such a resume and surfaces an error so the client reconnects once the
+  owner releases the lock, instead of clobbering the live session.
+
 ## [0.13.1] - 2026-06-26
 
 ### Fixed

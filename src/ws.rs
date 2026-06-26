@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
 use crate::agent::Agent;
-use crate::session::{extract_session_info, short_reason, try_load_session};
+use crate::session::{extract_session_info, is_stale_lock_error, short_reason, try_load_session};
 
 /// How often the server sends a WebSocket `Ping` to each attached
 /// browser. A live peer answers with a `Pong` (or sends any other
@@ -135,6 +135,21 @@ pub async fn negotiate_session(
     let (session_id, resumed, session_info, resume_failed_for) = match resume_session_id {
         Some(sid) => match try_load_session(agent, &sid, &cwd_str).await {
             Ok(value) => (sid, true, extract_session_info(&value), None),
+            // The resume target is held by a LIVE process. try_load_session
+            // already steals dead-PID locks and rides out the sub-second
+            // browser-reload race, so an "active in another process" error
+            // that survives the retry budget means a real owner still holds
+            // the session: a local agent mid-turn, or (with a synced ~/.kiro)
+            // an agent on another device. Starting a fresh session here would
+            // discard that live one -- abandoning the in-flight turn and
+            // dropping the browser onto an empty throwaway. Refuse instead and
+            // let the client reconnect (with back-off) once the owner releases
+            // the lock; a dead-PID lock still self-heals via the steal above.
+            Err(err_str) if is_stale_lock_error(&err_str) => {
+                return Err(anyhow!(
+                    "Session {sid} is active in another process; refusing to start a new one that would discard it. Reconnect once the other window or device releases it."
+                ));
+            }
             Err(err_str) => {
                 eprintln!("Session load failed: {err_str}. Falling back to a new session.");
                 let _ = to_ws_tx.send(text_msg(json!({
