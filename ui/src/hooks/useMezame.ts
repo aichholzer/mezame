@@ -153,6 +153,82 @@ const scheduleSync = () => {
   syncTimer = window.setTimeout(doSync, 400);
 };
 
+/**
+ * Build the `sessions` array to PUT to `/state`, merging this browser's
+ * local view with any sessions only the server knows about.
+ *
+ * `/state` is last-writer-wins per top-level key and `doSync` owns the
+ * `sessions` array, so a blind write of just the local list silently
+ * drops a session another device opened but this browser has not yet
+ * learned about: a backgrounded tab whose `/state/events` stream missed
+ * ticks, a device just switched to, or an init race. That is how a live
+ * session vanished from `state.json` while its conversation stayed on
+ * disk.
+ *
+ * Absence from the local list is ambiguous, exactly as on the read path
+ * (`shouldCloseAbsentSession`): it can mean "we never knew about it"
+ * (carry it forward) or "we closed it" (let the close propagate). We
+ * disambiguate with the same positive evidence: a deliberately closed
+ * session is recorded in a `closed` list. So we carry forward every
+ * server session we lack locally that is not recorded as closed on
+ * EITHER side, mirroring the keep-don't-drop bias of the reconcile.
+ *
+ * Pure and exported so the regression test can drive it without module
+ * state or `fetch`.
+ *
+ * @internal
+ */
+export const mergeSessionsForSync = (
+  localSessions: PersistedState['sessions'],
+  localClosed: ClosedEntry[],
+  existing: Partial<PersistedState> | null
+): PersistedState['sessions'] => {
+  const serverSessions = existing?.sessions;
+  if (!Array.isArray(serverSessions)) {
+    return localSessions;
+  }
+  const localIds = new Set(localSessions.map((s) => s.id));
+  // A deliberately closed session must not be resurrected; honour both
+  // our own `closed` history and the server's, so a close that
+  // originated on another device also suppresses the carry-forward.
+  const closedAcpIds = new Set<string>();
+  for (const c of localClosed) {
+    if (c && typeof c.acpSessionId === 'string') {
+      closedAcpIds.add(c.acpSessionId);
+    }
+  }
+  const serverClosed = existing?.closed;
+  if (Array.isArray(serverClosed)) {
+    for (const c of serverClosed) {
+      if (c && typeof c.acpSessionId === 'string') {
+        closedAcpIds.add(c.acpSessionId);
+      }
+    }
+  }
+  const carried: PersistedState['sessions'] = [];
+  for (const entry of serverSessions) {
+    if (!entry || typeof entry.id !== 'string' || localIds.has(entry.id)) {
+      continue;
+    }
+    // Only carry resumable sessions (an on-disk Kiro session exists),
+    // matching the restore guard in `reconcileFromServer`. An unused tab
+    // from another browser has no acp id yet and nothing to lose.
+    if (typeof entry.acpSessionId !== 'string' || entry.acpSessionId.length === 0) {
+      continue;
+    }
+    if (closedAcpIds.has(entry.acpSessionId)) {
+      continue;
+    }
+    carried.push({
+      id: entry.id,
+      label: typeof entry.label === 'string' ? entry.label : '?',
+      acpSessionId: entry.acpSessionId,
+      cwd: typeof entry.cwd === 'string' ? entry.cwd : null
+    });
+  }
+  return carried.length > 0 ? [...localSessions, ...carried] : localSessions;
+};
+
 export const doSync = async () => {
   syncTimer = null;
   const owned: PersistedState = {
@@ -182,8 +258,18 @@ export const doSync = async () => {
     // reconcile), silently resetting e.g. `autoAllowPermissions` so the
     // user gets re-prompted. Carry across whatever we do not own,
     // mirroring how `settings.ts` persist() preserves our fields.
+    //
+    // The `sessions` array is ours, but a blind write of just the local
+    // list has its own hazard: it drops a session another device opened
+    // that we have not synced yet (the residual of the cross-device
+    // clobber the reconcile guards against on the read path).
+    // `mergeSessionsForSync` unions in those server-only sessions first.
     const existing = await fetchState();
-    const body = { ...(existing ?? {}), ...owned };
+    const body = {
+      ...(existing ?? {}),
+      ...owned,
+      sessions: mergeSessionsForSync(owned.sessions, closed, existing)
+    };
     await fetch(STATE_URL, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },

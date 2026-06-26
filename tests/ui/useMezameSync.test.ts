@@ -12,7 +12,7 @@
 // not own. This test drives `doSync` directly and asserts the PUT body
 // still contains a pre-existing `settings` object.
 
-import { doSync } from '@/hooks/useMezame';
+import { doSync, mergeSessionsForSync } from '@/hooks/useMezame';
 
 type Captured = { url: string; body: unknown };
 
@@ -85,5 +85,98 @@ describe('doSync read-then-merge', () => {
     const body = puts[0].body as Record<string, unknown>;
     expect(body).toHaveProperty('sessions');
     expect(body).not.toHaveProperty('settings');
+  });
+});
+
+
+// Regression for the "live session vanished from state.json on device
+// switch" bug. `/state` is last-writer-wins and `doSync` owns the
+// `sessions` array, so a stale/backgrounded browser used to overwrite
+// the shared list with its own partial view, dropping a session another
+// device still had open (the conversation survived on disk, but the
+// pointer was lost and had to be re-added by hand). `mergeSessionsForSync`
+// unions in server-only sessions so a stale writer can no longer clobber
+// a peer's live session.
+
+const persisted = (id: string, acpSessionId: string | null = `acp-${id}`) => ({
+  id,
+  label: id,
+  acpSessionId,
+  cwd: null
+});
+
+const closedEntry = (acpSessionId: string) => ({
+  id: `c-${acpSessionId}`,
+  label: 'gone',
+  acpSessionId,
+  cwd: null,
+  closedAt: 1
+});
+
+describe('mergeSessionsForSync', () => {
+  it('carries forward a server session the local list is missing', () => {
+    const local = [persisted('a')];
+    const server = { sessions: [persisted('a'), persisted('peer', '9600fd23')], closed: [] };
+    const merged = mergeSessionsForSync(local, [], server);
+    expect(merged.map((s) => s.id).sort()).toEqual(['a', 'peer']);
+    expect(merged.find((s) => s.id === 'peer')?.acpSessionId).toBe('9600fd23');
+  });
+
+  it('does not duplicate sessions present on both sides', () => {
+    const local = [persisted('a'), persisted('b')];
+    const server = { sessions: [persisted('a'), persisted('b')], closed: [] };
+    expect(mergeSessionsForSync(local, [], server).map((s) => s.id)).toEqual(['a', 'b']);
+  });
+
+  it('does not resurrect a session in our own closed history', () => {
+    const local = [persisted('a')];
+    const server = { sessions: [persisted('a'), persisted('gone')], closed: [] };
+    const merged = mergeSessionsForSync(local, [closedEntry('acp-gone')], server);
+    expect(merged.map((s) => s.id)).toEqual(['a']);
+  });
+
+  it('does not resurrect a session in the server closed history', () => {
+    const local = [persisted('a')];
+    const server = {
+      sessions: [persisted('a'), persisted('gone')],
+      closed: [closedEntry('acp-gone')]
+    };
+    expect(mergeSessionsForSync(local, [], server).map((s) => s.id)).toEqual(['a']);
+  });
+
+  it('skips server sessions with no acp id (unused tab elsewhere)', () => {
+    const local = [persisted('a')];
+    const server = { sessions: [persisted('a'), persisted('fresh', null)], closed: [] };
+    expect(mergeSessionsForSync(local, [], server).map((s) => s.id)).toEqual(['a']);
+  });
+
+  it('returns the local list unchanged when the server has no sessions', () => {
+    const local = [persisted('a')];
+    expect(mergeSessionsForSync(local, [], null)).toBe(local);
+    expect(mergeSessionsForSync(local, [], {})).toBe(local);
+  });
+});
+
+describe('doSync session carry-forward', () => {
+  it('writes back a server session the local list is missing instead of clobbering it', async () => {
+    // Module-level local sessions are empty in this suite, so the only
+    // way `peer` reaches the PUT body is the carry-forward merge.
+    const peer = { id: 'peer-1', label: 'Memory Overhaul', acpSessionId: '9600fd23', cwd: null };
+    const calls = stubFetch({
+      sessions: [peer],
+      closed: [],
+      activeId: 'peer-1',
+      nextLabel: 5,
+      settings: { theme: 'dark' }
+    });
+
+    await doSync();
+
+    const puts = calls.filter((c) => c.url === '/state');
+    expect(puts).toHaveLength(1);
+    const body = puts[0].body as { sessions: Array<{ id: string }>; settings: unknown };
+    expect(body.sessions.map((s) => s.id)).toContain('peer-1');
+    // Existing read-then-merge behaviour still holds.
+    expect(body.settings).toEqual({ theme: 'dark' });
   });
 });
