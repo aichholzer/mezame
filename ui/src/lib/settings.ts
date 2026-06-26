@@ -17,6 +17,7 @@ type Settings = {
   theme: ThemePreference;
   autoAllowPermissions: boolean;
   sendOnEnter: boolean;
+  idleSuspendMinutes: number;
 };
 
 const DEFAULTS: Settings = {
@@ -34,7 +35,12 @@ const DEFAULTS: Settings = {
   // (Cmd on macOS, Ctrl elsewhere) plus Enter submits. Purely a UI
   // affordance: unlike autoAllowPermissions the Rust core never reads
   // it, so it rides the generic /state blob with no server change.
-  sendOnEnter: true
+  sendOnEnter: true,
+  // Minutes a backgrounded (or hidden active) session may sit idle after
+  // its last turn before Mezame suspends it, freeing its agent + MCP
+  // fleet. Read by the idle scan in useMezame; rides the /state settings
+  // blob, so the Rust core never reads it (no server change).
+  idleSuspendMinutes: 15
 };
 
 // Theme is mirrored to localStorage (in addition to the /state round
@@ -42,6 +48,23 @@ const DEFAULTS: Settings = {
 // before first paint — see `bootTheme` in hooks/useTheme.ts. Without
 // this the app would paint light then flip to dark once /state
 // resolves, a jarring flash for a night-mode feature.
+/** Idle-suspend bounds, in minutes. The Settings slider clamps to this
+ * inclusive range; the store clamps again defensively on every set so a
+ * hand-edited state.json or an out-of-range number box cannot push the
+ * threshold outside it. */
+export const IDLE_SUSPEND_MIN_MINUTES = 1;
+export const IDLE_SUSPEND_MAX_MINUTES = 60;
+
+const clampIdleMinutes = (n: number): number => {
+  if (!Number.isFinite(n)) {
+    return DEFAULTS.idleSuspendMinutes;
+  }
+  return Math.min(
+    IDLE_SUSPEND_MAX_MINUTES,
+    Math.max(IDLE_SUSPEND_MIN_MINUTES, Math.round(n))
+  );
+};
+
 const THEME_KEY = 'mezame.theme';
 
 const isThemePreference = (v: unknown): v is ThemePreference =>
@@ -116,6 +139,18 @@ export const setSendOnEnter = (next: boolean): void => {
   void persist();
 };
 
+export const getIdleSuspendMinutes = (): number => current.idleSuspendMinutes;
+
+export const setIdleSuspendMinutes = (next: number): void => {
+  const clamped = clampIdleMinutes(next);
+  if (current.idleSuspendMinutes === clamped) {
+    return;
+  }
+  current = { ...current, idleSuspendMinutes: clamped };
+  notify();
+  void persist();
+};
+
 /** Synchronous read of the persisted theme for pre-paint boot. Falls
  * back to the default when storage is empty or unavailable. */
 export const readThemeFromStorage = (): ThemePreference => {
@@ -178,6 +213,14 @@ export const initSettings = async (): Promise<void> => {
       if (typeof sendOnEnter === 'boolean' && sendOnEnter !== current.sendOnEnter) {
         current = { ...current, sendOnEnter };
         notify();
+      }
+      const idleMins = body.settings.idleSuspendMinutes;
+      if (typeof idleMins === 'number' && Number.isFinite(idleMins)) {
+        const clamped = clampIdleMinutes(idleMins);
+        if (clamped !== current.idleSuspendMinutes) {
+          current = { ...current, idleSuspendMinutes: clamped };
+          notify();
+        }
       }
     }
   } catch {

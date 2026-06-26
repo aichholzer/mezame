@@ -20,6 +20,7 @@ import type {
   Status,
   ToolCallLocation
 } from '@/types';
+import { getIdleSuspendMinutes } from '@/lib/settings';
 
 // Multi-session ACP store.
 //
@@ -127,6 +128,14 @@ const raiseAttention = (s: Session, level: NonNullable<Attention>) => {
   if (!s.attention || rank[level] >= rank[s.attention]) {
     s.attention = level;
   }
+};
+
+/** Stamp the session's idle anchor to "now". Called whenever the user or
+ * agent does something meaningful: a turn finishing, a prompt being sent,
+ * the tab being activated, or a (re)connect completing. The idle scan
+ * (`shouldSuspendIdle`) measures elapsed time from this stamp. */
+const markActivity = (s: Session) => {
+  s.lastActivityAt = Date.now();
 };
 
 // ---------- persistence ----------
@@ -592,6 +601,8 @@ const makeSession = (
   reconnectAttempt: 0,
   reconnectTimer: null,
   closing: false,
+  suspended: false,
+  lastActivityAt: Date.now(),
   inFlight: false,
   thoughtOpen: false
 });
@@ -620,7 +631,18 @@ const connect = (s: Session) => {
   };
 
   ws.onclose = () => {
+    // Stale-socket guard: if we have already moved on to a newer socket
+    // (a reconnect, or a suspend -> resume cycle), this close belongs to a
+    // dead one and must not drive reconnection.
+    if (s.ws !== ws) {
+      return;
+    }
     if (s.closing) {
+      return;
+    }
+    // Intentional idle-suspend: stay grey, do not reconnect. The server's
+    // grace timer reaps the agent; we reattach on the next interaction.
+    if (s.suspended) {
       return;
     }
     setStatus(s, 'reconnecting');
@@ -642,6 +664,132 @@ const connect = (s: Session) => {
   };
 
   ws.onmessage = (e) => handleMessage(s, e);
+};
+
+/** Soft-suspend a session for idleness: drop its socket WITHOUT archiving
+ * or auto-reconnecting, so the server's grace timer reaps the agent and
+ * its MCP fleet. The tab stays in the sidebar (grey). Mutates in place;
+ * the caller owns `notify()`. No-op when already suspended or closing. */
+const suspendSessionNoNotify = (s: Session) => {
+  if (s.suspended || s.closing) {
+    return;
+  }
+  s.suspended = true;
+  if (s.reconnectTimer !== null) {
+    clearTimeout(s.reconnectTimer);
+    s.reconnectTimer = null;
+  }
+  s.reconnectAttempt = 0;
+  try {
+    s.ws?.close();
+  } catch {
+    // Already gone: fine.
+  }
+  // Null the handle so the now-dead socket's late onclose is recognised as
+  // stale (see the `s.ws !== ws` guard) and never schedules a retry.
+  s.ws = null;
+};
+
+/** Resume a suspended session: clear the flag and reconnect, which
+ * reattaches via `?session=` (a resume) and rehydrates as needed. The
+ * in-memory log is kept (the tab stays `hydrated`), so resume is seamless.
+ * No-op when not suspended. */
+const resumeSession = (s: Session) => {
+  if (!s.suspended) {
+    return;
+  }
+  s.suspended = false;
+  s.reconnectAttempt = 0;
+  markActivity(s);
+  connect(s);
+};
+
+/** Pure predicate: should this session be suspended for idleness right
+ * now? Split out from the scan so the branch logic is unit-testable
+ * without timers, sockets, or the module singletons.
+ *
+ * All must hold: not already suspended/closing; used and resumable (has an
+ * acp id); not mid-turn (`busy`/`inFlight`); on a healthy live socket
+ * (`connected`); idle past the threshold. The active tab is exempt UNLESS
+ * the browser tab itself is hidden -- a visible active tab is "in use"
+ * even without turns.
+ *
+ * @internal
+ */
+export const shouldSuspendIdle = (
+  session: Pick<
+    Session,
+    | 'suspended'
+    | 'closing'
+    | 'used'
+    | 'acpSessionId'
+    | 'busy'
+    | 'inFlight'
+    | 'status'
+    | 'lastActivityAt'
+  >,
+  ctx: { isActive: boolean; visible: boolean; now: number; thresholdMs: number }
+): boolean => {
+  if (session.suspended || session.closing) {
+    return false;
+  }
+  if (!session.used || !session.acpSessionId) {
+    return false;
+  }
+  if (session.busy || session.inFlight) {
+    return false;
+  }
+  if (session.status !== 'connected') {
+    return false;
+  }
+  if (ctx.isActive && ctx.visible) {
+    return false;
+  }
+  return ctx.now - session.lastActivityAt >= ctx.thresholdMs;
+};
+
+let idleScanTimer: number | null = null;
+const IDLE_SCAN_INTERVAL_MS = 15_000;
+
+/** Scan every session and suspend those idle past the user-configured
+ * threshold. Driven by an interval started in `init`. */
+const maybeSuspendIdle = () => {
+  const thresholdMs = getIdleSuspendMinutes() * 60_000;
+  const now = Date.now();
+  const visible =
+    typeof document === 'undefined' || document.visibilityState === 'visible';
+  let dirty = false;
+  for (const s of sessions) {
+    const ctx = { isActive: s.id === activeId, visible, now, thresholdMs };
+    if (shouldSuspendIdle(s, ctx)) {
+      suspendSessionNoNotify(s);
+      dirty = true;
+    }
+  }
+  if (dirty) {
+    notify();
+  }
+};
+
+const startIdleScan = () => {
+  if (idleScanTimer !== null || typeof window === 'undefined') {
+    return;
+  }
+  idleScanTimer = window.setInterval(maybeSuspendIdle, IDLE_SCAN_INTERVAL_MS);
+};
+
+/** When the browser tab becomes visible again, resume the ACTIVE session
+ * if it was suspended while hidden. Background suspended tabs stay
+ * suspended until the user clicks them, so we never respawn every agent at
+ * once on focus. */
+const resumeActiveOnVisible = () => {
+  if (typeof document === 'undefined' || document.visibilityState !== 'visible') {
+    return;
+  }
+  const s = activeId ? findSession(activeId) : undefined;
+  if (s && s.suspended) {
+    resumeSession(s);
+  }
 };
 
 const handleMessage = (s: Session, event: MessageEvent<string>) => {
@@ -919,6 +1067,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         setBusy(s, false);
       }
       setStatus(s, 'connected');
+      markActivity(s);
       break;
     case 'append':
       // User-role chunks during replay: make sure each one starts on its
@@ -1085,6 +1234,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       });
       setBusy(s, false);
       raiseAttention(s, 'done');
+      markActivity(s);
       break;
     case 'error':
       appendLog(s, {
@@ -1099,6 +1249,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       s.thoughtOpen = false;
       setBusy(s, false);
       raiseAttention(s, 'error');
+      markActivity(s);
       break;
     case 'session_info':
       s.modes = msg.info.modes?.availableModes ?? [];
@@ -1120,6 +1271,15 @@ const activate = (id: string) => {
   const s = findSession(id);
   if (s && s.attention) {
     s.attention = null;
+  }
+  // Activating a session counts as interaction: stamp the idle anchor, and
+  // if the tab was suspended for idleness, resume it now (reconnect ->
+  // resume the agent session, rehydrating from history if needed).
+  if (s) {
+    markActivity(s);
+    if (s.suspended) {
+      resumeSession(s);
+    }
   }
   notify();
   scheduleSync();
@@ -1172,6 +1332,7 @@ const kickReconnectsOnVisible = () => {
 if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', clearActiveAttentionOnVisible);
   document.addEventListener('visibilitychange', kickReconnectsOnVisible);
+  document.addEventListener('visibilitychange', resumeActiveOnVisible);
 }
 
 const newSession = (cwd: string | null = null, name: string | null = null) => {
@@ -1370,6 +1531,7 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   }
   s.ws.send(JSON.stringify({ type: 'prompt', blocks }));
 
+  markActivity(s);
   s.thinking = true;
   s.inFlight = true;
   setBusy(s, true);
@@ -1548,6 +1710,7 @@ const init = async () => {
   // Subscribe to cross-browser change notifications so a session
   // started elsewhere shows up here without a manual reload.
   startStateEventStream();
+  startIdleScan();
 };
 
 // ---------- public hook ----------

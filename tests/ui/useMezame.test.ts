@@ -3,7 +3,12 @@
 // `Session` and assert the resulting log + flags. No React, no real
 // WebSocket, no fetch.
 
-import { applyServerMessage, deriveLabel, shouldCloseAbsentSession } from '@/hooks/useMezame';
+import {
+  applyServerMessage,
+  deriveLabel,
+  shouldCloseAbsentSession,
+  shouldSuspendIdle
+} from '@/hooks/useMezame';
 import type { LogEntry, ServerMessage, Session } from '@/types';
 
 /** Build a session with the same defaults the production factory uses. */
@@ -35,6 +40,8 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     reconnectAttempt: 0,
     reconnectTimer: null,
     closing: false,
+    suspended: false,
+    lastActivityAt: Date.now(),
     inFlight: false,
     ...overrides
   };
@@ -556,5 +563,80 @@ describe('deriveLabel', () => {
 
   it('strips URLs before deriving', () => {
     expect(deriveLabel('Check https://example.com/foo now')).toBe('Check now');
+  });
+});
+
+
+// ---------- idle suspend ----------
+
+describe('shouldSuspendIdle', () => {
+  const ctx = (over: Partial<{ isActive: boolean; visible: boolean; now: number; thresholdMs: number }> = {}) => ({
+    isActive: false,
+    visible: true,
+    now: 10_000_000,
+    thresholdMs: 60_000,
+    ...over
+  });
+  // A background session idle for 2 minutes against a 1-minute threshold.
+  const idle = (over: Partial<Session> = {}) =>
+    makeSession({
+      used: true,
+      acpSessionId: 'acp-1',
+      status: 'connected',
+      busy: false,
+      inFlight: false,
+      suspended: false,
+      closing: false,
+      lastActivityAt: 10_000_000 - 120_000,
+      ...over
+    });
+
+  it('suspends an idle, used, connected background session', () => {
+    expect(shouldSuspendIdle(idle(), ctx())).toBe(true);
+  });
+
+  it('does not suspend before the threshold elapses', () => {
+    expect(shouldSuspendIdle(idle({ lastActivityAt: 10_000_000 - 30_000 }), ctx())).toBe(false);
+  });
+
+  it('never suspends a session with a turn in flight', () => {
+    expect(shouldSuspendIdle(idle({ inFlight: true }), ctx())).toBe(false);
+    expect(shouldSuspendIdle(idle({ busy: true }), ctx())).toBe(false);
+  });
+
+  it('never suspends an unused or unresumable session', () => {
+    expect(shouldSuspendIdle(idle({ used: false }), ctx())).toBe(false);
+    expect(shouldSuspendIdle(idle({ acpSessionId: null }), ctx())).toBe(false);
+  });
+
+  it('never suspends a session that is not on a healthy socket', () => {
+    expect(shouldSuspendIdle(idle({ status: 'reconnecting' }), ctx())).toBe(false);
+  });
+
+  it('never re-suspends an already-suspended or closing session', () => {
+    expect(shouldSuspendIdle(idle({ suspended: true }), ctx())).toBe(false);
+    expect(shouldSuspendIdle(idle({ closing: true }), ctx())).toBe(false);
+  });
+
+  it('exempts the active tab while the browser tab is visible', () => {
+    expect(shouldSuspendIdle(idle(), ctx({ isActive: true, visible: true }))).toBe(false);
+  });
+
+  it('suspends the active tab when the browser tab is hidden', () => {
+    expect(shouldSuspendIdle(idle(), ctx({ isActive: true, visible: false }))).toBe(true);
+  });
+});
+
+describe('applyServerMessage idle anchor', () => {
+  it('stamps lastActivityAt on prompt_done', () => {
+    const s = makeSession({ lastActivityAt: 1 });
+    applyServerMessage(s, { type: 'prompt_done' });
+    expect(s.lastActivityAt).toBeGreaterThan(1);
+  });
+
+  it('stamps lastActivityAt on ready', () => {
+    const s = makeSession({ lastActivityAt: 1 });
+    applyServerMessage(s, { type: 'ready', sessionId: 'x', resumed: false });
+    expect(s.lastActivityAt).toBeGreaterThan(1);
   });
 });

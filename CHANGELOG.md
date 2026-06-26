@@ -13,6 +13,19 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.13.0] - 2026-06-26
+
+### Added
+
+- Idle session suspend/resume. A session left idle in the sidebar past
+  a configurable quiet period now drops its WebSocket so the server
+  tears down its agent and MCP fleet, reclaiming the memory those
+  processes hold. The tab stays in place, greyed out, and transparently
+  reconnects (resuming the agent session) the moment you interact with
+  it again. The active tab is only suspended while the browser tab is
+  hidden. A new Settings control sets the idle threshold (1-60 minutes,
+  default 15).
+
 ## [0.12.2] - 2026-06-08
 
 ### Fixed
@@ -177,7 +190,6 @@ build-time Vite define.
   throughout and Gugi for the wordmark.
 
   Highlights:
-
   - New image & avatar.
   - Warm cream surface ladder with a saturated terracotta primary
     that carries through to the user bubble, send button, sidebar
@@ -228,7 +240,6 @@ build-time Vite define.
   which is exactly what <code>web_search</code> does. The 1.25s
   poll window after the status flip ran out before the JSONL
   even existed for that block. Two changes:
-
   - The post-status poll window expands to ~5s (10 attempts at
     500ms), so a tool whose result lands a couple of seconds
     after the status flip still backfills mid-turn.
@@ -1191,7 +1202,7 @@ build-time Vite define.
   after interactive setup.
 - **Transports are now a list.** The top-level `transport` enum and
   `bind` string are gone. Replaced by `transports: [{ "kind":
-  "cloudflared", "bind": "..." }]`. Only one entry is accepted at
+"cloudflared", "bind": "..." }]`. Only one entry is accepted at
   runtime today; the list shape is forward-compatible with a future
   Telegram transport without another break.
 - **Default port changed from 7842 to 9510.** Existing tunnels and LAN
@@ -1299,6 +1310,7 @@ build-time Vite define.
 ## [0.6.0] — 2026-05-07
 
 ### Changed
+
 - Project renamed from `racp` to `okiro`. User-facing wordmark read
   "Okiro!" in the UI header and the window title. Japanese for "wake
   up!" (起きろ), which is what you do to a Kiro that is asleep
@@ -1314,6 +1326,7 @@ build-time Vite define.
 ## [0.5.6] — 2026-05-07
 
 ### Changed
+
 - Agent / Model selector trigger text is brighter: the current value
   uses `--foreground` now (was `--muted-foreground`) and the
   "Agent:" / "Model:" label prefix bumped from `/70` opacity to
@@ -1325,6 +1338,7 @@ build-time Vite define.
 ## [0.5.5] — 2026-05-07
 
 ### Changed
+
 - Single shared centred column at 1440px: TabBar and the chat area
   now live inside it as siblings, so the tab bar fills its parent
   with a plain `w-full` instead of duplicating the max-width
@@ -1333,12 +1347,14 @@ build-time Vite define.
 ## [0.5.4] — 2026-05-07
 
 ### Changed
+
 - Content column max width bumped to 1440px. Tab bar synced so the
   header and the chat pane stay aligned.
 
 ## [0.5.3] — 2026-05-07
 
 ### Changed
+
 - UI content column is now centred with a 1100px max width. Prevents
   the chat from spreading across the full viewport on ultrawide
   displays while still filling regular laptop and desktop screens.
@@ -1347,6 +1363,7 @@ build-time Vite define.
 ## [0.5.2] — 2026-05-07
 
 ### Changed
+
 - Agent and Model selectors are back inline (side-by-side) inside the
   composer's bottom-right, wrapping only if the composer gets
   unusually narrow. Textarea bottom padding reduced accordingly.
@@ -1354,6 +1371,7 @@ build-time Vite define.
 ## [0.5.1] — 2026-05-07
 
 ### Removed
+
 - In-UI cancel button is gone. While the agent is working the send
   button is disabled and the textarea becomes read-only with a
   "agent is working..." placeholder. The WS-level `cancel` path is
@@ -1363,6 +1381,7 @@ build-time Vite define.
 ## [0.5.0] — 2026-05-07
 
 ### Changed
+
 - Composer is now a floating card pinned to the bottom of the chat
   pane. The log pane spans the full height of `<main>`; the composer
   overlays it with `bg-background/70` plus `backdrop-blur-md`, so the
@@ -1381,6 +1400,7 @@ build-time Vite define.
 ## [0.4.1] — 2026-05-07
 
 ### Changed
+
 - Composer is a two-column layout now: message textarea fills column 1,
   Agent and Model selectors stack vertically in column 2.
 - Send and Cancel icon buttons moved inside the textarea (bottom-right
@@ -1391,6 +1411,7 @@ build-time Vite define.
 ## [0.4.0] — 2026-05-07
 
 ### Changed
+
 - Composer redesign. Input is now a multiline `textarea` (starts at two
   rows, auto-grows up to eight, scrolls thereafter). Enter sends,
   Shift+Enter inserts a newline.
@@ -1406,6 +1427,7 @@ build-time Vite define.
 ## [0.3.5] — 2026-05-07
 
 ### Changed
+
 - Busy-tab border thickness bumped from 1px to 2px while the travelling
   glow is running, so more of the rotating colour is visible. Padding
   trimmed by 1px on each side so the overall tab footprint stays
@@ -1414,6 +1436,7 @@ build-time Vite define.
 ## [0.3.4] — 2026-05-07
 
 ### Fixed
+
 - Busy-tab travelling border no longer bleeds across the label. The
   previous version used a 180-degree bright arc plus a translucent
   inner fill, which let the gradient's bright centre peek over the
@@ -1425,6 +1448,7 @@ build-time Vite define.
 ## [0.3.3] — 2026-05-07
 
 ### Changed
+
 - Busy-in-background tabs: the pulsing green fill is replaced by a
   travelling green highlight around the tab border. Uses an animated
   `@property --busy-border-angle` plus a layered background (opaque
@@ -1435,6 +1459,7 @@ build-time Vite define.
 ## [0.3.2] — 2026-05-07
 
 ### Fixed
+
 - Permission-request dot wasn't appearing on busy-in-background tabs.
   The dot was gated to `connected` only; permissions always arrive
   while the tab is `busy` (awaiting the user's click) so the new
@@ -1445,6 +1470,7 @@ build-time Vite define.
 ## [0.3.1] — 2026-05-07
 
 ### Fixed
+
 - Tab pulse, for real this time. Dropped the `color-mix` + custom-
   property + Tailwind-utility-class indirection and just hardcoded
   two plain keyframes (`mezame-pulse-orange`, `mezame-pulse-green`), then
@@ -1455,6 +1481,7 @@ build-time Vite define.
 ## [0.3.0] — 2026-05-07
 
 ### Added
+
 - Tabs now pulse **green** when a turn is still running in the
   background (busy, not the active tab). Precedence on the tab colour
   is now: error > connecting/reconnecting > busy-in-background >
@@ -1463,10 +1490,12 @@ build-time Vite define.
   the busy-background state.
 
 ### Changed
+
 - The attention dot moved to the left of the tab title so it reads as a
   leading indicator rather than trailing after the name.
 
 ### Fixed
+
 - Connecting/Reconnecting tabs actually pulse orange now. The previous
   keyframe was living inside a Tailwind v4 `@layer utilities` block
   that was flattening the animation in production. Moved the pulse
@@ -1477,6 +1506,7 @@ build-time Vite define.
 ## [0.2.2] — 2026-05-07
 
 ### Fixed
+
 - Connecting/Reconnecting tabs now visibly pulsate orange. The keyframe
   was being flattened by the tab's `transition-colors` and the
   low-opacity mix made it invisible even when animating. Intensity
@@ -1486,6 +1516,7 @@ build-time Vite define.
 ## [0.2.1] — 2026-05-07
 
 ### Fixed
+
 - Attention dot on tabs is now legible against any tab background
   (including the matching "Connected" green). Bigger, with a
   background-coloured outline ring and a subtle shadow so the
@@ -1494,6 +1525,7 @@ build-time Vite define.
 ## [0.2.0] — 2026-05-07
 
 ### Changed
+
 - Connection status moved from an in-log pill into the tab itself.
   Tabs now carry a subtle coloured background: green for Connected,
   pulsing orange for Connecting / Reconnecting, red for Disconnected.
@@ -1505,6 +1537,7 @@ build-time Vite define.
 Baseline. Everything that landed up to this point is folded into 0.1.0.
 
 ### Core
+
 - Rust bridge from a browser WebSocket to a locally spawned ACP agent
   (Kiro CLI or any stdio-ACP agent) over JSON-RPC 2.0.
 - Config at `~/.mezame/config.toml`, interactive `init` subcommand.
@@ -1512,6 +1545,7 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
 - Telegram transport stubbed.
 
 ### UI (React + Vite + Tailwind v4 + shadcn)
+
 - Multi-tab chat. One tab = one WS = one Kiro subprocess = one ACP session.
 - Cross-device state persisted via `GET/PUT /state` (`~/.mezame/state.json`).
 - Session resume on reconnect via `?session=<id>` and `session/load`.
@@ -1527,6 +1561,7 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
   budget, 250ms spacing).
 
 ### Markdown and chat layout
+
 - Agent turns rendered with `react-markdown` + `remark-gfm` +
   `rehype-highlight` + `github-dark` highlight.js theme, plus KaTeX
   math (`remark-math` + `rehype-katex`).
@@ -1540,6 +1575,7 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
   resume window to avoid double rendering.
 
 ### Kiro extensions
+
 - `_kiro.dev/commands/available` forwarded as a `commands` event for
   slash-command autocomplete above the input.
 - `modes` and `models` parsed from `session/new` / `session/load` and
@@ -1548,12 +1584,14 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
   `session/set_model` respectively.
 
 ### Layout niceties
+
 - Header: History and New-session buttons on the far left; new tabs
   appear leftmost. `Mezame!` wordmark + version string on the far right.
 - Mode and model selectors in a secondary row below the tab bar, shown
   only when the active session has populated them.
 
 ### Developer ergonomics
+
 - `MEZAME_DEBUG_ACP=1` dumps every inbound ACP line to stderr prefixed
   with `[acp<-]`, useful when wiring new Kiro extensions.
 - `MEZAME_SKIP_UI_BUILD=1` skips the Vite build in `build.rs` for

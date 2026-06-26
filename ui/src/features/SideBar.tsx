@@ -72,9 +72,19 @@ const attentionDotBase =
 // still running a turn while the user has moved to another tab, so
 // background work is never silently hidden. Precedence (top wins):
 //   error > connecting/reconnecting > busy-in-background > connected.
-type TabVisualState = 'connecting' | 'connected' | 'error' | 'busy-background';
+type TabVisualState =
+  | 'suspended'
+  | 'connecting'
+  | 'connected'
+  | 'error'
+  | 'busy-background';
 
 const tabVisualState = (s: Session, isActive: boolean): TabVisualState => {
+  // Idle-suspended sits above everything: a suspended tab shows a steady
+  // grey with no pulse, regardless of its last socket status.
+  if (s.suspended) {
+    return 'suspended';
+  }
   if (s.status === 'error') {
     return 'error';
   }
@@ -88,6 +98,10 @@ const tabVisualState = (s: Session, isActive: boolean): TabVisualState => {
 };
 
 const tabVisualClass: Record<TabVisualState, string> = {
+  // Steady grey, theme-aware via the surface/outline tokens. No animation
+  // entry in tabVisualStyle below, so a suspended tab never pulses.
+  suspended:
+    'bg-[color:var(--surface-container-low)]/50 border-transparent text-[color:var(--outline)] hover:bg-[color:var(--surface-container)] hover:text-foreground',
   connecting: 'border-[color:var(--attn-permission)]/60 text-foreground',
   connected:
     'bg-[color:var(--surface-container-low)] border-transparent text-foreground hover:bg-[color:var(--surface-container)]',
@@ -105,6 +119,8 @@ const tabVisualStyle: Partial<Record<TabVisualState, React.CSSProperties>> = {
 
 const tabTooltipStatus = (state: TabVisualState): string => {
   switch (state) {
+    case 'suspended':
+      return 'Idle - click to resume';
     case 'connecting':
       return 'Connecting...';
     case 'connected':

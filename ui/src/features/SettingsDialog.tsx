@@ -1,6 +1,7 @@
 import { SettingsIcon } from 'lucide-react';
 import { useSyncExternalStore } from 'react';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import {
   Dialog,
   DialogContent,
@@ -13,7 +14,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { cn } from '@/lib/utils';
 import {
   getSettingsSnapshot,
+  IDLE_SUSPEND_MAX_MINUTES,
+  IDLE_SUSPEND_MIN_MINUTES,
   setAutoAllowPermissions,
+  setIdleSuspendMinutes,
   setSendOnEnter,
   subscribeToSettings
 } from '@/lib/settings';
@@ -46,6 +50,14 @@ const useSendOnEnter = (): boolean =>
     subscribeToSettings,
     () => getSettingsSnapshot().sendOnEnter,
     () => getSettingsSnapshot().sendOnEnter
+  );
+
+/** Reactive read of the idle-suspend threshold (minutes). */
+const useIdleSuspendMinutes = (): number =>
+  useSyncExternalStore(
+    subscribeToSettings,
+    () => getSettingsSnapshot().idleSuspendMinutes,
+    () => getSettingsSnapshot().idleSuspendMinutes
   );
 
 /** Accessible on/off switch. No checkbox primitive ships in the UI kit,
@@ -84,6 +96,7 @@ const Switch = ({
 export const SettingsDialog = () => {
   const autoAllow = useAutoAllowPermissions();
   const sendOnEnter = useSendOnEnter();
+  const idleMinutes = useIdleSuspendMinutes();
 
   return (
     <Dialog>
@@ -134,6 +147,43 @@ export const SettingsDialog = () => {
               onChange={setSendOnEnter}
               label="Send message shortcut"
             />
+          </div>
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-sm text-foreground">Suspend idle sessions after</span>
+              <span className="text-xs text-muted-foreground">
+                Disconnect a background session once it has been idle this long, freeing its
+                agent and MCP servers. It reconnects automatically when you return to it.
+              </span>
+            </div>
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min={IDLE_SUSPEND_MIN_MINUTES}
+                max={IDLE_SUSPEND_MAX_MINUTES}
+                step={1}
+                value={idleMinutes}
+                onChange={(e) => setIdleSuspendMinutes(Number(e.target.value))}
+                aria-label="Suspend idle sessions after (minutes)"
+                className="h-1.5 flex-1 cursor-pointer accent-[color:var(--primary)]"
+              />
+              <div className="flex items-center gap-1">
+                <Input
+                  type="number"
+                  min={IDLE_SUSPEND_MIN_MINUTES}
+                  max={IDLE_SUSPEND_MAX_MINUTES}
+                  value={idleMinutes}
+                  onChange={(e) => setIdleSuspendMinutes(Number(e.target.value))}
+                  aria-label="Suspend idle sessions after (minutes, exact)"
+                  className="h-8 w-16 text-center"
+                />
+                <span className="text-xs text-muted-foreground">min</span>
+              </div>
+            </div>
+            <div className="flex justify-between text-[11px] text-muted-foreground">
+              <span>{IDLE_SUSPEND_MIN_MINUTES} min</span>
+              <span>{IDLE_SUSPEND_MAX_MINUTES} min</span>
+            </div>
           </div>
         </div>
       </DialogContent>
