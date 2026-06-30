@@ -13,6 +13,22 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.13.3] - 2026-06-30
+
+### Fixed
+
+- Losing focus on a mobile device mid-turn no longer interrupts the
+  turn. When the last browser detaches, Mezame arms a grace timer and,
+  on expiry, shuts the agent down -- which sends `session/cancel` and
+  aborts any running turn. On mobile, backgrounding the tab or locking
+  the screen drops the WebSocket within seconds, so a multi-minute turn
+  was reliably cancelled ("Response was interrupted by the user") before
+  the user returned. The grace timer is now turn-aware: it keeps the
+  agent warm while a `session/prompt` is in flight and only reclaims the
+  agent once the turn completes, so you can fire a prompt, switch away,
+  and come back to the finished answer. Idle sessions (no turn running)
+  are still reaped on the same grace window.
+
 ## [0.13.2] - 2026-06-26
 
 ### Fixed
