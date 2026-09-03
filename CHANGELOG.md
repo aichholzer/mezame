@@ -38,6 +38,11 @@ build-time Vite define.
   SHA, with its version in a trailing comment. `dtolnay/rust-toolchain`
   publishes no version tags. Its pin is a `master` commit, and every job
   that uses it now names its toolchain explicitly.
+- `actions/setup-node` moves to v7.0.0 and `codecov/codecov-action` to
+  v7.0.0, off the Node 20 action runtime GitHub is retiring. The runner
+  was already forcing both onto Node 24. Codecov's warning came from the
+  `actions/github-script` v7.0.1 it pinned internally; v6.0.0 onward pins
+  v8.0.0.
 - `anyhow` floor raised to 1.0.103, the first release without the
   `Error::downcast_mut` unsoundness of RUSTSEC-2026-0190. Mezame never
   calls that function. The advisory is graded informational.
