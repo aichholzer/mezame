@@ -38,6 +38,9 @@ build-time Vite define.
   SHA, with its version in a trailing comment. `dtolnay/rust-toolchain`
   publishes no version tags. Its pin is a `master` commit, and every job
   that uses it now names its toolchain explicitly.
+- `anyhow` floor raised to 1.0.103, the first release without the
+  `Error::downcast_mut` unsoundness of RUSTSEC-2026-0190. Mezame never
+  calls that function. The advisory carries an informational severity.
 
 ### Fixed
 
