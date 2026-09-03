@@ -49,7 +49,7 @@ Browse `http://127.0.0.1:5173`. The embedded bundle is only relevant when you ru
 The suite lives in `tests/` (Rust integration tests) and `tests/ui/` plus
 `ui/src/**` (Vitest). Run the Rust side with `cargo test --all-targets` and
 the UI side with `npm test` in `ui/`. CI also enforces a coverage floor via
-`cargo llvm-cov` (see `.github/workflows/test.yml`).
+`cargo llvm-cov` (see `.github/workflows/ci.yml`).
 
 Notable coverage already in place:
 
@@ -74,3 +74,22 @@ Notable coverage already in place:
 - `MEZAME_DEBUG_ACP=1` shows every inbound JSON line with `[acp<-]`.
 - Run the agent manually first to confirm the invocation works: `echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | kiro-cli acp` should respond with JSON.
 - Browser devtools, Network, WS view shows every frame in both directions.
+## Releasing
+
+`.github/workflows/publish.yml` publishes to crates.io. It is
+`workflow_dispatch` only: run it from the Actions tab, on `main`.
+
+Before dispatching, three things have to line up, and the workflow refuses
+the run if any of them does not:
+
+- `Cargo.toml` and `ui/package.json` carry the same version.
+- `CHANGELOG.md` has a `## [version]` section. Its body becomes the
+  GitHub release notes.
+- That version is not on crates.io already.
+
+The workflow runs the whole of `ci.yml` first, then packages the crate,
+compiles the packaged sources, publishes, and creates a GitHub release
+tagged with the bare version number.
+
+`CARGO_REGISTRY_TOKEN` is the only secret it needs beyond the automatic
+`GITHUB_TOKEN`.
