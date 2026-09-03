@@ -1,8 +1,7 @@
 import { useSyncExternalStore } from 'react';
 
 // Shared heartbeat so every component that cares about elapsed time
-// re-renders on the same cadence. One interval for the whole app rather
-// than one per component.
+// re-renders on the same cadence. One interval for the whole app.
 
 const INTERVAL_MS = 30_000;
 
@@ -40,5 +39,6 @@ const subscribe = (l: () => void) => {
 
 const getSnapshot = () => counter;
 
-/** Returns a number that increments every 30 seconds, forcing a re-render. */
+/** Returns a number that increments every 30 seconds. Each increment
+ * re-renders every subscriber. */
 export const useTick = (): number => useSyncExternalStore(subscribe, getSnapshot, getSnapshot);

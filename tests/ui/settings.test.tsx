@@ -22,7 +22,7 @@ import {
 beforeEach(() => {
   __resetSettingsForTests();
   // The store persists via fetch(PUT /state); stub it so the debounced
-  // write in tests is a no-op rather than a real network call.
+  // write in tests is a no-op.
   vi.stubGlobal(
     'fetch',
     vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }))

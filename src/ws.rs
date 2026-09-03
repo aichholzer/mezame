@@ -135,16 +135,17 @@ pub async fn negotiate_session(
     let (session_id, resumed, session_info, resume_failed_for) = match resume_session_id {
         Some(sid) => match try_load_session(agent, &sid, &cwd_str).await {
             Ok(value) => (sid, true, extract_session_info(&value), None),
-            // The resume target is held by a LIVE process. try_load_session
-            // already steals dead-PID locks and rides out the sub-second
-            // browser-reload race, so an "active in another process" error
-            // that survives the retry budget means a real owner still holds
-            // the session: a local agent mid-turn, or (with a synced ~/.kiro)
-            // an agent on another device. Starting a fresh session here would
-            // discard that live one -- abandoning the in-flight turn and
-            // dropping the browser onto an empty throwaway. Refuse instead and
-            // let the client reconnect (with back-off) once the owner releases
-            // the lock; a dead-PID lock still self-heals via the steal above.
+            // The resume target is held by a LIVE process.
+            // try_load_session already steals dead-PID locks and rides out
+            // the sub-second browser-reload race. An "active in another
+            // process" error that survives the retry budget means a real
+            // owner still holds the session: a local agent mid-turn, or
+            // (with a synced ~/.kiro) an agent on another device. Starting
+            // a fresh session here would discard that live one, abandoning
+            // the in-flight turn and dropping the browser onto an empty
+            // throwaway. This refuses and lets the client reconnect with
+            // back-off once the owner releases the lock. A dead-PID lock
+            // still self-heals via the steal above.
             Err(err_str) if is_stale_lock_error(&err_str) => {
                 return Err(anyhow!(
                     "Session {sid} is active in another process; refusing to start a new one that would discard it. Reconnect once the other window or device releases it."
@@ -156,17 +157,17 @@ pub async fn negotiate_session(
                     "type": "append",
                     "role": "sys",
                     "text": format!(
-                        "\n[{} — Starting a new one.]\n",
+                        "\n[{}. Starting a new one.]\n",
                         short_reason(&err_str)
                     )
                 })));
                 let (new_sid, info) = start_new_session(agent, &cwd_str).await?;
-                // Carry the id the browser asked to resume so the
-                // client can keep it pinned rather than overwriting
-                // its durable pointer with this throwaway fallback id.
-                // A transient load failure (wrong cwd, stale lock,
-                // agent restart) must not destroy the mapping to a
-                // real conversation on disk.
+                // Pass back the id the browser asked to resume. The
+                // client keeps it pinned and its durable pointer
+                // survives this throwaway fallback id. A transient
+                // load failure (wrong cwd, stale lock, agent restart)
+                // must not destroy the mapping to a real conversation
+                // on disk.
                 (new_sid, false, info, Some(sid))
             }
         },
@@ -176,13 +177,13 @@ pub async fn negotiate_session(
         }
     };
 
-    // Tell the browser which session id it is bound to so it can
-    // persist it for reconnect, and whether this was a resume (so it
-    // can clear stale log before the replay lands). The `cwd` is the
-    // actual path the agent session was opened with, so the UI can
-    // display it even when no `?cwd=` override was supplied.
-    // `buildId` is a unique-per-build token so the UI can detect a
-    // stale bundle and force a reload.
+    // Tell the browser which session id it is bound to, for it to
+    // persist against a reconnect, and whether this was a resume. On a
+    // resume it clears the stale log before the replay lands. The `cwd`
+    // is the actual path the agent session was opened with, and the UI
+    // displays it even when no `?cwd=` override was supplied. `buildId`
+    // is a unique-per-build token the UI reads to detect a stale bundle
+    // and force a reload.
     let _ = to_ws_tx.send(text_msg(json!({
         "type": "ready",
         "sessionId": session_id,
@@ -193,9 +194,10 @@ pub async fn negotiate_session(
         "resumeFailedFor": resume_failed_for
     })));
 
-    // Send the `modes` and `models` payload (if present in either
-    // session/new or session/load result) so the UI can render its
-    // mode/model selectors and the current selections.
+    // Send the `modes` and `models` payload when either the
+    // session/new or the session/load result carries one. The UI
+    // renders its mode and model selectors from it, current selections
+    // included.
     if let Some(info) = session_info {
         let _ = to_ws_tx.send(text_msg(json!({
             "type": "session_info",
@@ -213,10 +215,10 @@ pub async fn negotiate_session(
 /// `error` event to the browser prefixed with `error_prefix`.
 ///
 /// Used for fire-and-forget agent calls triggered by browser messages
-/// (`set_mode`, `set_model`, `permission_response`, etc.). The select
-/// loop must keep pumping while the call is in flight, so we do not
-/// `.await` the future inline. Errors are not propagated back through
-/// the loop, only surfaced to the browser as a UI notice.
+/// (`set_mode`, `set_model`, `permission_response`, and the rest). The
+/// select loop has to keep pumping while the call is in flight, and the
+/// future is never awaited inline. Errors reach the browser as a UI
+/// notice and never travel back through the loop.
 fn spawn_with_error_report(
     to_ws: mpsc::UnboundedSender<Message>,
     error_prefix: &'static str,
@@ -365,18 +367,18 @@ pub async fn run_attach_loop<S, E>(
 {
     // Heartbeat: ping the browser on an interval and evict the socket
     // if it goes silent past `heartbeat_timeout`. `last_seen` is bumped
-    // by ANY inbound frame (text, pong, ping, binary), so a chatty live
-    // browser is never evicted and an idle-but-alive one is kept up by
-    // its pong replies. A half-open socket sends nothing, so it trips
-    // the timeout and we break into the cooperative-shutdown path in
-    // the caller, which decrements the subscriber count and ultimately
-    // reaps the agent. See issue #4.
+    // by ANY inbound frame (text, pong, ping, binary). A chatty live
+    // browser is never evicted, and an idle-but-alive one is kept up by
+    // its pong replies. A half-open socket sends nothing and trips the
+    // timeout. The loop then breaks into the caller's
+    // cooperative-shutdown path, which decrements the subscriber count
+    // and ultimately reaps the agent. See issue #4.
     let mut heartbeat = interval(heartbeat_interval);
-    // If a tick is missed (e.g. the task was busy), fire once and
-    // realign rather than burst-firing to catch up.
+    // A missed tick (the task was busy) fires once and realigns. No
+    // burst of catch-up ticks.
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // The first tick completes immediately; skip it so we do not ping
-    // before the connection has had a chance to settle.
+    // The first tick completes immediately. Skipping it holds the first
+    // ping back until the connection has settled.
     heartbeat.tick().await;
     let mut last_seen = Instant::now();
 
@@ -516,16 +518,16 @@ pub async fn run_select_loop<S, E>(
 {
     loop {
         tokio::select! {
-            // User → agent: messages from the browser. Match the full
-            // Option<Result<Message, _>> here rather than relying on a
-            // `Some(Ok(...))` pattern guard. With a guard, a closed
-            // stream (`None`) or a transport error (`Some(Err(_))`)
-            // disables this select branch silently while the other
-            // branch keeps delivering agent updates. The `else => break`
-            // arm only fires when ALL branches are disabled, so the
-            // loop would never exit and `agent.shutdown()` would never
-            // run. Result: leaked agent subprocess + stale Kiro session
-            // lockfile on every browser disconnect during a long turn.
+            // User → agent: messages from the browser. This matches the
+            // full Option<Result<Message, _>>. A `Some(Ok(...))` pattern
+            // guard would not: with a guard, a closed stream (`None`) or
+            // a transport error (`Some(Err(_))`) disables this select
+            // branch silently while the other branch keeps delivering
+            // agent updates. The `else => break` arm only fires when ALL
+            // branches are disabled. The loop would never exit and
+            // `agent.shutdown()` would never run, leaking an agent
+            // subprocess and a stale Kiro session lockfile on every
+            // browser disconnect during a long turn.
             ws_msg = stream.next() => {
                 let text = match ws_msg {
                     None => break,                              // peer closed the socket
@@ -543,10 +545,10 @@ pub async fn run_select_loop<S, E>(
                     Some("prompt") => {
                         // Browser sends a prompt as either a plain `text`
                         // string (legacy path) or a full ACP-shaped
-                        // `blocks` array. The blocks path is how we carry
-                        // attachments (image, audio, resource) alongside
-                        // the user's text. The server does no validation
-                        // beyond "must be an array"; the agent will reject
+                        // `blocks` array. Attachments (image, audio,
+                        // resource) travel alongside the user's text on
+                        // the blocks path. The server validates nothing
+                        // beyond "must be an array"; the agent rejects
                         // block types it did not advertise support for.
                         let prompt_blocks: Vec<Value> = if let Some(blocks) = v.get("blocks").and_then(Value::as_array) {
                             blocks.clone()
@@ -705,17 +707,17 @@ pub async fn run_select_loop<S, E>(
 /// Translate an agent-originated message into browser-facing events.
 ///
 /// `suppress_session_updates` is set by the WS handler during a resume
-/// window: the browser seeds its log from `/history` instead of the ACP
-/// replay, so forwarding `session/update` events would duplicate every
-/// replayed chunk. Server-initiated requests (permission prompts) are
-/// still forwarded — they only occur for live tool calls, not replay.
+/// window. The browser seeds its log from `/history`, and forwarding the
+/// ACP replay's `session/update` events would duplicate every replayed
+/// chunk. Server-initiated requests (permission prompts) are still
+/// forwarded. Those only occur for live tool calls.
 ///
 /// Currently understood:
 ///
 /// - `session/update`:
 ///     - `agent_message_chunk`   → append as `agent` text
 ///     - `agent_thought_chunk`   → append as `sys` with a `(thinking)` prefix
-///     - `tool_call` / `tool_call_update` → append `[title — status]`
+///     - `tool_call` / `tool_call_update` → append `[title: status]`
 /// - `session/request_permission` → forwarded to the browser as a
 ///   `permission_request` event.
 /// - `_kiro.dev/commands/available` → trimmed and forwarded as a
@@ -734,9 +736,10 @@ pub async fn handle_agent_message(
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     match method {
         "_kiro.dev/commands/available" => {
-            // Kiro re-emits this notification as its catalogue warms up
-            // (MCP servers load, etc.). We treat each emission as the
-            // full current catalogue; last-wins semantics on the browser.
+            // Kiro re-emits this notification as its catalogue warms up,
+            // MCP servers loading among the reasons. Each emission is
+            // treated as the full current catalogue, last-wins on the
+            // browser.
             if let Some(params) = msg.get("params") {
                 let commands = params
                     .get("commands")
@@ -754,12 +757,12 @@ pub async fn handle_agent_message(
             }
         }
         "_kiro.dev/mcp/oauth_request" => {
-            // An MCP server wants the user to authorise at a URL out of
-            // band. We surface the request so the browser can render a
-            // card with an "Open" button. Kiro re-emits while waiting,
-            // so we forward an `id` (when present) and let the browser
-            // de-dup. Field shapes are best-effort: we accept either
-            // `serverName` / `name`, and `url` / `authUrl`.
+            // An MCP server is asking the user to authorise at a URL out
+            // of band. Surfacing the request lets the browser render a
+            // card with an "Open" button. Kiro re-emits while waiting.
+            // An `id` is forwarded when present and the browser de-dups
+            // on it. Field shapes are best-effort: either `serverName`
+            // or `name`, and either `url` or `authUrl`.
             if let Some(params) = msg.get("params") {
                 let server_name = params
                     .get("serverName")
@@ -774,8 +777,8 @@ pub async fn handle_agent_message(
                     .unwrap_or("")
                     .to_string();
                 if url.is_empty() {
-                    // Without a URL there is nothing actionable; drop
-                    // silently rather than rendering a dead card.
+                    // Without a URL there is nothing actionable. Drop
+                    // silently; a card here would be dead on arrival.
                     return;
                 }
                 let id = params
@@ -817,9 +820,9 @@ pub async fn handle_agent_message(
                     }
                 }
                 "user_message_chunk" => {
-                    // Only emitted during `session/load` replay, so this
-                    // does not double-render live prompts (the browser
-                    // already echoes those locally).
+                    // Only emitted during `session/load` replay. Live
+                    // prompts never double-render here; the browser
+                    // already echoes those locally.
                     if let Some(text) = update
                         .get("content")
                         .and_then(|c| c.get("text"))
@@ -834,9 +837,8 @@ pub async fn handle_agent_message(
                 }
                 "agent_thought_chunk" => {
                     // Reasoning tokens. Forwarded as a dedicated
-                    // `thought` event so the browser can aggregate
-                    // chunks into a collapsible block instead of
-                    // rendering one log line per token.
+                    // `thought` event. The browser aggregates the
+                    // chunks into one collapsible block.
                     if let Some(text) = update
                         .get("content")
                         .and_then(|c| c.get("text"))
@@ -854,14 +856,14 @@ pub async fn handle_agent_message(
                     // same WS event type; the UI dedupes by `toolCallId`
                     // and mutates the existing row in place on updates.
                     //
-                    // Fields are passed through as-is so the UI can
-                    // render whatever the agent supplied (title, status,
-                    // kind, input args, output content blocks, and file
-                    // locations touched).
+                    // Fields pass through as-is. The UI renders whatever
+                    // the agent supplied: title, status, kind, input
+                    // args, output content blocks, and the file
+                    // locations touched.
                     let tool_call_id = update.get("toolCallId").cloned().unwrap_or(Value::Null);
                     if tool_call_id.is_null() {
-                        // Nothing to key on; fall back to a sys line so
-                        // the user at least knows something happened.
+                        // Nothing to key on. A sys line at least tells
+                        // the user something happened.
                         let title = update
                             .get("title")
                             .and_then(Value::as_str)

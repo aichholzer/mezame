@@ -30,11 +30,11 @@ type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 /// In production the handle owns a spawned subprocess (`child` is `Some`)
 /// and a process-group id (`pgid > 0`). Tests build the same shape from
 /// in-memory streams via `Agent::from_io`; in that mode `child` is `None`
-/// and `pgid` is 0, so `shutdown` becomes a stdin EOF without any
+/// and `pgid` is 0. `shutdown` is then a stdin EOF with no
 /// process-management side effects.
 ///
-/// Thread-safety: all mutable state is behind `Mutex`/`Arc`, so the handle
-/// can be cloned into spawned tasks (as `Arc<Agent>` in `handle_ws`).
+/// Thread-safety: all mutable state sits behind `Mutex`/`Arc`. The handle
+/// clones into spawned tasks as `Arc<Agent>`; see `handle_ws`.
 pub struct Agent {
     /// Stdin to the child; serialised by a Mutex because prompt tasks may
     /// try to write concurrently.
@@ -45,23 +45,22 @@ pub struct Agent {
     /// response. Shared with the reader task that populates responses.
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     /// Owned child. `None` for test-built agents constructed via
-    /// `from_io`. SIGKILL on drop (kill_on_drop) remains as a safety net,
-    /// but `shutdown` tries a clean EOF+wait first so Kiro can release
-    /// its per-session lockfile.
+    /// `from_io`. SIGKILL on drop (kill_on_drop) remains as a safety net.
+    /// `shutdown` tries a clean EOF and wait first, giving Kiro the chance
+    /// to release its per-session lockfile.
     child: Option<Mutex<Child>>,
     /// Process group ID (Unix only). The child is spawned in its own
-    /// process group so `shutdown` can kill the entire tree (MCP servers,
-    /// npm wrappers, etc.) rather than just the direct child. 0 when
+    /// process group. `shutdown` kills the whole tree through it: MCP
+    /// servers, npm wrappers, everything below the direct child. 0 when
     /// there is no real subprocess (tests).
     #[cfg(unix)]
     pgid: i32,
-    /// Session ID (Unix only). Equal to `pgid` at spawn because `setsid`
-    /// makes the child both a session and process-group leader, but it is
-    /// the session — not the group — that MCP servers spawned via
-    /// `npx`/`npm` inherit (they fork into their own process groups). The
-    /// session sweep in `shutdown` uses this to reap those escapees that
-    /// the `kill(-pgid)` cannot reach. 0 when there is no real subprocess
-    /// (tests).
+    /// Session ID (Unix only). Equal to `pgid` at spawn: `setsid` makes
+    /// the child both a session and a process-group leader. MCP
+    /// servers spawned via `npx`/`npm` inherit the session and fork into
+    /// their own process groups. The session sweep in `shutdown` uses this
+    /// to reap the escapees a `kill(-pgid)` cannot reach. 0 when there is
+    /// no real subprocess (tests).
     #[cfg(unix)]
     sid: i32,
     /// Set to true once `shutdown()` has finished. Tests read this to
@@ -72,8 +71,8 @@ pub struct Agent {
 
 impl Agent {
     /// Write a single JSON-RPC message to the agent's stdin, terminated by
-    /// newline and flushed. The agent reads newline-delimited JSON, so the
-    /// trailing `\n` is part of the wire framing, not cosmetic.
+    /// newline and flushed. The agent reads newline-delimited JSON. The
+    /// trailing `\n` is part of the wire framing.
     async fn write_message(&self, msg: Value) -> Result<()> {
         let line = format!("{msg}\n");
         let mut stdin = self.stdin.lock().await;
@@ -86,9 +85,9 @@ impl Agent {
     ///
     /// Returns the `result` value on success, or an error if the agent
     /// responded with `error`, closed before replying, or the stdin write
-    /// failed. The caller is responsible for cancellation semantics — if
-    /// the future is dropped mid-flight, the response will arrive at a
-    /// dangling oneshot and be discarded.
+    /// failed. Cancellation semantics are the caller's: drop the future
+    /// mid-flight and the response arrives at a dangling oneshot and is
+    /// discarded.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -131,8 +130,8 @@ impl Agent {
     }
 
     /// Cooperative shutdown:
-    ///   1. Best-effort `session/cancel` so any in-flight tool or turn stops.
-    ///   2. Close stdin so the agent sees EOF and exits cleanly. Kiro uses
+    ///   1. Best-effort `session/cancel` to stop any in-flight tool or turn.
+    ///   2. Close stdin. The agent sees EOF and exits cleanly. Kiro uses
     ///      this signal to release its per-session PID lockfile; without it
     ///      you get "Session is active in another process (PID ...)" errors
     ///      on the next `session/load`.
@@ -142,7 +141,7 @@ impl Agent {
     ///      kill is a no-op. If `kiro-cli` exited cleanly but left its MCP
     ///      server grandchildren alive (the common case), this reaps them.
     ///   5. Sweep the agent's whole session. MCP servers launched through
-    ///      `npx`/`npm` put themselves in their own process groups, so the
+    ///      `npx`/`npm` put themselves in their own process groups and the
     ///      group kill in step 4 never reaches them; they only inherit the
     ///      agent's session. Without this they orphan to PID 1 and pile up
     ///      until the service cgroup is throttled. See `unix::reap_session`.
@@ -169,7 +168,7 @@ impl Agent {
         // that kiro-cli did not clean up.
         self.kill_process_group();
         // The group kill misses MCP servers that forked into their own
-        // process groups; sweep the whole session to catch those escapees.
+        // process groups. The session sweep catches those escapees.
         self.reap_session();
         self.shutdown_done.store(true, Ordering::Relaxed);
     }
@@ -197,9 +196,9 @@ impl Agent {
     }
 
     /// SIGKILL every process still in the agent's session. Catches MCP
-    /// servers that forked into their own process groups and so escaped
-    /// the `kill(-pgid)` group kill. No-op for test-built agents
-    /// (`sid == 0`) and guarded against sweeping our own session.
+    /// servers that forked into their own process groups and escaped the
+    /// `kill(-pgid)` group kill. No-op for test-built agents (`sid == 0`)
+    /// and guarded against sweeping our own session.
     #[cfg(unix)]
     fn reap_session(&self) {
         if self.sid > 0 {
@@ -214,16 +213,16 @@ impl Agent {
 }
 
 /// Safety net: if the Agent is dropped without a prior `shutdown()` call
-/// (e.g. a panic unwind or early return), kill the entire process group
-/// so grandchildren do not leak. `kill_on_drop(true)` on the Child only
-/// kills the direct child; this covers the rest of the tree. No-op for
-/// test-built agents because `pgid == 0`.
+/// (a panic unwind or an early return), the entire process group is killed
+/// and no grandchildren leak. `kill_on_drop(true)` on the Child only kills
+/// the direct child; this covers the rest of the tree. No-op for
+/// test-built agents, where `pgid == 0`.
 ///
 /// When `shutdown()` already ran, the group kill and session sweep are
-/// done, so we skip the (relatively heavy) `/proc` walk and only repeat
-/// the cheap group kill. On the early-return/panic path `shutdown()` did
-/// not run, so we also sweep the session to catch MCP servers that
-/// escaped the group via their own process groups.
+/// done. This repeats only the cheap group kill and skips the heavier
+/// `/proc` walk. On the early-return or panic path `shutdown()` never ran,
+/// and the session sweep runs here to catch MCP servers that escaped the
+/// group via their own process groups.
 #[cfg(unix)]
 impl Drop for Agent {
     fn drop(&mut self) {
@@ -243,13 +242,13 @@ impl Drop for Agent {
 /// of the session.
 ///
 /// Process lifecycle:
-/// - The child is spawned in its own process group via `setsid()` so the
-///   entire descendant tree (MCP servers, npm wrappers, bun/node) can be
-///   killed as a unit rather than only the direct child.
+/// - The child is spawned in its own process group via `setsid()`. The
+///   entire descendant tree (MCP servers, npm wrappers, bun/node) is then
+///   killable as a unit, down from the direct child.
 /// - `kill_on_drop(true)` provides a tokio-level safety net for the direct
 ///   child; the `Drop` impl on `Agent` covers the rest of the group.
 /// - Cooperative shutdown is preferred: `shutdown()` closes stdin and
-///   waits briefly so Kiro can release its session lockfile.
+///   waits briefly, leaving Kiro room to release its session lockfile.
 ///
 /// Two background tasks are spawned here:
 ///   1. Stderr forwarder, writes each line to our stderr prefixed with
@@ -265,10 +264,10 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    // Spawn the child in its own process group so we can kill the entire
-    // tree (MCP servers, npm wrappers, bun, node, etc.) on shutdown rather
-    // than just the direct child. Without this, grandchildren survive as
-    // orphans inside the systemd cgroup and accumulate memory.
+    // Spawn the child in its own process group. Shutdown then kills the
+    // entire tree through it: MCP servers, npm wrappers, bun, node.
+    // Without this, grandchildren survive as orphans inside the systemd
+    // cgroup and accumulate memory.
     //
     // SAFETY: `pre_exec` runs after fork() but before exec(), in a context
     // where only async-signal-safe functions may be called. `setsid` is
@@ -276,10 +275,10 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
-            // setsid() creates a new session (and process group), making
-            // the child its own group leader. Bail loudly if it fails so
-            // we never end up with a wrong pgid that could target the
-            // parent's group on shutdown.
+            // setsid() creates a new session and process group, making
+            // the child its own group leader. A failure bails loudly. A
+            // silent one would leave a wrong pgid behind, and shutdown
+            // would aim its group kill at the parent's group.
             if crate::unix::new_session() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -293,9 +292,9 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
 
     #[cfg(unix)]
     let pgid = child.id().map(|id| id as i32).unwrap_or(0);
-    // `setsid` in pre_exec makes the child a session leader as well, so the
-    // session id equals the child pid (== pgid). Tracked separately because
-    // the session — not the group — is what MCP servers inherit.
+    // `setsid` in pre_exec makes the child a session leader as well, and
+    // the session id equals the child pid (== pgid). Tracked separately:
+    // MCP servers inherit the session, and the group is theirs alone.
     #[cfg(unix)]
     let sid = pgid;
 
@@ -322,10 +321,11 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
 
     // Stdout reader: route responses vs notifications.
     //
-    // A response is any message carrying `result` or `error` whose `id`
-    // matches a pending request we sent. Everything else — notifications
-    // (no id) and server-initiated requests (id but no result/error) — is
-    // pushed onto the updates channel for the WS handler to act on.
+    // A response is any message holding `result` or `error` whose `id`
+    // matches a pending request we sent. Everything else is pushed onto
+    // the updates channel for the WS handler to act on: notifications with
+    // no id, and server-initiated requests with an id but no
+    // result or error.
     let pending_reader = pending.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
@@ -368,12 +368,11 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
 
 /// Build an `Agent` from in-memory streams. Test-only escape hatch:
 /// production code should always go through `spawn_agent`. The returned
-/// agent has no child process, so `shutdown` only closes stdin and
-/// flips the `shutdown_complete()` flag.
+/// agent has no child process. `shutdown` then closes stdin and flips the
+/// `shutdown_complete()` flag, and does nothing else.
 ///
-/// The `stdout` reader runs the same routing logic as the production
-/// path, so tests that care about response correlation get it for
-/// free.
+/// The `stdout` reader runs the same routing logic as the production path.
+/// Response correlation works here as it does in production.
 #[doc(hidden)]
 pub fn from_io(
     stdin: impl AsyncWrite + Send + Unpin + 'static,

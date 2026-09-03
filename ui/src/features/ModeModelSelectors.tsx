@@ -16,8 +16,9 @@ import type { Session } from '@/types';
 
 // Tab-level selectors for the agent "mode" (really Kiro agent variants
 // like kiro_default / kiro_planner / kiro_guide) and the underlying
-// model. Both are session-scoped and disabled while the session is busy
-// — Kiro doesn't guarantee mid-turn mode/model switches behave sensibly.
+// model. Both are session-scoped and disabled while the session is
+// busy: Kiro doesn't guarantee mid-turn mode/model switches behave
+// sensibly.
 
 type Props = {
   session: Session | null;
@@ -132,7 +133,7 @@ export const ModeModelSelectors = ({ session, layout = 'row' }: Props) => {
         onPick={mezameActions.setMode}
         disabled={busy}
         emptyLabel="none"
-        triggerLabel={currentMode?.name || currentMode?.id || '—'}
+        triggerLabel={currentMode?.name || currentMode?.id || 'none'}
       />
       <Picker
         label="Model"
@@ -141,7 +142,7 @@ export const ModeModelSelectors = ({ session, layout = 'row' }: Props) => {
         onPick={mezameActions.setModel}
         disabled={busy}
         emptyLabel="none"
-        triggerLabel={currentModel?.name || currentModel?.modelId || '—'}
+        triggerLabel={currentModel?.name || currentModel?.modelId || 'none'}
       />
     </div>
   );

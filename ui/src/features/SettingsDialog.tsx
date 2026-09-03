@@ -24,14 +24,13 @@ import {
 
 // Settings pane. A cog button in the sidebar footer (beside the theme
 // picker) opens a dialog that hosts app-wide preferences. The pane is
-// built as a list of rows so future toggles slot in without reworking
-// the layout.
+// built as a list of rows.
 //
 // The first row is "auto-allow all permissions": when on, Mezame
-// answers every agent permission request with an allow option instead
-// of showing an inline approval card. The decision is enforced
+// answers every agent permission request with an allow option and no
+// inline approval card is rendered. The decision is enforced
 // server-side (the hub reads the persisted flag from state.json on
-// each `session/request_permission`), so it applies to every attached
+// each `session/request_permission`). It applies to every attached
 // device and to unattended sessions alike. Off by default; the copy
 // spells out the risk because the toggle removes the human approval
 // step for all tool calls, including file writes and shell commands.
@@ -60,9 +59,9 @@ const useIdleSuspendMinutes = (): number =>
     () => getSettingsSnapshot().idleSuspendMinutes
   );
 
-/** Accessible on/off switch. No checkbox primitive ships in the UI kit,
- * so this is a minimal `role="switch"` button styled to match the
- * existing controls. */
+/** Accessible on/off switch. No checkbox primitive ships in the UI kit.
+ * This is a minimal `role="switch"` button styled to match the existing
+ * controls. */
 const Switch = ({
   checked,
   onChange,

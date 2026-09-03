@@ -62,9 +62,9 @@ fn json_body(bytes: &[u8]) -> Value {
 }
 
 // SAFETY: every test in this file takes `home_lock()` before touching the
-// env, so the unsafe set/remove calls below never race. Rust 2024 will
-// require `unsafe { std::env::set_var(...) }`; we are on 2021, but
-// keeping the calls behind helpers documents the contract.
+// env, and the unsafe set/remove calls below never race. Rust 2024 will
+// require `unsafe { std::env::set_var(...) }`. This crate is on 2021, and
+// the helpers document the contract in the meantime.
 fn set_home(p: &Path) {
     std::env::set_var("HOME", p);
 }
@@ -229,9 +229,9 @@ async fn get_history_with_fixture_returns_parsed_entries() {
 async fn get_history_emits_thought_entry_before_agent_text() {
     // Reasoning models produce assistant messages with a `thinking`
     // block followed by a `text` block. The history endpoint must
-    // surface both, in order, so the rehydrated log shows the
-    // collapsible reasoning section above the answer just like the
-    // live broadcast did.
+    // surface both, in order. The rehydrated log then shows the
+    // collapsible reasoning section above the answer, matching the live
+    // broadcast.
     let _g = home_lock().lock().await;
     let tmp = TempDir::new().unwrap();
     set_home(tmp.path());

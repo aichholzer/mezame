@@ -13,7 +13,7 @@ import {
 // or the entire Mezame browser tab is hidden, fire `new Notification`
 // so the user sees something happen even when they aren't looking.
 // The favicon badge and attention-dot logic still run; this is an
-// additional channel, not a replacement.
+// additional channel.
 //
 // First-use flow: the preference starts at `unset`. The first time an
 // event would fire, we bump the preference to `pending`; the
@@ -57,8 +57,8 @@ const fireNotification = (sessionLabel: string, level: AttentionLevel): void => 
       body: `Session ${sessionLabel}`,
       icon: '/favicon.png',
       // `tag` causes the OS to replace any prior notification with the
-      // same key, so rapid-fire status changes don't stack into a wall
-      // of toasts.
+      // same key. Rapid-fire status changes do not stack into a wall of
+      // toasts.
       tag: `mezame-${sessionLabel}-${level}`
     });
     n.onclick = () => {

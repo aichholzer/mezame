@@ -4,7 +4,7 @@
 //   - modifier mode: Cmd/Ctrl+Enter submits, bare Enter newlines.
 //
 // We drive the textarea's keydown directly and assert whether `onSubmit`
-// fired, rather than reaching through the whole hub.
+// fired.
 
 import { fireEvent, render, screen, waitFor } from '@/__test_utils';
 import { InputRow } from '@/features/InputRow';

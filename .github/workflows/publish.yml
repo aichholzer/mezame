@@ -1,0 +1,209 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Actions are pinned to commit SHAs here for the same reason as in
+# ci.yml, and with more at stake: this job holds `CARGO_REGISTRY_TOKEN`.
+# The token lives in the `env` of the single `cargo publish` step, out of
+# reach of every other step's environment.
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    # The benchmark job inside ci.yml exchanges an OIDC token with
+    # CodSpeed. A called workflow receives only what the caller grants.
+    permissions:
+      contents: read
+      id-token: write
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  publish:
+    name: build and publish
+    runs-on: ubuntu-latest
+    needs: ci
+
+    # The workflow token is read-only. Creating the release and its tag
+    # needs the grant here. This job is the only one that writes through
+    # the API, and contents is the narrowest scope covering a release.
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: stable
+
+      # `cargo publish` runs build.rs, which shells out to npm for the
+      # real Vite bundle. `MEZAME_SKIP_UI_BUILD` is unset throughout this
+      # job: a stub bundle would ship to crates.io.
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Everything that can be checked without a build happens here, in
+      # front of the two expensive steps. A publish that was going to be
+      # refused is refused in about ten seconds.
+      - name: Pre-flight checks
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "::error::Publish runs from main only. This run is on ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+          PKG_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          echo "PKG_VERSION=$PKG_VERSION" >> "$GITHUB_ENV"
+          echo "Cargo.toml is at ${PKG_VERSION}."
+
+          # The UI reads its displayed version from the Cargo.toml value
+          # through a Vite define, and the two files are bumped by hand.
+          # A mismatch ships a header showing the wrong version.
+          UI_VERSION="$(jq -r '.version' ui/package.json)"
+          if [[ "$UI_VERSION" != "$PKG_VERSION" ]]; then
+            echo "::error::ui/package.json is at ${UI_VERSION} and Cargo.toml at ${PKG_VERSION}. Bump both."
+            exit 1
+          fi
+
+          # Checked now, and used by the Release step further down. Left
+          # until then, a missing section would only surface after the
+          # crate had already shipped.
+          if ! grep -Fq "## [${PKG_VERSION}]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${PKG_VERSION}]' section. Add it before publishing."
+            exit 1
+          fi
+
+          # The sparse index is a static file: no API rate limit and no
+          # User-Agent policy. One newline-delimited JSON object per
+          # published version. The path splits the crate name into pairs.
+          INDEX_URL="https://index.crates.io/me/za/mezame"
+          INDEX_FILE="${RUNNER_TEMP}/crates-index.txt"
+          HTTP_CODE="$(curl -sS -o "$INDEX_FILE" -w '%{http_code}' "$INDEX_URL")"
+
+          case "$HTTP_CODE" in
+            200)
+              if jq -r '.vers' < "$INDEX_FILE" | grep -Fxq "$PKG_VERSION"; then
+                echo "::error::mezame ${PKG_VERSION} is already on crates.io. Bump the version first."
+                exit 1
+              fi
+              echo "mezame ${PKG_VERSION} is not on crates.io yet, proceeding."
+              ;;
+            404)
+              echo "mezame has never been published. Proceeding with the first release."
+              ;;
+            *)
+              echo "::error::The crates.io index returned HTTP ${HTTP_CODE}. Whether ${PKG_VERSION} exists cannot be determined."
+              exit 1
+              ;;
+          esac
+
+      # Packages the crate and compiles the packaged sources. This is
+      # where a wrong `exclude` list in Cargo.toml shows up, and it
+      # uploads nothing.
+      - name: Package and verify
+        run: cargo publish --dry-run --locked
+
+      # `--no-verify` skips a second verification build of an identical
+      # tree. The dry run above did it.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --no-verify
+
+      # Only reached when the publish above succeeded. A failing step ends
+      # the job. A release therefore exists only for a version that
+      # reached crates.io.
+      #
+      # continue-on-error because the crate has already shipped by the
+      # time this runs. Failing to write the release is bookkeeping, and a
+      # red run would say the publish failed. The step reports itself in
+      # the log and the summary.
+      #
+      # Idempotent. Re-running against a version already released does
+      # nothing. It also cannot revise the notes on a release that exists:
+      # edit those on GitHub, or delete the release and re-run.
+      - name: Release
+        id: release
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$PKG_VERSION" > /dev/null 2>&1; then
+            echo "$PKG_VERSION is already released, nothing to do."
+            exit 0
+          fi
+
+          NOTES="${RUNNER_TEMP}/release-notes.md"
+
+          # The body is this version's change log section. It is written
+          # per release, and reads better than anything generated from
+          # commit subjects. The match is on the heading prefix. A version
+          # that is no longer the top-most section still resolves, and the
+          # date suffix on the heading is ignored. `index()` keeps the
+          # match a literal string, and the dots in a version number stay
+          # literal with it. Blank lines at both ends are trimmed.
+          awk -v ver="$PKG_VERSION" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { line[++n] = $0 }
+            END {
+              for (first = 1; first <= n && line[first] ~ /^[[:space:]]*$/; first++);
+              for (last = n; last >= first && line[last] ~ /^[[:space:]]*$/; last--);
+              for (i = first; i <= last; i++) print line[i]
+            }
+          ' CHANGELOG.md > "$NOTES"
+
+          if [[ ! -s "$NOTES" ]]; then
+            MSG="The '## [${PKG_VERSION}]' section in CHANGELOG.md is empty."
+            MSG="$MSG The release would have no notes. Create it by hand."
+            echo "::error::$MSG"
+            exit 1
+          fi
+
+          RELEASE_URL="$(gh release create "$PKG_VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "V${PKG_VERSION}" \
+            --notes-file "$NOTES")"
+          echo "RELEASE_URL=$RELEASE_URL" >> "$GITHUB_ENV"
+          echo "Released $PKG_VERSION at ${GITHUB_SHA:0:7}: $RELEASE_URL"
+
+      # The success guard skips this when an earlier step failed. A failed
+      # Release step does not skip it: continue-on-error means that step
+      # cannot fail the job.
+      - name: Summary
+        if: success()
+        shell: bash
+        env:
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+        run: |
+          {
+            echo "### Published mezame ${PKG_VERSION}"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA:0:7}\`"
+            echo "- crates.io: https://crates.io/crates/mezame/${PKG_VERSION}"
+            echo "- Install: \`cargo install mezame --version ${PKG_VERSION}\`"
+            if [[ "$RELEASE_OUTCOME" == "failure" ]]; then
+              echo ""
+              echo "The GitHub release was not created. The publish itself"
+              echo "succeeded: ${PKG_VERSION} is on crates.io and must not"
+              echo "be rebuilt. See the Release step for why, then create"
+              echo "the release by hand."
+            elif [[ -n "${RELEASE_URL:-}" ]]; then
+              echo "- Release: ${RELEASE_URL}"
+            else
+              echo "- Release: ${PKG_VERSION} was already released. Nothing was created."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

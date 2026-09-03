@@ -7,13 +7,12 @@
 
 /* mezame design tokens.
  *
- * Warm cream + terracotta light theme. Body text in Manrope; the
- * wordmark and section headings use EB Garamond serif for a single
- * note of editorial personality. The user bubble takes the primary
- * terracotta; the agent bubble takes the secondary container so the
- * two roles read distinctly without either one shouting. Dark-mode
- * follow-up is left for a later pass; the current shell is light
- * only, matching the reference design. */
+ * Warm cream and terracotta. `:root` holds the light palette and the
+ * `.dark` block further down overrides the source tokens for night
+ * mode. Typography is JetBrains Mono throughout, with Gugi on the
+ * wordmark. The user bubble takes the primary terracotta and the agent
+ * bubble takes the secondary container; the two roles read distinctly
+ * and neither one shouts. */
 
 :root {
   /* Surface ladder, lightest at the top. */
@@ -44,8 +43,8 @@
   --border: oklch(0.85 0.012 70);
   --input: var(--surface-container-low);
 
-  /* Terracotta primary. Warm, fairly saturated; carries through to
-   * the user bubble and the send button. */
+  /* Terracotta primary. Warm, fairly saturated; used by the user
+   * bubble and the send button. */
   --primary: oklch(0.62 0.14 45);
   --primary-foreground: oklch(0.99 0 0);
   --primary-container: oklch(0.7 0.13 45);
@@ -66,7 +65,7 @@
   --attn-error: var(--destructive);
 
   /* User message bubble. Same hue as primary so the user role reads as
-   * the active speaker; agent bubble below picks up the cool secondary
+   * the active speaker; agent bubble below uses the cool secondary
    * container so it reads as "the other person". */
   --user-bubble: var(--primary);
   --user-bubble-foreground: var(--primary-foreground);
@@ -80,10 +79,10 @@
   --mz-sidebar-width: 272px;
 
   /* Reservation gutter for the main column to clear the floating
-   * sidebar at desktop widths. Defaults to 0 (mobile drawer mode);
-   * the media query below promotes it to "sidebar width plus 18 px
-   * of breathing room" on screens wide enough that the sidebar is
-   * always visible. */
+   * sidebar at desktop widths. Defaults to 0 (mobile drawer mode). The
+   * media query below promotes it to the sidebar width plus 40 px of
+   * breathing room on screens wide enough that the sidebar is always
+   * visible. */
   --mz-main-left: 0px;
 
   /* Virtual-keyboard inset, populated by useKeyboardInset() at
@@ -96,25 +95,22 @@
   --mz-safe-left: env(safe-area-inset-left, 0px);
   --mz-safe-right: env(safe-area-inset-right, 0px);
 
-  /* Typography. EB Garamond for the wordmark and section titles;
-   * Manrope for everything else. JetBrains Mono kept around for code
-   * fences in markdown so output stays legible. */
-  /* Typography. JetBrains Mono everywhere; Chelsea Market for the
-   * wordmark. The reskin briefly used EB Garamond + Manrope to match
-   * the supplied reference, but the project's identity is the
-   * mono-throughout look that pre-dates the reskin. Keeping the warm
-   * palette but reverting fonts. */
+  /* Typography. JetBrains Mono everywhere, Gugi on the wordmark. The
+   * reskin briefly ran EB Garamond and Manrope to match the supplied
+   * reference. The project's identity is the mono-throughout look that
+   * pre-dates it, and the fonts were reverted while the warm palette
+   * stayed. */
   --font-display: 'Gugi', ui-serif, Georgia, serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
   --font-body: var(--font-mono);
 }
 
-/* Night mode — "warm espresso". Overrides only the source tokens that
+/* Night mode: "warm espresso". Overrides only the source tokens that
  * `:root` sets as literals; everything mapped through `var(--token)`
  * (the shadcn aliases, role colours, bubbles) re-tints automatically.
  * The hue (~70, warm brown) and the brightened terracotta primary
- * keep Mezame's identity instead of going neutral-grey. Applied by
- * toggling `.dark` on <html> (see hooks/useTheme.ts). */
+ * keep Mezame's identity. Applied by toggling `.dark` on <html>
+ * (see hooks/useTheme.ts). */
 .dark {
   --background: oklch(0.19 0.010 70);
   --surface-bright: oklch(0.24 0.012 70);
@@ -253,10 +249,9 @@
   }
 }
 
-/* Traveling-border animation for busy-in-background tabs. The
+/* Travelling-border animation for busy-in-background tabs. The
  * conic gradient rotates around the tab while the inner fill stays
- * constant; the warmer palette wants a softer terracotta glow rather
- * than the previous green chase. */
+ * constant; the glow is a soft terracotta on the warmer palette. */
 @property --busy-border-angle {
   syntax: '<angle>';
   initial-value: 0deg;

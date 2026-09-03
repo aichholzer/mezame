@@ -155,13 +155,13 @@ const scheduleSync = () => {
 
 /**
  * Build the `sessions` array to PUT to `/state`, merging this browser's
- * local view with any sessions only the server knows about.
+ * local view with any sessions recorded only on the server.
  *
  * `/state` is last-writer-wins per top-level key and `doSync` owns the
- * `sessions` array, so a blind write of just the local list silently
- * drops a session another device opened but this browser has not yet
- * learned about: a backgrounded tab whose `/state/events` stream missed
- * ticks, a device just switched to, or an init race. That is how a live
+ * `sessions` array. A blind write of just the local list silently drops
+ * a session another device opened but this browser has not yet learned
+ * about: a backgrounded tab whose `/state/events` stream missed ticks,
+ * a device just switched to, or an init race. That is how a live
  * session vanished from `state.json` while its conversation stayed on
  * disk.
  *
@@ -171,7 +171,7 @@ const scheduleSync = () => {
  * disambiguate with the same positive evidence: a deliberately closed
  * session is recorded in a `closed` list. So we carry forward every
  * server session we lack locally that is not recorded as closed on
- * EITHER side, mirroring the keep-don't-drop bias of the reconcile.
+ * EITHER side. The reconcile has the same keep-don't-drop bias.
  *
  * Pure and exported so the regression test can drive it without module
  * state or `fetch`.
@@ -189,8 +189,8 @@ export const mergeSessionsForSync = (
   }
   const localIds = new Set(localSessions.map((s) => s.id));
   // A deliberately closed session must not be resurrected; honour both
-  // our own `closed` history and the server's, so a close that
-  // originated on another device also suppresses the carry-forward.
+  // our own `closed` history and the server's. A close that originated
+  // on another device then also suppresses the carry-forward.
   const closedAcpIds = new Set<string>();
   for (const c of localClosed) {
     if (c && typeof c.acpSessionId === 'string') {
@@ -212,7 +212,7 @@ export const mergeSessionsForSync = (
     }
     // Only carry resumable sessions (an on-disk Kiro session exists),
     // matching the restore guard in `reconcileFromServer`. An unused tab
-    // from another browser has no acp id yet and nothing to lose.
+    // from another browser has no acp id yet and no conversation on disk.
     if (typeof entry.acpSessionId !== 'string' || entry.acpSessionId.length === 0) {
       continue;
     }
@@ -239,9 +239,7 @@ export const doSync = async () => {
       // used. Kiro writes the on-disk JSONL only on first prompt;
       // persisting a never-used id makes a future `session/load`
       // fail with "Session not found". Peer browsers therefore
-      // only see a fresh tab from us after the first prompt; that
-      // tradeoff is preferable to a noisy storm of load failures
-      // every time someone reloads.
+      // only see a fresh tab from us after the first prompt.
       acpSessionId: s.used ? s.acpSessionId : null,
       cwd: s.cwd
     })),
@@ -255,9 +253,9 @@ export const doSync = async () => {
     // (`lib/settings.ts`) owns `settings`. A blind PUT of only our
     // fields would clobber `settings` on every session event (open,
     // rename, close, tab switch, first-prompt id record, cross-browser
-    // reconcile), silently resetting e.g. `autoAllowPermissions` so the
-    // user gets re-prompted. Carry across whatever we do not own,
-    // mirroring how `settings.ts` persist() preserves our fields.
+    // reconcile). A silently reset `autoAllowPermissions` re-prompts
+    // the user. Carry across whatever we do not own. `settings.ts`
+    // persist() preserves our fields the same way.
     //
     // The `sessions` array is ours, but a blind write of just the local
     // list has its own hazard: it drops a session another device opened
@@ -311,7 +309,7 @@ const fetchState = async (): Promise<Partial<PersistedState> | null> => {
 // - Sessions present on the server but not locally were opened
 //   somewhere else; we restore them.
 // - Sessions present on both keep their local instance (its WS,
-///   log, busy state, etc.) but pick up label changes from the
+//   log, busy state, etc.) but take label changes from the
 //   server.
 //
 // The active session is preserved when possible: if the server's
@@ -355,7 +353,7 @@ const reconcileFromServer = async () => {
     }
     // Only restore sessions that have an `acpSessionId` recorded;
     // a fresh-but-unused tab on another browser has no on-disk
-    // Kiro session yet, so attaching here would spawn a separate
+    // Kiro session yet. Attaching here would spawn a separate
     // agent. Once that browser sends a first prompt the id lands
     // on the server and the next tick brings it across.
     if (typeof entry.acpSessionId !== 'string' || entry.acpSessionId.length === 0) {
@@ -372,9 +370,9 @@ const reconcileFromServer = async () => {
 
   // Close sessions present locally but missing on the server, but
   // ONLY when we have positive evidence the disappearance was a
-  // deliberate close, not a clobber. Each browser PUTs its own full
-  // session list last-writer-wins, so "absent from the latest server
-  // snapshot" is ambiguous: it can mean "closed on another device"
+  // deliberate close. Each browser PUTs its own full session list
+  // last-writer-wins. "Absent from the latest server snapshot" is
+  // therefore ambiguous: it can mean "closed on another device"
   // OR "another device just overwrote the list with a partial view
   // that happened to omit this session" (an init race, a restore
   // that didn't carry every tab, etc.). Treating the ambiguous case
@@ -385,13 +383,12 @@ const reconcileFromServer = async () => {
   // history (see `closeSession`). A clobber does not. So we only
   // close locally when the session's acp id shows up in the server's
   // `closed` list; otherwise we keep it, and our next sync re-adds it
-  // to the server snapshot, healing the omission.
+  // to the server snapshot.
   //
   // Tradeoff: if a deliberate close is later evicted from the capped
   // `closed` history (HISTORY_MAX) before this browser reconciles, we
-  // will keep a tab that was actually closed elsewhere. That is a
-  // benign stale-tab lingering, self-corrects on the next close, and
-  // is vastly preferable to silently dropping a live session.
+  // will keep a tab that was actually closed elsewhere. The stale tab
+  // is benign and self-corrects on the next close.
   const serverClosedAcpIds = new Set<string>();
   if (Array.isArray(saved.closed)) {
     for (const entry of saved.closed) {
@@ -438,9 +435,9 @@ const reconcileFromServer = async () => {
   }
 
   // Closed-history list: server view wins. The dropdown is
-  // already a "best effort" archive (capped at HISTORY_MAX); using
-  // the server snapshot means the most-recently-closed entries
-  // stay consistent across browsers without ping-ponging.
+  // already a "best effort" archive (capped at HISTORY_MAX). On the
+  // server snapshot the most-recently-closed entries stay consistent
+  // across browsers with no ping-pong.
   if (Array.isArray(saved.closed)) {
     const next = saved.closed.slice(0, HISTORY_MAX);
     if (JSON.stringify(next) !== JSON.stringify(closed)) {
@@ -465,8 +462,8 @@ const reconcileFromServer = async () => {
   if (dirty) {
     // Suppress the next scheduleSync: we have just applied the
     // server's view, there is nothing to push back. Cancel any
-    // pending push from before the reconcile too, so we do not
-    // overwrite the server with the now-stale local snapshot.
+    // pending push from before the reconcile too. It would overwrite
+    // the server with the now-stale local snapshot.
     if (syncTimer !== null) {
       clearTimeout(syncTimer);
       syncTimer = null;
@@ -510,7 +507,7 @@ export const shouldCloseAbsentSession = (
  * non-persistence side effects of `closeSession` (cancel timer,
  * close socket, fall back to a fresh activeId, archive in `closed`)
  * but does NOT call `scheduleSync` because the caller is reacting
- * to a server snapshot the server already knows about. */
+ * to a server snapshot the server already holds. */
 const closeSessionLocal = (id: string) => {
   const i = sessions.findIndex((x) => x.id === id);
   if (i < 0) {
@@ -753,7 +750,7 @@ const connect = (s: Session) => {
 };
 
 /** Soft-suspend a session for idleness: drop its socket WITHOUT archiving
- * or auto-reconnecting, so the server's grace timer reaps the agent and
+ * or auto-reconnecting. The server's grace timer then reaps the agent and
  * its MCP fleet. The tab stays in the sidebar (grey). Mutates in place;
  * the caller owns `notify()`. No-op when already suspended or closing. */
 const suspendSessionNoNotify = (s: Session) => {
@@ -778,8 +775,8 @@ const suspendSessionNoNotify = (s: Session) => {
 
 /** Resume a suspended session: clear the flag and reconnect, which
  * reattaches via `?session=` (a resume) and rehydrates as needed. The
- * in-memory log is kept (the tab stays `hydrated`), so resume is seamless.
- * No-op when not suspended. */
+ * in-memory log is kept and the tab stays `hydrated`. No-op when not
+ * suspended. */
 const resumeSession = (s: Session) => {
   if (!s.suspended) {
     return;
@@ -797,7 +794,7 @@ const resumeSession = (s: Session) => {
  * All must hold: not already suspended/closing; used and resumable (has an
  * acp id); not mid-turn (`busy`/`inFlight`); on a healthy live socket
  * (`connected`); idle past the threshold. The active tab is exempt UNLESS
- * the browser tab itself is hidden -- a visible active tab is "in use"
+ * the browser tab itself is hidden; a visible active tab is "in use"
  * even without turns.
  *
  * @internal
@@ -866,8 +863,8 @@ const startIdleScan = () => {
 
 /** When the browser tab becomes visible again, resume the ACTIVE session
  * if it was suspended while hidden. Background suspended tabs stay
- * suspended until the user clicks them, so we never respawn every agent at
- * once on focus. */
+ * suspended until the user clicks them. Focus never respawns every agent
+ * at once. */
 const resumeActiveOnVisible = () => {
   if (typeof document === 'undefined' || document.visibilityState !== 'visible') {
     return;
@@ -886,26 +883,26 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     return;
   }
 
-  // Capture hydration state before the reducer flips it, so the
-  // `/history` seed below can tell a first load from a reconnect.
+  // Capture hydration state before the reducer flips it. The `/history`
+  // seed below can then tell a first load from a reconnect.
   const wasHydrated = s.hydrated;
 
   // Side effects that live outside the pure reducer: a stale build id
   // triggers a full page reload, and `ready { resumed: true }` kicks off
   // the `/history` rehydration fetch. Both are kept here so
-  // `applyServerMessage` stays free of `window`/`fetch` to keep it
+  // `applyServerMessage` stays free of `window`/`fetch` and stays
   // trivially testable.
   if (msg.type === 'ready' && msg.buildId && msg.buildId !== __MEZAME_BUILD_ID__) {
     // Reload at most once per served build id. `ready` fires on every
-    // WS (re)connect, and macOS / idle sockets reconnect often, so an
+    // WS (re)connect, and macOS / idle sockets reconnect often. An
     // unconditional reload here turns a single bundle/binary mismatch
     // (e.g. a tunnel caching a stale asset) into a reload-on-every-
     // reconnect loop: reload, load the same mismatching bundle, get
     // `ready` again, reload again. The latch breaks that loop: if a
     // reload does not resolve the mismatch, we surface it once and
     // stop fighting the user. A genuinely new deploy carries a new
-    // server buildId, which is a fresh latch key, so real upgrades
-    // still trigger exactly one reload.
+    // server buildId. That is a fresh latch key, and a real upgrade
+    // still triggers exactly one reload.
     let alreadyTried = false;
     try {
       const key = `mezame.reloadedFor.${msg.buildId}`;
@@ -924,7 +921,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
       return;
     }
     // Mismatch persisted across a reload. Stop reloading; let the
-    // session continue on the bundle we have rather than thrashing.
+    // session continue on the bundle we have.
     // eslint-disable-next-line no-console
     console.warn(
       `Mezame UI build ${__MEZAME_BUILD_ID__} does not match server ${msg.buildId}; ` +
@@ -936,10 +933,10 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
 
   if (msg.type === 'ready') {
     // Seed from /history only on the tab's first hydrate. `wasHydrated`
-    // is captured before `applyServerMessage` flips the flag, so a
+    // is captured before `applyServerMessage` flips the flag. A
     // transient reconnect (which arrives as `resumed: true` from the
-    // hub) does not refetch history and rebuild the log underneath the
-    // user. The in-memory log from the live session is kept as-is.
+    // hub) then does not refetch history and rebuild the log underneath
+    // the user. The in-memory log from the live session is kept as-is.
     if (msg.resumed && !wasHydrated) {
       void loadHistory(s);
     }
@@ -990,9 +987,9 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
   // End-of-turn sweep: some tools (web_search again) only flush
   // their result body to disk once the agent's whole response is
   // done. By the time `prompt_done` lands, Kiro has written the
-  // JSONL for the entire turn, so a sweep over any tool_call
-  // entries still missing content is the deterministic backstop
-  // for the mid-turn polling window.
+  // JSONL for the entire turn. A sweep over any tool_call entries
+  // still missing content is the deterministic backstop for the
+  // mid-turn polling window.
   if (msg.type === 'prompt_done') {
     void sweepToolResultsOnPromptDone(s);
   }
@@ -1005,7 +1002,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
 // Kiro writes the JSONL asynchronously: the live status flip can
 // land long before the on-disk `ToolResults` entry. Some tools
 // (notably web_search) only flush their result body once the
-// agent's overall turn finishes, so a tight poll window after the
+// agent's overall turn finishes. A tight poll window after the
 // status flip can miss the write entirely.
 //
 // Two-stage approach:
@@ -1015,7 +1012,7 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
 //    output appears mid-turn without waiting for `prompt_done`.
 // 2. On `prompt_done`, sweep every tool_call entry in the session
 //    that still has no content and try once more. By then Kiro
-//    has flushed its JSONL for the turn, so this is the
+//    has flushed its JSONL for the turn. That makes the sweep the
 //    deterministic backstop.
 
 const FINAL_BACKFILL_ATTEMPTS = 10;
@@ -1083,7 +1080,7 @@ const tryFetchToolResult = async (
 
 /** End-of-turn sweep: walk every tool_call entry that is still
  * missing content and pull once. By `prompt_done` Kiro has
- * flushed its JSONL for the turn, so this is the deterministic
+ * flushed its JSONL for the turn. This is the deterministic
  * backstop for tools whose result was not on disk during the
  * mid-turn polling window. */
 const sweepToolResultsOnPromptDone = async (s: Session): Promise<void> => {
@@ -1112,7 +1109,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
     case 'ready':
       // Seed the pane from history ONLY on this tab's first `ready`.
       // The hub stamps `resumed: true` on every attach (an attach is
-      // always a join to a live hub), so keying the wipe on `resumed`
+      // always a join to a live hub). Keying the wipe on `resumed`
       // alone cleared the log and refetched `/history` on every
       // transient reconnect, which looked exactly like the browser
       // reloading mid-chat and could drop an in-flight reply. A
@@ -1129,12 +1126,13 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       s.liveSessionId = msg.sessionId;
       // Durable identity. Only advance it when this was NOT a
       // fallback-after-failed-resume. On a clean resume `msg.sessionId`
-      // equals the id we asked for, so this is a no-op; on a brand-new
-      // tab it adopts the freshly minted id. But when the server tells
-      // us the resume failed (`resumeFailedFor`), we keep the original
-      // id pinned so a transient failure (wrong host for an SMB-shared
-      // session, stale lock, agent restart) never overwrites the
-      // pointer to a real conversation with a throwaway empty session.
+      // equals the id we asked for and the assignment is a no-op; on a
+      // brand-new tab it adopts the freshly minted id. But when the
+      // server tells us the resume failed (`resumeFailedFor`), we keep
+      // the original id pinned so a transient failure (wrong host for an
+      // SMB-shared session, stale lock, agent restart) never overwrites
+      // the pointer to a real conversation with a throwaway empty
+      // session.
       if (!msg.resumeFailedFor) {
         s.acpSessionId = msg.sessionId;
       }
@@ -1143,7 +1141,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       // After a resume, clear any in-flight markers we set when the
       // socket dropped. The agent will not replay the old
       // `prompt_done` (the server suppresses the live replay during
-      // the resume window), so without this the composer would stay
+      // the resume window). Without this the composer would stay
       // pinned to busy until the next turn naturally completed.
       // Safe even on a fresh connect: a session that has not sent a
       // prompt has both flags clear already.
@@ -1161,15 +1159,14 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       if (msg.role === 'user') {
         ensureTrailingNewline(s);
         // The hub broadcasts a single `append { role: 'user' }` echo
-        // when any browser sends a prompt, so this is also the
-        // signal to peer browsers that a turn just started. Mark
-        // the session busy here so every attached browser shows
-        // the spinner and locks its composer for the duration of
-        // the turn; `prompt_done` clears all three flags. The
-        // sender already set these in `sendPrompt`, so the
-        // assignment is a no-op for them. We skip on history
-        // replays (those land via `loadHistory`, not the live
-        // broadcast, so this branch is only hit on real turns).
+        // when any browser sends a prompt. That echo also tells peer
+        // browsers a turn just started. Mark the session busy here so
+        // every attached browser shows the spinner and locks its
+        // composer for the duration of the turn; `prompt_done` clears
+        // all three flags. The sender already set these in
+        // `sendPrompt` and the assignment is a no-op for them. History
+        // replays land via `loadHistory`; this branch is only hit on
+        // real turns.
         s.thinking = true;
         s.inFlight = true;
         setBusy(s, true);
@@ -1185,7 +1182,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
     case 'thought': {
       // Reasoning tokens stream as many small chunks. Merge into a
       // single `thought` log entry per turn so the UI renders one
-      // collapsible block, not a torrent of one-token rows.
+      // collapsible block.
       const last = s.log.at(-1);
       if (s.thoughtOpen && last && last.kind === 'thought') {
         last.text += msg.text;
@@ -1218,8 +1215,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
           resolution: remembered.name || remembered.optionId || 'option',
           auto: true
         });
-        // Deliberately no `raiseAttention`: the user already opted in,
-        // so a remembered allow-or-reject should not draw the eye.
+        // Deliberately no `raiseAttention`: the user already opted in.
         break;
       }
       raiseAttention(s, 'permission');
@@ -1387,10 +1383,10 @@ const clearActiveAttentionOnVisible = () => {
 };
 
 /** When the browser tab becomes visible after being idle, kick any
- * session that is currently sitting in `reconnecting` to retry now
- * instead of waiting out the exponential back-off. macOS' WebSocket
- * tends to die quietly across long idle periods or display sleep,
- * so without this the user sees stale UI for up to 30 seconds. */
+ * session that is currently sitting in `reconnecting` to retry now,
+ * without waiting out the exponential back-off. macOS' WebSocket
+ * tends to die quietly across long idle periods or display sleep.
+ * Without this the user sees stale UI for up to 30 seconds. */
 const kickReconnectsOnVisible = () => {
   if (typeof document === 'undefined' || document.visibilityState !== 'visible') {
     return;
@@ -1425,8 +1421,7 @@ const newSession = (cwd: string | null = null, name: string | null = null) => {
   const id = newId();
   const label = name && name.length > 0 ? name : String(nextLabel++);
   const s = makeSession(id, label, null, cwd);
-  // New sessions appear leftmost, right after the fixed `+` button, so
-  // the freshly-created tab is closest to the control that spawned it.
+  // New sessions appear leftmost, right after the fixed `+` button.
   sessions.unshift(s);
   connect(s);
   activate(id);
@@ -1504,7 +1499,7 @@ const restoreFromHistory = (acpSessionId: string) => {
   const entry = closed.splice(i, 1)[0];
   const s = makeSession(entry.id, entry.label, entry.acpSessionId, entry.cwd);
   // Restoring is user-initiated; place the tab leftmost alongside
-  // freshly-created ones for consistency.
+  // freshly-created ones.
   sessions.unshift(s);
   connect(s);
   activate(s.id);
@@ -1521,9 +1516,9 @@ const forgetHistory = (acpSessionId: string) => {
   scheduleSync();
 };
 
-// Derive a short label from the user's first prompt. Pure heuristic,
-// no network, no model — keeps Mezame "a dumb pipe" while making
-// numeric tab labels less anonymous after the first turn.
+// Derive a short label from the user's first prompt. Pure heuristic:
+// no network, no model, Mezame stays "a dumb pipe". Numeric tab labels
+// stop being anonymous after the first turn.
 //
 // Returns null when the prompt isn't useful as a label (empty, slash
 // command, attachments-only). The caller leaves the original label in
@@ -1556,8 +1551,8 @@ export const deriveLabel = (text: string): string | null => {
 
   // Soft cap so a long single sentence doesn't become the label.
   // Word segmentation matters for scripts without spaces (CJK). We
-  // slice the original string up to the end of the last word we keep,
-  // so spacing and punctuation between words are preserved verbatim.
+  // slice the original string up to the end of the last word we keep.
+  // Spacing and punctuation between words are preserved verbatim.
   const MAX_WORDS = 10;
   const wordSeg = new Intl.Segmenter(locale, { granularity: 'word' });
   let lastEnd = 0;
@@ -1600,7 +1595,7 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   // its timeline. Local-render-only would hide our prompt from peer
   // browsers and produce inconsistent timelines after multi-attach.
   // The round-trip is microseconds in practice (broadcast in-process,
-  // WS sink is local), so the sender sees no perceptible delay.
+  // WS sink is local). The sender sees no perceptible delay.
   //
   // Attachments are still part of the wire payload but the echo
   // shows only the text portion; agents that surface uploaded files
@@ -1670,8 +1665,8 @@ const resolvePermission = (
     };
   }
   // User answered the prompt: drop any lingering permission attention
-  // so the favicon/title badge de-escalates immediately rather than
-  // waiting for a turn end or tab switch.
+  // so the favicon/title badge de-escalates immediately, with no wait
+  // for a turn end or tab switch.
   if (s.attention === 'permission') {
     s.attention = null;
   }

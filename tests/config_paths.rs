@@ -1,7 +1,7 @@
 //! Tests for the path-resolution and load helpers in `mezame::config`.
-//! Mutates the process-global `HOME` env var, so all tests in this file
-//! take a file-scoped mutex (same pattern as
-//! `tests/session_steal_stale_lock.rs`).
+//! Mutates the process-global `HOME` env var. Every test in this file
+//! takes a file-scoped mutex, the same pattern as
+//! `tests/session_steal_stale_lock.rs`.
 
 use std::sync::OnceLock;
 

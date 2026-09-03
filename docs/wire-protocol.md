@@ -14,7 +14,7 @@ Mezame speaks two protocols: JSON text frames to the browser over `/ws`, and ACP
 { "type": "set_model", "modelId": "claude-sonnet-4.5" }
 ```
 
-`prompt` accepts either a legacy `text` string (wrapped into a single text block on the server) or a full ACP `blocks` array. The server forwards blocks unchanged, so the agent is the one that validates types against its own capabilities.
+`prompt` accepts either a legacy `text` string (wrapped into a single text block on the server) or a full ACP `blocks` array. The server forwards blocks unchanged. The agent validates types against its own capabilities.
 
 ## Mezame to browser
 
@@ -39,7 +39,7 @@ Details:
 - `session_info` arrives immediately after `ready` whenever Kiro reported `modes` / `models` on `session/new` or `session/load`. Drives the mode and model selectors in the header.
 - `commands` forwards Kiro's `_kiro.dev/commands/available` catalogue (commands + prompts only; the massive tool catalogue is stripped on the server to keep WS frames light). Drives the `/` autocomplete.
 - `append` is the ACP streaming path for a live turn. During a resume window the server suppresses these so the browser's `/history`-seeded log doesn't get duplicated.
-- `tool_call` carries the full ACP tool-call payload (arguments, content, file locations). Updates for the same `toolCallId` merge into the existing UI row in place rather than appending.
+- `tool_call` carries the full ACP tool-call payload (arguments, content, file locations). Updates for the same `toolCallId` merge into the existing UI row in place. No new row is appended.
 - `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which Mezame forwards to the agent to unblock it. When the "auto-allow all permissions" setting is on (see Cross-device UI state), the server answers `session/request_permission` itself with an allow option and suppresses the card; the tool still streams its `tool_call` updates so the run stays visible.
 - `mcp_oauth_request` renders an inline card with an Open button when an MCP server needs out-of-band authorisation. Carries `serverName`, `url`, and a dedupe `id` (Kiro re-emits while waiting). Dropped silently when no `url` is present.
 - `cancel` triggers `session/cancel` on the agent.
@@ -48,7 +48,7 @@ Details:
 
 `GET` / `PUT /state` persists the open-tabs list, recently-closed history, active tab, and numeric label counter. Backing file is `~/.mezame/state.json`. Any browser hitting this Mezame sees the same list, useful when moving between devices behind the same tunnel. Actual conversation content stays with the agent (Kiro at `~/.kiro/sessions/cli/`); Mezame only stores labels, cwds, and ACP session ids.
 
-The same file carries a `settings` object for app-wide preferences (theme, notifications, and `autoAllowPermissions`). The server reads `settings.autoAllowPermissions` on each `session/request_permission` to decide whether to auto-allow; the rest are client-only.
+The same file holds a `settings` object for app-wide preferences (theme, notifications, and `autoAllowPermissions`). The server reads `settings.autoAllowPermissions` on each `session/request_permission` to decide whether to auto-allow; the rest are client-only.
 
 `GET /state/events` is a Server-Sent Events stream that emits a `state_changed` event each time `PUT /state` writes a new file. Browsers use it as a "go refetch `/state`" signal so a session opened in another browser shows up without a manual reload. A periodic keep-alive comment keeps intermediaries from idle-timing out the stream.
 
@@ -71,7 +71,7 @@ Notifications Mezame handles:
   - `agent_message_chunk` to `append` with `role: "agent"`. Rendered as markdown in the chat pane.
   - `user_message_chunk` to `append` with `role: "user"` during `session/load` replay (suppressed when we're seeding from `/history`, see above).
   - `agent_thought_chunk` to `append` with `role: "sys"` and a `(thinking)` prefix. Kiro itself does not emit these today; reasoning-model agents do.
-  - `tool_call` / `tool_call_update` forwarded as a structured `tool_call` event keyed by `toolCallId`. Updates mutate the existing entry in place on the browser, so one tool call equals one collapsible row regardless of how many update notifications it emits.
+  - `tool_call` / `tool_call_update` forwarded as a structured `tool_call` event keyed by `toolCallId`. Updates mutate the existing entry in place on the browser. One tool call equals one collapsible row, whatever the number of update notifications behind it.
 - `session/request_permission` to `permission_request` event for the browser.
 - `_kiro.dev/commands/available` to `commands` event (trimmed to `commands` + `prompts`).
 - `_kiro.dev/mcp/oauth_request` to `mcp_oauth_request` event (serverName + url + dedupe id).

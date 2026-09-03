@@ -22,9 +22,9 @@ createRoot(container).render(
 );
 
 // PWA installability hook. Registration is deferred to `load` so it
-// does not compete with the first render; a failure here does not
-// break the app (no offline story depends on it), so we swallow.
-// See `ui/public/sw.js` for scope and intent.
+// does not compete with the first render. A failure is swallowed; no
+// offline story depends on it. See `ui/public/sw.js` for scope and
+// intent.
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch(() => {

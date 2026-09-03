@@ -11,9 +11,8 @@
  *   else        → "N years ago"
  *
  * Future timestamps clamp to "just now". Months and years use the
- * standard 30.44- and 365.25-day approximations rather than calendar
- * arithmetic; it is good enough for chat timeline labels and avoids
- * dragging in a date library.
+ * standard 30.44- and 365.25-day approximations, good enough for chat
+ * timeline labels. Calendar arithmetic would need a date library.
  */
 export const timeAgo = (ts: number, now: number = Date.now()): string => {
   const diff = Math.max(0, now - ts);
@@ -37,7 +36,7 @@ export const timeAgo = (ts: number, now: number = Date.now()): string => {
   // Bump to months once the week count would hit 9 (~63 days).
   // Eight weeks would round oddly to "8 weeks" right before flipping
   // to "2 months"; capping at the 8-week mark keeps the transition
-  // clean and the months branch picks up at 9 weeks.
+  // clean and the months branch starts at 9 weeks.
   if (w < 9) {
     return plural(w, 'week');
   }

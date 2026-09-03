@@ -6,8 +6,8 @@ use mezame::unix::send_signal;
 
 #[test]
 fn signal_zero_to_self_succeeds() {
-    // `kill(self, 0)` queries existence without delivering a signal;
-    // the process always exists, so the syscall must return 0. Doubles
+    // `kill(self, 0)` queries existence without delivering a signal.
+    // The process always exists and the syscall must return 0. Doubles
     // as a smoke test for the FFI symbol resolution.
     let pid = std::process::id() as i32;
     assert_eq!(send_signal(pid, 0), 0);

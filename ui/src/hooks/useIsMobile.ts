@@ -11,12 +11,12 @@ import { useSyncExternalStore } from 'react';
 //
 // Desktop-with-touch at >= 1024 px is treated as desktop because the
 // horizontal space is there. Mobile-with-mouse is vanishingly rare and
-// handled as mobile only if the width is narrow, which is the same
+// handled as mobile only if the width is narrow. That is the same
 // branch as a phone in portrait.
 //
-// Kept CSS-media-query-backed (not a resize observer) because
-// matchMedia only fires at the breakpoint boundary, so listener count
-// stays constant regardless of how fast the user drags a window edge.
+// Backed by a CSS media query because matchMedia only fires at the
+// breakpoint boundary. The listener count stays constant regardless of
+// how fast the user drags a window edge.
 
 const QUERY =
     '(max-width: 767.98px), (pointer: coarse) and (max-width: 1023.98px)';

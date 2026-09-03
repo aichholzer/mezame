@@ -13,61 +13,105 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
-## [0.13.3] - 2026-06-30
+## [0.13.4] - 2026-09-04
 
 ### Fixed
 
-- Losing focus on a mobile device mid-turn no longer interrupts the
-  turn. When the last browser detaches, Mezame arms a grace timer and,
-  on expiry, shuts the agent down -- which sends `session/cancel` and
-  aborts any running turn. On mobile, backgrounding the tab or locking
-  the screen drops the WebSocket within seconds, so a multi-minute turn
-  was reliably cancelled ("Response was interrupted by the user") before
-  the user returned. The grace timer is now turn-aware: it keeps the
-  agent warm while a `session/prompt` is in flight and only reclaims the
-  agent once the turn completes, so you can fire a prompt, switch away,
-  and come back to the finished answer. Idle sessions (no turn running)
-  are still reaped on the same grace window.
+- Losing focus on a mobile device mid-turn no longer interrupts the turn.
+  When the last browser detaches, Mezame arms a grace timer and shuts the
+  agent down on expiry. The first step of that shutdown is
+  `session/cancel`, and a running turn died with it. Backgrounding a
+  mobile tab or locking the screen drops the WebSocket within seconds,
+  and a multi-minute turn was reliably cancelled ("Response was
+  interrupted by the user") before the user came back. The grace timer is
+  now turn-aware: it holds the agent while a `session/prompt` is in
+  flight and reclaims it once the turn resolves. Fire a prompt, switch
+  away, and the finished answer is waiting. An idle session with no turn
+  running is reaped on the same grace window as before.
+- The turn-aware hold is capped at 30 minutes. A turn that never resolves
+  (a wedged agent, an MCP server that never answers) would otherwise keep
+  the agent and its MCP fleet alive for the life of the process.
+
+## [0.13.3] - 2026-09-03
+
+### Added
+
+- Publishing to crates.io runs from GitHub Actions. A manual
+  `Publish` workflow gates on the full CI suite, refuses to republish
+  a version already on crates.io, refuses a version whose
+  `Cargo.toml` and `ui/package.json` disagree or that has no
+  `CHANGELOG.md` section, then publishes and cuts a GitHub release
+  using that section as the notes.
+
+### Changed
+
+- The Mezame mark no longer appears beside every agent response. The
+  copy button keeps its place in the left rail on desktop and below
+  the bubble on mobile.
+- The Agent and Model pickers read `none` when no selection is
+  current, in place of a dash.
+- CI consolidated into a single `ci.yml`, absorbing the separate
+  CodSpeed workflow and adding a job that gates on rustdoc warnings
+  and runs doctests.
+- Every action in CI and the publish workflow is pinned to a commit
+  SHA, with its version in a trailing comment. `dtolnay/rust-toolchain`
+  publishes no version tags. Its pin is a `master` commit, and every job
+  that uses it now names its toolchain explicitly.
+- `anyhow` floor raised to 1.0.103, the first release without the
+  `Error::downcast_mut` unsoundness of RUSTSEC-2026-0190. Mezame never
+  calls that function. The advisory is graded informational.
+
+### Fixed
+
+- The `agent_reap_session` test compiles under Rust 1.99. Its
+  `extern "C"` declarations of `read` and `write` took `u8` buffers where
+  the platform signature takes `c_void`. rustc 1.99 rejects that through
+  the new `suspicious_runtime_symbol_definitions` lint, and the CI beta
+  leg caught it ahead of the stable release.
+- The CI job named "Release build with UI" was not building the UI.
+  It cleared `MEZAME_SKIP_UI_BUILD` by setting it to an empty string,
+  and `build.rs` treats the variable as set whenever it is present.
+  Every release build in CI compiled against the stub bundle.
 
 ## [0.13.2] - 2026-06-26
 
 ### Fixed
 
 - Resuming a session held by a live process no longer destroys it.
-  Mezame already steals a stale lock whose PID is dead and rides out the
-  sub-second browser-reload race, but when the lock was held by a
+  Mezame already steals a stale lock whose PID is dead and rides out
+  the sub-second browser-reload race, but when the lock was held by a
   genuinely live owner (a local agent still finishing a turn, or, with
   a synced `~/.kiro`, an agent on another device) the resume fell
-  through to starting a brand-new session, abandoning the in-flight turn
-  and dropping the browser onto an empty throwaway. Mezame now refuses
-  such a resume and surfaces an error so the client reconnects once the
-  owner releases the lock, instead of clobbering the live session.
+  through to starting a brand-new session, abandoning the in-flight
+  turn and dropping the browser onto an empty throwaway. Mezame now
+  refuses such a resume and surfaces an error. The client reconnects
+  once the owner releases the lock.
 
 ## [0.13.1] - 2026-06-26
 
 ### Fixed
 
-- A session could disappear from the sidebar when switching devices. The
-  cross-device session list at `/state` is last-writer-wins, and a
+- A session could disappear from the sidebar when switching devices.
+  The cross-device session list at `/state` is last-writer-wins, and a
   browser whose live `/state/events` stream had fallen behind (a
-  backgrounded mobile tab, a device just switched to) would overwrite the
-  shared list with its own stale view, dropping a session another device
-  still had open. The conversation was never lost (Kiro keeps it on
-  disk), but its entry vanished from Mezame and had to be re-added by
-  hand. The session sync now merges in sessions only the server knows
-  about, skipping any it can prove were deliberately closed, so a stale
-  writer can no longer clobber a live session out of the list. Complements
-  the read-side reconcile guard that already prevented the same loss on
-  refetch.
+  backgrounded mobile tab, a device just switched to) would overwrite
+  the shared list with its own stale view, dropping a session another
+  device still had open. The conversation was never lost (Kiro keeps it
+  on disk), but its entry vanished from Mezame and had to be re-added
+  by hand. The session sync now merges in sessions present only on the
+  server, skipping any it can prove were deliberately closed. A stale
+  writer can no longer clobber a live session out of the list.
+  Complements the read-side reconcile guard that already prevented the
+  same loss on refetch.
 
 ## [0.13.0] - 2026-06-26
 
 ### Added
 
 - Idle session suspend/resume. A session left idle in the sidebar past
-  a configurable quiet period now drops its WebSocket so the server
-  tears down its agent and MCP fleet, reclaiming the memory those
-  processes hold. The tab stays in place, greyed out, and transparently
+  a configurable quiet period now drops its WebSocket, and the server
+  tears down its agent and MCP fleet. The memory those processes held
+  is reclaimed. The tab stays in place, greyed out, and transparently
   reconnects (resuming the agent session) the moment you interact with
   it again. The active tab is only suspended while the browser tab is
   hidden. A new Settings control sets the idle threshold (1-60 minutes,
@@ -83,8 +127,8 @@ build-time Vite define.
   settings store had written; any session event (open/rename/close, tab
   switch, first-prompt id record, cross-browser reconcile) silently
   reverted `autoAllowPermissions` to its default and re-prompted the
-  user. The sync now reads-then-merges, preserving fields it does not
-  own, mirroring how the settings store already persists. The Rust
+  user. The sync now reads-then-merges and preserves fields it does not
+  own, matching how the settings store already persists. The Rust
   enforcement added in the original feature was correct; only the UI
   write path dropped the field.
 
@@ -92,13 +136,13 @@ build-time Vite define.
 
 ### Fixed
 
-- Reap the agent's whole session on teardown. MCP servers spawned by the
-  agent through `npx`/`npm` place themselves in their own process groups,
-  so the existing `kill(-pgid)` process-group kill never reached them; on
-  shutdown they orphaned to PID 1 and accumulated until the service cgroup
-  was throttled (systemd `MemoryHigh`) and Mezame became unresponsive after
-  a few days. Shutdown now also walks the agent's session and SIGKILLs every
-  process still in it, catching those escapees.
+- Reap the agent's whole session on teardown. MCP servers spawned by
+  the agent through `npx`/`npm` place themselves in their own process
+  groups. The existing `kill(-pgid)` process-group kill never reached
+  them; on shutdown they orphaned to PID 1 and accumulated until the
+  service cgroup was throttled (systemd `MemoryHigh`) and Mezame became
+  unresponsive after a few days. Shutdown now also walks the agent's
+  session and SIGKILLs every process still in it.
 
 ## [0.12.0] - 2026-06-08
 
@@ -119,12 +163,12 @@ build-time Vite define.
   across all sessions and devices.
 - Auto-allow all permissions. A toggle in the new Settings pane makes
   Mezame answer every agent permission request automatically with an
-  allow option instead of showing an approval card, so tool calls run
-  without interruption. Off by default; a new install always prompts
-  until the user opts in. Enforced server-side (the hub reads the
-  preference on each `session/request_permission`), so it applies to
-  every attached device and to unattended sessions, and takes effect on
-  the next request without a reconnect. Reject options are never chosen
+  allow option. No approval card appears, and tool calls run without
+  interruption. Off by default; a new install always prompts until the
+  user opts in. Enforced server-side: the hub reads the preference on
+  each `session/request_permission`. It applies to every attached
+  device and to unattended sessions, and takes effect on the next
+  request without a reconnect. Reject options are never chosen
   automatically: if no option can be identified as an allow, Mezame
   falls back to prompting.
 
@@ -134,12 +178,11 @@ build-time Vite define.
 
 - Night mode. A theme picker in the bottom-left of the sidebar
   switches between System, Light, and Dark. "System" follows the
-  operating system's `prefers-color-scheme` and tracks it live, so an
-  OS configured to go dark on a schedule flips Mezame with it. The
-  dark palette is a warm "espresso" scheme that keeps the terracotta
-  accent rather than going neutral grey. The choice persists across
-  reloads and is applied before first paint to avoid a flash of the
-  light theme.
+  operating system's `prefers-color-scheme` and tracks it live. An OS
+  configured to go dark on a schedule flips Mezame with it. The dark
+  palette is a warm "espresso" scheme that keeps the terracotta
+  accent. The choice persists across reloads and is applied before
+  first paint to avoid a flash of the light theme.
 
 ## [0.9.0] - 2026-06-04
 
@@ -147,13 +190,13 @@ build-time Vite define.
 
 - New sessions now auto-label from their first prompt. A short label is
   derived by a pure client-side heuristic (strip code fences and URLs,
-  take the first sentence via `Intl.Segmenter`, soft-cap at 10 words),
-  so a tab reads as its topic instead of a bare number after the first
-  turn. No network or model is involved. Only the numeric placeholder
-  is overwritten; names set in the new-session dialog or via rename are
-  left untouched, and slash-command or attachments-only prompts leave
-  the label numeric. Works across scripts, including CJK and accented
-  Latin. Thanks to @zoucet (#1).
+  take the first sentence via `Intl.Segmenter`, soft-cap at 10 words).
+  A tab reads as its topic after the first turn. No network or model is
+  involved. Only the numeric placeholder is overwritten; names set in
+  the new-session dialog or via rename are left untouched, and
+  slash-command or attachments-only prompts leave the label numeric.
+  Works across scripts, including CJK and accented Latin. Thanks to
+  @zoucet (#1).
 
 ## [0.8.45] - 2026-06-04
 
@@ -162,16 +205,16 @@ build-time Vite define.
 - Agent subprocesses no longer leak on half-open WebSockets. A browser
   that vanished without a TCP close (laptop sleep, Wi-Fi drop, or a
   reverse proxy silently dropping an idle upstream) left an
-  `ESTABLISHED` socket that yielded nothing, so the per-attach loop
+  `ESTABLISHED` socket that yielded nothing. The per-attach loop
   blocked forever, the hub never tore down, and its `kiro-cli` agent
-  tree was never reaped, growing memory unbounded on a long-lived
+  tree was never reaped; memory grew unbounded on a long-lived
   deployment. The server now sends a WebSocket ping every 20s and
-  evicts a peer after 60s of total silence, which runs the existing
-  cooperative shutdown and reaps the agent. TCP keepalive is also set
-  on the listener as a kernel-level backstop. Reported in #4.
+  evicts a peer after 60s of total silence. The eviction runs the
+  existing cooperative shutdown and reaps the agent. TCP keepalive is
+  also set on the listener as a kernel-level backstop. Reported in #4.
 - The chat no longer appears to reload mid-conversation on a transient
   reconnect. The hub stamps `resumed: true` on every attach, and the
-  client treated that as "wipe the log and refetch history", so every
+  client treated that as "wipe the log and refetch history". Every
   WebSocket reconnect (common on macOS across idle/sleep) cleared and
   rebuilt the timeline and could drop an in-flight reply. The client
   now seeds from history only on a tab's first connect; reconnects
@@ -186,23 +229,23 @@ build-time Vite define.
   another machine over the shared SMB folder, a stale lock, or an
   agent restart), Mezame fell back to a fresh `session/new` and the
   browser overwrote the tab's stored session id with the throwaway
-  id. On the next restart the original was gone, so tabs silently
+  id. On the next restart the original was gone. Tabs silently
   ratcheted onto empty sessions while real conversations orphaned on
   disk. The server now reports `resumeFailedFor` on the `ready` frame
-  and the client keeps the durable session id pinned, using a
-  separate transient id for the fallback connection. A failed resume
-  now shows an empty pane and can be retried later instead of losing
-  the conversation.
+  and the client keeps the durable session id pinned, with a separate
+  transient id for the fallback connection. A failed resume now shows
+  an empty pane and can be retried later; the conversation survives.
 - Sessions no longer vanish from `state.json` during cross-device
   reconcile. A session absent from another browser's last-writer-wins
   snapshot is only closed locally when the server's closed-history
   corroborates a deliberate close; an unverified omission (a clobber
   or init race) keeps the session and heals on the next sync.
 - The composer no longer sends a second prompt while a turn is in
-  flight, which the agent rejected with an "already received this
-  request" error. `sendPrompt` now refuses when the session is busy.
+  flight. The agent rejected such a prompt with an "already received
+  this request" error. `sendPrompt` now refuses when the session is
+  busy.
 - The page no longer reloads repeatedly mid-chat. The stale-bundle
-  reload is latched to once per server build id, so a persistent
+  reload is latched to once per server build id. A persistent
   bundle/id mismatch (e.g. a cached asset) can no longer loop a
   reload on every WebSocket reconnect.
 
@@ -212,14 +255,15 @@ build-time Vite define.
   horizontal-overflow guard plus a min-width fix on the chat column
   stop a wide child from making the whole page scroll sideways.
 - The composer and chat column now use a symmetric 8 px gutter on
-  mobile (left, right, and bottom) instead of a desktop-sized 20 px
-  inset that was flush on the left and gapped on the right.
+  mobile (left, right, and bottom). The previous desktop-sized 20 px
+  inset was flush on the left and gapped on the right.
 - The sidebar drawer hides completely when collapsed. Its
   desktop floating-card margins were applied on all viewports, and
   the left margin survived the slide-out transform, leaving a sliver
   overlapping the composer. The margins are now desktop-only.
 - On mobile the agent avatar is hidden and the copy button moves
-  below the response, reclaiming horizontal space for the bubble.
+  below the response. The bubble takes the horizontal space that
+  frees up.
 
 ## [0.8.43] - 2026-05-31
 
@@ -239,7 +283,7 @@ build-time Vite define.
   Highlights:
   - New image & avatar.
   - Warm cream surface ladder with a saturated terracotta primary
-    that carries through to the user bubble, send button, sidebar
+    that runs through to the user bubble, send button, sidebar
     accent bar, and the active session row.
   - Sidebar floats as a card on desktop with rounded corners, a
     dark soft shadow, and 20/10/20/20 px margins. The active
@@ -249,8 +293,8 @@ build-time Vite define.
     cream-secondary for the agent. Agent bubbles show a
     placeholder avatar to their left with a copy button below it.
   - The "thinking" indicator is now the avatar with a bouncing
-    dots bubble that transitions seamlessly into the streamed
-    response.
+    dots bubble that transitions without a break into the
+    streamed response.
   - Tool-call cards, thought blocks, permission cards, and MCP
     OAuth cards are indented to align with the agent bubble edge.
   - The floating composer is a white card with a warm shadow that
@@ -268,13 +312,12 @@ build-time Vite define.
 - The copy button and timestamp under an agent message now appear
   only after the response is complete. While Kiro is streaming
   the trailing agent text entry, both fields would be referencing
-  partial text and a still-changing timestamp; hiding them keeps
-  the visual quieter and matches what users expect from a chat UI.
-  Earlier agent entries in the same turn (interleaved with tool
-  calls) are already final and keep their footer.
+  partial text and a still-changing timestamp. Earlier agent
+  entries in the same turn (interleaved with tool calls) are
+  already final and keep their footer.
 
   The signal is the session's <code>thinking</code> flag combined
-  with "this is the last agent text entry" so only one footer is
+  with "this is the last agent text entry". Only one footer is
   ever suppressed per turn. <code>prompt_done</code> clears
   <code>thinking</code> and the meta lights up.
 
@@ -283,17 +326,17 @@ build-time Vite define.
 ### Fixed
 
 - 0.8.39's tool-result backfill missed when Kiro flushed the
-  result body only after the agent's whole turn completed,
-  which is exactly what <code>web_search</code> does. The 1.25s
+  result body only after the agent's whole turn completed.
+  <code>web_search</code> does exactly that. The 1.25s
   poll window after the status flip ran out before the JSONL
   even existed for that block. Two changes:
   - The post-status poll window expands to ~5s (10 attempts at
-    500ms), so a tool whose result lands a couple of seconds
+    500ms). A tool whose result lands a couple of seconds
     after the status flip still backfills mid-turn.
   - On <code>prompt_done</code> we now sweep every
     <code>tool_call</code> entry in the session that still has
     no content and try once more. By that point Kiro has
-    flushed the JSONL for the whole turn, so this is the
+    flushed the JSONL for the whole turn. This is the
     deterministic backstop for slow-flushing tools.
 
   Combined, fast tools backfill within seconds; slow ones land
@@ -304,11 +347,12 @@ build-time Vite define.
 ### Added
 
 - Tool-call output is now visible in the live timeline as soon as
-  the result lands on disk, not just on reload. Some tools
-  (notably web search) only stream a status flip on the live wire;
-  the result body lands in the on-disk JSONL once Kiro finalises
-  the turn. The browser now polls a new <code>GET /tool-result</code>
-  endpoint after a <code>tool_call_update</code> arrives with a
+  the result lands on disk. Previously it appeared only after a
+  reload. Some tools (notably web search) only stream a status flip
+  on the live wire; the result body lands in the on-disk JSONL once
+  Kiro finalises the turn. The browser now polls a new
+  <code>GET /tool-result</code> endpoint after a
+  <code>tool_call_update</code> arrives with a
   final status (<code>completed</code> / <code>failed</code> /
   <code>cancelled</code>) and no streamed content. The endpoint
   scans the same JSONL the history view uses and returns the
@@ -331,23 +375,22 @@ build-time Vite define.
   entry per <code>toolUse</code> and patches its <code>status</code>
   and <code>content</code> from the matching <code>ToolResults</code>
   by <code>toolUseId</code>. The wire shape mirrors the live
-  <code>tool_call</code> event so the client pushes the same
+  <code>tool_call</code> event, and the client pushes the same
   log entry on rehydrate as it does during a live turn; the
   rendered card is identical.
 
   Title displays the tool's raw <code>name</code> from the JSONL
-  (e.g. <code>web_search</code>) rather than the friendly title
-  the live stream emits (e.g. <code>Searching the web</code>).
-  The friendly title comes from the agent's
-  <code>session/update</code> events at runtime; we do not have it
-  on disk.
+  (e.g. <code>web_search</code>). The live stream emits a friendly
+  title (e.g. <code>Searching the web</code>) that comes from the
+  agent's <code>session/update</code> events at runtime; we do not
+  have it on disk.
 
 ## [0.8.37] - 2026-05-29
 
 ### Fixed
 
 - Permission and OAuth requests landed on every attached browser,
-  not just the one that started the turn. A user on browser A
+  including ones that had not started the turn. A user on browser A
   would see a permission card pop up because B asked the agent
   to do a web search; A had no useful action to take but had to
   dismiss the card or watch the resolved-state appear after B
@@ -358,8 +401,8 @@ build-time Vite define.
   prompter; peer browsers' WS write loop drops events whose
   `_target` does not match their own attach id. Other event
   types (text, tool calls, thoughts, append echoes) stay
-  untargeted and broadcast to everyone, since those are the
-  shared timeline of the session.
+  untargeted and broadcast to everyone. Those are the shared
+  timeline of the session.
 
   Each `AttachedHub` now carries a process-unique `attach_id`
   generated from a static `AtomicU64`. The hub tracks the
@@ -376,7 +419,7 @@ build-time Vite define.
 - The reasoning blocks now survive a page reload. Kiro records
   reasoning as a <code>thinking</code> content block inside its
   <code>AssistantMessage</code> entries; the history endpoint
-  ignored them, so the rehydrated log showed only the answer
+  ignored them. The rehydrated log showed only the answer
   text. The <code>/history</code> endpoint now extracts thinking
   blocks alongside text blocks and returns them as a separate
   entry with role <code>thought</code>, ordered before the
@@ -398,7 +441,7 @@ build-time Vite define.
   and the mutation walked into <code>info.modes.currentModeId</code>,
   not <code>info.currentModeId</code>. The cached snapshot already
   carries the wrapping <code>{ type: "session_info", info: ... }</code>
-  envelope, so <code>get_mut("modes")</code> on the outer frame
+  envelope. <code>get_mut("modes")</code> on the outer frame
   always returned <code>None</code> and the broadcast was a
   no-op. The fix walks one step into <code>info</code> before
   poking the field, and returns just the inner object so the
@@ -416,12 +459,11 @@ build-time Vite define.
   `session/set_model`, mutates the cached `session_info` half of
   its snapshot, and broadcasts the updated `session_info` event
   to every attached browser. Future attaches read the latest
-  selection from the snapshot, so a fresh page load also picks
+  selection from the snapshot. A fresh page load also picks
   up the correct value.
 
   When the agent rejects a mode or model change, the hub
-  broadcasts a sys-line error notice so peers see the failure
-  rather than a silent revert mismatch.
+  broadcasts a sys-line error notice so peers see the failure.
 
 ## [0.8.33] - 2026-05-29
 
@@ -453,15 +495,15 @@ build-time Vite define.
   Fix: when the live broadcast is an `append { role: 'user' }`,
   set the same flags the sender sets in `sendPrompt`. The hub's
   prompt-echo is already the single source of truth for the start
-  of a turn, so peers light up alongside the sender. The existing
-  `prompt_done` arm clears them everywhere, so the spinner falls
+  of a turn. Peers light up alongside the sender. The existing
+  `prompt_done` arm clears them everywhere, and the spinner falls
   away in lockstep on every attached browser. History replays go
-  through `/history`, not the live broadcast, so historic user
+  through `/history` and never the live broadcast. Historic user
   turns do not trigger this branch.
 
   Side effect: peer browsers now also lock their composer for
-  the duration of a turn. The hub serialises commands anyway, so
-  letting both browsers send concurrently would just queue at the
+  the duration of a turn. The hub serialises commands anyway.
+  Letting both browsers send concurrently would just queue at the
   hub; locking is the friendlier signal.
 
 ## [0.8.31] - 2026-05-29
@@ -487,8 +529,8 @@ build-time Vite define.
 
 - Closing a session on browser A did not propagate to browser B,
   and vice versa. Worse, after a few rounds the closed sessions
-  would reappear on both browsers, making it effectively impossible
-  to close anything when two browsers were open.
+  would reappear on both browsers. Closing anything with two
+  browsers open became effectively impossible.
 
   Root cause: 0.8.28's reconcile was additive only. When B closed
   sessions 1 to 3, B's PUT held only [4]. A's reconcile saw 4
@@ -508,9 +550,8 @@ build-time Vite define.
 
   Also: cancel any pending sync after a reconcile, otherwise our
   pre-reconcile snapshot would clobber the server view we just
-  applied. The closed-history list also follows the server now,
-  so the recent-sessions dropdown stays consistent across
-  browsers.
+  applied. The closed-history list also follows the server now.
+  The recent-sessions dropdown stays consistent across browsers.
 
   Also: reverted the 0.8.28 change that persisted `acpSessionId`
   for unused sessions. That change caused a storm of "Session not
@@ -519,7 +560,7 @@ build-time Vite define.
   only after the first prompt; the tradeoff is fewer log errors
   and a cleaner restart story.
 
-  Also: reconcile on EventSource open, so a browser that missed
+  Also: reconcile on EventSource open. A browser that missed
   ticks while offline catches up the moment the SSE stream
   reconnects.
 
@@ -541,12 +582,12 @@ build-time Vite define.
   `build_hub`, and re-checks the registry after taking the mutex.
   The first arrival builds the hub and registers it; the second
   finds it already there and falls into the fast attach path.
-  Fresh-session attaches (no `?session=`) skip the gate entirely
-  since they are independent by definition.
+  Fresh-session attaches (no `?session=`) skip the gate entirely.
+  They are independent by definition.
 
   The per-id mutex is dropped from the auxiliary map as soon as
-  nobody else is waiting on it, so the gate does not leak one
-  mutex per session id ever attached.
+  nobody else is waiting on it. The gate does not leak one mutex
+  per session id ever attached.
 
 ## [0.8.28] - 2026-05-29
 
@@ -582,8 +623,8 @@ build-time Vite define.
 - Sender's composer stayed locked at "Agent is working" after a
   multi-attach turn finished. The hub's prompt path fired
   `session/prompt` as fire-and-forget and never broadcast a
-  `prompt_done` (or `error`) once the agent's reply resolved, so
-  the sender's `busy`/`inFlight` flags, which only clear on those
+  `prompt_done` (or `error`) once the agent's reply resolved. The
+  sender's `busy`/`inFlight` flags, which only clear on those
   events, never flipped back. Peer browsers were unaffected because
   they had not entered the busy state in the first place.
 
@@ -607,7 +648,7 @@ build-time Vite define.
   Browser B joining an existing session saw an empty chat. The hub
   cached the `ready` event from the first attach with `resumed: false`
   (the first browser was the one that ran `session/new`); subsequent
-  attaches replayed that snapshot, so the client never took the
+  attaches replayed that snapshot. The client never took the
   `resumed: true` branch that fetches `/history`. Fixed by always
   rewriting `ready.resumed` to `true` when subscribing to a hub:
   every attach is functionally a join to a conversation that
@@ -713,8 +754,7 @@ build-time Vite define.
 - Sidebar is now resizable. Drag the right edge to widen or narrow
   the panel; the chosen width is persisted to localStorage on a
   per-browser basis so it survives reloads. Clamped between 192 px
-  (min, so labels stay readable) and 480 px (max, so the chat
-  pane is never crowded). The drag handle is a thin strip pinned
+  (min) and 480 px (max). The drag handle is a thin strip pinned
   to the right edge, hidden on mobile (where the sidebar is a
   drawer and a resize handle would not make sense). New default
   width 272 px gives the larger MEZAME wordmark room to breathe.
@@ -735,7 +775,7 @@ build-time Vite define.
 ### Fixed
 
 - The copy button on syntax-highlighted code blocks now copies the
-  full source instead of dropping every highlighted token. Bug
+  full source. It used to drop every highlighted token. Bug
   surfaced on a CSS snippet: `.element { width: 100vw; ... }`
   pasted as `{: ;: ( - );}`. After `rehype-highlight` runs, the
   `<code>` element's children are a mix of plain strings (the
@@ -762,13 +802,13 @@ build-time Vite define.
 - Reworked the remembered-permission affordances on the permission
   card. The previous "Forget for this session" button appeared on
   every resolved card whenever any policy was active, with wording
-  that read like a state ("this is forgotten") instead of an action.
+  and its wording read like a state ("this is forgotten").
   Now the originating card and any subsequent auto-resolved cards
   carry a `Remembered for this session` status badge plus a `Disable`
   button; cards that have nothing to do with a remembered policy
   stay clean. New per-title `forgetRememberedPermission` action
-  clears just the policy that matches a given card, so Disable on
-  one card no longer wipes every other remembered policy on the
+  clears just the policy that matches a given card. Disable on one
+  card no longer wipes every other remembered policy on the
   tab. Tickbox label rewritten to "Remember my choice and apply
   automatically next time" so users know what ticking it does.
 
@@ -800,7 +840,7 @@ build-time Vite define.
   nearly half the suite would have been needed to trip it. The new
   floor sits comfortably below the current figure: routine drift
   passes, a five-plus-point drop fails. The floor is a regression
-  alarm, not a target.
+  alarm.
 
 ## [0.8.17] - 2026-05-26
 
@@ -829,10 +869,10 @@ build-time Vite define.
   suite (8 cases). `spawn_agent` is exercised against a real `cat`
   subprocess, confirming the stdin / stdout / reader-task wiring
   and the failure path for a missing binary (3 cases). The asset
-  route tests gained the `sw.js` no-cache assertion and a default-
-  short-cache assertion for top-level static files (3 cases). The
-  `build.rs` SPA stub now writes `sw.js` and a `favicon.png` stub
-  so the new tests have real bytes to fetch under
+  route tests now include the `sw.js` no-cache assertion and a
+  default-short-cache assertion for top-level static files (3
+  cases). The `build.rs` SPA stub now writes `sw.js` and a
+  `favicon.png` stub so the new tests have real bytes to fetch under
   `MEZAME_SKIP_UI_BUILD=1`. Three `pub(crate)` items widened to
   `pub` so integration tests can import them (`config_path`,
   `load_config`, `spawn_agent`); no behaviour change. Test count
@@ -846,11 +886,11 @@ build-time Vite define.
   0.8.12 because the `tests/session_steal_stale_lock.rs` file had
   two latent bugs that tarpaulin's parallelism throttle had been
   hiding. First: the five tests in the file all mutate the
-  process-global `HOME` env var, so cargo's default
-  intra-binary parallelism let one test swap `HOME` mid-flight
+  process-global `HOME` env var. Cargo's default intra-binary
+  parallelism let one test swap `HOME` mid-flight
   for another. Second: the dead-PID test used `i32::MAX` as a
   "definitely dead" sentinel, which macOS reports as ESRCH but
-  some Linux runners do not, so `steal_stale_session_lock`
+  some Linux runners do not. `steal_stale_session_lock`
   refused to fire. Added a file-scoped `tokio::sync::Mutex` via
   `OnceLock` (same pattern `tests/http_routes.rs` uses) to
   serialise the HOME-mutating tests, and replaced the magic PID
@@ -863,7 +903,7 @@ build-time Vite define.
   `@tailwindcss/oxide-wasm32-wasi` package pulls in
   `@napi-rs/wasm-runtime`, which depends on emnapi. A plain
   `npm install` on macOS picks the macos-arm64 oxide and never
-  visits the wasi variant, so the emnapi entries never landed in
+  visits the wasi variant. The emnapi entries never landed in
   the lockfile; Linux `npm ci` walks a different optional tree and
   demands them. Regenerated with `npm install --include=optional`
   so the lockfile is a cross-platform superset.
@@ -899,9 +939,9 @@ build-time Vite define.
   was failing reliably on Linux despite every test binary it spawned
   reporting ok; the recent duplex-pipe async tests and `tokio::time::pause`
   usage tripped its instrumentation. llvm-cov uses LLVM's source-based
-  coverage built into rustc, so it does not need a custom test harness,
-  is faster, and emits lcov directly which Codecov v5 accepts natively.
-  The 35% threshold carries over.
+  coverage built into rustc. It does not need a custom test harness,
+  is faster, and emits lcov directly, which Codecov v5 accepts
+  natively. The 35% threshold is unchanged.
 
 ## [0.8.11] - 2026-05-26
 
@@ -924,24 +964,24 @@ build-time Vite define.
      session pinned to busy with no `prompt_done` coming to clear it.
   2. `ready { resumed: true }` after a successful reconnect did not
      clear the busy markers. The server suppresses Kiro's live replay
-     during the resume window, so the historical `prompt_done` never
+     during the resume window. The historical `prompt_done` never
      landed.
   3. Reconnect was driven solely by the exponential back-off (capped
-     at 30s), so returning to an idle tab could mean waiting half a
-     minute for the next attempt instead of going through immediately.
+     at 30s). Returning to an idle tab could mean waiting half a
+     minute for the next attempt.
 
   Fixes: a new `Session.inFlight` flag tracks whether a prompt is
-  actually outstanding, so `ws.onclose` only flags busy when one is.
+  actually outstanding. `ws.onclose` only flags busy when one is.
   `ready { resumed: true }` now clears `busy`, `thinking`, and
   `inFlight` as a safety net. A `visibilitychange` listener kicks any
   session sitting in `reconnecting` to retry immediately when the tab
-  comes back into focus, dropping the worst-case "back to a stale UI"
-  delay from 30s to under a second.
+  comes back into focus. The worst-case "back to a stale UI" delay
+  drops from 30s to under a second.
 
 - Fenced code blocks render with their language pill and copy button
   again. The Markdown renderer's switch between fenced and inline code
   used `className.startsWith('language-')`, but `rehype-highlight`
-  runs first and prepends `hljs` to the className, so fenced blocks
+  runs first and prepends `hljs` to the className. Fenced blocks
   arrived as `"hljs language-rust"` and fell through to the inline
   branch. Switched the test to `/(?:^|\s)language-\w/` which matches
   the language token wherever it sits in the class list. Side
@@ -966,9 +1006,8 @@ build-time Vite define.
   prompt-the-user path.
 
 - `mezame --version` and `mezame -V` print the version and exit
-  cleanly, instead of falling through to the normal startup path.
-  `mezame --help` and `-h` print a short usage block listing the
-  `init` subcommand, the two flags, and the `MEZAME_DEBUG_ACP` /
+  cleanly. `mezame --help` and `-h` print a short usage block listing
+  the `init` subcommand, the two flags, and the `MEZAME_DEBUG_ACP` /
   `MEZAME_SKIP_UI_BUILD` environment variables. Both flags short
   circuit before any config load or runtime build.
 
@@ -979,7 +1018,7 @@ build-time Vite define.
   headings produce `h1`/`h2`, inline code stays inline, fenced
   blocks carry a `language-*` class on the inner `code`, the
   language pill text is visible, fenced blocks without a language
-  do not gain a `language-*` class, the copy button appears next
+  have no `language-*` class, the copy button appears next
   to fenced code, GFM pipe tables render as tables with `<th>` and
   `<td>` populated, and external links land with `target="_blank"`
   and a `rel` containing `noreferrer`. A future `react-markdown`
@@ -988,7 +1027,7 @@ build-time Vite define.
 - Pure-formatter tests for `lib/time.ts`. Thirteen cases under
   `tests/ui/time.test.ts` lock the wording `timeAgo` produces at every
   threshold (just now, 1 min, 59 min, 1 h, 23 h, 1 d, multi-day),
-  confirm the singular noun does not gain an "s", clamp future
+  confirm the singular noun takes no "s", clamp future
   timestamps to "just now", and assert `formatAbsolute` includes
   year, day, month token, and a hh:mm separator. Test inputs use
   explicit `now` arguments and locale-tolerant assertions so the
@@ -1003,12 +1042,12 @@ build-time Vite define.
   `embeddedContext`. The mime was always fine; the rejection was
   always about the missing capability. `fileToAttachment` now folds
   the trailing `unknown-type` branch into the existing
-  `embed-not-supported` reason, so any non-image embedded file gets
+  `embed-not-supported` reason. Any non-image embedded file gets
   the same accurate message regardless of mime ("This agent does not
   accept embedded files."). The `unknown-type` variant of
   `RejectReason` is gone; tests for it removed in lockstep. Bonus:
   the file picker's `accept` attribute now narrows to `image/*` when
-  the agent only advertises image support, so the OS dialogue does
+  the agent only advertises image support. The OS dialogue does
   not even offer file types the agent will reject.
 
 ### Added
@@ -1038,11 +1077,11 @@ build-time Vite define.
   desktop notification via the browser's `Notification` API. First
   use surfaces an inline banner asking the user to opt in; clicking
   "Enable" triggers `Notification.requestPermission()` and persists
-  the choice. The `tag` field deduplicates rapid status changes so
-  the OS replaces prior notifications instead of stacking them.
+  the choice. The `tag` field deduplicates rapid status changes. The
+  OS replaces a prior notification and they do not stack.
   Preference stored in `state.json` under `settings.notifications`
   (`unset` / `pending` / `on` / `off`). Requires a secure context
-  (https or localhost), so plain-LAN bind addresses won't see the
+  (https or localhost). Plain-LAN bind addresses won't see the
   prompt; the favicon badge and attention dots still work in that
   case.
 
@@ -1053,7 +1092,7 @@ build-time Vite define.
   base64/text reader paths, and the `cleanup` URL revocation. The PDF
   bug (#31) has both an expected-failing test for the desired
   behaviour and a passing test that locks in the current buggy
-  behaviour, so the fix lands paired with the `it.fails` removal.
+  behaviour. The fix lands paired with the `it.fails` removal.
 
 - Reducer tests for `useMezame`. Sixteen cases across
   `tests/ui/useMezame.test.ts` lock down the wire shape the UI
@@ -1124,7 +1163,7 @@ build-time Vite define.
 
 - WebSocket integration tests. New `Agent::from_io` constructor and an
   extracted `ws::run_select_loop` function let the per-session loop be
-  tested with in-memory streams instead of a real subprocess. Five
+  tested with in-memory streams. No subprocess is spawned. Five
   tests under `tests/ws_select_loop.rs` cover the disconnect paths
   that bug #32 missed: stream close (`None`), Close frame, transport
   error, agent exit, and a permission round-trip that confirms a
@@ -1160,7 +1199,7 @@ build-time Vite define.
   `mcp_oauth_request` WS event and the UI renders an inline card with
   the server name, the auth URL, and an "Open" button. The button
   must be triggered by a user gesture (browsers block popups
-  otherwise), so we never auto-open. Re-emissions are de-duped by
+  otherwise). Mezame never auto-opens. Re-emissions are de-duped by
   request id, falling back to serverName + url when the agent did not
   include an id.
 
@@ -1168,10 +1207,10 @@ build-time Vite define.
 
 ### Changed
 
-- `mime_for` now reads from a const lookup table instead of a chain of
-  branches. Removes the per-request `to_ascii_lowercase()` allocation,
-  keeps the extension-to-mime mapping in one place, and adds
-  `webmanifest` to the known extensions.
+- `mime_for` now reads from a const lookup table. It used to walk a
+  chain of branches. Removes the per-request `to_ascii_lowercase()`
+  allocation, keeps the extension-to-mime mapping in one place, and
+  adds `webmanifest` to the known extensions.
 
 ## [0.8.7] - 2026-05-25
 
@@ -1182,7 +1221,7 @@ build-time Vite define.
   `Some(Ok(...))` pattern guard. When the stream returned `None`
   (peer closed) or `Some(Err(_))` (transport error), the pattern did
   not match and tokio disabled the branch silently. The agent-updates
-  branch stayed active, so the loop kept looping, never reached
+  branch stayed active. The loop kept looping, never reached
   `else => break`, and `agent.shutdown()` never ran. Symptoms: leaked
   agent subprocess on every browser close during a long turn, stale
   Kiro session lockfile blocking the next `session/load`, and
@@ -1214,7 +1253,7 @@ build-time Vite define.
   channel a compile-time invariant. Removes two `expect()` panics and
   the `Mutex<Option<...>>` wrapper. Behaviour unchanged.
 - HTTP handlers `/state`, `/history`, and the corresponding writes now
-  use `tokio::fs` instead of the synchronous `std::fs` API. Removes a
+  use `tokio::fs`. The synchronous `std::fs` API is gone. Removes a
   latent footgun where each request blocked a tokio worker thread for
   the duration of the I/O. Behaviour and response shape unchanged.
 
@@ -1236,10 +1275,10 @@ build-time Vite define.
     `mezameActions`), UI package (`okiro-ui` to `mezame-ui`), and CSS
     keyframes (`okiro-pulse-orange` / `okiro-border-spin` to
     `mezame-pulse-orange` / `mezame-border-spin`) all renamed.
-- README now carries an explicit disclaimer that the project is not
+- Added an explicit disclaimer to the README: the project is not
   affiliated with AWS or the Kiro product.
 
-## [0.8.0] — 2026-05-08
+## [0.8.0] - 2026-05-08
 
 ### Breaking
 
@@ -1258,11 +1297,11 @@ build-time Vite define.
 
 ### Added
 
-- **`cargo install mezame` support.** Crate now carries the metadata
+- **`cargo install mezame` support.** Crate now declares the metadata
   crates.io requires (`description`, `license`, `keywords`,
   `categories`, `repository`, `readme`, `exclude`). `build.rs`
-  compiles the UI inside `$OUT_DIR` instead of the source tree so
-  `cargo publish` verify passes.
+  compiles the UI inside `$OUT_DIR` so `cargo publish` verify passes.
+  The source tree is left alone.
 - **Interactive init with arrow keys.** `mezame init` now uses
   `dialoguer` for the bind-address and agent menus. `init` also probes
   `$PATH` for known ACP CLIs (Kiro CLI, Claude Agent CLI, Gemini CLI,
@@ -1287,7 +1326,7 @@ build-time Vite define.
   development, and the service guide all moved to `docs/`. README down
   from ~260 lines to ~130.
 
-## [0.7.1] — 2026-05-08
+## [0.7.1] - 2026-05-08
 
 ### Added
 
@@ -1306,13 +1345,12 @@ build-time Vite define.
   request, turn complete, error) paints a red numeric pill onto the
   favicon and prefixes `document.title` with `(N) `. Attention now
   also raises for the active in-app session when the whole Mezame
-  browser tab is hidden, so you see a badge when a turn finishes
+  browser tab is hidden. A badge appears when a turn finishes
   while you're reading elsewhere. `visibilitychange` clears it on
   return.
 - **Cwd chip in the composer.** Shows the working directory the
-  session was started with, with the server-reported resolved path
-  (not just the user-supplied override). Double-click to open a
-  sibling tab at a different path.
+  session was started with, using the path the server resolved.
+  Double-click to open a sibling tab at a different path.
 - **Bind-address menu in `mezame init`.** Three options: loopback
   (default), `0.0.0.0` for trusted-LAN setups where cloudflared runs
   elsewhere, or a custom address. The LAN option prints an explicit
@@ -1337,14 +1375,14 @@ build-time Vite define.
   messages to the browser, and init prompts rewritten as sentence case
   with em dashes replaced by colons. Init prompt accepts transport
   identifiers case-insensitively. New logos, new favicon, and a new
-  "Why Mezame" section in the README positioning the tool against
+  "Why Mezame" section in the README that positions the tool against
   direct-to-provider gateways.
 
 ### Fixed
 
 - `cargo build` on a clean checkout no longer requires the
   `cloudflared/` folder to exist; the example config is inlined in
-  the README instead, and `ui/dist/` is gitignored as expected.
+  the README, and `ui/dist/` is gitignored as expected.
 - Rebased a `build.rs` docstring typo and cleaned up stale comment
   blocks in `src/main.rs`.
 
@@ -1354,7 +1392,7 @@ build-time Vite define.
   `/history` parser only handles text today; inspecting what Kiro
   records for image and resource blocks in its JSONL is a follow-up.
 
-## [0.6.0] — 2026-05-07
+## [0.6.0] - 2026-05-07
 
 ### Changed
 
@@ -1370,7 +1408,7 @@ build-time Vite define.
   `racpActions`), and UI package name (`racp-ui`) all renamed to their
   `okiro` equivalents.
 
-## [0.5.6] — 2026-05-07
+## [0.5.6] - 2026-05-07
 
 ### Changed
 
@@ -1382,23 +1420,22 @@ build-time Vite define.
   primary blue. Gives the floating card a clearer outline against
   the dark log pane.
 
-## [0.5.5] — 2026-05-07
+## [0.5.5] - 2026-05-07
 
 ### Changed
 
 - Single shared centred column at 1440px: TabBar and the chat area
-  now live inside it as siblings, so the tab bar fills its parent
-  with a plain `w-full` instead of duplicating the max-width
-  constant.
+  now live inside it as siblings. The tab bar fills its parent with
+  a plain `w-full` and no longer duplicates the max-width constant.
 
-## [0.5.4] — 2026-05-07
+## [0.5.4] - 2026-05-07
 
 ### Changed
 
 - Content column max width bumped to 1440px. Tab bar synced so the
   header and the chat pane stay aligned.
 
-## [0.5.3] — 2026-05-07
+## [0.5.3] - 2026-05-07
 
 ### Changed
 
@@ -1407,7 +1444,7 @@ build-time Vite define.
   displays while still filling regular laptop and desktop screens.
   Tab bar, log pane, and floating composer all share the same column.
 
-## [0.5.2] — 2026-05-07
+## [0.5.2] - 2026-05-07
 
 ### Changed
 
@@ -1415,7 +1452,7 @@ build-time Vite define.
   composer's bottom-right, wrapping only if the composer gets
   unusually narrow. Textarea bottom padding reduced accordingly.
 
-## [0.5.1] — 2026-05-07
+## [0.5.1] - 2026-05-07
 
 ### Removed
 
@@ -1425,13 +1462,13 @@ build-time Vite define.
   still in place in the store for future keyboard shortcut or
   command-palette use.
 
-## [0.5.0] — 2026-05-07
+## [0.5.0] - 2026-05-07
 
 ### Changed
 
 - Composer is now a floating card pinned to the bottom of the chat
   pane. The log pane spans the full height of `<main>`; the composer
-  overlays it with `bg-background/70` plus `backdrop-blur-md`, so the
+  overlays it with `bg-background/70` plus `backdrop-blur-md`. The
   latest message shows through faintly as you type. Rounded corners,
   drop shadow, 12px inset from the pane edges.
 - Send button moved to the top-right corner of the composer.
@@ -1442,9 +1479,9 @@ build-time Vite define.
   posts `session/cancel`. Placeholder text also swaps to "agent is
   working..." during a turn.
 - Textarea has no visible border any more (the floating card owns the
-  chrome) and auto-grows 2–8 rows as before.
+  chrome) and auto-grows 2 to 8 rows as before.
 
-## [0.4.1] — 2026-05-07
+## [0.4.1] - 2026-05-07
 
 ### Changed
 
@@ -1455,7 +1492,7 @@ build-time Vite define.
   padding on the textarea keeps typed text clear of the buttons.
 - "Agent" and "Model" labels capitalised in the selectors.
 
-## [0.4.0] — 2026-05-07
+## [0.4.0] - 2026-05-07
 
 ### Changed
 
@@ -1465,22 +1502,22 @@ build-time Vite define.
 - Cancel and Send are icon-only buttons (ban, send-arrow) with
   tooltips.
 - Agent and model dropdowns moved from their dedicated header row into
-  the composer's bottom toolbar, so all input controls sit together.
+  the composer's bottom toolbar. All input controls now sit together.
   Header is one row taller but the chat pane now has more vertical
   space on short viewports.
 - Mode/model selectors hide themselves entirely when the agent
   advertises neither (non-Kiro agents).
 
-## [0.3.5] — 2026-05-07
+## [0.3.5] - 2026-05-07
 
 ### Changed
 
 - Busy-tab border thickness bumped from 1px to 2px while the travelling
-  glow is running, so more of the rotating colour is visible. Padding
+  glow is running. More of the rotating colour is visible. Padding
   trimmed by 1px on each side so the overall tab footprint stays
   identical to neutral tabs.
 
-## [0.3.4] — 2026-05-07
+## [0.3.4] - 2026-05-07
 
 ### Fixed
 
@@ -1489,10 +1526,10 @@ build-time Vite define.
   inner fill, which let the gradient's bright centre peek over the
   short edges and ride across the text as it rotated. Opaque inner
   fill now, and the conic gradient is mostly transparent with a
-  narrow (~45-degree) bright arc, so a discrete glow moves around
-  the outline instead of a rotating half-disc.
+  narrow (~45-degree) bright arc. A discrete glow moves around the
+  outline; the rotating half-disc is gone.
 
-## [0.3.3] — 2026-05-07
+## [0.3.3] - 2026-05-07
 
 ### Changed
 
@@ -1503,7 +1540,7 @@ build-time Vite define.
   distinctive than the pulse and less visually noisy for tabs that are
   running longer turns.
 
-## [0.3.2] — 2026-05-07
+## [0.3.2] - 2026-05-07
 
 ### Fixed
 
@@ -1514,7 +1551,7 @@ build-time Vite define.
   on top of the pulse for both `connected` and `busy-background`
   states.
 
-## [0.3.1] — 2026-05-07
+## [0.3.1] - 2026-05-07
 
 ### Fixed
 
@@ -1525,21 +1562,21 @@ build-time Vite define.
   so nothing in the cascade can flatten them. Connecting/Reconnecting
   now pulse orange; busy-in-background pulses green.
 
-## [0.3.0] — 2026-05-07
+## [0.3.0] - 2026-05-07
 
 ### Added
 
 - Tabs now pulse **green** when a turn is still running in the
-  background (busy, not the active tab). Precedence on the tab colour
-  is now: error > connecting/reconnecting > busy-in-background >
-  connected.
+  background (busy while another tab is active). Precedence on the
+  tab colour is now: error > connecting/reconnecting >
+  busy-in-background > connected.
 - Status verbs in the tab tooltip expanded to include "Working..." for
   the busy-background state.
 
 ### Changed
 
-- The attention dot moved to the left of the tab title so it reads as a
-  leading indicator rather than trailing after the name.
+- The attention dot moved to the left of the tab title. It reads as a
+  leading indicator.
 
 ### Fixed
 
@@ -1550,7 +1587,7 @@ build-time Vite define.
   via a `--pulse-color` custom property so the same animation drives
   both the orange connecting pulse and the new green busy pulse.
 
-## [0.2.2] — 2026-05-07
+## [0.2.2] - 2026-05-07
 
 ### Fixed
 
@@ -1560,7 +1597,7 @@ build-time Vite define.
   bumped (28-60% of the permission orange) and `transition-colors`
   suppressed while pulsing.
 
-## [0.2.1] — 2026-05-07
+## [0.2.1] - 2026-05-07
 
 ### Fixed
 
@@ -1569,17 +1606,17 @@ build-time Vite define.
   background-coloured outline ring and a subtle shadow so the
   semantic fill colour stays the signal without blending in.
 
-## [0.2.0] — 2026-05-07
+## [0.2.0] - 2026-05-07
 
 ### Changed
 
 - Connection status moved from an in-log pill into the tab itself.
-  Tabs now carry a subtle coloured background: green for Connected,
+  Tabs now have a subtle coloured background: green for Connected,
   pulsing orange for Connecting / Reconnecting, red for Disconnected.
   The attention dot still appears on non-active Connected tabs.
 - Status verbs surface on hover via the tab tooltip.
 
-## [0.1.0] — 2026-05-07
+## [0.1.0] - 2026-05-07
 
 Baseline. Everything that landed up to this point is folded into 0.1.0.
 
@@ -1598,7 +1635,7 @@ Baseline. Everything that landed up to this point is folded into 0.1.0.
 - Session resume on reconnect via `?session=<id>` and `session/load`.
 - Per-tab `cwd` override via `?cwd=...`.
 - Permission prompts rendered as inline cards, reply carries selected `optionId`.
-- Tool calls surface as `[title — status]`, thinking chunks as `(thinking)`.
+- Tool calls surface as `[title: status]`, thinking chunks as `(thinking)`.
 - Reconnect with exponential backoff (max 30s), scroll pinning,
   per-tab attention dots (`done` / `permission` / `error`).
 - Cooperative Kiro shutdown (`session/cancel` + stdin EOF + 500ms wait)

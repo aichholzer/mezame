@@ -16,8 +16,8 @@ import {
 } from '@/lib/settings';
 import type { Session } from '@/types';
 
-// -- Mock the session store. The notifications hook only needs the
-// shape `{ sessions, activeId }`, not the full module.
+// Mock the session store. The notifications hook only needs the shape
+// `{ sessions, activeId }`.
 let mockSessions: Session[] = [];
 let mockActiveId: string | null = null;
 
@@ -30,8 +30,8 @@ vi.mock('@/hooks/useMezame', () => ({
   })
 }));
 
-// -- Mock Notification globally. Jsdom doesn't provide it; we count
-// calls and assert payloads.
+// Mock Notification globally. Jsdom doesn't provide it; we count calls
+// and assert payloads.
 const NotificationMock = vi.fn().mockImplementation(function (
   this: { onclick: (() => void) | null; close: () => void },
   _title: string,

@@ -1,0 +1,272 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  # Called by publish.yml as the gate in front of a release. A called
+  # workflow only receives the permissions its caller grants, and the
+  # benchmark job below asks for `id-token: write`.
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `MEZAME_SKIP_UI_BUILD` is set per job, on each job that needs the
+# skip. build.rs keys on the variable being present, and an empty value
+# still counts as present. A workflow-level default would reach the
+# release build too, and no job could switch it off.
+
+# Every action is pinned to a commit SHA with its version in a trailing
+# comment. A tag is a moving reference the upstream owner can repoint at
+# any commit. SHA pinning closes that hole. Renovate and Dependabot both
+# read the version comment, and a bump stays reviewable.
+#
+# `dtolnay/rust-toolchain` publishes no version tags. The pin is the
+# `master` head. The branch names it advertises (`@stable`, `@1.86.0`) are
+# branches whose only difference is a default for the `toolchain` input.
+# Pinning by SHA drops that default. Every job below names its toolchain.
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    env:
+      MEZAME_SKIP_UI_BUILD: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mezame is Unix-only: src/unix.rs reaches `kill` and `setsid`
+        # through FFI, gated on `#[cfg(unix)]`. Windows compiles, and its
+        # runtime is degraded: `pid_is_alive` always returns true and
+        # there is no process group. No Windows binaries ship, and CI
+        # does not cover Windows.
+        include:
+          - os: ubuntu-latest
+            rust: stable
+          - os: macos-latest
+            rust: stable
+          - os: ubuntu-latest
+            rust: beta
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Lint with clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --verbose
+
+  ui-tests:
+    name: UI tests (Vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI deps
+        run: npm ci
+        working-directory: ui
+
+      - name: Link node_modules into tests/ui
+        # Vite's bare-import resolver only walks parent directories from
+        # the importing file. The tests sit at tests/ui/, outside the ui/
+        # package, and this symlink puts the package's node_modules on
+        # that walk. Same treatment as the local pre-commit hook.
+        run: ln -s ../../ui/node_modules tests/ui/node_modules
+
+      - name: Run Vitest
+        run: npm test
+        working-directory: ui
+
+      - name: Type-check and bundle
+        # `npm run build` is `tsc -b && vite build`. The release-build job
+        # covers the same ground through build.rs. This runs in seconds
+        # with node_modules already warm, and reports a type error in the
+        # fastest job on the board.
+        run: npm run build
+        working-directory: ui
+
+  release-build:
+    name: Release build with UI
+    runs-on: ubuntu-latest
+    # `MEZAME_SKIP_UI_BUILD` is deliberately absent. This is the only job
+    # that compiles against the real Vite bundle, which is why it also
+    # installs Node and pays for `npm ci` inside build.rs. Linux only.
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build release
+        run: cargo build --release --verbose
+
+  docs:
+    name: Docs and doctests
+    runs-on: ubuntu-latest
+    env:
+      MEZAME_SKIP_UI_BUILD: "1"
+      # Turns a broken intra-doc link into a failed build.
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build the docs
+        run: cargo doc --no-deps
+
+      - name: Run doctests
+        # `--all-targets` in the test matrix excludes doctests. This is
+        # the only place they run.
+        run: cargo test --doc
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    env:
+      MEZAME_SKIP_UI_BUILD: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust with llvm-tools
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Run tests with coverage
+        # The floor sits below the current 65.57 figure. Routine drift
+        # passes, and a drop of five points or more fails. Lift it
+        # whenever a coverage gain lands.
+        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --fail-under-lines 60
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./lcov.info
+          flags: rust
+          name: codecov-rust
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-audit
+
+      - name: Security audit
+        run: cargo audit
+
+  msrv:
+    name: Minimum Supported Rust Version
+    runs-on: ubuntu-latest
+    env:
+      MEZAME_SKIP_UI_BUILD: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust 1.86
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: 1.86.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check MSRV
+        run: cargo check --all-targets
+
+  benchmarks:
+    name: Benchmarks (CodSpeed)
+    runs-on: ubuntu-latest
+    # `id-token: write` covers CodSpeed's OIDC exchange for its upload
+    # credential. A `workflow_dispatch` run also lets CodSpeed backtest
+    # performance to seed a baseline.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      MEZAME_SKIP_UI_BUILD: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-codspeed
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: cargo-codspeed
+
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@f22792bfac16f3e14eb9fbea76f4a48e9cc22b93 # v4.19.1
+        with:
+          mode: simulation
+          run: cargo codspeed run

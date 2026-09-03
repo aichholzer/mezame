@@ -3,10 +3,10 @@
 // the settings store (`lib/settings.ts`, owns `settings`) and the
 // session sync in `useMezame` (owns sessions/closed/activeId/nextLabel).
 //
-// `doSync` used to PUT only the fields it owns, with no read first, so
-// every session event clobbered the `settings` block the settings store
+// `doSync` used to PUT only the fields it owns, with no read first.
+// Every session event clobbered the `settings` block the settings store
 // had just written. The server stores the body verbatim
-// (last-writer-wins), so `autoAllowPermissions` reverted to its default
+// (last-writer-wins). `autoAllowPermissions` reverted to its default
 // and the user was re-prompted. The fix makes `doSync` read-then-merge,
 // mirroring `settings.ts` persist(): it must carry across fields it does
 // not own. This test drives `doSync` directly and asserts the PUT body
@@ -60,7 +60,7 @@ describe('doSync read-then-merge', () => {
     expect(body).toHaveProperty('sessions');
     expect(body).toHaveProperty('nextLabel');
     // ...and the unowned settings block survived the write. The old
-    // blind-overwrite behaviour dropped this, re-prompting the user.
+    // blind-overwrite behaviour dropped this and re-prompted the user.
     expect(body.settings).toEqual(settings);
   });
 
@@ -91,8 +91,8 @@ describe('doSync read-then-merge', () => {
 
 // Regression for the "live session vanished from state.json on device
 // switch" bug. `/state` is last-writer-wins and `doSync` owns the
-// `sessions` array, so a stale/backgrounded browser used to overwrite
-// the shared list with its own partial view, dropping a session another
+// `sessions` array. A stale/backgrounded browser used to overwrite the
+// shared list with its own partial view and drop a session another
 // device still had open (the conversation survived on disk, but the
 // pointer was lost and had to be re-added by hand). `mergeSessionsForSync`
 // unions in server-only sessions so a stale writer can no longer clobber
@@ -158,9 +158,9 @@ describe('mergeSessionsForSync', () => {
 });
 
 describe('doSync session carry-forward', () => {
-  it('writes back a server session the local list is missing instead of clobbering it', async () => {
-    // Module-level local sessions are empty in this suite, so the only
-    // way `peer` reaches the PUT body is the carry-forward merge.
+  it('writes a server-only session back into the PUT body', async () => {
+    // Module-level local sessions are empty in this suite. `peer`
+    // reaches the PUT body only through the carry-forward merge.
     const peer = { id: 'peer-1', label: 'Memory Overhaul', acpSessionId: '9600fd23', cwd: null };
     const calls = stubFetch({
       sessions: [peer],

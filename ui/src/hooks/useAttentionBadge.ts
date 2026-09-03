@@ -4,7 +4,7 @@ import { useMezame } from '@/hooks/useMezame';
 // Paints a numeric badge onto the favicon and prefixes the document
 // title with `(N)` when one or more background sessions have attention.
 // Attention is set by the store on permission request, turn completion,
-// or error; the active session never gets it, so the count is always
+// or error; the active session never gets it. The count is always
 // "things waiting for the user elsewhere".
 
 const FAVICON_URL = '/favicon.png';
@@ -66,7 +66,7 @@ const paintBadge = async (count: number) => {
     }
     ctx.drawImage(img, 0, 0, ICON_SIZE, ICON_SIZE);
 
-    // Badge: bottom-right circle, roughly 45% of the icon diameter.
+    // Badge: bottom-right circle, 56% of the icon diameter.
     const label = count > 9 ? '9+' : String(count);
     const radius = ICON_SIZE * 0.28;
     const cx = ICON_SIZE - radius - 2;
