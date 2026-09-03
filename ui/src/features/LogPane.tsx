@@ -1,5 +1,4 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { BotIcon } from '@/components/BotIcon';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
 import { McpOauthCard } from '@/features/McpOauthCard';
@@ -26,18 +25,17 @@ const PermissionCard = ({
 }) => {
   const resolved = !!entry.resolution;
   // "Remember for this session" tickbox state. Resets per card because
-  // each is its own React component instance; that's the right scope.
+  // each is its own React component instance.
   const [remember, setRemember] = useState(false);
   // Whether this card is connected to a remembered-policy slot, i.e.
   // it either set the policy (`remembered`) or was auto-resolved by
   // it (`auto`). Subsequent auto cards keep the badge until the user
-  // disables the policy on any matching card.
+  // clicks Forget on any matching card.
   const isRememberedCard = entry.remembered || entry.auto;
-  // Active iff the policy is still live (not yet disabled). Looking
-  // it up against the live session state means a click on Disable on
-  // any card with the same title clears the badge on every other
-  // card too, which matches the user's mental model: there is one
-  // policy per title, not one per card.
+  // Active while the policy is still live. The lookup goes against the
+  // live session state. A Forget click on any card with the same title
+  // clears the badge on every other card too. There is one policy per
+  // title.
   const policyActive = entry.title in session.rememberedPermissions;
   const optionTone = (opt: PermissionOption) => {
     const kind = (opt.kind || opt.optionId || '').toString();
@@ -134,28 +132,21 @@ const PermissionCard = ({
  * the store prepends/appends. Neither belongs in a chat bubble. */
 const cleanUserText = (text: string): string => text.replace(/^> /, '').trimEnd();
 
-/** Placeholder avatar shown to the left of every agent bubble. The
- * design intentionally keeps this generic until we decide whether
- * sessions get distinct avatars (per-agent? per-model?). For now, a
- * flat primary-tinted disc with a small bot glyph is enough to give
- * the bubble its anchor point matching the reference design. */
-const AgentAvatar = () => (
-  <div
-    aria-hidden="true"
-    className="flex size-12 shrink-0 items-center justify-center rounded-full"
-  >
-    <BotIcon className="size-12" />
-  </div>
-);
+/** Left edge of an agent bubble on desktop, expressed as a margin for
+ * the cards that line up with it. The rail holds the copy button at
+ * `size-7` (1.75rem) and the flex `gap-2` (0.5rem) sits between the
+ * rail and the bubble, putting the bubble's left edge at 2.25rem. On
+ * mobile the rail is hidden and everything starts flush left. */
+const AGENT_INDENT = 'ml-0 md:ml-9';
 
 const ThoughtCard = ({ entry }: { entry: Extract<LogEntry, { kind: 'thought' }> }) => {
   const trimmed = entry.text.trim();
   if (!trimmed) {
     return null;
   }
-  // Native <details> keeps the open/closed state local to the DOM,
-  // so React never has to thread a per-entry expansion flag through
-  // the store.
+  // Native <details> keeps the open/closed state local to the DOM.
+  // React never has to thread a per-entry expansion flag through the
+  // store.
   return (
     <details className="my-3 group">
       <summary className="cursor-pointer list-none inline-flex items-center gap-1.5 rounded-md border border-border/60 bg-card/40 px-2.5 py-1 text-[11px] italic text-muted-foreground hover:bg-card/60 transition">
@@ -204,11 +195,13 @@ const TextEntry = ({
     const copyText = entry.text.trim();
     return (
       <div className="my-5 flex items-start justify-start gap-2">
-        {/* Avatar + copy live in a left rail on desktop. On mobile the
-         * avatar is hidden to reclaim horizontal width and the copy
-         * button moves below the bubble (rendered after it). */}
-        <div className="hidden md:flex flex-col items-center gap-2">
-          <AgentAvatar />
+        {/* Copy sits in a left rail on desktop. On mobile the rail is
+         * hidden to reclaim horizontal width and the copy button moves
+         * below the bubble (rendered after it). The rail width is
+         * pinned to the button's own `size-7`. A streaming reply has no
+         * copy button yet, and without the pin its bubble would shift
+         * left until the button appeared. */}
+        <div className="hidden md:flex w-7 shrink-0 flex-col items-center gap-2">
           {!isStreaming && (
             <CopyButton text={copyText} title="Copy message" className="size-7" />
           )}
@@ -265,7 +258,7 @@ export const LogPane = ({ session, isActive }: Props) => {
 
   // Auto-scroll when new content arrives if the user is pinned to the
   // bottom. useLayoutEffect so the scroll happens in the same frame as
-  // the DOM update, avoiding visible jumps.
+  // the DOM update. Nothing visibly jumps.
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) {
@@ -340,30 +333,27 @@ export const LogPane = ({ session, isActive }: Props) => {
           // session is still thinking; both will appear once
           // `prompt_done` clears the flag. Earlier agent entries
           // in the same turn (interleaved with tool calls) are
-          // already final, so they keep their footer.
+          // already final and keep their footer.
           const isStreaming =
             session.thinking && entry.role === 'agent' && idx === lastAgentTextIndex;
           return <TextEntry key={entry.id} entry={entry} isStreaming={isStreaming} />;
         }
         if (entry.kind === 'thought') {
-          return <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><ThoughtCard entry={entry} /></div>;
+          return <div key={entry.id} className={cn(AGENT_INDENT, 'max-w-[88%] sm:max-w-[78%]')}><ThoughtCard entry={entry} /></div>;
         }
         if (entry.kind === 'tool_call') {
-          return <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><ToolCallCard entry={entry} /></div>;
+          return <div key={entry.id} className={cn(AGENT_INDENT, 'max-w-[88%] sm:max-w-[78%]')}><ToolCallCard entry={entry} /></div>;
         }
         if (entry.kind === 'mcp_oauth') {
-          return <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><McpOauthCard session={session} entry={entry} /></div>;
+          return <div key={entry.id} className={cn(AGENT_INDENT, 'max-w-[88%] sm:max-w-[78%]')}><McpOauthCard session={session} entry={entry} /></div>;
         }
         return (
-          <div key={entry.id} className="ml-0 md:ml-14 max-w-[88%] sm:max-w-[78%]"><PermissionCard session={session} entry={entry} options={entry.options} /></div>
+          <div key={entry.id} className={cn(AGENT_INDENT, 'max-w-[88%] sm:max-w-[78%]')}><PermissionCard session={session} entry={entry} options={entry.options} /></div>
         );
       })}
 
       {showThinking && (
-        <div className="my-3 flex items-start gap-2">
-          <div className="hidden md:block">
-            <AgentAvatar />
-          </div>
+        <div className={cn('my-3 flex items-start gap-2', AGENT_INDENT)}>
           <div
             className="rounded-2xl rounded-tl-[0px] bg-[color:var(--agent-bubble)] px-4 py-4 shadow-sm"
             role="status"

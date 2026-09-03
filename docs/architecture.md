@@ -14,7 +14,7 @@ flowchart LR
   mezame --- transport
 ```
 
-- One ACP session = one agent subprocess, owned by a hub. Many browser WebSockets can attach to the same hub at once, so the same conversation stays in sync across phone, laptop, and desktop. The agent is spawned when the first browser attaches and stays warm for a short grace window (30s) after the last browser detaches, so a reload or transient drop reattaches to the running agent rather than respawning it. See `src/hub.rs`.
+- One ACP session = one agent subprocess, owned by a hub. Many browser WebSockets can attach to the same hub at once, and the same conversation stays in sync across phone, laptop, and desktop. The agent is spawned when the first browser attaches and stays warm for a short grace window (30s) after the last browser detaches. A reload or transient drop reattaches to the running agent. See `src/hub.rs`.
 - Mezame binds loopback by default; `mezame init` also offers `0.0.0.0` for trusted-LAN setups. Public reachability can be delegated to an existing Cloudflare Tunnel on your network.
 - The web UI is a React + Tailwind v4 app under `ui/`. The `build.rs` step runs the Vite build; the compiled bundle is baked into the binary via `rust-embed` so the release binary stays self-contained.
 
@@ -50,7 +50,7 @@ Mezame/
 │       ├── types.ts            # wire-protocol and state types
 │       ├── hooks/useMezame.ts   # store, WS lifecycle, state sync
 │       ├── features/           # SideBar, LogPane, InputRow, ...
-│       ├── components/         # CopyButton, BotIcon + shadcn primitives
+│       ├── components/         # CopyButton + shadcn primitives
 │       └── lib/                # utils, time helpers
 ```
 
@@ -66,7 +66,7 @@ Mezame/
 }
 ```
 
-- `transports`: list of transport entries. Each entry is internally tagged by `kind`. Only `"cloudflared"` is implemented today; running more than one entry at once is not yet supported, so keep the list at a single element. The list shape is future-proofing for adding Telegram and others later (see Roadmap).
+- `transports`: list of transport entries. Each entry is internally tagged by `kind`. Only `"cloudflared"` is implemented today, and running more than one entry at once is not yet supported. Keep the list at a single element. The list shape leaves room for Telegram and others later (see Roadmap).
 - `transports[].kind = "cloudflared"`: serves HTTP + WebSocket on `bind`, for an external tunnel.
-- `transports[].bind` (cloudflared only): local bind address. Default is loopback; `mezame init` offers `0.0.0.0:9510` if you want LAN reach. Mezame has no auth of its own today, so anything non-loopback relies on Cloudflare Access, or your LAN being trusted.
+- `transports[].bind` (cloudflared only): local bind address. Default is loopback; `mezame init` offers `0.0.0.0:9510` if you want LAN reach. Mezame has no auth of its own today. Anything non-loopback relies on Cloudflare Access, or on your LAN being trusted.
 - `agent_cmd`: command to launch the ACP agent. Either a bare name, resolved via `$PATH`, or an absolute path. For Kiro use `kiro-cli` with args `["acp"]`.
