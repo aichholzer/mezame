@@ -44,6 +44,11 @@ build-time Vite define.
 
 ### Fixed
 
+- The `agent_reap_session` test compiles under Rust 1.99. Its
+  `extern "C"` declarations of `read` and `write` took `u8` buffers where
+  the platform signature takes `c_void`. rustc 1.99 rejects that through
+  the new `suspicious_runtime_symbol_definitions` lint, and the CI beta
+  leg caught it ahead of the stable release.
 - The CI job named "Release build with UI" was not building the UI.
   It cleared `MEZAME_SKIP_UI_BUILD` by setting it to an empty string,
   and `build.rs` treats the variable as set whenever it is present.

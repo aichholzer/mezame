@@ -19,18 +19,25 @@
 
 #![cfg(target_os = "linux")]
 
+use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 use mezame::unix::{reap_session, send_signal};
 
+// `read` and `write` take `c_void` buffers, matching the platform
+// signatures the standard library itself declares. A `*mut u8` here
+// compiles and runs, and rustc's `suspicious_runtime_symbol_definitions`
+// lint rejects it: two disagreeing declarations of a symbol the standard
+// library also uses is the shape of a real linker hazard. The call sites
+// below cast their byte buffers.
 extern "C" {
     fn fork() -> i32;
     fn setsid() -> i32;
     fn setpgid(pid: i32, pgid: i32) -> i32;
     fn execvp(file: *const u8, argv: *const *const u8) -> i32;
     fn pipe(fds: *mut i32) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn read(fd: i32, buf: *mut c_void, count: usize) -> isize;
+    fn write(fd: i32, buf: *const c_void, count: usize) -> isize;
     fn close(fd: i32) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn getsid(pid: i32) -> i32;
@@ -129,7 +136,7 @@ fn spawn_session_with_escapee() -> (i32, i32) {
             // good and the leader can report us safely.
             let ready = [1u8];
             unsafe {
-                write(sync_wr, ready.as_ptr(), 1);
+                write(sync_wr, ready.as_ptr().cast::<c_void>(), 1);
                 close(sync_wr);
             }
             exec_sleep();
@@ -138,7 +145,7 @@ fn spawn_session_with_escapee() -> (i32, i32) {
         // reporting it. The test then never races the group kill.
         unsafe { close(sync_wr) };
         let mut ready = [0u8; 1];
-        let n = unsafe { read(sync_rd, ready.as_mut_ptr(), 1) };
+        let n = unsafe { read(sync_rd, ready.as_mut_ptr().cast::<c_void>(), 1) };
         unsafe { close(sync_rd) };
         if n != 1 {
             std::process::exit(15);
@@ -147,7 +154,7 @@ fn spawn_session_with_escapee() -> (i32, i32) {
         // then become a long-lived process ourselves.
         let bytes = escapee.to_ne_bytes();
         unsafe {
-            write(report_wr, bytes.as_ptr(), bytes.len());
+            write(report_wr, bytes.as_ptr().cast::<c_void>(), bytes.len());
             close(report_wr);
         }
         exec_sleep();
@@ -157,7 +164,7 @@ fn spawn_session_with_escapee() -> (i32, i32) {
     // also the session id (setsid set sid == leader pid).
     unsafe { close(report_wr) };
     let mut buf = [0u8; 4];
-    let n = unsafe { read(report_rd, buf.as_mut_ptr(), buf.len()) };
+    let n = unsafe { read(report_rd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
     unsafe { close(report_rd) };
     assert_eq!(n, 4, "read escapee pid");
     let escapee = i32::from_ne_bytes(buf);
