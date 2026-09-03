@@ -302,8 +302,8 @@ async fn put_state(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     // A send error here only means no browser is currently subscribed.
-    // The next subscriber fetches /state on connect and picks up
-    // everything that changed in the meantime.
+    // The next subscriber fetches /state on connect and sees everything
+    // that changed in the meantime.
     let _ = app.state_changes.send(());
     Ok(StatusCode::NO_CONTENT)
 }

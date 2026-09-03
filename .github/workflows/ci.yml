@@ -27,14 +27,13 @@ env:
 
 # Every action is pinned to a commit SHA with its version in a trailing
 # comment. A tag is a moving reference the upstream owner can repoint at
-# any commit, which is the supply-chain hole SHA pinning closes. Renovate
-# and Dependabot both read the comment, so bumps stay reviewable.
+# any commit. SHA pinning closes that hole. Renovate and Dependabot both
+# read the version comment, and a bump stays reviewable.
 #
 # `dtolnay/rust-toolchain` publishes no version tags. The pin is the
-# `master` head, and the branch names it advertises (`@stable`, `@1.86.0`)
-# are branches whose only difference is a default for the `toolchain`
-# input. Pinning by SHA drops that default, so every job below names its
-# toolchain.
+# `master` head. The branch names it advertises (`@stable`, `@1.86.0`) are
+# branches whose only difference is a default for the `toolchain` input.
+# Pinning by SHA drops that default. Every job below names its toolchain.
 
 jobs:
   test:

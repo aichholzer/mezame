@@ -82,7 +82,7 @@ Notable coverage already in place:
 Before dispatching, three things have to line up, and the workflow refuses
 the run if any of them does not:
 
-- `Cargo.toml` and `ui/package.json` carry the same version.
+- `Cargo.toml` and `ui/package.json` agree on the version.
 - `CHANGELOG.md` has a `## [version]` section. Its body becomes the
   GitHub release notes.
 - That version is not on crates.io already.
