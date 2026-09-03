@@ -1,4 +1,4 @@
-![Mezame](https://github.com/aichholzer/mezame/blob/06cd603a6cc025be3058441a32a47cd212a8967b/assets/Mezame.png)
+![Mezame](https://raw.githubusercontent.com/aichholzer/mezame/0b37a3051b6d9a7853ffcdf3c07602215f4e85c6/assets/Mezame.png)
 
 [![CI](https://github.com/aichholzer/mezame/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/aichholzer/mezame/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/aichholzer/mezame/graph/badge.svg?token=UV3BE0RQ0U)](https://codecov.io/gh/aichholzer/mezame)
