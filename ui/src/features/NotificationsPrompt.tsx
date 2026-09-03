@@ -6,12 +6,11 @@ import {
 } from '@/hooks/useNotifications';
 import { setNotificationPreference } from '@/lib/settings';
 
-// Renders only when the preference is `pending`: that flag is bumped
-// by `useNotifications` the first time an event would have fired but
-// we have not asked the user yet. Click "Enable" calls the browser
-// permission prompt and persists the choice; "Not now" sets the
-// preference to `off` so we never bother again until the user opts
-// in from settings.
+// Renders only when the preference is `pending`. `useNotifications`
+// bumps that flag the first time an event would have fired with the
+// user never asked. Enable calls the browser permission prompt and
+// persists the choice. Dismiss sets the preference to `off`, and
+// nothing asks again until the user opts in from settings.
 
 export const NotificationsPrompt = () => {
   const preference = useNotificationPreference();

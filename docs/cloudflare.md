@@ -67,7 +67,7 @@ Route the hostname once:
 cloudflared tunnel route dns <your-tunnel-name> mezame.example.com
 ```
 
-Reload `cloudflared`. WebSocket upgrades are forwarded by default, so `/ws` needs no special flags.
+Reload `cloudflared`. WebSocket upgrades are forwarded by default and `/ws` needs no special flags.
 
 ## Put Cloudflare Access in front (strongly recommended)
 

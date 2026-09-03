@@ -1,7 +1,6 @@
 // Pure-formatter tests for `timeAgo` and `formatAbsolute`. Both take
 // timestamps as `number` (ms since epoch) and return strings; no DOM
-// involvement, no `Date.now()` dependence, so the tests are
-// deterministic.
+// involvement, no `Date.now()` dependence.
 
 import { formatAbsolute, timeAgo } from '@/lib/time';
 
@@ -60,7 +59,7 @@ describe('timeAgo', () => {
 
   it('flips to months at 9 weeks (~63 days), with proper plural', () => {
     // The week branch caps at 8 weeks (56 days). The first day past
-    // that, week count would round to 9, so the function falls
+    // that, the week count would round to 9 and the function falls
     // through to months. 63 / 30.44 ≈ 2 months.
     expect(timeAgo(NOW - 63 * DAY, NOW)).toBe('2 months ago');
     expect(timeAgo(NOW - 6 * 30 * DAY, NOW)).toBe('5 months ago');
@@ -79,7 +78,7 @@ describe('timeAgo', () => {
 
   it('defaults the `now` argument to Date.now()', () => {
     // Don't assert exact wording; just confirm the call shape is
-    // accepted. Useful regression against accidental signature change.
+    // accepted. Guards against an accidental signature change.
     const text = timeAgo(Date.now() - MINUTE);
     expect(typeof text).toBe('string');
     expect(text.length).toBeGreaterThan(0);
@@ -88,14 +87,14 @@ describe('timeAgo', () => {
 
 describe('formatAbsolute', () => {
   // `toLocaleString` output depends on the runtime locale and time
-  // zone, so we only assert that the formatter mentions the
+  // zone. The assertions only check that the formatter mentions the
   // information we asked for: year, month, day, plus hour/minute
   // separators. The exact string differs between Node and browsers.
   //
-  // Building the timestamp via the local-time `Date` constructor
-  // (rather than `Date.UTC`) keeps the displayed day stable across
-  // host time zones; otherwise May 26 14:30 UTC slips forward or
-  // back a day depending on where the test runs.
+  // Building the timestamp via the local-time `Date` constructor keeps
+  // the displayed day stable across host time zones; otherwise May 26
+  // 14:30 UTC slips forward or back a day depending on where the test
+  // runs.
 
   const ts = new Date(2026, 4, 26, 14, 30, 45).getTime();
 
@@ -109,8 +108,8 @@ describe('formatAbsolute', () => {
 
   it('includes a short month token (May)', () => {
     // "May" happens to have a 3-letter form identical to its full
-    // name, so this assertion holds regardless of "short" vs "long"
-    // month naming on the host locale.
+    // name. The assertion holds regardless of "short" vs "long" month
+    // naming on the host locale.
     expect(formatAbsolute(ts)).toMatch(/May/);
   });
 

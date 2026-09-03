@@ -9,10 +9,10 @@ import type { Session } from '@/types';
 
 // Shows the session's working directory next to the mode/model pickers
 // and lets the user spawn a sibling session pointed at a different
-// path. Intentionally does NOT try to rebind the current session: ACP
-// has no `session/set_cwd`, so changing cwd after `session/new` means
-// starting a new session. We do that in a new tab so the existing log
-// stays intact.
+// path. The current session is never rebound: ACP has no
+// `session/set_cwd`. Changing cwd after `session/new` means starting a
+// new session, and we do that in a new tab. The existing log stays
+// intact.
 //
 // Double-click (or Enter on focus) swaps the chip for an inline input
 // preseeded with the current cwd. Commit spawns a new tab via
@@ -24,7 +24,7 @@ type Props = {
 
 const SERVER_DEFAULT = 'server default';
 
-// Middle-ellipsis for long paths so both the parent and leaf stay
+// Middle-ellipsis for long paths. The parent and the leaf both stay
 // visible: `/Users/stefan/.../repos/mezame`.
 const truncateMiddle = (value: string, max: number) => {
   if (value.length <= max) {

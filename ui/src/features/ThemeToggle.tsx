@@ -15,8 +15,7 @@ import type { ThemePreference } from '@/lib/settings';
 
 // Theme picker for the sidebar footer. An icon button (showing the
 // active preference's glyph) opens a three-option menu: System, Light,
-// Dark. Mirrors the History dropdown's trigger styling so the two
-// sidebar controls read as a set.
+// Dark. Mirrors the History dropdown's trigger styling.
 
 const OPTIONS: { value: ThemePreference; label: string; icon: LucideIcon }[] = [
   { value: 'system', label: 'System', icon: MonitorIcon },

@@ -57,7 +57,7 @@ type Props = {
 };
 
 // Upper bound stays the same on all viewports; taller than this and the
-// textarea scrolls internally rather than dominating the screen.
+// textarea scrolls internally.
 const MAX_ROWS = 8;
 
 export const InputRow = ({ session, onSubmit }: Props) => {
@@ -157,8 +157,8 @@ export const InputRow = ({ session, onSubmit }: Props) => {
     ? 'Enter to send, Shift+Enter for newline'
     : `${isMac() ? '\u2318' : 'Ctrl'}+Enter to send, Enter for newline`;
 
-  /** Stage a single file: classify, quota-check, append. Returns false
-   * when rejected so caller can stop at the first failure. */
+  /** Stage a single file: classify, quota-check, append. Returns `null`
+   * when rejected. The caller stops at the first failure. */
   const stageFile = useCallback(
     (file: File, currentAtts: Attachment[]): Attachment[] | null => {
       if (currentAtts.length >= MAX_ATTACHMENTS) {
@@ -254,7 +254,7 @@ export const InputRow = ({ session, onSubmit }: Props) => {
       return;
     }
     // Modifier mode: Cmd/Ctrl+Enter submits; a bare Enter inserts a
-    // newline (textarea default), so we only intercept the chord.
+    // newline (textarea default). Only the chord is intercepted.
     if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       void submit();
@@ -293,8 +293,8 @@ export const InputRow = ({ session, onSubmit }: Props) => {
 
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     // Accept-indicator only. Presence of files in dataTransfer is
-    // unreliable during dragover in some browsers, so we show the
-    // hint for any drag that enters the card.
+    // unreliable during dragover in some browsers. The hint shows for
+    // any drag that enters the card.
     if (!canAttachAnything || disabled) {
       return;
     }
@@ -325,19 +325,18 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         // Absolute so the log pane behind it keeps using the full
         // viewport height. Insets leave a visible gutter of scrollback
         // around the card so you can see the chat peeking out.
-        // Bottom offset picks up `--mz-kb-inset` so the composer
-        // rides above the virtual keyboard on mobile, and
-        // `--mz-safe-bottom` so it clears the home indicator on iOS.
-        // Both custom properties default to 0 on desktop, so the
-        // composer rests at `bottom: 1.25rem` (20 px) on desktop,
-        // matching the sidebar's outer margin so both bottom edges
-        // align.
+        // The bottom offset adds `--mz-kb-inset`, which lifts the
+        // composer above the virtual keyboard on mobile, and
+        // `--mz-safe-bottom`, which clears the home indicator on iOS.
+        // Both custom properties default to 0 on desktop. There the
+        // composer rests at `bottom: 1.25rem` (20 px), the same as the
+        // sidebar's outer margin, and both bottom edges align.
         'pointer-events-none absolute left-2 right-2 md:left-0 md:right-5 z-10 pt-[12px] bg-[color:var(--background)]',
-        // Bottom gap matches the side gutters: 8px on mobile, 20px on
+        // Bottom gap matches the side gutters: 8 px on mobile, 20 px on
         // desktop. The `--mz-kb-inset` term lifts the composer above the
         // virtual keyboard, and `--mz-safe-bottom` clears the iOS home
-        // indicator; both default to 0. Expressed as responsive classes
-        // rather than an inline style so the `md:` breakpoint applies.
+        // indicator; both default to 0. Expressed as responsive classes.
+        // An inline style would not apply the `md:` breakpoint.
         'bottom-[calc(0.5rem+var(--mz-kb-inset)+var(--mz-safe-bottom))]',
         'md:bottom-[calc(1.25rem+var(--mz-kb-inset)+var(--mz-safe-bottom))]'
       )}
@@ -386,8 +385,8 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           className={cn(
             // Keep text clear of the overlay widgets on the right
             // (desktop send button) and along the bottom row. The
-            // bottom row is taller on mobile (44 px send button), so
-            // the textarea reserves more bottom padding there.
+            // bottom row is taller on mobile (44 px send button). The
+            // textarea reserves more bottom padding there.
             // 16 px (`text-base`) on mobile prevents iOS Safari
             // auto-zooming on focus; desktop keeps the denser 14 px.
             'border-0 bg-transparent shadow-none pr-3 md:pr-14 pl-3 pt-3 pb-16 md:pb-12 text-base md:text-sm',
@@ -577,10 +576,9 @@ const formatBytes = (bytes: number): string => {
 
 // Mobile-only trigger that opens a DropdownMenu containing the Agent
 // and Model pickers stacked vertically. Reuses the existing
-// `@radix-ui/react-dropdown-menu` primitive so we don't pull in a
-// new dep. Renders nothing when the agent advertised no modes and no
-// models (e.g., non-Kiro agents); matches `ModeModelSelectors`'s own
-// empty-state rule.
+// `@radix-ui/react-dropdown-menu` primitive. Renders nothing when the
+// agent advertised no modes and no models (e.g., non-Kiro agents);
+// matches `ModeModelSelectors`'s own empty-state rule.
 const MobileSettingsTrigger = ({ session }: { session: Session | null }) => {
   if (!session) {
     return null;

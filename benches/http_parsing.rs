@@ -2,12 +2,12 @@
 //!
 //! These cover the CPU-bound parsing/formatting functions on the hot
 //! path of serving the UI and replaying chat history:
-//!   - `mime_for`            — content-type lookup for every served asset
-//!   - `extract_text_blocks` — pull text out of ACP content arrays
-//!   - `parse_kiro_history`  — parse a Kiro session JSONL log on resume
+//!   - `mime_for`:            content-type lookup for every served asset
+//!   - `extract_text_blocks`: pull text out of ACP content arrays
+//!   - `parse_kiro_history`:  parse a Kiro session JSONL log on resume
 //!
-//! They are isolated, deterministic, and allocation-light, which makes
-//! them a good fit for CodSpeed's CPU simulation instrument.
+//! They are isolated, deterministic and allocation-light. CodSpeed's CPU
+//! simulation instrument suits that shape.
 
 use mezame::http::{extract_text_blocks, mime_for, parse_kiro_history};
 use serde_json::json;

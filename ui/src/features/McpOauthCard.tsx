@@ -9,9 +9,9 @@ type Props = {
 };
 
 /** Inline card surfacing an MCP server's OAuth request. The agent waits
- * out-of-band for the user to complete the auth flow in their browser;
- * we just bridge the gap. The Open button must be triggered by a user
- * gesture (browsers block popups otherwise), so we never auto-open. */
+ * out-of-band for the user to complete the auth flow in their browser.
+ * The Open button must be triggered by a user gesture; browsers block
+ * popups otherwise. Nothing is ever opened automatically. */
 export const McpOauthCard = ({ session, entry }: Props) => {
   const open = () => {
     window.open(entry.url, '_blank', 'noopener,noreferrer');

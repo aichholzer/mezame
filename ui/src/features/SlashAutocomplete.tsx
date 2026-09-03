@@ -66,8 +66,8 @@ export const SlashAutocomplete = forwardRef<SlashAutocompleteHandle, Props>(
     const isOpen = value.startsWith('/') && entries.length > 0;
     const [index, setIndex] = useState(0);
 
-    // Reset the highlighted index when the filter set changes, so it never
-    // points past the end of the list.
+    // Reset the highlighted index when the filter set changes. The
+    // index never points past the end of the list.
     useEffect(() => {
       if (index >= entries.length) {
         setIndex(0);

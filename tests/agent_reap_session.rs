@@ -2,20 +2,20 @@
 //!
 //! Reproduces the production leak that the process-group kill alone could
 //! not fix: an MCP server launched by the agent through `npx`/`npm` forks
-//! into its OWN process group while keeping the agent's SESSION id. A
-//! `kill(-pgid)` on the agent's process group therefore never reaches it,
-//! so on the agent's death it reparents to PID 1 and survives, piling up
-//! until the service cgroup is throttled.
+//! into its OWN process group and keeps the agent's SESSION id. A
+//! `kill(-pgid)` on the agent's process group never reaches it. On the
+//! agent's death it reparents to PID 1 and survives, piling up until the
+//! service cgroup is throttled.
 //!
-//! We model that exactly: a session leader (its own direct child) spawns a
-//! grandchild that `setpgid`s into a fresh process group but stays in the
-//! leader's session — the "escapee". We then show a group kill misses the
-//! escapee, and that `reap_session` (called by `Agent::shutdown` after the
-//! group kill) does reap it.
+//! The model here is exact: a session leader (its own direct child) spawns
+//! a grandchild that `setpgid`s into a fresh process group and stays in
+//! the leader's session, the "escapee". The tests then show a group kill
+//! missing the escapee, and `reap_session` (called by `Agent::shutdown`
+//! after the group kill) reaping it.
 //!
-//! The whole reproduction is Linux-specific (procfs + the session walk),
-//! so the file compiles to nothing on other targets, where `reap_session`
-//! is a documented no-op.
+//! The whole reproduction is Linux-specific (procfs plus the session
+//! walk). The file compiles to nothing on other targets, where
+//! `reap_session` is a documented no-op.
 
 #![cfg(target_os = "linux")]
 
@@ -37,8 +37,8 @@ extern "C" {
 }
 
 /// Replace the current process with a long-lived `sleep`. Called only
-/// between `fork` and `exec`, so it touches nothing but async-signal-safe
-/// functions and stack-local byte literals (no allocation).
+/// between `fork` and `exec`. It touches nothing but async-signal-safe
+/// functions and stack-local byte literals, with no allocation.
 fn exec_sleep() -> ! {
     let prog = b"sleep\0";
     let arg0 = b"sleep\0";
@@ -60,10 +60,10 @@ fn proc_state(pid: i32) -> Option<char> {
 }
 
 /// True while `pid` exists and is not a zombie. A SIGKILLed process is at
-/// worst a zombie (it can never run again), so treating zombies as dead
-/// makes the assertions robust against subreaper environments where an
-/// orphan's zombie may linger before being reaped — `kill(pid, 0)` would
-/// still report such a zombie as "alive", procfs state does not.
+/// worst a zombie and can never run again. Counting zombies as dead holds
+/// the assertions steady in subreaper environments, where an orphan's
+/// zombie may linger before being reaped. `kill(pid, 0)` reports such a
+/// zombie as "alive"; the procfs state does not.
 fn running(pid: i32) -> bool {
     matches!(proc_state(pid), Some(state) if state != 'Z')
 }
@@ -84,11 +84,11 @@ fn wait_until_not_running(pid: i32, within: Duration) -> bool {
 /// leader's session but lives in its own process group. Returns
 /// `(session_id, escapee_pid)`. Both processes are `exec`'d `sleep`s.
 ///
-/// A fork inherits the parent's process group, so the escapee starts in
-/// the leader's group and only moves to its own when it calls `setpgid`.
-/// To make the reproduction deterministic (rather than racing the later
-/// group kill), the leader does not report the escapee's pid until the
-/// escapee has signalled — over a sync pipe — that its `setpgid` is done.
+/// A fork inherits the parent's process group. The escapee starts in the
+/// leader's group and only moves to its own when it calls `setpgid`. The
+/// leader withholds the escapee's pid until the escapee has signalled,
+/// over a sync pipe, that its `setpgid` is done. That keeps the
+/// reproduction deterministic against the later group kill.
 fn spawn_session_with_escapee() -> (i32, i32) {
     // report pipe: leader -> test, carries the escapee pid.
     let mut report = [0i32; 2];
@@ -98,8 +98,8 @@ fn spawn_session_with_escapee() -> (i32, i32) {
     let leader = unsafe { fork() };
     assert!(leader >= 0, "fork leader");
     if leader == 0 {
-        // Leader: become a session (and process-group) leader, so our pid
-        // is the session id. Then fork the escapee.
+        // Leader: become a session and process-group leader, making our
+        // pid the session id. Then fork the escapee.
         unsafe { close(report_rd) };
         if unsafe { setsid() } == -1 {
             std::process::exit(11);
@@ -115,8 +115,8 @@ fn spawn_session_with_escapee() -> (i32, i32) {
             std::process::exit(12);
         }
         if escapee == 0 {
-            // Escapee: move into a fresh process group (its own pid) while
-            // staying in the leader's session — exactly what npm/node do.
+            // Escapee: move into a fresh process group (its own pid) and
+            // stay in the leader's session, exactly what npm/node do.
             unsafe {
                 close(report_wr);
                 close(sync_rd);
@@ -126,7 +126,7 @@ fn spawn_session_with_escapee() -> (i32, i32) {
             }
             // Signal the leader that setpgid is done, then exec. Once
             // setpgid has returned, the escapee is in its own group for
-            // good, so the leader can safely report us now.
+            // good and the leader can report us safely.
             let ready = [1u8];
             unsafe {
                 write(sync_wr, ready.as_ptr(), 1);
@@ -135,7 +135,7 @@ fn spawn_session_with_escapee() -> (i32, i32) {
             exec_sleep();
         }
         // Leader: wait for the escapee's "setpgid done" signal before
-        // reporting it, so the test never races the group kill.
+        // reporting it. The test then never races the group kill.
         unsafe { close(sync_wr) };
         let mut ready = [0u8; 1];
         let n = unsafe { read(sync_rd, ready.as_mut_ptr(), 1) };
@@ -171,9 +171,9 @@ fn reap_session_kills_escapee_that_group_kill_misses() {
     assert!(running(escapee), "escapee should be running");
 
     // The pre-existing teardown is `kill(-pgid, SIGKILL)` on the agent's
-    // process group. The escapee forked into its own group, so the group
+    // process group. The escapee forked into its own group and the group
     // kill cannot reach it. Prove it: kill the leader's group, reap the
-    // leader, then confirm the escapee is still running — the bug.
+    // leader, then confirm the escapee is still running. That is the bug.
     assert_eq!(send_signal(-sid, 9), 0, "group kill of the leader's group");
     let mut status = 0i32;
     unsafe { waitpid(sid, &mut status as *mut i32, 0) };
@@ -186,7 +186,7 @@ fn reap_session_kills_escapee_that_group_kill_misses() {
         "regression guard: the group kill alone must miss the escapee"
     );
 
-    // The fix: sweep the whole session, which `Agent::shutdown` now does
+    // The fix: sweep the whole session. `Agent::shutdown` now does that
     // right after the group kill.
     reap_session(sid);
 
@@ -200,8 +200,8 @@ fn reap_session_kills_escapee_that_group_kill_misses() {
 fn reap_session_spares_processes_in_other_sessions() {
     let (sid, escapee) = spawn_session_with_escapee();
 
-    // A control process in the TEST's own session (a plain child that does
-    // not call setsid), so it shares our session id, not `sid`.
+    // A control process in the TEST's own session: a plain child that
+    // never calls setsid, sharing our session id and never `sid`.
     let control = unsafe { fork() };
     assert!(control >= 0, "fork control");
     if control == 0 {
@@ -217,8 +217,8 @@ fn reap_session_spares_processes_in_other_sessions() {
         "reap_session must not touch a process in another session"
     );
 
-    // Cleanup: the control is our direct child, so we can reap it. The
-    // leader/escapee were already swept by reap_session above.
+    // Cleanup: the control is our direct child and reapable here. The
+    // leader and escapee were already swept by reap_session above.
     send_signal(control, 9);
     let mut status = 0i32;
     unsafe { waitpid(control, &mut status as *mut i32, 0) };
@@ -240,7 +240,7 @@ fn reap_session_is_a_noop_for_guarded_session_ids() {
     // The kernel/init session ids are guarded and never swept.
     reap_session(0);
     reap_session(1);
-    // Our own session is guarded too — sweeping it would SIGKILL the test
+    // Our own session is guarded too. Sweeping it would SIGKILL the test
     // runner itself; surviving past this line proves the guard holds.
     let own = unsafe { getsid(0) };
     reap_session(own);

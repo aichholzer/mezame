@@ -257,10 +257,10 @@ async fn prompt_done_is_broadcast_after_session_prompt_resolves() {
     // working" indefinitely on the sender (and on any peer browser
     // that subsequently reads the broadcast for cancel / take-over
     // purposes).
-    // Send a prompt through the hub. The fixture's reader auto-
-    // replies with a stub result, so the hub's pending oneshot for
-    // `session/prompt` resolves immediately and the prompt task's
-    // continuation broadcasts `prompt_done`.
+    // Send a prompt through the hub. The fixture's reader auto-replies
+    // with a stub result. The hub's pending oneshot for `session/prompt`
+    // resolves immediately and the prompt task's continuation broadcasts
+    // `prompt_done`.
     let registry = HubRegistry::new();
     let (agent, updates_rx, _inject) = make_fake_agent();
     let mut attached = registry
@@ -657,9 +657,9 @@ async fn oauth_request_is_targeted_at_the_prompter() {
 }
 
 /// Minimal config for the `attach_or_create` fast path. The fast path
-/// returns before the config is ever read (it only matters when a new
-/// hub has to be built via `spawn_agent`), so the values here are
-/// placeholders that never get exercised.
+/// returns before the config is ever read; it only matters when a new hub
+/// has to be built via `spawn_agent`. The values here are placeholders
+/// and never get exercised.
 fn dummy_config() -> Arc<Config> {
     Arc::new(Config {
         transports: vec![TransportConfig::Cloudflared {
@@ -753,9 +753,9 @@ async fn detach_to_zero_then_reattach_exercises_grace_counter() {
     drop(first);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Re-attach inside the grace window. The hub is still registered
-    // (the grace timer has not fired), so this climbs the count back to
-    // one and cancels the pending shutdown.
+    // Re-attach inside the grace window. The hub is still registered,
+    // the grace timer having not fired. This climbs the count back to one
+    // and cancels the pending shutdown.
     let mut second = registry
         .attach_existing_for_test(SESSION_ID)
         .await

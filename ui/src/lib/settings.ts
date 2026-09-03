@@ -2,14 +2,15 @@
 // endpoint, alongside the session list. Read on init, written on each
 // change.
 //
-// Currently only carries the notification preference; will grow as
-// other features (sounds, theme, custom CSS) settle.
+// Holds the notification preference, the theme, the auto-allow flag,
+// the send-on-Enter chord and the idle-suspend threshold. More will land
+// here as other features (sounds, custom CSS) settle.
 
 export type NotificationPreference = 'unset' | 'pending' | 'on' | 'off';
 
 /** Theme preference. `system` follows the OS via `prefers-color-scheme`
- * (and tracks live changes, so an OS day/night schedule flips the app
- * automatically); `light`/`dark` are explicit overrides. */
+ * and tracks live changes: an OS day/night schedule flips the app
+ * automatically. `light`/`dark` are explicit overrides. */
 export type ThemePreference = 'system' | 'light' | 'dark';
 
 type Settings = {
@@ -26,26 +27,26 @@ const DEFAULTS: Settings = {
   // Auto-allow all tool permissions. Off by default: a new install
   // always prompts for each tool call until the user opts in via the
   // Settings pane. Read server-side per permission request (see
-  // `read_auto_allow_permissions` in the Rust core), so flipping it
-  // here takes effect on the next request without a reconnect.
+  // `read_auto_allow_permissions` in the Rust core). Flipping it here
+  // takes effect on the next request without a reconnect.
   autoAllowPermissions: false,
   // Send-on-Enter. True (default) keeps the classic chat behaviour:
   // a bare Enter submits and Shift+Enter inserts a newline. False
-  // flips it — Enter inserts a newline and the platform modifier
+  // flips it: Enter inserts a newline and the platform modifier
   // (Cmd on macOS, Ctrl elsewhere) plus Enter submits. Purely a UI
   // affordance: unlike autoAllowPermissions the Rust core never reads
-  // it, so it rides the generic /state blob with no server change.
+  // it. It rides the generic /state blob with no server change.
   sendOnEnter: true,
   // Minutes a backgrounded (or hidden active) session may sit idle after
-  // its last turn before Mezame suspends it, freeing its agent + MCP
+  // its last turn before Mezame suspends it and frees its agent + MCP
   // fleet. Read by the idle scan in useMezame; rides the /state settings
-  // blob, so the Rust core never reads it (no server change).
+  // blob. The Rust core never reads it (no server change).
   idleSuspendMinutes: 15
 };
 
 // Theme is mirrored to localStorage (in addition to the /state round
 // trip the rest of the settings use) so it can be read synchronously
-// before first paint — see `bootTheme` in hooks/useTheme.ts. Without
+// before first paint; see `bootTheme` in hooks/useTheme.ts. Without
 // this the app would paint light then flip to dark once /state
 // resolves, a jarring flash for a night-mode feature.
 /** Idle-suspend bounds, in minutes. The Settings slider clamps to this

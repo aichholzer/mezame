@@ -1,9 +1,10 @@
 //! On-disk configuration and interactive setup.
 //!
-//! Config lives at `~/.mezame/config.json`. Schema changes are breaking for
-//! existing users, so add fields with `#[serde(default)]` rather than
-//! reshuffling. Transports live in a list (`TransportConfig`) internally
-//! tagged on `kind`; see the README Configuration reference and todo #19.
+//! Config lives at `~/.mezame/config.json`. A schema change breaks
+//! existing users. Add fields with `#[serde(default)]` and leave the
+//! existing ones where they are. Transports live in a list
+//! (`TransportConfig`) internally tagged on `kind`; see the README
+//! Configuration reference and todo #19.
 
 use std::path::PathBuf;
 
@@ -31,17 +32,17 @@ pub struct Config {
     pub agent_args: Vec<String>,
 }
 
-/// Transport entries are internally tagged by `kind`, so each variant can
-/// carry its own config without a separate top-level section. Adding a new
-/// transport is: add a variant here, add an arm in `main`, implement its
-/// `run_*` entry point.
+/// Transport entries are internally tagged by `kind`. Each variant holds
+/// its own config with no separate top-level section. A new transport
+/// takes three steps: add a variant here, add an arm in `main`, implement
+/// its `run_*` entry point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TransportConfig {
     Cloudflared { bind: String },
-    // Telegram { token: String } — commented out until `run_telegram`
-    // ships. Leaving the variant here would require it to round-trip, and
-    // we do not want to pretend it works.
+    // Telegram { token: String }: commented out until `run_telegram`
+    // ships. An enabled variant would have to round-trip through the
+    // config, advertising a transport that does nothing.
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -61,11 +62,11 @@ pub fn state_path() -> Result<PathBuf> {
 /// the UI state store (`state.json`). The flag is written by the
 /// browser Settings pane through the existing `PUT /state` endpoint and
 /// read here on demand whenever the agent raises
-/// `session/request_permission`. Reads are rare (human-paced) so the
-/// per-request file read is negligible and always reflects the latest
-/// toggle without a restart. Any failure — missing file, malformed
-/// JSON, absent field — resolves to the safe default `false`, so a
-/// permission request falls back to prompting the human.
+/// `session/request_permission`. Reads are human-paced and rare, and the
+/// per-request file read costs nothing measurable while always picking up
+/// the latest toggle without a restart. Any failure (missing file,
+/// malformed JSON, absent field) resolves to the safe default `false`. A
+/// permission request then falls back to prompting the human.
 pub async fn read_auto_allow_permissions() -> bool {
     let Ok(path) = state_path() else {
         return false;
@@ -80,9 +81,9 @@ pub async fn read_auto_allow_permissions() -> bool {
 }
 
 /// Pure extraction of the auto-allow flag from a parsed `state.json`
-/// value. Split from the IO in `read_auto_allow_permissions` so the
-/// lookup can be unit-tested without touching the filesystem. Defaults
-/// to `false` when `settings.autoAllowPermissions` is missing or not a
+/// value. Split from the IO in `read_auto_allow_permissions` to keep the
+/// lookup unit-testable without touching the filesystem. Defaults to
+/// `false` when `settings.autoAllowPermissions` is missing or not a
 /// boolean.
 pub fn auto_allow_from_state(state: &serde_json::Value) -> bool {
     state
@@ -102,10 +103,10 @@ pub fn load_config() -> Result<Config> {
 
 pub(crate) fn init_config() -> Result<Config> {
     // Transport prompt commented out while Cloudflared is the only
-    // implemented option. When Telegram ships, rewrite this to build up the
-    // `transports` list interactively (ask for Cloudflared, offer to add
-    // another, loop) rather than resurrecting the single-choice block
-    // below verbatim.
+    // implemented option. When Telegram ships, rewrite this to build the
+    // `transports` list interactively: ask for Cloudflared, offer to add
+    // another, loop. The single-choice block below is a record of what was
+    // there.
     //
     // let transport_idx = Select::with_theme(&ColorfulTheme::default())
     //     .with_prompt("Which transport?")
@@ -209,8 +210,8 @@ struct KnownAgent {
     /// Binary name resolved against `$PATH`.
     bin: &'static str,
     /// Args we pre-fill when the user picks this agent. Only set it when
-    /// we are sure the subcommand is correct (Kiro CLI uses `acp`; the
-    /// others currently hedge, so leave empty).
+    /// the subcommand is known to be correct. Kiro CLI uses `acp`; the
+    /// others are unconfirmed and stay empty.
     default_args: &'static [&'static str],
 }
 
@@ -237,9 +238,10 @@ const KNOWN_AGENTS: &[KnownAgent] = &[
     },
 ];
 
-/// Resolved agent picked from the menu. The path carries the full
-/// `$PATH`-resolved location so the saved config is not re-resolving the
-/// binary at run time (handy when the user has multiple installs).
+/// Resolved agent picked from the menu. The path is the full
+/// `$PATH`-resolved location. The saved config names an exact binary and
+/// never re-resolves at run time. A machine with several installs keeps
+/// the one the user chose.
 struct PickedAgent {
     path: PathBuf,
     default_args: Vec<String>,

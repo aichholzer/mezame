@@ -52,16 +52,16 @@ pub struct AppState {
     /// Process-wide shutdown signal. Fired by the SIGINT/SIGTERM
     /// handler before letting axum's graceful shutdown drain.
     /// Long-poll handlers (currently just the SSE stream) listen
-    /// on this so they end their futures promptly instead of
-    /// holding the serve loop hostage forever.
+    /// on this and end their futures promptly. Without it they
+    /// would hold the serve loop open forever.
     pub shutdown: Arc<Notify>,
 }
 
 /// React UI bundle baked into the binary by `build.rs` + `rust-embed`.
 ///
 /// The build script compiles the React/Vite app into
-/// `$OUT_DIR/ui/dist/` so the source directory stays untouched, which
-/// is a hard crates.io requirement. `rust-embed`'s
+/// `$OUT_DIR/ui/dist/` and leaves the source directory untouched. That is
+/// a hard crates.io requirement. `rust-embed`'s
 /// `interpolate-folder-path` feature lets us reference `$OUT_DIR` in the
 /// attribute below.
 #[derive(RustEmbed)]
@@ -95,14 +95,14 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
 
 /// Enable TCP keepalive on the listening socket as a kernel-level
 /// backstop to the application heartbeat in `src/ws.rs`. Accepted
-/// connections inherit the listener's keepalive setting on Linux, so
-/// a half-open socket the kernel can detect (no ACKs for the probes)
-/// is eventually torn down even if the app-level ping task were to
-/// wedge. The app heartbeat is the primary defence (it also catches
-/// peers that ACK at the TCP layer but have stopped reading); this
-/// just ensures the kernel does not hold a truly dead socket
-/// `ESTABLISHED` forever. Best-effort: a failure here is logged and
-/// ignored rather than aborting startup. See GitHub issue #4.
+/// connections inherit the listener's keepalive setting on Linux. A
+/// half-open socket the kernel can detect (no ACKs for the probes) is
+/// eventually torn down even with the app-level ping task wedged. The app
+/// heartbeat is the primary defence, and it also catches peers that ACK at
+/// the TCP layer but have stopped reading. This keeps the kernel from
+/// holding a truly dead socket `ESTABLISHED` forever. Best-effort: a
+/// failure here is logged and ignored, and startup continues. See GitHub
+/// issue #4.
 fn enable_tcp_keepalive(listener: &TcpListener) {
     use socket2::{SockRef, TcpKeepalive};
 
@@ -134,15 +134,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 /// Resolve when the process receives SIGINT (Ctrl+C) or SIGTERM (systemd
 /// / launchd `stop`). `with_graceful_shutdown` stops accepting new
-/// connections on the returned future, so Mezame exits promptly when its
+/// connections on the returned future. Mezame exits promptly when its
 /// service manager asks it to.
 ///
-/// Before returning we fire `shutdown` so any long-poll handlers in
-/// flight (the SSE state-events stream) end their futures and let
-/// axum's graceful drain complete instead of waiting on them forever.
+/// Before returning we fire `shutdown`. Long-poll handlers in flight (the
+/// SSE state-events stream) end their futures, and axum's graceful drain
+/// completes. Without it the drain waits on them forever.
 ///
-/// Live WebSocket sessions are dropped on shutdown; the agent subprocess
-/// is killed (`kill_on_drop`), which may leave a Kiro session lockfile
+/// Live WebSocket sessions are dropped on shutdown. The agent subprocess
+/// is killed (`kill_on_drop`) and may leave a Kiro session lockfile
 /// behind. The next start self-heals via `steal_stale_session_lock`.
 async fn shutdown_signal(shutdown: Arc<Notify>) {
     let ctrl_c = async {
@@ -170,23 +170,23 @@ async fn shutdown_signal(shutdown: Arc<Notify>) {
         _ = ctrl_c => eprintln!("\nReceived SIGINT, shutting down."),
         _ = terminate => eprintln!("Received SIGTERM, shutting down."),
     }
-    // Wake every long-poll handler so they release their futures
-    // before axum's drain kicks in. `notify_waiters` only wakes
-    // tasks that are currently waiting; long-pollers attached after
-    // this point check the same flag inline before subscribing.
+    // Wake every long-poll handler. They release their futures before
+    // axum's drain kicks in. `notify_waiters` only wakes tasks that are
+    // currently waiting; long-pollers attached after this point check the
+    // same flag inline before subscribing.
     shutdown.notify_waiters();
 }
 
 /// Serve a single file from the embedded UI bundle.
 ///
-/// Strips the leading `/`, falls back to `index.html` for empty paths and
-/// for any unknown path (so the SPA handles its own routing). Sets a
-/// reasonable Cache-Control: long-lived for hashed `/assets/*` filenames
-/// Vite emits, no-cache for `index.html`.
+/// Strips the leading `/` and falls back to `index.html` for empty paths
+/// and for any unknown path, leaving the SPA to handle its own routing.
+/// Sets a reasonable Cache-Control: long-lived for the hashed `/assets/*`
+/// filenames Vite emits, no-cache for `index.html`.
 async fn serve_ui_asset(uri: Uri) -> Response {
     let raw_path = uri.path().trim_start_matches('/');
     // Resolve to an actual asset. `/` and unknown routes both fall back to
-    // `index.html` so the SPA can handle its own routing.
+    // `index.html`, and the SPA handles its own routing from there.
     let (asset, resolved_path) = match UiAssets::get(raw_path) {
         Some(a) => (a, raw_path),
         None => match UiAssets::get("index.html") {
@@ -200,15 +200,15 @@ async fn serve_ui_asset(uri: Uri) -> Response {
 
     let mime = mime_for(resolved_path);
     let cache_control = if is_index || resolved_path == "sw.js" {
-        // Both `index.html` and the service-worker script must not be
-        // cached aggressively: `index.html` is the SPA entry point and
-        // `sw.js` is how we update the SW itself (browsers already
-        // bypass HTTP cache for SW updates in most cases, but the
-        // explicit no-cache keeps any intermediary from stashing it).
+        // Neither `index.html` nor the service-worker script tolerates
+        // aggressive caching. `index.html` is the SPA entry point, and
+        // `sw.js` is how the SW updates itself. Browsers already bypass
+        // the HTTP cache for SW updates in most cases; the explicit
+        // no-cache keeps any intermediary from stashing it.
         "no-cache, no-store, must-revalidate"
     } else if resolved_path.starts_with("assets/") {
-        // Vite emits content-hashed filenames under /assets, so we can
-        // cache them for a year without risking stale content.
+        // Vite emits content-hashed filenames under /assets. A year of
+        // caching cannot serve stale content.
         "public, max-age=31536000, immutable"
     } else {
         "public, max-age=3600"
@@ -262,7 +262,7 @@ pub fn mime_for(path: &str) -> &'static str {
         .unwrap_or("application/octet-stream")
 }
 
-/// GET /state — returns the persisted browser state as JSON, or `{}` if the
+/// GET /state: returns the persisted browser state as JSON, or `{}` if the
 /// file does not exist yet. Mezame does not interpret the contents; it is
 /// purely a cross-device store for the UI.
 async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
@@ -277,11 +277,11 @@ async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
     }
 }
 
-/// PUT /state — atomically replaces the stored state. Writes to a sibling
-/// `.tmp` then `rename` so readers never see a partial file. After a
-/// successful write we fire a tick on the `state_changes` broadcast so
-/// every browser subscribed to `/state/events` knows to refetch and
-/// merge in any new sessions another browser opened.
+/// PUT /state: atomically replaces the stored state. Writes to a sibling
+/// `.tmp` then calls `rename`, and readers never see a partial file. A
+/// successful write fires a tick on the `state_changes` broadcast. Every
+/// browser subscribed to `/state/events` then refetches and merges in any
+/// new sessions another browser opened.
 async fn put_state(
     State(app): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -301,21 +301,21 @@ async fn put_state(
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    // Send-error here only means no browser is currently subscribed,
-    // which is fine: the next subscriber will fetch /state on connect
-    // and pick up any changes since.
+    // A send error here only means no browser is currently subscribed.
+    // The next subscriber fetches /state on connect and picks up
+    // everything that changed in the meantime.
     let _ = app.state_changes.send(());
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /state/events — Server-Sent Events stream. Emits one
+/// GET /state/events: Server-Sent Events stream. Emits one
 /// `state_changed` event each time `put_state` writes a new state
-/// file. The browser uses this as a "go refetch /state" signal so
-/// new sessions opened in another browser show up without a manual
+/// file. The browser reads it as a "go refetch /state" signal, and
+/// sessions opened in another browser show up without a manual
 /// reload.
 ///
-/// We also emit a periodic keep-alive comment so a Cloudflare Tunnel
-/// or other intermediary does not idle-timeout the stream during a
+/// A periodic keep-alive comment goes out alongside. A Cloudflare Tunnel
+/// or other intermediary would otherwise idle-timeout the stream during a
 /// quiet period.
 async fn state_events(
     State(app): State<Arc<AppState>>,
@@ -325,10 +325,10 @@ async fn state_events(
     let stream = futures_util::stream::unfold((rx, shutdown), |(mut rx, shutdown)| async move {
         loop {
             tokio::select! {
-                // Shutdown wins: end the stream so axum's graceful
-                // drain can finish. Without this, Ctrl+C hangs
-                // because the SSE handler holds a request future
-                // that never resolves.
+                // Shutdown wins: end the stream and let axum's
+                // graceful drain finish. Without this the SSE handler
+                // holds a request future that never resolves, and
+                // Ctrl+C hangs.
                 _ = shutdown.notified() => return None,
                 msg = rx.recv() => match msg {
                     Ok(()) => {
@@ -338,7 +338,7 @@ async fn state_events(
                         ));
                     }
                     // Lagged: skip and wait for the next message. The
-                    // browser will refetch on the next event we deliver.
+                    // browser refetches on the next event delivered.
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     // All senders dropped: end the stream. In practice
                     // this only happens when the server is shutting down.
@@ -354,20 +354,21 @@ async fn state_events(
     )
 }
 
-/// GET /history?session=<id> — returns a compact history reconstructed from
-/// Kiro's own `~/.kiro/sessions/cli/<id>.jsonl` event log.
+/// `GET /history?session=<id>`: returns a compact history reconstructed
+/// from Kiro's own `~/.kiro/sessions/cli/<id>.jsonl` event log.
 ///
 /// Kiro records a `meta.timestamp` (Unix seconds) only on `Prompt` entries.
 /// Subsequent `AssistantMessage` / `ToolResults` inherit the timestamp of
-/// the most recent preceding `Prompt`, which is the right grouping: a
-/// turn and its reply share a single user-facing time.
+/// the most recent preceding `Prompt`. That is the right grouping: a turn
+/// and its reply share a single user-facing time.
 ///
 /// Returned JSON:
 ///   { "entries": [{ "role": "user"|"agent"|"sys", "text": "...",
 ///                   "timestamp": <ms since epoch> }, ...] }
 ///
-/// Missing session file → `{ "entries": [] }`, not an error. Reading a
-/// file Kiro currently has open for append is safe; we only read.
+/// A missing session file resolves to `{ "entries": [] }` and no error.
+/// Reading a file Kiro currently has open for append is safe; this only
+/// ever reads.
 async fn get_history(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -395,20 +396,19 @@ async fn get_history(
     Ok(Json(json!({ "entries": entries })))
 }
 
-/// GET /tool-result?session=<id>&id=<toolUseId> — returns the result
+/// `GET /tool-result?session=<id>&id=<toolUseId>`: returns the result
 /// content for a single tool call from Kiro's session JSONL.
 ///
 /// Live `session/update` events for `tool_call_update` flip status
-/// to `completed` or `failed` but do not stream the result content
-/// for some tools (e.g. web search). The data does land on disk in
-/// the `ToolResults` JSONL entry once Kiro finalises the turn. The
-/// client polls this endpoint after a status flip so the user can
-/// see the result without reloading the page.
+/// to `completed` or `failed` and do not stream the result content
+/// for some tools (web search among them). The data does land on disk
+/// in the `ToolResults` JSONL entry once Kiro finalises the turn. The
+/// client polls this endpoint after a status flip, and the user sees
+/// the result without reloading the page.
 ///
-/// Response shape mirrors the equivalent fields the live wire would
-/// have carried: `{ "status": <string|null>, "content": <Value|null> }`.
-/// Missing entry returns 404 so the client can decide to retry or
-/// give up gracefully.
+/// The response shape mirrors the fields the live wire would have
+/// carried: `{ "status": <string|null>, "content": <Value|null> }`. A
+/// missing entry returns 404, leaving the client to retry or give up.
 async fn get_tool_result(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -486,29 +486,31 @@ pub fn find_tool_result(raw: &str, tool_use_id: &str) -> Option<Value> {
 /// Parse Kiro's session JSONL into compact browser-facing entries.
 ///
 /// Shape we consume:
-///   { "kind": "Prompt", "data": {
-///       "content": [{ "kind": "text", "data": "..." }, ...],
-///       "meta": { "timestamp": <unix seconds> } } }
-///   { "kind": "AssistantMessage", "data": {
-///       "content": [
-///           { "kind": "thinking", "data": { "text": "..." } },
-///           { "kind": "text", "data": "..." },
-///           { "kind": "toolUse", "data": { "toolUseId": "...", "name": "...", "input": {...} } },
-///           ...
-///       ] } }
-///   { "kind": "ToolResults", "data": {
-///       "content": [
-///           { "kind": "toolResult", "data": { "toolUseId": "...", "content": [...], "status": "..." } },
-///           ...
-///       ] } }
 ///
-/// AssistantMessage entries can carry thinking, text, and toolUse
-/// blocks; we emit them as separate history entries so the timeline
-/// reads "user, reasoning, answer, tool call". ToolResults entries
-/// merge into the most recent tool_call with a matching toolUseId,
-/// updating its status and content in place. The wire shape mirrors
-/// the live `tool_call` event so the client can push the same
-/// structured log entry the live stream produces.
+/// ```text
+/// { "kind": "Prompt", "data": {
+///     "content": [{ "kind": "text", "data": "..." }, ...],
+///     "meta": { "timestamp": <unix seconds> } } }
+/// { "kind": "AssistantMessage", "data": {
+///     "content": [
+///         { "kind": "thinking", "data": { "text": "..." } },
+///         { "kind": "text", "data": "..." },
+///         { "kind": "toolUse", "data": { "toolUseId": "...", "name": "...", "input": {...} } },
+///         ...
+///     ] } }
+/// { "kind": "ToolResults", "data": {
+///     "content": [
+///         { "kind": "toolResult", "data": { "toolUseId": "...", "content": [...], "status": "..." } },
+///         ...
+///     ] } }
+/// ```
+///
+/// An AssistantMessage entry holds thinking, text, and toolUse blocks.
+/// Each becomes its own history entry, and the timeline reads "user,
+/// reasoning, answer, tool call". ToolResults entries merge into the most
+/// recent tool_call with a matching toolUseId, updating its status and
+/// content in place. The wire shape mirrors the live `tool_call` event,
+/// and the client pushes the same structured log entry either way.
 pub fn parse_kiro_history(raw: &str) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     // Timestamp of the most recent Prompt. Persisted in ms for the
@@ -715,9 +717,9 @@ pub fn merge_tool_results(data: &Value, out: &mut [Value]) {
                 None => continue,
             };
             // Map Kiro's coarse status to the live wire's status
-            // string. Kiro emits `success` / `error`; the UI renders
-            // any non-empty string verbatim, so a passthrough works
-            // and keeps the data faithful.
+            // string. Kiro emits `success` / `error`, and the UI renders
+            // any non-empty string verbatim. A passthrough works here and
+            // keeps the data faithful.
             if let Some(status) = inner.get("status").cloned() {
                 map.insert("status".into(), status);
             }

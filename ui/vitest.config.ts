@@ -4,8 +4,8 @@ import viteConfig from './vite.config';
 
 // Vitest re-uses the Vite config (plugins, alias, define) but layers a
 // `test` block on top. Tests live OUTSIDE the UI package, under
-// `tests/ui/` at the repo root, so the SPA bundle stays free of test
-// code and the `tests/` umbrella mirrors where Rust tests live.
+// `tests/ui/` at the repo root. The SPA bundle stays free of test code
+// and the `tests/` umbrella mirrors where Rust tests live.
 //
 // Because the test files live above the package root, vite's bare-
 // import resolver needs help finding `@testing-library/*` and friends
@@ -16,7 +16,7 @@ export default mergeConfig(
   defineConfig({
     // Vite's dev server refuses to serve files outside the project
     // root by default; vitest inherits that. Tests and their setup
-    // live one level up, so explicitly allow the repo root.
+    // live one level up. The repo root is allowed explicitly.
     server: {
       fs: {
         allow: [path.resolve(__dirname, '..')]

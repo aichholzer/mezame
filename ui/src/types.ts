@@ -15,8 +15,8 @@ export type ServerMessage =
     buildId?: string;
     /** Present only when a requested resume failed and the server fell
      * back to a fresh session. Carries the id the browser asked to
-     * resume so the client can keep it pinned (and retry later)
-     * instead of overwriting it with the throwaway fallback id. */
+     * resume so the client can keep it pinned and retry later. The
+     * throwaway fallback id never overwrites it. */
     resumeFailedFor?: string;
   }
   | { type: 'session_info'; info: SessionInfo }
@@ -47,7 +47,7 @@ export type PromptCapabilities = {
 
 /** Subset of ACP ContentBlock types we build on the client side. The
  * server accepts any ACP-shaped block and forwards it without
- * validation, so this union can grow without a server change. */
+ * validation. Adding a member here needs no server change. */
 export type PromptBlock =
   | { type: 'text'; text: string }
   | { type: 'image'; mimeType: string; data: string }
@@ -142,8 +142,8 @@ export type LogEntry =
     /** Set once the user picks an option. Presence disables buttons. */
     resolution?: string;
     /** True when the resolution was auto-applied from a remembered
-     * policy on the session, not from a click. Drives an "(auto)"
-     * indicator in the resolved card. */
+     * policy on the session. Drives an "(auto)" indicator in the
+     * resolved card. */
     auto?: boolean;
     /** True when the user explicitly ticked "Remember for this
      * session" on this card before picking an option. Distinct from
@@ -262,8 +262,8 @@ export type Session = {
   /** True while the session is intentionally suspended to free its agent
    * + MCP fleet after an idle period. Distinct from `closing`: a suspended
    * session stays in the sidebar (rendered grey) and its socket is dropped
-   * WITHOUT auto-reconnect, letting the server's grace timer reap the
-   * agent. It reconnects (resume) on the next interaction. Not persisted. */
+   * WITHOUT auto-reconnect. The server's grace timer then reaps the agent.
+   * It reconnects (resume) on the next interaction. Not persisted. */
   suspended: boolean;
   /** Whether a `session/prompt` request is currently in flight. Used
    * by the WS close handler to decide whether to re-flag the session

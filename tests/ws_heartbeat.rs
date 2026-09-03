@@ -37,8 +37,8 @@ fn ready_event() -> Value {
 }
 
 /// A stream that never yields, modelling a half-open socket: the peer
-/// is gone but the TCP connection is still `ESTABLISHED`, so the WS
-/// stream produces neither data, error, nor close.
+/// is gone and the TCP connection is still `ESTABLISHED`. The WS stream
+/// produces no data, no error and no close.
 fn silent_stream() -> impl Stream<Item = Result<Message, Infallible>> + Unpin {
     Box::pin(futures_util::stream::pending())
 }
@@ -97,9 +97,9 @@ async fn silent_socket_is_evicted_after_the_heartbeat_timeout() {
     let (to_ws_tx, _to_ws_rx) = mpsc::unbounded_channel::<Message>();
     let mut stream = silent_stream();
 
-    // 50 ms ping interval, 150 ms silence budget. A live peer would
-    // be pinged ~3 times; our silent stream answers none, so the loop
-    // must break shortly after 150 ms.
+    // 50 ms ping interval, 150 ms silence budget. A live peer would be
+    // pinged about 3 times. The silent stream answers none of them and
+    // the loop must break shortly after 150 ms.
     let started = Instant::now();
     let done = timeout(
         Duration::from_secs(2),
@@ -174,8 +174,9 @@ async fn an_active_peer_is_not_evicted() {
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
     let mut stream = channel_stream(browser_rx);
 
-    // Feed a pong every 30 ms for ~250 ms (timeout is 120 ms, so a
-    // silent peer would have been evicted twice over), then close.
+    // Feed a pong every 30 ms for about 250 ms, then close. The timeout
+    // is 120 ms, and a silent peer would have been evicted twice over in
+    // that span.
     let feeder = tokio::spawn(async move {
         for _ in 0..8 {
             if browser_tx.send(Message::Pong(Vec::new())).is_err() {

@@ -15,6 +15,6 @@ self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim(
 
 self.addEventListener('fetch', () => {
     // Pass-through. Not calling respondWith() lets the browser handle
-    // the request normally. The single listener is what satisfies
-    // Chrome's "has a fetch handler" install check.
+    // the request normally. This listener satisfies Chrome's "has a
+    // fetch handler" install check.
 });
