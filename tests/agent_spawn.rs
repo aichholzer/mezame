@@ -40,10 +40,10 @@ async fn spawn_agent_routes_responses_back_through_request() {
     // request goes out as `{"jsonrpc":"2.0","id":1,"method":"...","params":...}`;
     // cat reads that line and writes the same bytes to stdout. The
     // response router sees `result` is missing and `error` is missing,
-    // so this echo lands on the updates channel rather than completing
-    // the in-flight request. That is fine for this test: we drop the
-    // request future after a short timeout and instead verify the
-    // updates channel saw the echoed frame, which proves the full
+    // and the echo lands on the updates channel. The in-flight request
+    // never completes. That is fine for this test: the request future is
+    // dropped after a short timeout and the assertion is on the updates
+    // channel seeing the echoed frame. That proves the full
     // stdin -> child -> stdout -> reader-task path is wired up.
     let (agent, mut updates_rx) = spawn_agent(&cat_config()).await.expect("spawn_agent");
 

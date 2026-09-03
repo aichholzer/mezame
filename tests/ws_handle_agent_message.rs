@@ -24,8 +24,8 @@ fn recv_event(rx: &mut mpsc::UnboundedReceiver<Message>) -> Value {
 
 fn assert_no_event(rx: &mut mpsc::UnboundedReceiver<Message>) {
     // After `dispatch` returns, the sender has been dropped (it was a
-    // local in the helper), so the channel reads as Disconnected. The
-    // important invariant is that no message landed before the drop;
+    // local in the helper) and the channel reads as Disconnected. The
+    // invariant that matters is that no message landed before the drop.
     // try_recv reports that as either Empty (sender still around) or
     // Disconnected (sender gone). Both are acceptable here.
     match rx.try_recv() {
@@ -280,8 +280,9 @@ async fn kiro_mcp_oauth_request_passes_through_canonical_fields() {
 
 #[tokio::test]
 async fn kiro_mcp_oauth_request_resolves_alternative_field_names() {
-    // Some agents send `name` and `authUrl` instead of `serverName` and
-    // `url`. Both are accepted and resolved to the canonical names.
+    // Some agents send `name` and `authUrl` where others send
+    // `serverName` and `url`. Both pairs are accepted and resolved to the
+    // canonical names.
     let msg = json!({
         "method": "_kiro.dev/mcp/oauth_request",
         "params": {

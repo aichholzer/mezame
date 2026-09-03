@@ -95,9 +95,9 @@ describe('applyServerMessage / ready', () => {
 
   it('preserves the in-memory log on a reconnect (already hydrated)', () => {
     // Regression for the "browser reloads every so often" report: the
-    // hub stamps resumed=true on every attach, so a transient
-    // reconnect must NOT wipe the log and refetch history. Only the
-    // first hydrate clears; subsequent resumed readies keep the log.
+    // hub stamps resumed=true on every attach. A transient reconnect
+    // must NOT wipe the log and refetch history. Only the first
+    // hydrate clears; subsequent resumed readies keep the log.
     const liveLog: LogEntry[] = [
       { kind: 'text', id: 'a', role: 'user', text: '> hi\n', timestamp: 1 },
       { kind: 'text', id: 'b', role: 'agent', text: 'hello', timestamp: 2 }
@@ -112,11 +112,11 @@ describe('applyServerMessage / ready', () => {
     expect(s.hydrated).toBe(true);
   });
 
-  it('clears busy / thinking / inFlight on resume so the composer unsticks', () => {
+  it('clears busy / thinking / inFlight on resume', () => {
     // Simulates the post-idle-drop path: the socket dropped while a
     // turn was in flight, the close handler set busy=true, and now
     // the reconnect succeeds. The historical `prompt_done` is not
-    // replayed, so the reducer has to clear the flags itself.
+    // replayed. The reducer clears the flags itself.
     const s = makeSession({
       busy: true,
       thinking: true,
@@ -219,7 +219,7 @@ describe('applyServerMessage / permission_request', () => {
     // Active session check: with no document.visibilityState match,
     // `raiseAttention` will set the level. The session is not active
     // in the store (activeId is null at module level until activate
-    // runs), so the guard never trips here.
+    // runs). The guard never trips here.
     applyServerMessage(s, {
       type: 'permission_request',
       id: 7,
@@ -499,8 +499,8 @@ describe('shouldCloseAbsentSession', () => {
 
   it('keeps a used session absent from the snapshot but NOT in closed history', () => {
     // The clobber case: another browser PUT a partial list that
-    // omitted this session. No closed-history corroboration, so we
-    // must keep it rather than erase it.
+    // omitted this session. With no closed-history corroboration,
+    // reconcile keeps it.
     const s = { used: true, acpSessionId: 'acp-1' };
     expect(shouldCloseAbsentSession(s, closedIds('acp-other'))).toBe(false);
     expect(shouldCloseAbsentSession(s, closedIds())).toBe(false);

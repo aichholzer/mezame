@@ -222,10 +222,10 @@ async fn resume_failure_falls_back_to_new_session_and_emits_sys_notice() {
     let ready = frames.iter().find(|f| f["type"] == "ready").expect("ready");
     assert_eq!(ready["sessionId"], "fallback-sid");
     assert_eq!(ready["resumed"], false);
-    // The ready frame must carry the id the browser asked to resume so
-    // the client keeps it pinned rather than overwriting its durable
-    // pointer with the throwaway fallback id. This is the server half
-    // of the fix for the vanishing/overwritten-session bug.
+    // The ready frame must carry the id the browser asked to resume. The
+    // client keeps it pinned and its durable pointer survives the
+    // throwaway fallback id. This is the server half of the fix for the
+    // vanishing/overwritten-session bug.
     assert_eq!(
         ready["resumeFailedFor"], "missing-sid",
         "fallback ready must report the original id the resume was for"
@@ -292,12 +292,12 @@ async fn omitted_prompt_capabilities_default_to_empty_object() {
 #[tokio::test(start_paused = true)]
 async fn resume_of_live_locked_session_refuses_instead_of_clobbering() {
     // session/load keeps returning the stale-lock error and the lock
-    // cannot be stolen (no dead PID to reap, and no lockfile for this
-    // fixture id), so try_load_session exhausts its retry budget and
+    // cannot be stolen: no dead PID to reap, and no lockfile for this
+    // fixture id. try_load_session exhausts its retry budget and
     // surfaces "active in another process". negotiate_session must NOT
-    // paper over that by starting a fresh session -- that would discard
-    // the live one -- it returns an error so the client can reconnect
-    // once the owner releases the lock.
+    // paper over that by starting a fresh session, which would discard
+    // the live one. It returns an error, and the client reconnects once
+    // the owner releases the lock.
     let mut replies = vec![FakeReply::Ok(json!({
         "agentCapabilities": { "promptCapabilities": {} }
     }))];

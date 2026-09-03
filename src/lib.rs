@@ -7,11 +7,11 @@
 //! extension points. In-code extension points are marked with `TODO:`.
 //!
 //! Layout:
-//!   - `config`  — on-disk config and interactive setup
-//!   - `agent`   — ACP subprocess wrapper and JSON-RPC framing
-//!   - `session` — session resume and stale-lock recovery
-//!   - `http`    — cloudflared transport (HTTP/WS server, UI assets, /state, /history)
-//!   - `ws`      — per-WebSocket session loop and agent-message dispatch
+//!   - `config`:  on-disk config and interactive setup
+//!   - `agent`:   ACP subprocess wrapper and JSON-RPC framing
+//!   - `session`: session resume and stale-lock recovery
+//!   - `http`:    cloudflared transport (HTTP/WS server, UI assets, /state, /history)
+//!   - `ws`:      per-WebSocket session loop and agent-message dispatch
 //!
 //! The crate is exposed as a library so integration tests in `tests/` can
 //! import internals. The thin binary in `src/main.rs` calls `run()`.
@@ -84,7 +84,7 @@ pub fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "mezame {version} -- ACP client that bridges a local agent to a browser UI
+        "mezame {version}: ACP client that bridges a local agent to a browser UI
 
 USAGE:
     mezame [SUBCOMMAND]

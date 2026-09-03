@@ -11,15 +11,15 @@ import {
 
 // Theme application layer.
 //
-// The CSS in index.css carries two palettes: the `:root` light tokens
+// The CSS in index.css defines two palettes: the `:root` light tokens
 // and a `.dark` override block. This module decides whether `.dark`
 // belongs on <html> and keeps it in sync with both the user's
-// preference and — when the preference is `system` — the OS's
+// preference and, when the preference is `system`, the OS's
 // `prefers-color-scheme`.
 //
-// `system` is the default and the reason this feature exists: an OS
-// configured to switch to dark on a schedule will flip Mezame with it,
-// hands-free, via the matchMedia listener below.
+// `system` is the default: an OS configured to switch to dark on a
+// schedule will flip Mezame with it, hands-free, via the matchMedia
+// listener below.
 
 const DARK_QUERY = '(prefers-color-scheme: dark)';
 
@@ -42,8 +42,8 @@ const applyDark = (dark: boolean): void => {
 };
 
 /** Apply the persisted theme synchronously, before React mounts, to
- * avoid a flash of the light theme. Reads the localStorage mirror
- * (not /state, which is async). Call once from main.tsx. */
+ * avoid a flash of the light theme. Reads the localStorage mirror;
+ * /state is async. Call once from main.tsx. */
 export const bootTheme = (): void => {
   applyDark(resolveDark(readThemeFromStorage()));
 };
@@ -57,7 +57,7 @@ export const useThemePreference = (): ThemePreference =>
   );
 
 /** Mount once at the app root. Applies `.dark` whenever the preference
- * changes, and — while on `system` — re-applies when the OS flips. */
+ * changes. While on `system`, re-applies when the OS flips. */
 export const useApplyTheme = (): void => {
   const pref = useThemePreference();
 

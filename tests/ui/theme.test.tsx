@@ -19,8 +19,8 @@ import {
 } from '@/lib/settings';
 
 // matchMedia is not implemented in jsdom. Provide a controllable mock:
-// `setOsDark` flips the resolved value and fires registered listeners,
-// emulating an OS day/night schedule change.
+// `setOsDark` flips the resolved value and fires registered listeners.
+// That emulates an OS day/night schedule change.
 let osDark = false;
 const mediaListeners = new Set<() => void>();
 

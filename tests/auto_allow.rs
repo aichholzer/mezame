@@ -68,8 +68,8 @@ fn pick_allow_option_falls_back_to_name_when_kind_absent() {
 
 #[test]
 fn pick_allow_option_returns_none_when_no_allow() {
-    // Reject-only set: we never auto-pick a reject, so the caller is
-    // told to prompt the human instead.
+    // Reject-only set. A reject is never auto-picked, and the caller is
+    // told to prompt the human.
     let msg = json!({
         "params": { "options": [
             { "optionId": "r1", "name": "Reject", "kind": "reject_once" },

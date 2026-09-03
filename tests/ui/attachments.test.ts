@@ -13,8 +13,8 @@ import {
 } from '@/lib/attachments';
 import type { PromptCapabilities } from '@/types';
 
-/** Wrap `fileToAttachment` and pull the attachment out, throwing if
- * the caller staged something the test expected to be accepted. */
+/** Wrap `fileToAttachment` and pull the attachment out. Throws when the
+ * file was rejected. */
 function staged(file: File, caps: PromptCapabilities): Attachment {
   const result = fileToAttachment(file, caps);
   if (!result.ok) {
@@ -41,7 +41,7 @@ const json = (): File =>
   new File(['{}'], 'data.json', { type: 'application/json' });
 
 // Mock URL.createObjectURL + revokeObjectURL: jsdom doesn't implement
-// them by default, and they're called on every accepted image.
+// them by default. They're called on every accepted image.
 beforeAll(() => {
   if (!URL.createObjectURL) {
     URL.createObjectURL = () => 'blob:mock';

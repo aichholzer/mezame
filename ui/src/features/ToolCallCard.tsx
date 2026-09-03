@@ -5,11 +5,11 @@ import { Markdown } from '@/features/Markdown';
 import { cn } from '@/lib/utils';
 import type { LogEntry, ToolCallLocation } from '@/types';
 
-// Renders an ACP tool_call as a collapsible summary row. The row itself
-// shows title, status pill, and kind; expanded, it reveals arguments
-// (as JSON), content (as markdown if present), and the file locations
+// Renders an ACP tool_call as a collapsible summary row. The row shows
+// the title and a status pill. Expanded, it reveals the arguments (as
+// JSON), the content (as markdown when present), and the file locations
 // the tool touched. Multiple tool_call_update notifications with the
-// same toolCallId mutate the underlying store entry in place, so this
+// same toolCallId mutate the underlying store entry in place. This
 // component just re-renders.
 
 type Entry = Extract<LogEntry, { kind: 'tool_call' }>;

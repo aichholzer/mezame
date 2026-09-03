@@ -5,8 +5,8 @@ import { useEffect, useSyncExternalStore } from 'react';
 // AND exposes the same value to React via `useKeyboardInsetValue()`.
 //
 // CSS consumers (composer bottom offset, log pane bottom padding)
-// pick it up via `calc(... + var(--mz-kb-inset))` with zero re-
-// render cost. React consumers that need to react to keyboard
+// read it via `calc(... + var(--mz-kb-inset))` with zero re-render
+// cost. React consumers that need to react to keyboard
 // open/close (e.g. re-pinning the log scroll to the bottom when the
 // keyboard appears) subscribe via the exported hook.
 //
@@ -76,9 +76,9 @@ export const useKeyboardInset = (): void => {
     }, []);
 };
 
-/** Read-side hook for components that need to react (not just style)
- * to keyboard open/close. Returns the current inset in pixels;
- * subscribes to updates via `useSyncExternalStore`. */
+/** Read-side hook for components that need to react to keyboard
+ * open/close. Returns the current inset in pixels; subscribes to
+ * updates via `useSyncExternalStore`. */
 export const useKeyboardInsetValue = (): number =>
     useSyncExternalStore(
         subscribe,

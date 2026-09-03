@@ -1,6 +1,6 @@
 ![Mezame](https://github.com/aichholzer/mezame/blob/06cd603a6cc025be3058441a32a47cd212a8967b/assets/Mezame.png)
 
-[![Tests](https://github.com/aichholzer/mezame/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aichholzer/mezame/actions/workflows/test.yml)
+[![CI](https://github.com/aichholzer/mezame/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/aichholzer/mezame/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/aichholzer/mezame/graph/badge.svg?token=UV3BE0RQ0U)](https://codecov.io/gh/aichholzer/mezame)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/aichholzer/mezame?utm_source=badge)
 [![Latest version](https://img.shields.io/crates/v/mezame.svg)](https://crates.io/crates/mezame)
@@ -23,13 +23,13 @@ Mezame is an **ACP client**. It spawns your configured agent binary as a child p
 
 ## What Mezame is not
 
-Clarity matters here, because "AI-adjacent tool" covers a lot of ground.
+"AI-adjacent tool" covers a lot of ground, and clarity matters here.
 
 - **Mezame is not an agent.** It does not reason, plan, call tools, or make any decisions of its own.
 - **Mezame does not talk to an LLM.** It has no model, no inference code, no prompt engineering. It carries bytes between a browser and a subprocess; that is the entire job.
 - **Mezame has no credentials of its own.** It does not hold API keys, OAuth tokens, or AWS credentials. It never authenticates to any provider.
 - **Mezame is useless on its own.** It requires an ACP-speaking agent (e.g. Kiro CLI) to be installed, authenticated, and working locally. All intelligence, access, billing, and policy live with that agent. Mezame only exposes a conversation surface to a browser you control.
-- **Mezame does not modify your agent's files.** It reads `~/.kiro/sessions/cli/<id>.jsonl` to replay history on resume, and it declares `fs.readTextFile: false` and `fs.writeTextFile: false` at ACP `initialize`, so the agent cannot ask Mezame to touch the filesystem either. The sole exception is stale-lockfile cleanup under `~/.kiro/sessions/cli/`: if a `.lock` points at a dead PID, Mezame removes it so the next `session/load` succeeds. Mezame's own config and state live in `~/.mezame/`.
+- **Mezame does not modify your agent's files.** It reads `~/.kiro/sessions/cli/<id>.jsonl` to replay history on resume, and it declares `fs.readTextFile: false` and `fs.writeTextFile: false` at ACP `initialize`. The agent cannot ask Mezame to touch the filesystem either. The sole exception is stale-lockfile cleanup under `~/.kiro/sessions/cli/`: if a `.lock` points at a dead PID, Mezame removes it so the next `session/load` succeeds. Mezame's own config and state live in `~/.mezame/`.
 
 **Put plainly:** if you uninstall the agent, Mezame has nothing to show you.
 
@@ -136,7 +136,7 @@ Then:
 docker compose up -d
 ```
 
-Kiro credentials, session history, and Mezame config are persisted in named volumes, so you only authenticate once. See the comments in `compose.yaml` for the full flow.
+Kiro credentials, session history, and Mezame config are persisted in named volumes. You authenticate once. See the comments in `compose.yaml` for the full flow.
 
 Stderr carries Mezame's own logs and, prefixed with `[agent]`, the agent's stderr. Useful env vars:
 
@@ -148,7 +148,7 @@ Stderr carries Mezame's own logs and, prefixed with `[agent]`, the agent's stder
 
 1. **Auth enforcement.** Mezame trusts everything that reaches the WebSocket upgrade. When fronted by Cloudflare Access, validate the `Cf-Access-Jwt-Assertion` header (JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`). See `ws_upgrade` in `src/ws.rs` and the backlog in `todo.md`.
 2. **Remaining Kiro extensions.** Compaction and clear status notifications are still dropped. Slash commands, the commands catalogue, and MCP OAuth URL requests are surfaced.
-3. **Attachment rehydration on resume.** Prompts with images or embedded resources are sent correctly on the live path, but when the browser reconnects and Mezame replays history via Kiro's on-disk JSONL, only text turns are rendered. The parser in `parse_kiro_history` (`src/http.rs`) only knows about user/agent text today. Extending it requires knowing the shape Kiro uses for non-text prompt blocks in its JSONL, which has not been inspected yet. Until then, attachments in historical turns will appear as plain text (or be missing entirely) after a resume.
+3. **Attachment rehydration on resume.** Prompts with images or embedded resources are sent correctly on the live path, but when the browser reconnects and Mezame replays history via Kiro's on-disk JSONL, only text turns are rendered. The parser in `parse_kiro_history` (`src/http.rs`) only knows about user/agent text today. Extending it requires the shape Kiro uses for non-text prompt blocks in its JSONL. Nobody has inspected that yet. Until then, attachments in historical turns appear as plain text, or go missing entirely, after a resume.
 
 ## Roadmap
 

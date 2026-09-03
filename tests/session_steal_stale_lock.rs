@@ -1,11 +1,11 @@
 //! Tests for the lockfile-stealing path of
 //! `mezame::session::try_load_session`. Lives in its own integration
 //! binary because it has to override `HOME`, which is process-wide.
-//! Cargo runs each `tests/*.rs` file as a separate test binary, so the
+//! Cargo runs each `tests/*.rs` file as a separate test binary, and the
 //! override here cannot bleed into other test files. Within the file,
-//! cargo still runs the individual tests concurrently, so we take a
-//! file-scoped mutex around every test that touches `HOME` to keep
-//! them serialised against each other.
+//! cargo still runs the individual tests concurrently. A file-scoped
+//! mutex wraps every test that touches `HOME` and serialises them
+//! against each other.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -140,7 +140,7 @@ async fn dead_pid_lockfile_is_stolen_and_retry_succeeds() {
 // ---------- direct branch coverage of steal_stale_session_lock ----------
 //
 // The remaining cases call the function directly and never go near
-// `try_load_session`, so they don't need the agent fixture above.
+// `try_load_session`. None of them needs the agent fixture above.
 
 /// Set up an isolated `HOME` for the rest of the test and return the
 /// lockfile path for `sid`. `HOME` is process-wide; this is safe here

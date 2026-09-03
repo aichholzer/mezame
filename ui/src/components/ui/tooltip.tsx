@@ -26,12 +26,11 @@ const TooltipContent = ({
       data-slot="tooltip-content"
       sideOffset={sideOffset}
       className={cn(
-        // Tooltips are helpful with a fine pointer but noise with a
+        // Tooltips are helpful with a fine pointer and noise with a
         // coarse one: a tap triggers the trigger's action and the
         // tooltip lingers with no way to dismiss it. `tt-fine-only`
         // (see index.css) hides the content unless `pointer: fine`.
-        // Every trigger carries an aria-label for screen readers, so
-        // suppressing the visual tooltip does not hurt a11y.
+        // Every trigger has an aria-label for screen readers.
         'tt-fine-only',
         'z-50 overflow-hidden rounded-md bg-popover px-2 py-1 text-xs text-popover-foreground border shadow-md',
         'data-[state=delayed-open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=delayed-open]:fade-in-0',

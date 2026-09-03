@@ -2,12 +2,11 @@ import { useCallback, useEffect, useState } from 'react';
 
 // Sidebar resize, with persistence and clamping.
 //
-// Width is stored in pixels (not rem) so the runtime drag math is
-// trivial: pageX delta maps directly to width delta. The persisted
-// value lives in `localStorage` under a stable key so the choice
-// survives reloads on the same browser; this is intentionally
-// per-browser, not per-session, because the right width depends on
-// the display, not on the workspace.
+// Width is stored in pixels so the runtime drag math is trivial:
+// pageX delta maps directly to width delta. The persisted value lives
+// in `localStorage` under a stable key so the choice survives reloads
+// on the same browser. Persistence is per-browser: the right width
+// depends on the display.
 
 const STORAGE_KEY = 'mezame.sidebar.width';
 
@@ -63,7 +62,7 @@ export type SidebarWidthState = {
    * so the resize keeps tracking even when the cursor leaves the
    * narrow handle strip. */
   beginDrag: (e: React.PointerEvent) => void;
-  /** True while a drag is in flight, so the consumer can disable
+  /** True while a drag is in flight. Consumers use it to disable
    * transitions and apply a resize cursor cleanly. */
   dragging: boolean;
 };
@@ -120,8 +119,8 @@ export const useSidebarWidth = (): SidebarWidthState => {
   // (the main chat column) can reserve matching left padding without
   // prop-drilling. The sidebar floats on `position: fixed` at desktop
   // widths so it does not push the main column itself; the variable
-  // is the bridge that keeps the two columns visually aligned. The
-  // value is wrapped with `px` for direct use in calc() expressions.
+  // keeps the two columns visually aligned. The value is wrapped with
+  // `px` for direct use in calc() expressions.
   useEffect(() => {
     if (typeof document === 'undefined') {
       return;

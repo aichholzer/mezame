@@ -86,7 +86,8 @@ pub fn is_stale_lock_error(msg: &str) -> bool {
 
 /// If the lockfile for `session_id` points at a dead PID, remove it and
 /// return true. Any uncertainty (lockfile missing, unreadable, malformed,
-/// PID still alive) returns false so we fall through to `session/new`.
+/// PID still alive) returns false. The caller then falls through to
+/// `session/new`.
 pub fn steal_stale_session_lock(session_id: &str) -> bool {
     let Ok(home) = std::env::var("HOME") else {
         return false;
@@ -120,8 +121,8 @@ pub fn steal_stale_session_lock(session_id: &str) -> bool {
 
 /// Unix PID liveness check. `kill(pid, 0)` returns 0 if the process exists
 /// and we can signal it, `-1` otherwise. On ESRCH (no such process) the
-/// PID is definitely dead; on EPERM the process exists but we can't
-/// signal it, which for our case means we should NOT steal the lock.
+/// PID is definitely dead. On EPERM the process exists and we cannot
+/// signal it. Treat that as alive and leave the lock where it is.
 #[cfg(unix)]
 pub fn pid_is_alive(pid: i32) -> bool {
     // `kill` with signal 0 does not send a signal, it only queries
@@ -136,12 +137,12 @@ pub fn pid_is_alive(_pid: i32) -> bool {
 }
 
 /// Pull the `modes` and `models` blocks out of a `session/new` or
-/// `session/load` result. Returns `None` when neither is present so the
-/// WS handler can skip emitting the `session_info` event entirely.
+/// `session/load` result. Returns `None` when neither is present. The WS
+/// handler then skips the `session_info` event entirely.
 ///
-/// The shape passed through is exactly what Kiro sends, so the browser
-/// can key off `currentModeId` / `availableModes` / `currentModelId` /
-/// `availableModels` without any translation.
+/// The shape passed through is exactly what Kiro sends. The browser keys
+/// off `currentModeId` / `availableModes` / `currentModelId` /
+/// `availableModels` with no translation in between.
 pub fn extract_session_info(result: &Value) -> Option<Value> {
     let modes = result.get("modes").cloned();
     let models = result.get("models").cloned();
@@ -164,7 +165,7 @@ pub fn short_reason(msg: &str) -> String {
             return rest[..end].to_string();
         }
     }
-    // Fallback: trim the generic prefixes so the user sees something
-    // useful rather than three nested quote levels.
+    // Fallback: trim the generic prefixes. The raw message arrives with
+    // three levels of nested quoting; this hands back one readable line.
     msg.trim_start_matches("agent error: ").trim().to_string()
 }

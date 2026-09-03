@@ -1,6 +1,6 @@
 [package]
 name = "mezame"
-version = "0.13.2"
+version = "0.13.3"
 edition = "2021"
 rust-version = "1.86"
 build = "build.rs"
@@ -33,7 +33,7 @@ exclude = [
 ]
 
 [dependencies]
-anyhow = "1.0.95"
+anyhow = "1.0.103"
 axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 dialoguer = { version = "0.12.0", default-features = false }
 futures-util = "0.3.31"

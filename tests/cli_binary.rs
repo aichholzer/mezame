@@ -25,8 +25,9 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mezame")
 }
 
-/// Run the binary with `args` and an explicit `HOME`, with stdin closed so
-/// any accidental interactive prompt fails fast rather than hanging.
+/// Run the binary with `args` and an explicit `HOME`, with stdin closed.
+/// An accidental interactive prompt then fails fast; open stdin would
+/// leave the test hanging.
 fn run_with_home(args: &[&str], home: &std::path::Path) -> std::process::Output {
     Command::new(bin())
         .args(args)
@@ -103,10 +104,10 @@ fn short_help_flag_matches_long_form() {
 
 #[test]
 fn empty_transports_config_bails() {
-    // A well-formed config with no transports must fail loudly rather than
-    // silently doing nothing. This exercises the `[]` arm of run()'s
-    // transport match, plus the full config-discovery and runtime-build
-    // path that precedes it.
+    // A well-formed config with no transports must fail loudly. Doing
+    // nothing in silence is the failure mode this guards. It exercises
+    // the `[]` arm of run()'s transport match, plus the full
+    // config-discovery and runtime-build path that precedes it.
     let tmp = home_with_config(r#"{ "transports": [], "agent_cmd": "cat" }"#);
     let out = run_with_home(&[], tmp.path());
 
@@ -123,8 +124,9 @@ fn empty_transports_config_bails() {
 
 #[test]
 fn multiple_transports_config_bails() {
-    // Multi-transport is parsed but not yet runnable; run() bails on the
-    // `_` arm rather than silently serving only the first entry.
+    // Multi-transport is parsed and not yet runnable. run() bails on the
+    // `_` arm. Serving only the first entry in silence is the failure
+    // mode this guards.
     let body = r#"{
         "transports": [
             { "kind": "cloudflared", "bind": "127.0.0.1:9510" },

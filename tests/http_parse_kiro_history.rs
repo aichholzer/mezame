@@ -61,9 +61,9 @@ fn skips_malformed_json_lines() {
 
 #[test]
 fn assistant_before_any_prompt_has_null_timestamp() {
-    // Documented edge case: if the on-disk log starts with an assistant
-    // message, no Prompt has set a baseline timestamp yet, so the entry
-    // is emitted with `timestamp: null`.
+    // Documented edge case: when the on-disk log starts with an assistant
+    // message, no Prompt has set a baseline timestamp yet. The entry is
+    // emitted with `timestamp: null`.
     let raw = r#"{"kind":"AssistantMessage","data":{"content":[{"kind":"text","data":"orphan"}]}}"#;
     let entries = parse_kiro_history(raw);
     assert_eq!(entries.len(), 1);

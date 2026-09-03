@@ -18,8 +18,8 @@ import { cn } from '@/lib/utils';
 //   to every fenced code block.
 //
 // Memoised by input text so React does not re-run the parser when
-// unrelated state changes. During streaming the `text` prop grows, which
-// busts the memo on every chunk, which is what we want.
+// unrelated state changes. During streaming each chunk lengthens the
+// `text` prop and busts the memo.
 
 const InlineCode = ({ className, children, ...props }: ComponentPropsWithoutRef<'code'>) => (
   <code
@@ -33,12 +33,12 @@ const InlineCode = ({ className, children, ...props }: ComponentPropsWithoutRef<
 /**
  * Recursively flatten a React node into its plain-text content.
  *
- * Rehype-highlight wraps highlighted tokens in `<span>` elements, so
- * by the time the code block reaches our `FencedCode` renderer the
+ * Rehype-highlight wraps highlighted tokens in `<span>` elements. By
+ * the time the code block reaches our `FencedCode` renderer the
  * children are a mixed tree of strings (whitespace and punctuation
  * between tokens) and React elements (the tokens themselves). The
- * copy button needs the original source, which means walking every
- * branch.
+ * copy button needs the original source, and every branch has to be
+ * walked to reach it.
  *
  * Numbers are coerced to strings so `Date.now()` and similar
  * highlighted literal values still copy. Anything else (booleans,
@@ -78,10 +78,9 @@ const FencedCode = ({ className, children, ...props }: ComponentPropsWithoutRef<
 
   // Layout: a top gutter row holds the copy button and the language
   // label on the left; the code element sits below it. The copy
-  // button stays permanently visible (no hover gate) so it does not
-  // require a mouse hover to discover, and a tooltip is always
-  // accessible on touch devices that the previous opacity-on-hover
-  // version effectively hid.
+  // button stays permanently visible (no hover gate), along with its
+  // tooltip. The previous opacity-on-hover version effectively hid
+  // both on touch devices.
   return (
     <span className="block">
       <span className="flex items-center gap-2 pb-1">
@@ -116,10 +115,9 @@ const components: Components = {
   code(props) {
     const className = props.className ?? '';
     // `rehype-highlight` runs first and prepends `hljs` to the
-    // className, so a fenced block arrives here as `"hljs
-    // language-rust"`, not `"language-rust"`. Match anywhere in the
-    // class list. Inline code (single backticks) never carries a
-    // `language-` token, so this is unambiguous.
+    // className. A fenced block arrives here as `"hljs language-rust"`.
+    // Match anywhere in the class list. Inline code (single backticks)
+    // never has a `language-` token.
     if (/(?:^|\s)language-\w/.test(className)) {
       return <FencedCode {...props} />;
     }
@@ -139,9 +137,8 @@ const components: Components = {
   },
   table({ className, ...rest }) {
     // Wrap tables so wide content scrolls horizontally within the
-    // wrapper instead of expanding the page. Without this, a table
-    // with long cells would push the body viewport wider than the
-    // window on narrow screens.
+    // wrapper. Without this, a table with long cells would push the
+    // body viewport wider than the window on narrow screens.
     return (
       <div className="my-2 w-full overflow-x-auto scrollbar-thin">
         <table className={cn('border-collapse', className)} {...rest} />

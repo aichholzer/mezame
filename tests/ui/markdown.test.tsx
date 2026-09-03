@@ -1,8 +1,8 @@
 // Smoke tests for the Markdown renderer. Lives across react-markdown,
 // remark-gfm, rehype-highlight, remark-math, rehype-katex, and a small
-// custom code-block wrapper that adds a copy button. The point is to
-// catch a version bump that quietly changes the rendered output, not
-// to assert the exact HTML.
+// custom code-block wrapper that adds a copy button. These catch a
+// version bump that quietly changes the rendered output. The assertions
+// target structure and visible text.
 
 import { fireEvent, render, screen } from '@/__test_utils';
 import { Markdown } from '@/features/Markdown';
@@ -58,7 +58,7 @@ describe('Markdown', () => {
     expect(screen.getByRole('button', { name: /copy/i })).toBeInTheDocument();
   });
 
-  it('copies the full code body, not just whitespace between highlighted tokens', async () => {
+  it('copies the full code body including the highlighted token text', async () => {
     // Regression for the bug where `nodeToText` only flattened the
     // string entries in `children` and silently dropped every
     // highlighted span (`hljs-*`). On css blocks that meant copy

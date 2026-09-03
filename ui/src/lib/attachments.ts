@@ -157,9 +157,8 @@ const readAsBase64 = (file: File): Promise<string> =>
 
 const readAsText = (file: File): Promise<string> => file.text();
 
-/** Turn a staged attachment into an ACP `PromptBlock`. Reads file
- * bytes here rather than at stage time so the UI stays snappy when
- * files are large. */
+/** Turn a staged attachment into an ACP `PromptBlock`. Reads the file
+ * bytes at submit time. Staging stays cheap for large files. */
 export const attachmentToBlock = async (att: Attachment): Promise<PromptBlock> => {
   switch (att.kind) {
     case 'image': {

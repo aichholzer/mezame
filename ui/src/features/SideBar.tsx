@@ -52,8 +52,8 @@ type Props = {
   onRequestClose: () => void;
 };
 
-// Attention dot: fill carries the semantic (done/permission/error), a
-// white outline plus drop shadow keeps it legible on top of any row
+// Attention dot: the fill encodes done, permission or error. A white
+// outline plus drop shadow keeps it legible on top of any row
 // background colour.
 const attentionClass: Record<NonNullable<Attention>, string> = {
   done: 'bg-[color:var(--attn-done)]',
@@ -69,8 +69,8 @@ const attentionDotBase =
 // left accent bar on top.
 //
 // The extra `busy-background` state pulses green for a tab that is
-// still running a turn while the user has moved to another tab, so
-// background work is never silently hidden. Precedence (top wins):
+// still running a turn while the user has moved to another tab.
+// Background work is never silently hidden. Precedence (top wins):
 //   error > connecting/reconnecting > busy-in-background > connected.
 type TabVisualState =
   | 'suspended'
@@ -98,8 +98,9 @@ const tabVisualState = (s: Session, isActive: boolean): TabVisualState => {
 };
 
 const tabVisualClass: Record<TabVisualState, string> = {
-  // Steady grey, theme-aware via the surface/outline tokens. No animation
-  // entry in tabVisualStyle below, so a suspended tab never pulses.
+  // Steady grey, theme-aware via the surface/outline tokens.
+  // `tabVisualStyle` below has no entry for it. A suspended tab never
+  // pulses.
   suspended:
     'bg-[color:var(--surface-container-low)]/50 border-transparent text-[color:var(--outline)] hover:bg-[color:var(--surface-container)] hover:text-foreground',
   connecting: 'border-[color:var(--attn-permission)]/60 text-foreground',
@@ -202,9 +203,8 @@ export const SideBar = ({
   return (
     <>
       {/* Backdrop: mobile-only, dims the chat while the drawer is
-       * open so the modal affordance is unambiguous. Tapping it
-       * closes the drawer. Hidden on desktop where the sidebar is
-       * static. */}
+       * open. Tapping it closes the drawer. Hidden on desktop where
+       * the sidebar is static. */}
       <div
         onClick={onRequestClose}
         className={cn(
@@ -228,10 +228,10 @@ export const SideBar = ({
           // Desktop floating-card margins. On mobile the drawer must
           // have NO margin: a left margin would survive the
           // `-translate-x-full` hide (translate shifts the border box
-          // by its own width but leaves the margin behind), leaving a
-          // sliver of the panel on-screen overlapping the composer.
-          // Top/right/bottom margins would also inset the full-height
-          // drawer. So all four are `md:`-only.
+          // by its own width but leaves the margin behind). A sliver
+          // of the panel would stay on-screen, overlapping the
+          // composer. Top/right/bottom margins would also inset the
+          // full-height drawer. So all four are `md:`-only.
           'md:mt-5 md:mr-2.5 md:mb-5 md:ml-5',
           // Drawer mode (mobile): translate-x animation for show/hide.
           // Disable the transition while resizing so the live width
@@ -355,7 +355,8 @@ export const SideBar = ({
             // background rows (so a pending permission prompt remains
             // visible on top of the green pulse). Suppressed on the
             // active row (the user is already looking) and when the row
-            // carries its own strong colour (error / connecting).
+            // already has a strong colour of its own (error /
+            // connecting).
             const showAttentionDot =
               !isActive &&
               s.attention !== null &&
@@ -475,7 +476,7 @@ export const SideBar = ({
             'absolute inset-y-0 right-0 hidden w-1.5 -mr-0.5 cursor-col-resize md:block',
             // A subtle hover tint reveals the handle without putting a
             // permanent line over the existing right border. While
-            // dragging we light it up to make the action feel direct.
+            // dragging it lights up further.
             'transition-colors duration-150',
             sidebar.dragging
               ? 'bg-[color:var(--primary)]/40'
