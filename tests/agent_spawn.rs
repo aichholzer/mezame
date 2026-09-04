@@ -84,3 +84,46 @@ async fn spawn_agent_errors_when_command_does_not_exist() {
         "unexpected error wording: {msg}"
     );
 }
+
+/// A shell agent that reads one line and answers it as a JSON-RPC
+/// response.
+///
+/// The id is fixed at 1, which is what `Agent` assigns to the first request
+/// on a fresh handle (`next_id` starts there). A change to that scheme
+/// fails the test below on its assertion.
+fn responder_config() -> Config {
+    Config {
+        transports: vec![TransportConfig::Cloudflared {
+            bind: "127.0.0.1:0".into(),
+        }],
+        agent_cmd: "/bin/sh".into(),
+        agent_args: vec![
+            "-c".into(),
+            r#"read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#.into(),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn a_response_from_a_real_subprocess_resolves_its_request() {
+    // The production reader's correlation branch: a line carrying `result`
+    // against a known `id` has to reach the oneshot its request is parked
+    // on. `cat` cannot exercise this, as echoing a request back produces a
+    // frame with neither `result` nor `error`, which the router sends to the
+    // updates channel. `from_io` covers the same routing for the test
+    // constructor, and this is the only test driving it through a spawned
+    // process.
+    let (agent, _updates) = spawn_agent(&responder_config()).await.expect("spawn_agent");
+
+    let result = timeout(
+        Duration::from_secs(5),
+        agent.request("initialize", json!({})),
+    )
+    .await
+    .expect("the response must resolve the request")
+    .expect("a well-formed result is not an error");
+
+    assert_eq!(result["ok"], true);
+
+    agent.shutdown(None).await;
+}
