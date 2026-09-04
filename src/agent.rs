@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -24,6 +25,25 @@ use crate::config::Config;
 /// production this wraps `ChildStdin`; tests pass in a `tokio::io::duplex`
 /// half so the loop can be exercised without a real subprocess.
 type Writer = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// In-flight request table, shared between the handle and its stdout
+/// reader task.
+///
+/// `None` means the agent's stdout has reached EOF and no further response
+/// can arrive. The reader takes the map on EOF, which drops every sender
+/// still in it and wakes each waiter with a `RecvError`, and a request
+/// arriving afterwards finds `None` and fails on the spot.
+///
+/// The closed marker lives inside the same lock as the map on purpose.
+/// Holding them apart would let a request read "open", lose the race to
+/// the reader's cleanup, and then insert into a table nobody will ever
+/// drain again. See issue #9.
+type Pending = Arc<Mutex<Option<HashMap<i64, oneshot::Sender<Value>>>>>;
+
+/// Ceiling on a single wait for the child to exit during `shutdown`.
+/// Applied twice: once for the cooperative stdin-EOF exit, and once after
+/// the kills to collect the pid.
+const CHILD_WAIT: Duration = Duration::from_millis(500);
 
 /// Handle on the ACP agent.
 ///
@@ -42,8 +62,9 @@ pub struct Agent {
     /// Monotonic JSON-RPC id generator.
     next_id: AtomicI64,
     /// Map from in-flight request id to the oneshot waiting for its
-    /// response. Shared with the reader task that populates responses.
-    pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    /// response. Shared with the reader task that populates responses, and
+    /// emptied by that task when the agent's stdout closes. See `Pending`.
+    pending: Pending,
     /// Owned child. `None` for test-built agents constructed via
     /// `from_io`. SIGKILL on drop (kill_on_drop) remains as a safety net.
     /// `shutdown` tries a clean EOF and wait first, giving Kiro the chance
@@ -88,10 +109,23 @@ impl Agent {
     /// failed. Cancellation semantics are the caller's: drop the future
     /// mid-flight and the response arrives at a dangling oneshot and is
     /// discarded.
+    ///
+    /// An agent that dies with this request outstanding resolves it as an
+    /// error, from the reader task emptying `pending` on EOF. This call
+    /// terminates for every outcome the agent can produce, including
+    /// dying without answering. Issue #9 is what happens when it does
+    /// not: the future is held forever, and with it the `Arc<Agent>` and
+    /// an unreaped child process.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        {
+            let mut pending = self.pending.lock().await;
+            let Some(outstanding) = pending.as_mut() else {
+                bail!("Agent closed before replying");
+            };
+            outstanding.insert(id, tx);
+        }
 
         self.write_message(json!({
             "jsonrpc": "2.0",
@@ -145,6 +179,12 @@ impl Agent {
     ///      group kill in step 4 never reaches them; they only inherit the
     ///      agent's session. Without this they orphan to PID 1 and pile up
     ///      until the service cgroup is throttled. See `unix::reap_session`.
+    ///   6. Wait on the direct child once more, which collects its pid.
+    ///      Steps 4 and 5 are what ended it whenever the wait in step 3
+    ///      timed out, and tokio only reaps a `Child` when the `Child` is
+    ///      dropped. The handle can outlive teardown by a long way.
+    ///      Without this the pid sits `<defunct>` against the service's
+    ///      `TasksMax` for as long as the `Agent` is held. See issue #9.
     pub async fn shutdown(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
             let _ = self
@@ -155,13 +195,7 @@ impl Agent {
             let mut stdin = self.stdin.lock().await;
             let _ = stdin.shutdown().await;
         }
-        if let Some(child) = self.child.as_ref() {
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-                let mut child = child.lock().await;
-                let _ = child.wait().await;
-            })
-            .await;
-        }
+        self.wait_briefly().await;
 
         // Always kill the group. Idempotent: a no-op if everything already
         // exited, otherwise reaps any orphaned MCP servers / npm wrappers
@@ -170,7 +204,22 @@ impl Agent {
         // The group kill misses MCP servers that forked into their own
         // process groups. The session sweep catches those escapees.
         self.reap_session();
+        // Collect the direct child now that it has certainly been killed.
+        self.wait_briefly().await;
         self.shutdown_done.store(true, Ordering::Relaxed);
+    }
+
+    /// Wait up to `CHILD_WAIT` for the child to exit, which also reaps it.
+    /// A child that ignores stdin EOF cannot stall teardown past the
+    /// bound. No-op for test-built agents, which own no child.
+    async fn wait_briefly(&self) {
+        if let Some(child) = self.child.as_ref() {
+            let _ = tokio::time::timeout(CHILD_WAIT, async {
+                let mut child = child.lock().await;
+                let _ = child.wait().await;
+            })
+            .await;
+        }
     }
 
     /// True once `shutdown()` has run to completion. Test-only signal so
@@ -310,8 +359,7 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
         }
     });
 
-    let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
 
     // Optional ACP tracing. Set `MEZAME_DEBUG_ACP=1` to dump every inbound
@@ -340,7 +388,12 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
             let is_response = msg.get("result").is_some() || msg.get("error").is_some();
             if is_response {
                 if let Some(id) = msg.get("id").and_then(Value::as_i64) {
-                    if let Some(tx) = pending_reader.lock().await.remove(&id) {
+                    let waiting = pending_reader
+                        .lock()
+                        .await
+                        .as_mut()
+                        .and_then(|outstanding| outstanding.remove(&id));
+                    if let Some(tx) = waiting {
                         let _ = tx.send(msg);
                         continue;
                     }
@@ -348,6 +401,20 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
             }
             let _ = updates_tx.send(msg);
         }
+
+        // Stdout is closed: the agent exited or its stdio broke, and no
+        // response can arrive from here on. Take the map, which marks the
+        // handle closed and drops every sender still waiting. Each caller
+        // blocked in `request` wakes with a `RecvError`.
+        //
+        // Without this a request outstanding at the moment the agent died
+        // waits for a reply that cannot come. That future holds the
+        // `Arc<Agent>`, the `Agent` holds the `Child`, and tokio reaps a
+        // `Child` only on drop. The pid then sits `<defunct>` for the life
+        // of the process. See issue #9.
+        let outstanding = pending_reader.lock().await.take();
+        // Dropped outside the lock: waking a waiter takes no part in it.
+        drop(outstanding);
     });
 
     Ok((
@@ -371,15 +438,16 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
 /// agent has no child process. `shutdown` then closes stdin and flips the
 /// `shutdown_complete()` flag, and does nothing else.
 ///
-/// The `stdout` reader runs the same routing logic as the production path.
-/// Response correlation works here as it does in production.
+/// The `stdout` reader runs the same routing logic as the production path,
+/// including emptying the pending table when the stream ends. Response
+/// correlation and closed-agent behaviour both work here as they do in
+/// production.
 #[doc(hidden)]
 pub fn from_io(
     stdin: impl AsyncWrite + Send + Unpin + 'static,
     stdout: impl AsyncRead + Send + Unpin + 'static,
 ) -> (Agent, mpsc::UnboundedReceiver<Value>) {
-    let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
 
     let pending_reader = pending.clone();
@@ -393,7 +461,12 @@ pub fn from_io(
             let is_response = msg.get("result").is_some() || msg.get("error").is_some();
             if is_response {
                 if let Some(id) = msg.get("id").and_then(Value::as_i64) {
-                    if let Some(tx) = pending_reader.lock().await.remove(&id) {
+                    let waiting = pending_reader
+                        .lock()
+                        .await
+                        .as_mut()
+                        .and_then(|outstanding| outstanding.remove(&id));
+                    if let Some(tx) = waiting {
                         let _ = tx.send(msg);
                         continue;
                     }
@@ -401,6 +474,11 @@ pub fn from_io(
             }
             let _ = updates_tx.send(msg);
         }
+
+        // Matches the production reader: end of stream closes the handle
+        // and fails everything outstanding. See issue #9.
+        let outstanding = pending_reader.lock().await.take();
+        drop(outstanding);
     });
 
     (

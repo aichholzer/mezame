@@ -59,6 +59,17 @@ use crate::ws::handle_agent_message;
 /// coming back from a transient drop lands well inside this window.
 const GRACE_PERIOD: Duration = Duration::from_secs(30);
 
+/// Ceiling on the ACP handshake for a freshly spawned agent.
+///
+/// `initialize` plus `session/new` or `session/load` normally settles in
+/// well under a second, and a `session/load` replaying a long history is
+/// the slow case. An agent that execs and then answers nothing would
+/// otherwise hold this future for the life of the process, along with its
+/// `Arc<Agent>` and an unreaped child process. 60s matches
+/// `ws::HEARTBEAT_TIMEOUT` and leaves generous headroom over the
+/// handshake. See issue #9.
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How many grace periods a detached hub may hold a running turn before
 /// teardown proceeds anyway. 60 periods is 30 minutes against the
 /// production `GRACE_PERIOD`, and the multiple keeps the cap in
@@ -578,14 +589,23 @@ async fn build_hub(
     // local buffer. No WS sink is involved. The buffer becomes the
     // snapshot subscribers replay on attach.
     let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<axum::extract::ws::Message>();
-    let _outcome = crate::ws::negotiate_session(
-        &agent,
-        &snapshot_tx,
-        resume_session_id,
-        cwd_override,
-        build_id,
+    let negotiation = tokio::time::timeout(
+        NEGOTIATION_TIMEOUT,
+        crate::ws::negotiate_session(
+            &agent,
+            &snapshot_tx,
+            resume_session_id,
+            cwd_override,
+            build_id,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("Agent did not finish negotiation within {NEGOTIATION_TIMEOUT:?}")
+    });
+    // Both failure shapes land here, and either way `agent` drops on the
+    // way out: the child is killed and collected.
+    let _outcome = negotiation??;
     drop(snapshot_tx);
 
     // The negotiate helper writes WS-shaped `Message::Text` frames, and

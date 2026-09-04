@@ -1017,3 +1017,100 @@ async fn grace_reclaims_the_agent_once_the_inflight_hold_is_capped() {
         "capped teardown must run the cooperative shutdown"
     );
 }
+
+#[tokio::test]
+async fn a_turn_outstanding_when_the_agent_dies_resolves_and_tears_down() {
+    // The second half of GitHub issue #9. A `session/prompt` in flight when
+    // the agent died used to leave its task parked on a response that could
+    // never arrive. That task holds its own `Arc<Agent>`. The child was
+    // never collected even after the hub had torn down and released its own
+    // reference, and the browser sat on "Agent is working" forever.
+    //
+    // With the pending table emptied when the agent's stdout closes, the
+    // request fails, the browser is told, and the in-flight guard drops.
+    let registry = HubRegistry::new();
+    let (server_to_agent, agent_stdin) = duplex(8 * 1024);
+    let (agent_stdout, server_reader) = duplex(8 * 1024);
+    let (agent, updates_rx) = from_io(server_to_agent, server_reader);
+
+    // Read back what mezame writes so the test can wait for the prompt to
+    // reach the agent. Nothing ever answers it.
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_stdin).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = line_tx.send(line);
+        }
+    });
+
+    let mut attached = registry
+        .register_for_test_with_grace(
+            Duration::from_millis(50),
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![json!({ "type": "text", "text": "long running" })],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+
+    // Sync point: the request reached the agent. The turn is in flight and
+    // the guard is armed.
+    let first = timeout(Duration::from_secs(2), line_rx.recv())
+        .await
+        .expect("session/prompt within 2s")
+        .expect("channel open");
+    let first: Value = serde_json::from_str(&first).expect("valid JSON");
+    assert_eq!(first["method"], "session/prompt");
+
+    // The agent dies mid-turn.
+    drop(agent_stdout);
+
+    // Both events have to land. `error` tells the user what happened and
+    // `prompt_done` is what unlocks the composer.
+    let mut saw_error = false;
+    let mut saw_done = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !(saw_error && saw_done) {
+        match timeout(Duration::from_millis(200), attached.outbound.recv()).await {
+            Ok(Ok(event)) => match (*event)["type"].as_str() {
+                Some("error") => saw_error = true,
+                Some("prompt_done") => saw_done = true,
+                _ => {}
+            },
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_error,
+        "a turn cut short by a dead agent must surface an error"
+    );
+    assert!(
+        saw_done,
+        "a turn cut short by a dead agent must still emit prompt_done"
+    );
+
+    // And the hub goes. Closing the agent's stdout also ends the updates
+    // stream the owner loop selects on. Teardown runs without waiting for
+    // the grace timer.
+    drop(attached);
+    let mut gone = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if !registry.is_registered_for_test(SESSION_ID).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "the hub must not outlive its dead agent");
+}
