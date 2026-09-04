@@ -103,7 +103,10 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
 /// holding a truly dead socket `ESTABLISHED` forever. Best-effort: a
 /// failure here is logged and ignored, and startup continues. See GitHub
 /// issue #4.
-fn enable_tcp_keepalive(listener: &TcpListener) {
+///
+/// Public for the integration tests in `tests/`. Its only caller is
+/// `run_cloudflared`, which serves until a signal arrives.
+pub fn enable_tcp_keepalive(listener: &TcpListener) {
     use socket2::{SockRef, TcpKeepalive};
 
     let keepalive = TcpKeepalive::new()

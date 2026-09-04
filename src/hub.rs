@@ -41,13 +41,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::time::Instant;
 
 use crate::agent::{spawn_agent, Agent};
 use crate::config::Config;
@@ -57,6 +58,41 @@ use crate::ws::handle_agent_message;
 /// 30s matches the WS reconnect-backoff cap on the client. A browser
 /// coming back from a transient drop lands well inside this window.
 const GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// How many grace periods a detached hub may hold a running turn before
+/// teardown proceeds anyway. 60 periods is 30 minutes against the
+/// production `GRACE_PERIOD`, and the multiple keeps the cap in
+/// proportion for tests that drive a short period.
+const MAX_INFLIGHT_HOLD_PERIODS: u32 = 60;
+
+/// Ceiling on a single detached-but-busy hold. A turn that never resolves
+/// would otherwise keep its hub, agent and MCP fleet alive for the life
+/// of the process, which is the leak the process-group and session
+/// sweeps exist to prevent.
+fn max_inflight_hold(grace_period: Duration) -> Duration {
+    grace_period * MAX_INFLIGHT_HOLD_PERIODS
+}
+
+/// Decrements the in-flight turn count on drop.
+///
+/// The count has to fall even if the prompt task panics before it can
+/// clear the marker itself. A count stuck above zero makes the hub
+/// immortal: every grace fire re-arms for the capped window, and past the
+/// cap the agent is reclaimed mid-turn on a session that was never busy.
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl InflightGuard {
+    fn arm(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Process-static attach id counter. Bumped on every successful
 /// `subscribe`. It wraps eventually, and attach lifetimes never overlap
@@ -429,6 +465,15 @@ impl HubRegistry {
         map.remove(session_id);
     }
 
+    /// Test-only: report whether a hub is currently registered for
+    /// `session_id`, without attaching (attaching would increment the
+    /// subscriber count and disarm the grace timer). Lets tests observe
+    /// grace teardown.
+    #[doc(hidden)]
+    pub async fn is_registered_for_test(&self, session_id: &str) -> bool {
+        self.inner.read().await.contains_key(session_id)
+    }
+
     /// Test-only: register a pre-built hub directly. Bypasses the
     /// agent-spawn and ACP-negotiation phases so tests can exercise
     /// the broadcast / counter / grace-timer flow with an agent
@@ -436,6 +481,30 @@ impl HubRegistry {
     #[doc(hidden)]
     pub async fn register_for_test(
         &self,
+        agent: Arc<Agent>,
+        session_id: String,
+        updates_rx: mpsc::UnboundedReceiver<Value>,
+        ready: Value,
+        session_info: Option<Value>,
+    ) -> AttachedHub {
+        self.register_for_test_with_grace(
+            GRACE_PERIOD,
+            agent,
+            session_id,
+            updates_rx,
+            ready,
+            session_info,
+        )
+        .await
+    }
+
+    /// Test-only variant of `register_for_test` with an explicit grace
+    /// period. A test drives the grace timer with a short value and never
+    /// waits out the production `GRACE_PERIOD`.
+    #[doc(hidden)]
+    pub async fn register_for_test_with_grace(
+        &self,
+        grace_period: Duration,
         agent: Arc<Agent>,
         session_id: String,
         updates_rx: mpsc::UnboundedReceiver<Value>,
@@ -471,6 +540,7 @@ impl HubRegistry {
             grace_rx,
             registry: self.clone(),
             snapshot,
+            grace_period,
         }));
 
         let mut map = self.inner.write().await;
@@ -595,6 +665,7 @@ async fn build_hub(
         grace_rx,
         registry,
         snapshot,
+        grace_period: GRACE_PERIOD,
     }));
 
     Ok(hub)
@@ -616,6 +687,10 @@ struct HubLoopState {
     /// `session_info` half on a successful set_mode or set_model, and
     /// every later attach replays the current selection.
     snapshot: Arc<Mutex<NegotiationSnapshot>>,
+    /// How long the agent stays warm after the last browser detaches.
+    /// Defaults to `GRACE_PERIOD`. Holding it on the loop state lets a
+    /// test drive the timer deterministically with a short period.
+    grace_period: Duration,
 }
 
 /// Owner loop: serialises browser commands and broadcasts agent
@@ -633,6 +708,7 @@ async fn run_hub_loop(state: HubLoopState) {
         mut grace_rx,
         registry,
         snapshot,
+        grace_period,
     } = state;
 
     // Adapter: `handle_agent_message` writes WS-shaped Text frames
@@ -656,6 +732,19 @@ async fn run_hub_loop(state: HubLoopState) {
     // never see a permission card they were not asked to answer.
     let current_prompter: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
 
+    // Number of turns currently in flight (spawned `session/prompt`
+    // tasks that have not yet resolved). The grace timer must not tear
+    // the agent down while this is non-zero: doing so sends
+    // `session/cancel` and aborts the user's turn (the "lose focus on
+    // mobile mid-turn -> Response was interrupted by the user" bug). A
+    // detached-but-busy session stays warm until its turn completes.
+    let inflight: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+    // When the current detached-but-busy hold began. `None` whenever a
+    // browser is attached or no turn is running. The grace branch reads
+    // it to cap how long a single hold may last.
+    let mut inflight_hold_since: Option<Instant> = None;
+
     let mut grace_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
 
     loop {
@@ -672,6 +761,7 @@ async fn run_hub_loop(state: HubLoopState) {
                         &outbound,
                         &snapshot,
                         &current_prompter,
+                        &inflight,
                     ).await,
                     None => break, // all senders dropped: nobody can reach us
                 }
@@ -775,13 +865,16 @@ async fn run_hub_loop(state: HubLoopState) {
                         let cancel_rx = counter.install_cancel().await;
                         grace_deadline = Some(Box::pin(async move {
                             tokio::select! {
-                                _ = tokio::time::sleep(GRACE_PERIOD) => {}
+                                _ = tokio::time::sleep(grace_period) => {}
                                 _ = cancel_rx => {}
                             }
                         }));
                     }
                     Some(GraceEvent::Refilled) => {
                         grace_deadline = None;
+                        // A browser is back. Any later hold starts its
+                        // cap afresh.
+                        inflight_hold_since = None;
                     }
                     None => {} // counter dropped its sender; should not happen while we hold a strong ref
                 }
@@ -793,13 +886,42 @@ async fn run_hub_loop(state: HubLoopState) {
                     None => std::future::pending().await,
                 }
             }, if grace_deadline.is_some() => {
-                if counter.count().await == 0 {
+                if counter.count().await != 0 {
+                    // Race: a fresh subscriber arrived between the timer
+                    // firing and the count read. Cancel the deadline and
+                    // keep going.
+                    grace_deadline = None;
+                    inflight_hold_since = None;
+                } else if inflight.load(Ordering::SeqCst) == 0 {
                     break;
+                } else {
+                    // Nobody is attached and a turn is still running.
+                    // Tearing down here sends `session/cancel` and aborts
+                    // the turn, which is the mobile "lose focus mid-turn"
+                    // bug. Hold the agent and re-arm; a later fire
+                    // reclaims it once the turn resolves.
+                    //
+                    // The hold is capped. A turn that never resolves (a
+                    // wedged agent, an MCP server that never answers)
+                    // would otherwise keep this hub, its agent and its
+                    // MCP fleet alive for the life of the process.
+                    let held_since = *inflight_hold_since.get_or_insert_with(Instant::now);
+                    let held_for = held_since.elapsed();
+                    if held_for >= max_inflight_hold(grace_period) {
+                        eprintln!(
+                            "Session {session_id}: a turn has been in flight for {held_for:?} \
+                             with no browser attached. Reclaiming the agent."
+                        );
+                        break;
+                    }
+                    let cancel_rx = counter.install_cancel().await;
+                    grace_deadline = Some(Box::pin(async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep(grace_period) => {}
+                            _ = cancel_rx => {}
+                        }
+                    }));
                 }
-                // Race: a fresh subscriber arrived between the timer
-                // firing and the count read. Cancel the deadline and
-                // keep going.
-                grace_deadline = None;
             }
         }
     }
@@ -824,6 +946,7 @@ async fn handle_command(
     outbound: &broadcast::Sender<Arc<Value>>,
     snapshot: &Arc<Mutex<NegotiationSnapshot>>,
     current_prompter: &Arc<Mutex<Option<u64>>>,
+    inflight: &Arc<AtomicUsize>,
 ) {
     match cmd {
         HubCommand::Prompt { blocks, attach_id } => {
@@ -834,6 +957,11 @@ async fn handle_command(
             // during this turn get stamped with their attach id and
             // land only on the originating browser.
             *current_prompter.lock().await = Some(attach_id);
+            // Mark a turn in flight. The grace branch reads this and
+            // holds the agent until the turn resolves, even with no
+            // browser attached. Losing focus mid-turn no longer tears the
+            // agent down and cancels the turn.
+            let inflight_guard = InflightGuard::arm(inflight);
             // First live prompt after a resume: stop hiding Kiro's
             // session/update events. From here on everything the
             // agent emits is real.
@@ -885,6 +1013,12 @@ async fn handle_command(
                 // instance) is then never mis-attributed to the
                 // previous sender.
                 *prompter_clone.lock().await = None;
+                // Turn finished. Clear the in-flight marker ahead of the
+                // prompt_done broadcast, which leaves a detached and now
+                // idle hub eligible for grace teardown on the next fire.
+                // The guard's `Drop` covers the same decrement if this
+                // task panics before reaching here.
+                drop(inflight_guard);
                 let _ = outbound_clone.send(Arc::new(json!({ "type": "prompt_done" })));
             });
         }

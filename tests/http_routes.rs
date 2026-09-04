@@ -446,3 +446,170 @@ async fn top_level_static_file_uses_short_cache() {
         "top-level static cache-control was `{cc}`"
     );
 }
+
+// ---------- error paths ----------
+
+#[tokio::test]
+async fn get_state_returns_500_when_the_state_file_cannot_be_read() {
+    // A `state.json` that exists as a directory fails the read with
+    // something other than `NotFound`, which is the one error the handler
+    // absorbs into an empty object. Anything else is reported.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    std::fs::create_dir_all(tmp.path().join(".mezame/state.json")).unwrap();
+
+    let req = Request::get("/state").body(Body::empty()).unwrap();
+    let (status, _, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn put_state_returns_500_when_the_parent_cannot_be_created() {
+    // `.mezame` occupied by a regular file makes `create_dir_all` fail.
+    // The write is refused and the caller is told, and no partial state
+    // file is left behind.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    std::fs::write(tmp.path().join(".mezame"), b"not a directory").unwrap();
+
+    let payload = json!({ "sessions": [] });
+    let req = Request::put("/state")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn get_history_returns_500_when_home_is_unset() {
+    let _g = home_lock().lock().await;
+    unset_home();
+
+    let req = Request::get("/history?session=abc")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn get_history_returns_500_when_the_session_path_is_unreadable() {
+    // The session JSONL present as a directory. A missing file is an empty
+    // history; a broken one is an error.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let sid = "wedged";
+    std::fs::create_dir_all(tmp.path().join(format!(".kiro/sessions/cli/{sid}.jsonl"))).unwrap();
+
+    let req = Request::get(format!("/history?session={sid}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn get_tool_result_rejects_missing_or_invalid_params() {
+    // One guard per candidate, in the order the handler checks them:
+    // absent `session`, absent `id`, then the traversal and empty-id
+    // checks on the session value.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let candidates = [
+        "/tool-result",
+        "/tool-result?id=tu-1",
+        "/tool-result?session=abc",
+        "/tool-result?session=&id=tu-1",
+        "/tool-result?session=..&id=tu-1",
+        "/tool-result?session=foo%2F..%2Fbar&id=tu-1",
+        "/tool-result?session=..%2Fetc%2Fpasswd&id=tu-1",
+    ];
+    for url in candidates {
+        let req = Request::get(url).body(Body::empty()).unwrap();
+        let (status, _, _) = run_request(req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400 for `{url}`");
+    }
+}
+
+#[tokio::test]
+async fn get_tool_result_returns_500_when_home_is_unset() {
+    let _g = home_lock().lock().await;
+    unset_home();
+
+    let req = Request::get("/tool-result?session=abc&id=tu-1")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn get_tool_result_returns_404_when_the_session_file_is_missing() {
+    // The browser polls this endpoint after a live status flip arrived
+    // with no content. A 404 tells it to retry or give up, and it is
+    // distinct from the 400s above.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let req = Request::get("/tool-result?session=never-existed&id=tu-1")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_state_serves_an_empty_object_for_malformed_json() {
+    // A hand-edited or truncated `state.json` resolves to `{}`. The
+    // browser then rebuilds its session list from scratch, and a corrupt
+    // file never wedges the UI behind a 500.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let dir = tmp.path().join(".mezame");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("state.json"), "{ truncated").unwrap();
+
+    let req = Request::get("/state").body(Body::empty()).unwrap();
+    let (status, bytes, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&bytes), json!({}));
+}
+
+#[tokio::test]
+async fn get_tool_result_returns_500_when_the_session_path_is_unreadable() {
+    // An absent session file is a 404; one that fails the read for any
+    // other reason is reported as a 500, and the client can tell the two
+    // apart.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let sid = "wedged-result";
+    std::fs::create_dir_all(tmp.path().join(format!(".kiro/sessions/cli/{sid}.jsonl"))).unwrap();
+
+    let req = Request::get(format!("/tool-result?session={sid}&id=tu-1"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}

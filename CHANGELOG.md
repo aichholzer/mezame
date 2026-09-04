@@ -13,6 +13,30 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.13.4] - 2026-09-04
+
+### Changed
+
+- `config::which` and `http::enable_tcp_keepalive` are public, joining
+  the other internals the library exposes to its own test suite.
+
+### Fixed
+
+- Losing focus on a mobile device mid-turn no longer interrupts the turn.
+  When the last browser detaches, Mezame arms a grace timer and shuts the
+  agent down on expiry. The first step of that shutdown is
+  `session/cancel`, and a running turn died with it. Backgrounding a
+  mobile tab or locking the screen drops the WebSocket within seconds,
+  and a multi-minute turn was reliably cancelled ("Response was
+  interrupted by the user") before the user came back. The grace timer is
+  now turn-aware: it holds the agent while a `session/prompt` is in
+  flight and reclaims it once the turn resolves. Fire a prompt, switch
+  away, and the finished answer is waiting. An idle session with no turn
+  running is reaped on the same grace window as before.
+- The turn-aware hold is capped at 30 minutes. A turn that never resolves
+  (a wedged agent, an MCP server that never answers) would otherwise keep
+  the agent and its MCP fleet alive for the life of the process.
+
 ## [0.13.3] - 2026-09-03
 
 ### Added

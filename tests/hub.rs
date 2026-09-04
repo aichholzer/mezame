@@ -780,3 +780,240 @@ async fn detach_to_zero_then_reattach_exercises_grace_counter() {
         .expect("channel open");
     assert_eq!((*event)["text"], "still alive");
 }
+
+#[tokio::test]
+async fn grace_does_not_cancel_an_in_flight_turn() {
+    // Regression for the mobile "lose focus mid-turn -> Response was
+    // interrupted by the user" bug. When the last browser detaches the
+    // hub arms its grace timer; if that teardown ran while a
+    // `session/prompt` was still in flight it would send
+    // `session/cancel` and abort the user's turn. With the in-flight
+    // guard the agent stays warm until the turn finishes. No
+    // `session/cancel` is sent on detach.
+    let registry = HubRegistry::new();
+    let (server_to_agent, agent_stdin) = duplex(8 * 1024);
+    let (agent_stdout, server_reader) = duplex(8 * 1024);
+    let (agent, updates_rx) = from_io(server_to_agent, server_reader);
+    // Keep the agent's stdout open: closing it would EOF the updates
+    // channel and tear the hub down for an unrelated reason, masking
+    // what we want to test.
+    let _agent_stdout = agent_stdout;
+
+    // Capture every line mezame writes to the agent's stdin. We never
+    // reply. The `session/prompt` request stays unresolved and the turn
+    // is "in flight" for the whole test.
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_stdin).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = line_tx.send(line);
+        }
+    });
+
+    let attached = registry
+        .register_for_test_with_grace(
+            Duration::from_millis(50),
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![json!({ "type": "text", "text": "long running" })],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+
+    // Sync point: the `session/prompt` request reaches the agent, which
+    // means the prompt task spawned and the in-flight counter is set.
+    let first = timeout(Duration::from_secs(2), line_rx.recv())
+        .await
+        .expect("session/prompt within 2s")
+        .expect("channel open");
+    let first: Value = serde_json::from_str(&first).expect("valid JSON");
+    assert_eq!(first["method"], "session/prompt");
+
+    // Detach the only browser: count -> 0 arms the 50ms grace timer.
+    drop(attached);
+
+    // Over the next 250ms the grace timer fires several times. A
+    // turn-blind teardown would write `session/cancel` here. The guard
+    // must keep the agent warm and the channel stays silent.
+    let leaked = timeout(Duration::from_millis(250), line_rx.recv()).await;
+    assert!(
+        leaked.is_err(),
+        "grace must not send session/cancel while a turn is in flight (got {leaked:?})"
+    );
+
+    // The hub is still registered: the agent was held.
+    assert!(
+        registry.is_registered_for_test(SESSION_ID).await,
+        "hub must stay registered while a turn is in flight"
+    );
+}
+
+#[tokio::test]
+async fn grace_still_tears_down_once_the_turn_completes() {
+    // The in-flight guard must not defeat memory reclamation: once the
+    // turn resolves and the last browser is gone, the grace timer must
+    // still tear the agent down and drop the hub from the registry.
+    let registry = HubRegistry::new();
+    let (agent, updates_rx, _inject) = make_fake_agent(); // auto-replies
+
+    let mut attached = registry
+        .register_for_test_with_grace(
+            Duration::from_millis(50),
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![json!({ "type": "text", "text": "quick" })],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+
+    // Wait for prompt_done: the turn has resolved and the in-flight
+    // counter is back to zero.
+    let mut saw_done = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), attached.outbound.recv()).await {
+            Ok(Ok(event)) => {
+                if (*event)["type"] == "prompt_done" {
+                    saw_done = true;
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(saw_done, "turn should resolve and broadcast prompt_done");
+
+    // Detach the only browser. With no turn in flight the grace timer
+    // (50ms) should fire and remove the hub from the registry. We poll
+    // with the non-attaching helper so the check itself does not disarm
+    // the timer.
+    drop(attached);
+
+    let mut gone = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if !registry.is_registered_for_test(SESSION_ID).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        gone,
+        "idle hub must be torn down by the grace timer once the turn completes"
+    );
+}
+
+#[tokio::test]
+async fn grace_reclaims_the_agent_once_the_inflight_hold_is_capped() {
+    // The turn-aware hold keeps a detached hub alive while a
+    // `session/prompt` is outstanding. A prompt that never resolves would
+    // hold it forever, and the agent plus its MCP fleet would leak for the
+    // life of the process. The hold is capped at
+    // `MAX_INFLIGHT_HOLD_PERIODS` grace periods, after which teardown
+    // proceeds even though the turn is still open.
+    //
+    // The cap is a multiple of the grace period. A 10ms period puts it at
+    // 600ms here.
+    let registry = HubRegistry::new();
+    let (server_to_agent, agent_stdin) = duplex(8 * 1024);
+    let (agent_stdout, server_reader) = duplex(8 * 1024);
+    let (agent, updates_rx) = from_io(server_to_agent, server_reader);
+    // Hold the agent's stdout open. Closing it would EOF the updates
+    // channel and break the loop for an unrelated reason.
+    let _agent_stdout = agent_stdout;
+
+    // Never reply. The `session/prompt` request stays outstanding for the
+    // whole test and the in-flight count never falls.
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_stdin).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let _ = line_tx.send(line);
+        }
+    });
+
+    let attached = registry
+        .register_for_test_with_grace(
+            Duration::from_millis(10),
+            Arc::new(agent),
+            SESSION_ID.into(),
+            updates_rx,
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![json!({ "type": "text", "text": "never finishes" })],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+
+    // Sync point: the prompt reached the agent and the turn is in flight.
+    let first = timeout(Duration::from_secs(2), line_rx.recv())
+        .await
+        .expect("session/prompt within 2s")
+        .expect("channel open");
+    let first: Value = serde_json::from_str(&first).expect("valid JSON");
+    assert_eq!(first["method"], "session/prompt");
+
+    // Detach the only browser and start the hold.
+    drop(attached);
+
+    // Past the cap the hub must be gone from the registry.
+    let mut gone = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if !registry.is_registered_for_test(SESSION_ID).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        gone,
+        "a hold that outlives the cap must still release the agent"
+    );
+
+    // Teardown runs the cooperative shutdown. The agent sees the
+    // `session/cancel` the hold had been deferring.
+    let mut saw_cancel = false;
+    while let Ok(Some(line)) = timeout(Duration::from_millis(200), line_rx.recv()).await {
+        let frame: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if frame["method"] == "session/cancel" {
+            saw_cancel = true;
+            break;
+        }
+    }
+    assert!(
+        saw_cancel,
+        "capped teardown must run the cooperative shutdown"
+    );
+}

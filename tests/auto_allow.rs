@@ -308,3 +308,13 @@ async fn auto_allow_off_forwards_card_as_before() {
     assert_eq!((*event)["type"], "permission_request");
     assert_eq!((*event)["id"], 7);
 }
+
+#[tokio::test]
+async fn read_auto_allow_false_when_home_is_unset() {
+    // `state_path()` fails with no `HOME`, and the read resolves to the
+    // safe default. A permission request then prompts the human, which is
+    // the behaviour to keep when the environment is broken.
+    let _g = home_lock().lock().await;
+    std::env::remove_var("HOME");
+    assert!(!read_auto_allow_permissions().await);
+}
