@@ -286,8 +286,10 @@ fn pick_agent(theme: &ColorfulTheme) -> Result<Option<PickedAgent>> {
 }
 
 /// Tiny `$PATH` lookup; mirrors the helper in `build.rs`. Avoids pulling
-/// in a `which` dep just for this one call.
-fn which(name: &str) -> Option<PathBuf> {
+/// in a `which` dep just for this one call. Public for the integration
+/// tests in `tests/`, which are the only way to reach it: every caller
+/// sits behind an interactive `dialoguer` prompt.
+pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);

@@ -88,3 +88,45 @@ fn handles_empty_input() {
     assert!(parse_kiro_history("").is_empty());
     assert!(parse_kiro_history("\n\n  \n").is_empty());
 }
+
+#[test]
+fn ignores_entries_of_an_unrecognised_kind() {
+    // The catch-all arm. `skips_unknown_kinds_and_blank_lines` above feeds
+    // `ToolResults`, which has a branch of its own; these three reach the
+    // catch-all: a kind the parser has never seen, an entry with no `kind`
+    // field, and one whose `kind` is not a string. All three are dropped,
+    // and the surrounding turn still parses.
+    let raw = concat!(
+        r#"{"kind":"SomethingNew","data":{"content":[{"kind":"text","data":"ignored"}]}}"#,
+        "\n",
+        r#"{"data":{"content":[{"kind":"text","data":"also ignored"}]}}"#,
+        "\n",
+        r#"{"kind":7,"data":{"content":[{"kind":"text","data":"ignored too"}]}}"#,
+        "\n",
+        r#"{"kind":"Prompt","data":{"content":[{"kind":"text","data":"q"}],"meta":{"timestamp":3}}}"#,
+        "\n",
+    );
+    let entries = parse_kiro_history(raw);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].get("role"), Some(&json!("user")));
+    assert_eq!(entries[0].get("text"), Some(&json!("q")));
+}
+
+#[test]
+fn prompt_without_a_timestamp_keeps_the_previous_one() {
+    // Kiro records `meta.timestamp` on Prompt entries. One that arrives
+    // without it inherits whatever the last Prompt set, and the turn still
+    // lands on the timeline at a plausible point.
+    let raw = concat!(
+        r#"{"kind":"Prompt","data":{"content":[{"kind":"text","data":"first"}],"meta":{"timestamp":1700000000}}}"#,
+        "\n",
+        r#"{"kind":"Prompt","data":{"content":[{"kind":"text","data":"second"}]}}"#,
+        "\n",
+    );
+    let entries = parse_kiro_history(raw);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].get("timestamp"),
+        Some(&json!(1_700_000_000_000_i64))
+    );
+}

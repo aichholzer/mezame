@@ -15,6 +15,11 @@ build-time Vite define.
 
 ## [0.13.4] - 2026-09-04
 
+### Changed
+
+- `config::which` and `http::enable_tcp_keepalive` are public, joining
+  the other internals the library exposes to its own test suite.
+
 ### Fixed
 
 - Losing focus on a mobile device mid-turn no longer interrupts the turn.
