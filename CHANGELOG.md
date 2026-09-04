@@ -43,6 +43,10 @@ build-time Vite define.
   working". Reported in #9.
 - The ACP handshake is bounded at 60 seconds. An agent that starts and
   then answers nothing is torn down once the bound expires.
+- An agent's pid is released the moment it exits. Detection keys on
+  process exit and no longer on the agent's stdout closing, which a
+  grandchild that inherited the pipe can hold open; MCP servers launched
+  through `npx` are that shape.
 
 ## [0.13.3] - 2026-09-03
 

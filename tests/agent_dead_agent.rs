@@ -8,6 +8,10 @@
 //! is dropped. The pid therefore stayed `<defunct>` for the life of the
 //! process, one slot per failed session against the service's `TasksMax`.
 //!
+//! Two triggers empty that table: the stdout reader at EOF, and the reaper
+//! task when the process exits. The second covers a grandchild holding the
+//! agent's stdout open, where EOF never arrives.
+//!
 //! Each test puts a hard timeout around the call under test. A regression
 //! shows up as that timeout expiring, which is the failure the field report
 //! describes.
@@ -218,4 +222,48 @@ async fn from_io_rejects_a_request_raised_after_stdout_ended() {
         err.to_string().contains("closed before replying"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn a_request_fails_when_the_child_exits_with_its_stdout_held_open() {
+    // The case stdout EOF cannot cover, and the reason the `Child` lives in
+    // a reaper task. The agent forks a grandchild that inherits its stdout
+    // and then exits. The write end of that pipe stays open. The reader
+    // task sits on a stream that never ends, and only the child's own exit
+    // says the request can never be answered.
+    //
+    // MCP servers launched through `npx`/`npm` are this shape, which is what
+    // makes it worth covering.
+    let (agent, pid, _updates) = start("sleep 30 & sleep 0.3; exit 0").await;
+
+    let result = timeout(PATIENCE, agent.request("initialize", json!({})))
+        .await
+        .expect("the child's exit must resolve the request, and not hang");
+    let err = result.expect_err("a dead child cannot have answered");
+    assert!(
+        err.to_string().contains("closed before replying"),
+        "unexpected error: {err}"
+    );
+
+    // The direct child is collected even though its stdout is still held.
+    assert!(
+        wait_until_reaped(pid).await,
+        "pid {pid} outlived its own exit"
+    );
+}
+
+#[tokio::test]
+async fn the_child_is_collected_as_soon_as_it_exits() {
+    // The reaper parks on `child.wait()`. The pid is released when the
+    // process exits. Holding the `Agent` afterwards no longer keeps a
+    // `<defunct>` entry against the service's `TasksMax`, which is the
+    // behaviour issue #9 reported.
+    let (agent, pid, _updates) = start("exit 101").await;
+
+    assert!(
+        wait_until_reaped(pid).await,
+        "pid {pid} is still present while the Agent is held"
+    );
+    // Held deliberately across the assertion above.
+    drop(agent);
 }

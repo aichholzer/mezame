@@ -16,8 +16,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::config::Config;
 
@@ -47,11 +47,11 @@ const CHILD_WAIT: Duration = Duration::from_millis(500);
 
 /// Handle on the ACP agent.
 ///
-/// In production the handle owns a spawned subprocess (`child` is `Some`)
-/// and a process-group id (`pgid > 0`). Tests build the same shape from
-/// in-memory streams via `Agent::from_io`; in that mode `child` is `None`
-/// and `pgid` is 0. `shutdown` is then a stdin EOF with no
-/// process-management side effects.
+/// In production the handle drives a spawned subprocess and holds a
+/// process-group id (`pgid > 0`). The `Child` itself belongs to the reaper
+/// task; see `exited`. Tests build the same shape from in-memory streams
+/// via `Agent::from_io`, where `exited` is `None` and `pgid` is 0, and
+/// `shutdown` is then a stdin EOF with no process-management side effects.
 ///
 /// Thread-safety: all mutable state sits behind `Mutex`/`Arc`. The handle
 /// clones into spawned tasks as `Arc<Agent>`; see `handle_ws`.
@@ -62,14 +62,23 @@ pub struct Agent {
     /// Monotonic JSON-RPC id generator.
     next_id: AtomicI64,
     /// Map from in-flight request id to the oneshot waiting for its
-    /// response. Shared with the reader task that populates responses, and
-    /// emptied by that task when the agent's stdout closes. See `Pending`.
+    /// response. Shared with the stdout reader and the reaper task, either
+    /// of which empties it. See `Pending`.
     pending: Pending,
-    /// Owned child. `None` for test-built agents constructed via
-    /// `from_io`. SIGKILL on drop (kill_on_drop) remains as a safety net.
-    /// `shutdown` tries a clean EOF and wait first, giving Kiro the chance
-    /// to release its per-session lockfile.
-    child: Option<Mutex<Child>>,
+    /// Flips to `true` once the reaper task has collected the child.
+    /// `None` for test-built agents, which own no process.
+    ///
+    /// The `Child` lives in that task, which parks on `child.wait()` for
+    /// the life of the agent. The handle keeps none of its own. A dead
+    /// process is then noticed and collected the moment it exits, with no
+    /// dependence on its stdout reaching EOF. `shutdown` observes exit
+    /// through this channel.
+    exited: Option<watch::Receiver<bool>>,
+    /// Dropped with the handle, which tells the reaper task to kill the
+    /// child and collect it. The channel is never sent on; the drop is the
+    /// whole signal, and it keeps teardown deterministic on platforms with
+    /// no process-group kill to fall back on.
+    _kill_on_drop: Option<oneshot::Sender<()>>,
     /// Process group ID (Unix only). The child is spawned in its own
     /// process group. `shutdown` kills the whole tree through it: MCP
     /// servers, npm wrappers, everything below the direct child. 0 when
@@ -179,12 +188,10 @@ impl Agent {
     ///      group kill in step 4 never reaches them; they only inherit the
     ///      agent's session. Without this they orphan to PID 1 and pile up
     ///      until the service cgroup is throttled. See `unix::reap_session`.
-    ///   6. Wait on the direct child once more, which collects its pid.
-    ///      Steps 4 and 5 are what ended it whenever the wait in step 3
-    ///      timed out, and tokio only reaps a `Child` when the `Child` is
-    ///      dropped. The handle can outlive teardown by a long way.
-    ///      Without this the pid sits `<defunct>` against the service's
-    ///      `TasksMax` for as long as the `Agent` is held. See issue #9.
+    ///   6. Wait again for the reaper to confirm the pid is collected.
+    ///      Steps 4 and 5 are what ended the child whenever the wait in
+    ///      step 3 timed out. The reaper collects it either way, and this
+    ///      makes `shutdown` return with that already done. See issue #9.
     pub async fn shutdown(&self, session_id: Option<&str>) {
         if let Some(sid) = session_id {
             let _ = self
@@ -209,17 +216,29 @@ impl Agent {
         self.shutdown_done.store(true, Ordering::Relaxed);
     }
 
-    /// Wait up to `CHILD_WAIT` for the child to exit, which also reaps it.
-    /// A child that ignores stdin EOF cannot stall teardown past the
-    /// bound. No-op for test-built agents, which own no child.
+    /// Wait up to `CHILD_WAIT` for the reaper task to report the child
+    /// collected. A child that ignores stdin EOF cannot stall teardown past
+    /// the bound. No-op for test-built agents, which own no process.
     async fn wait_briefly(&self) {
-        if let Some(child) = self.child.as_ref() {
-            let _ = tokio::time::timeout(CHILD_WAIT, async {
-                let mut child = child.lock().await;
-                let _ = child.wait().await;
-            })
-            .await;
-        }
+        let Some(exited) = self.exited.as_ref() else {
+            return;
+        };
+        let mut rx = exited.clone();
+        let _ = tokio::time::timeout(CHILD_WAIT, async move {
+            loop {
+                // The borrow is released before the await below.
+                let collected = *rx.borrow_and_update();
+                if collected {
+                    return;
+                }
+                // Err means the reaper task is gone without reporting.
+                // No amount of further waiting changes that.
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
     }
 
     /// True once `shutdown()` has run to completion. Test-only signal so
@@ -263,9 +282,9 @@ impl Agent {
 
 /// Safety net: if the Agent is dropped without a prior `shutdown()` call
 /// (a panic unwind or an early return), the entire process group is killed
-/// and no grandchildren leak. `kill_on_drop(true)` on the Child only kills
-/// the direct child; this covers the rest of the tree. No-op for
-/// test-built agents, where `pgid == 0`.
+/// and no grandchildren leak. Dropping the handle also closes the reaper's
+/// kill channel, which deals with the direct child; this covers the rest of
+/// the tree. No-op for test-built agents, where `pgid == 0`.
 ///
 /// When `shutdown()` already ran, the group kill and session sweep are
 /// done. This repeats only the cheap group kill and skips the heavier
@@ -294,15 +313,20 @@ impl Drop for Agent {
 /// - The child is spawned in its own process group via `setsid()`. The
 ///   entire descendant tree (MCP servers, npm wrappers, bun/node) is then
 ///   killable as a unit, down from the direct child.
-/// - `kill_on_drop(true)` provides a tokio-level safety net for the direct
-///   child; the `Drop` impl on `Agent` covers the rest of the group.
+/// - The reaper task owns the `Child` and collects it the moment it exits.
+///   Dropping the `Agent` closes that task's kill channel, which kills the
+///   direct child on any platform. `kill_on_drop(true)` stays as a last
+///   resort for a runtime teardown that drops the task itself, and the
+///   `Drop` impl on `Agent` covers the rest of the group.
 /// - Cooperative shutdown is preferred: `shutdown()` closes stdin and
 ///   waits briefly, leaving Kiro room to release its session lockfile.
 ///
-/// Two background tasks are spawned here:
-///   1. Stderr forwarder, writes each line to our stderr prefixed with
+/// Three background tasks are spawned here:
+///   1. Reaper, parks on `child.wait()` and empties the pending request
+///      table once the process is gone.
+///   2. Stderr forwarder, writes each line to our stderr prefixed with
 ///      `[agent]`, for debugging.
-///   2. Stdout reader, newline-delimited JSON decoder that routes
+///   3. Stdout reader, newline-delimited JSON decoder that routes
 ///      responses to their pending oneshots and everything else to the
 ///      returned mpsc receiver.
 pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver<Value>)> {
@@ -361,6 +385,44 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
 
     let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
     let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+
+    // Reaper. Owns the `Child` and parks on `wait()` for the life of the
+    // agent. That call collects the pid the instant the process exits.
+    //
+    // This is the trigger the stdout reader cannot be: a grandchild that
+    // inherited the agent's stdout holds that pipe open after the agent
+    // itself is gone, and the reader then sits on a stream that never
+    // reaches EOF. MCP servers launched through `npx`/`npm` are exactly
+    // that shape. Process exit is the fact worth keying on, and this is
+    // where it is observed.
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    let (exited_tx, exited_rx) = watch::channel(false);
+    let pending_reaper = pending.clone();
+    tokio::spawn(async move {
+        // Two ways out: the child exits on its own, or the `Agent` is
+        // dropped and takes `kill_tx` with it. `kill_rx` resolves either
+        // way, and the drop is the signal; nothing is ever sent.
+        let handle_dropped = {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            tokio::select! {
+                _ = &mut wait => false,
+                _ = kill_rx => true,
+            }
+        };
+        if handle_dropped {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+
+        // The process is gone and collected. Nothing outstanding can be
+        // answered now, whatever state its stdout is in. `take` on an
+        // already-empty table is a no-op. Racing the stdout reader here is
+        // harmless. See issue #9.
+        let outstanding = pending_reaper.lock().await.take();
+        drop(outstanding);
+        let _ = exited_tx.send(true);
+    });
 
     // Optional ACP tracing. Set `MEZAME_DEBUG_ACP=1` to dump every inbound
     // line from the agent to Mezame's stderr. Helpful when wiring new
@@ -422,7 +484,8 @@ pub async fn spawn_agent(cfg: &Config) -> Result<(Agent, mpsc::UnboundedReceiver
             stdin: Mutex::new(Box::new(stdin)),
             next_id: AtomicI64::new(1),
             pending,
-            child: Some(Mutex::new(child)),
+            exited: Some(exited_rx),
+            _kill_on_drop: Some(kill_tx),
             #[cfg(unix)]
             pgid,
             #[cfg(unix)]
@@ -486,7 +549,8 @@ pub fn from_io(
             stdin: Mutex::new(Box::new(stdin)),
             next_id: AtomicI64::new(1),
             pending,
-            child: None,
+            exited: None,
+            _kill_on_drop: None,
             #[cfg(unix)]
             pgid: 0,
             #[cfg(unix)]
