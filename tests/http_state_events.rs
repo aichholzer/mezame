@@ -32,8 +32,6 @@ fn test_state(capacity: usize) -> Arc<AppState> {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
             }],
-            agent_cmd: "/bin/true".to_string(),
-            agent_args: vec![],
         }),
         hubs: HubRegistry::new(),
         state_changes,

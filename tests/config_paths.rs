@@ -79,33 +79,9 @@ async fn load_config_reads_a_well_formed_json_file() {
     std::fs::write(dir.join("config.json"), body.to_string()).unwrap();
 
     let cfg: Config = load_config().expect("load_config");
-    assert_eq!(cfg.agent_cmd, "kiro-cli");
-    assert_eq!(cfg.agent_args, vec!["acp"]);
     assert_eq!(cfg.transports.len(), 1);
     let TransportConfig::Cloudflared { bind } = &cfg.transports[0];
     assert_eq!(bind, "127.0.0.1:9510");
-}
-
-#[tokio::test]
-async fn load_config_defaults_agent_args_when_missing() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let dir = tmp.path().join(".mezame");
-    std::fs::create_dir_all(&dir).unwrap();
-    // `agent_args` deliberately omitted; serde should populate the
-    // default empty Vec via `#[serde(default)]`.
-    let body = json!({
-        "transports": [
-            { "kind": "cloudflared", "bind": "127.0.0.1:9510" }
-        ],
-        "agent_cmd": "claude"
-    });
-    std::fs::write(dir.join("config.json"), body.to_string()).unwrap();
-
-    let cfg = load_config().expect("load_config");
-    assert!(cfg.agent_args.is_empty());
 }
 
 #[tokio::test]

@@ -16,8 +16,9 @@
 //! useful in local Rust-only iteration where you're running `vite dev` in
 //! a separate terminal.
 //!
-//! If `npm` or `node` are not on PATH we fail loudly with an actionable
-//! message. This is a hard requirement; we don't ship a fallback.
+//! If `npm` or `node` are not on PATH, or Node.js is below the version the
+//! UI build needs, we fail loudly with an actionable message. This is a
+//! hard requirement; we don't ship a fallback.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -98,6 +99,7 @@ fn main() {
     if which("node").is_none() {
         panic!("`node` not found on PATH. Install Node.js and retry `cargo build` or `cargo install mezame`.");
     }
+    check_node_version();
 
     // Mirror the source tree into OUT_DIR. Only the UI inputs, never
     // node_modules or dist from the source tree. node_modules/ is
@@ -202,6 +204,47 @@ fn run(cmd: &str, args: &[&str], cwd: &std::path::Path) {
         .unwrap_or_else(|e| panic!("failed to spawn `{cmd}`: {e}"));
     if !status.success() {
         panic!("`{cmd} {}` failed in {}", args.join(" "), cwd.display());
+    }
+}
+
+/// The oldest Node.js the UI build is supported on.
+const MIN_NODE_MAJOR: u32 = 24;
+
+/// Fail the build when Node.js is older than the UI needs.
+///
+/// The failure this replaces: a user on Node 20 runs the install, `npm ci`
+/// succeeds, and `vite build` dies somewhere inside Rollup. What cargo
+/// then reports is that `npm run build` failed in a path under the build
+/// directory, with no mention of Node anywhere in the output.
+///
+/// An unparseable version string is not treated as a failure. A format
+/// change upstream must not be able to break an install, so it warns and
+/// carries on.
+fn check_node_version() {
+    let output = match Command::new("node").arg("--version").output() {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            println!("cargo:warning=could not run `node --version`; skipping the version check");
+            return;
+        }
+    };
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // `v24.16.0`, and only the major matters.
+    let major = raw
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok());
+    match major {
+        Some(major) if major < MIN_NODE_MAJOR => panic!(
+            "Mezame needs Node.js {MIN_NODE_MAJOR} or newer to build its UI; `node --version` \
+             reports {raw}. Install Node.js {MIN_NODE_MAJOR}+ and retry `cargo build` or \
+             `cargo install mezame`."
+        ),
+        Some(_) => {}
+        None => {
+            println!("cargo:warning=could not read a major version out of `node --version` output {raw:?}; skipping the version check");
+        }
     }
 }
 

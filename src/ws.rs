@@ -1,22 +1,23 @@
-//! Per-WebSocket session loop.
+//! The WebSocket half of the transport: the upgrade, the per-attach
+//! loop, and the client command set.
 //!
 //! Ownership and concurrency:
 //!
-//! - The WS is split into a `sink` (owned by a writer task) and a `stream`
-//!   (polled directly in the select loop).
-//! - Sends to the browser go through an unbounded mpsc so handlers never
-//!   contend on the sink directly.
-//! - The agent subprocess is spawned once per session and wrapped in `Arc`
-//!   so both the select loop and spawned prompt tasks can call into it.
-//! - Prompts are run in their own spawned tasks so a long-running
-//!   `session/prompt` does not block the select loop from draining
-//!   `session/update` notifications.
+//! - `ws_upgrade` decides the session id before the handshake, so a value
+//!   Mezame would never bind a hub to is refused with no socket
+//!   established.
+//! - `handle_ws` splits the socket into a sink owned by a writer task and
+//!   a stream polled by the attach loop. Sends to the browser go through
+//!   an unbounded channel, so no handler contends on the sink.
+//! - `run_attach_loop` is one attach: it forwards this browser's commands
+//!   to its hub, forwards the hub's broadcast to this socket, and evicts a
+//!   peer that has gone silent. Everything about the turn itself belongs
+//!   to the hub and its Backend.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -30,9 +31,6 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
-use crate::agent::Agent;
-use crate::session::{extract_session_info, is_stale_lock_error, short_reason, try_load_session};
-
 /// How often the server sends a WebSocket `Ping` to each attached
 /// browser. A live peer answers with a `Pong` (or sends any other
 /// frame), which resets the liveness clock.
@@ -43,17 +41,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 /// multiple of `HEARTBEAT_INTERVAL` so a single dropped pong or a brief
 /// network stall does not evict a live browser. At 60s a dead peer is
 /// reaped after ~2-3 missed pings; combined with the hub's 30s grace
-/// window the agent tree is gone ~90s after the peer vanishes.
+/// window the session is released ~90s after the peer vanishes.
 ///
 /// This is the fix for half-open sockets (laptop sleep, Wi-Fi drop, a
 /// reverse proxy silently dropping an idle upstream): such a socket
 /// stays `ESTABLISHED` forever and `stream.next()` yields nothing, so
 /// without a heartbeat the attach loop blocks indefinitely, the
-/// `AttachedHub` never drops, the grace timer never arms, and the
-/// agent subprocess tree leaks. See GitHub issue #4.
+/// `AttachedHub` never drops, the grace timer never arms, and the session
+/// is never reclaimed. See GitHub issue #4.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
-
-const PROTOCOL_VERSION: u32 = 1;
 
 /// Mint a session id: 16 bytes of OS entropy rendered as 32 lowercase
 /// hexadecimal characters.
@@ -116,186 +112,6 @@ pub fn decide_session(param: Option<&str>) -> SessionDecision {
     }
 }
 
-/// Open a fresh ACP session and pull out the bits we forward to the
-/// browser. Returns `(sessionId, modes/models payload)`. Used both as
-/// the primary path when the browser does not request a resume, and as
-/// the fallback when `session/load` fails.
-async fn start_new_session(agent: &Agent, cwd: &str) -> Result<(String, Option<Value>)> {
-    let result = agent
-        .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
-        .await
-        .context("Failed to start new session")?;
-    let sid = result
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Session creation returned no session id"))?
-        .to_string();
-    Ok((sid, extract_session_info(&result)))
-}
-
-/// Outcome of the agent handshake plus session-setup phase. Returned
-/// to `handle_ws` so it can drive the select loop with the right
-/// session id and replay-suppression flag.
-#[doc(hidden)]
-pub struct NegotiationOutcome {
-    pub session_id: String,
-    /// True after a `session/load` resume; the select loop drops Kiro's
-    /// `session/update` replay so the browser's parallel `/history`
-    /// fetch is the single source of truth for past turns.
-    pub suppress_session_updates: bool,
-}
-
-/// Drive the agent handshake and session setup, emitting the `ready`
-/// and (optionally) `session_info` events to the browser via `to_ws_tx`.
-///
-/// Extracted from `handle_ws` so integration tests can drive it with
-/// `Agent::from_io` and a fake agent that responds to `initialize`,
-/// `session/new`, and `session/load`. Production code path is
-/// unchanged: `handle_ws` calls this and continues straight into the
-/// select loop with the returned `NegotiationOutcome`.
-#[doc(hidden)]
-pub async fn negotiate_session(
-    agent: &Agent,
-    to_ws_tx: &mpsc::UnboundedSender<Message>,
-    resume_session_id: Option<String>,
-    cwd_override: Option<String>,
-    build_id: &str,
-) -> Result<NegotiationOutcome> {
-    // ACP handshake. `initialize` advertises no filesystem capabilities
-    // because Mezame does not back `fs/read_text_file` etc. today; the
-    // agent is expected to use its own tools for file I/O.
-    //
-    // The agent responds with its own `agentCapabilities`, including
-    // `promptCapabilities` (image, audio, embeddedContext). We capture
-    // the prompt capabilities to forward to the UI so it can decide
-    // whether to surface image paste/drop and file upload.
-    let initialize_result = agent
-        .request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false }
-                }
-            }),
-        )
-        .await
-        .context("Failed to initialize agent")?;
-    let prompt_capabilities = initialize_result
-        .get("agentCapabilities")
-        .and_then(|c| c.get("promptCapabilities"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    // `cwd` comes from the browser's `?cwd=<path>` query param if
-    // provided; otherwise we use Mezame's own process cwd.
-    let cwd_str = match cwd_override {
-        Some(c) => c,
-        None => std::env::current_dir()?.to_string_lossy().to_string(),
-    };
-
-    let (session_id, resumed, session_info, resume_failed_for) = match resume_session_id {
-        Some(sid) => match try_load_session(agent, &sid, &cwd_str).await {
-            Ok(value) => (sid, true, extract_session_info(&value), None),
-            // The resume target is held by a LIVE process.
-            // try_load_session already steals dead-PID locks and rides out
-            // the sub-second browser-reload race. An "active in another
-            // process" error that survives the retry budget means a real
-            // owner still holds the session: a local agent mid-turn, or
-            // (with a synced ~/.kiro) an agent on another device. Starting
-            // a fresh session here would discard that live one, abandoning
-            // the in-flight turn and dropping the browser onto an empty
-            // throwaway. This refuses and lets the client reconnect with
-            // back-off once the owner releases the lock. A dead-PID lock
-            // still self-heals via the steal above.
-            Err(err_str) if is_stale_lock_error(&err_str) => {
-                return Err(anyhow!(
-                    "Session {sid} is active in another process; refusing to start a new one that would discard it. Reconnect once the other window or device releases it."
-                ));
-            }
-            Err(err_str) => {
-                eprintln!("Session load failed: {err_str}. Falling back to a new session.");
-                let _ = to_ws_tx.send(text_msg(json!({
-                    "type": "append",
-                    "role": "sys",
-                    "text": format!(
-                        "\n[{}. Starting a new one.]\n",
-                        short_reason(&err_str)
-                    )
-                })));
-                let (new_sid, info) = start_new_session(agent, &cwd_str).await?;
-                // Pass back the id the browser asked to resume. The
-                // client keeps it pinned and its durable pointer
-                // survives this throwaway fallback id. A transient
-                // load failure (wrong cwd, stale lock, agent restart)
-                // must not destroy the mapping to a real conversation
-                // on disk.
-                (new_sid, false, info, Some(sid))
-            }
-        },
-        None => {
-            let (sid, info) = start_new_session(agent, &cwd_str).await?;
-            (sid, false, info, None)
-        }
-    };
-
-    // Tell the browser which session id it is bound to, for it to
-    // persist against a reconnect, and whether this was a resume. On a
-    // resume it clears the stale log before the replay lands. The `cwd`
-    // is the actual path the agent session was opened with, and the UI
-    // displays it even when no `?cwd=` override was supplied. `buildId`
-    // is a unique-per-build token the UI reads to detect a stale bundle
-    // and force a reload.
-    let _ = to_ws_tx.send(text_msg(json!({
-        "type": "ready",
-        "sessionId": session_id,
-        "resumed": resumed,
-        "cwd": cwd_str,
-        "promptCapabilities": prompt_capabilities,
-        "buildId": build_id,
-        "resumeFailedFor": resume_failed_for
-    })));
-
-    // Send the `modes` and `models` payload when either the
-    // session/new or the session/load result carries one. The UI
-    // renders its mode and model selectors from it, current selections
-    // included.
-    if let Some(info) = session_info {
-        let _ = to_ws_tx.send(text_msg(json!({
-            "type": "session_info",
-            "info": info
-        })));
-    }
-
-    Ok(NegotiationOutcome {
-        session_id,
-        suppress_session_updates: resumed,
-    })
-}
-
-/// Spawn a task that runs `fut` to completion; on error, push a typed
-/// `error` event to the browser prefixed with `error_prefix`.
-///
-/// Used for fire-and-forget agent calls triggered by browser messages
-/// (`set_mode`, `set_model`, `permission_response`, and the rest). The
-/// select loop has to keep pumping while the call is in flight, and the
-/// future is never awaited inline. Errors reach the browser as a UI
-/// notice and never travel back through the loop.
-fn spawn_with_error_report(
-    to_ws: mpsc::UnboundedSender<Message>,
-    error_prefix: &'static str,
-    fut: impl Future<Output = Result<()>> + Send + 'static,
-) {
-    tokio::spawn(async move {
-        if let Err(e) = fut.await {
-            let _ = to_ws.send(text_msg(json!({
-                "type": "error",
-                "message": format!("{error_prefix}: {e}")
-            })));
-        }
-    });
-}
-
 /// The `/ws` handler. Decides the session id before the handshake, so a
 /// value Mezame would never bind a hub to is refused with no WebSocket
 /// established and no hub created.
@@ -321,8 +137,7 @@ pub(crate) async fn ws_upgrade(
     })
 }
 
-/// Serialise a JSON value into a WS text frame. The terminology split keeps
-/// `handle_agent_message` free of `Message::Text(...)` noise.
+/// Serialise a JSON value into a WS text frame.
 fn text_msg(value: Value) -> Message {
     Message::Text(value.to_string())
 }
@@ -402,19 +217,19 @@ async fn handle_ws(
     Ok(())
 }
 
-/// The per-WebSocket attach loop, extracted from `handle_ws` so it can
-/// be driven by integration tests with a fake stream (in particular a
-/// silent one, to prove the half-open eviction path runs). Generic over
-/// the stream so tests can supply an mpsc-backed or a never-yielding
-/// stream without a real socket.
+/// The per-WebSocket attach loop, extracted from `handle_ws` so it can be
+/// driven by integration tests with a fake stream, in particular a silent
+/// one, to prove the half-open eviction path runs. Generic over the
+/// stream so a test supplies an mpsc-backed or a never-yielding stream
+/// with no real socket.
 ///
-/// Mirrors the original `run_select_loop` shape: the WS-frame branch
-/// parses browser messages and forwards them as `HubCommand`s; the
-/// broadcast branch serialises agent events to this WS sink. The
-/// heartbeat branch pings the peer and breaks the loop when it has been
-/// silent past `heartbeat_timeout`, which is the only thing that ends
-/// the loop for a half-open socket. Returns when any branch decides the
-/// connection is over; the caller runs cooperative shutdown.
+/// Three branches. The frame branch parses this browser's commands and
+/// forwards them to the hub. The broadcast branch writes the hub's events
+/// to this socket, dropping any frame stamped for another attach. The
+/// heartbeat branch pings the peer and returns when it has been silent
+/// past `heartbeat_timeout`, which is the only thing that ends the loop
+/// for a half-open socket. The caller drops its attach when this
+/// returns.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_attach_loop<S, E>(
@@ -433,9 +248,9 @@ pub async fn run_attach_loop<S, E>(
     // by ANY inbound frame (text, pong, ping, binary). A chatty live
     // browser is never evicted, and an idle-but-alive one is kept up by
     // its pong replies. A half-open socket sends nothing and trips the
-    // timeout. The loop then breaks into the caller's
-    // cooperative-shutdown path, which decrements the subscriber count
-    // and ultimately reaps the agent. See issue #4.
+    // timeout. The loop then returns, the caller drops its attach, the
+    // subscriber count falls, and the session is eventually reclaimed.
+    // See issue #4.
     let mut heartbeat = interval(heartbeat_interval);
     // A missed tick (the task was busy) fires once and realigns. No
     // burst of catch-up ticks.
@@ -492,13 +307,13 @@ pub async fn run_attach_loop<S, E>(
                 match evt {
                     Ok(value) => {
                         // Drop targeted broadcasts that are not for
-                        // this attach. The hub stamps `_target` on
-                        // permission and oauth requests with the
-                        // attach id of the originating browser; peer
-                        // browsers receive the broadcast but skip it
-                        // here so they do not see a permission card
-                        // they were not asked to answer. Untargeted
-                        // events fall through to the WS sink.
+                        // this attach. The hub stamps `_target` on a
+                        // permission request with the attach id of the
+                        // browser that started the turn; every other
+                        // attach receives the broadcast and skips it
+                        // here, so nobody renders a card they were not
+                        // asked to answer. Untargeted events fall
+                        // through to the sink.
                         if let Some(target) = value.get("_target").and_then(Value::as_u64) {
                             if target != attach_id {
                                 continue;
@@ -575,436 +390,4 @@ fn parse_browser_command(v: &Value, attach_id: u64) -> Option<crate::hub::HubCom
         eprintln!("Discarded a `{command_type}` frame");
     }
     parsed
-}
-
-/// Drive the per-session select loop until either the WS stream or the
-/// agent updates channel ends. Extracted from `handle_ws` so integration
-/// tests can build a fake stream and a fake agent and exercise the same
-/// logic without spinning up axum or spawning a real subprocess.
-///
-/// The loop never returns an error; transport-level failures cause it
-/// to break out so the caller can run cooperative shutdown.
-///
-/// The pattern matching here is deliberately exhaustive on the
-/// `Option<Result<Message, _>>` returned by `stream.next()`. An earlier
-/// version used a `Some(Ok(...))` guard, which silently disabled the
-/// branch on stream close or transport error and prevented shutdown
-/// from running. See the `Fixed` entry for 0.8.7 in CHANGELOG.md.
-pub async fn run_select_loop<S, E>(
-    stream: &mut S,
-    to_ws_tx: &mpsc::UnboundedSender<Message>,
-    agent: Arc<Agent>,
-    updates_rx: &mut mpsc::UnboundedReceiver<Value>,
-    session_id: &str,
-    suppress_session_updates: &mut bool,
-) where
-    S: Stream<Item = std::result::Result<Message, E>> + Unpin,
-{
-    loop {
-        tokio::select! {
-            // User → agent: messages from the browser. This matches the
-            // full Option<Result<Message, _>>. A `Some(Ok(...))` pattern
-            // guard would not: with a guard, a closed stream (`None`) or
-            // a transport error (`Some(Err(_))`) disables this select
-            // branch silently while the other branch keeps delivering
-            // agent updates. The `else => break` arm only fires when ALL
-            // branches are disabled. The loop would never exit and
-            // `agent.shutdown()` would never run, leaking an agent
-            // subprocess and a stale Kiro session lockfile on every
-            // browser disconnect during a long turn.
-            ws_msg = stream.next() => {
-                let text = match ws_msg {
-                    None => break,                              // peer closed the socket
-                    Some(Err(_)) => break,                      // transport error
-                    Some(Ok(Message::Close(_))) => break,       // clean close frame
-                    Some(Ok(Message::Text(t))) => t,
-                    Some(Ok(_)) => continue,                    // ping/pong/binary
-                };
-                let v: Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(_) => continue
-                };
-
-                match v.get("type").and_then(Value::as_str) {
-                    Some("prompt") => {
-                        // Browser sends a prompt as either a plain `text`
-                        // string (legacy path) or a full ACP-shaped
-                        // `blocks` array. Attachments (image, audio,
-                        // resource) travel alongside the user's text on
-                        // the blocks path. The server validates nothing
-                        // beyond "must be an array"; the agent rejects
-                        // block types it did not advertise support for.
-                        let prompt_blocks: Vec<Value> = if let Some(blocks) = v.get("blocks").and_then(Value::as_array) {
-                            blocks.clone()
-                        } else if let Some(user_text) = v.get("text").and_then(Value::as_str) {
-                            vec![json!({ "type": "text", "text": user_text })]
-                        } else {
-                            continue;
-                        };
-                        if prompt_blocks.is_empty() {
-                            continue;
-                        }
-
-                        // First live prompt after resume: stop hiding
-                        // `session/update` events. From here on everything
-                        // the agent emits is genuinely new.
-                        *suppress_session_updates = false;
-
-                        // Run `session/prompt` in its own task so the select
-                        // loop keeps pumping `session/update` notifications
-                        // while the agent is working. When the request
-                        // resolves we tell the browser the turn is over (or
-                        // surface the error).
-                        let agent = agent.clone();
-                        let to_ws = to_ws_tx.clone();
-                        let sid = session_id.to_string();
-                        tokio::spawn(async move {
-                            let res = agent
-                                .request(
-                                    "session/prompt",
-                                    json!({
-                                        "sessionId": sid,
-                                        "prompt": prompt_blocks
-                                    })
-                                )
-                                .await;
-                            if let Err(e) = res {
-                                let _ = to_ws.send(text_msg(json!({ "type": "error", "message": format!("{e}") })));
-                            }
-                            let _ = to_ws.send(text_msg(json!({ "type": "prompt_done" })));
-                        });
-                    }
-                    Some("permission_response") => {
-                        // Browser replied to a `session/request_permission`
-                        // we forwarded earlier. The `id` must match the one
-                        // we forwarded; we pass it straight back to the
-                        // agent so it can unblock.
-                        let Some(id) = v.get("id").cloned() else {
-                            continue;
-                        };
-                        let option_id = v
-                            .get("optionId")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let agent = agent.clone();
-                        spawn_with_error_report(
-                            to_ws_tx.clone(),
-                            "Permission reply failed",
-                            async move {
-                                agent
-                                    .respond(
-                                        id,
-                                        json!({
-                                            "outcome": {
-                                                "outcome": "selected",
-                                                "optionId": option_id
-                                            }
-                                        }),
-                                    )
-                                    .await
-                            },
-                        );
-                    }
-                    Some("cancel") => {
-                        // ACP `session/cancel` is a notification (no id, no
-                        // response expected). The agent is responsible for
-                        // stopping whatever tool or turn is in flight and
-                        // eventually resolving the outstanding
-                        // `session/prompt` request, which is what unblocks
-                        // the browser's "busy" state.
-                        let agent = agent.clone();
-                        let sid = session_id.to_string();
-                        tokio::spawn(async move {
-                            let _ = agent
-                                .notify(
-                                    "session/cancel",
-                                    json!({ "sessionId": sid })
-                                )
-                                .await;
-                        });
-                    }
-                    Some("set_mode") => {
-                        // Kiro calls them "modes" but the available ids are
-                        // agent configs (`kiro_default`, `kiro_planner`,
-                        // `kiro_guide`). Forward as `session/set_mode`.
-                        let Some(mode_id) = v.get("modeId").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        let mode_id = mode_id.to_string();
-                        let agent = agent.clone();
-                        let sid = session_id.to_string();
-                        spawn_with_error_report(
-                            to_ws_tx.clone(),
-                            "Failed to change agent mode",
-                            async move {
-                                agent
-                                    .request(
-                                        "session/set_mode",
-                                        json!({ "sessionId": sid, "modeId": mode_id }),
-                                    )
-                                    .await?;
-                                Ok(())
-                            },
-                        );
-                    }
-                    Some("set_model") => {
-                        let Some(model_id) = v.get("modelId").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        let model_id = model_id.to_string();
-                        let agent = agent.clone();
-                        let sid = session_id.to_string();
-                        spawn_with_error_report(
-                            to_ws_tx.clone(),
-                            "Failed to change model",
-                            async move {
-                                agent
-                                    .request(
-                                        "session/set_model",
-                                        json!({ "sessionId": sid, "modelId": model_id }),
-                                    )
-                                    .await?;
-                                Ok(())
-                            },
-                        );
-                    }
-                    _ => continue
-                }
-            }
-            // Agent → user: notifications and server-initiated requests.
-            // Same caveat as the stream branch: a guarded `Some(...)`
-            // pattern would silently disable the branch when the agent
-            // exits. Match the full `Option<Value>` so we can break out
-            // of the loop and run cooperative shutdown.
-            agent_msg = updates_rx.recv() => {
-                match agent_msg {
-                    Some(msg) => handle_agent_message(to_ws_tx, msg, *suppress_session_updates).await,
-                    None => break, // agent stdout reader exited; child is gone or going
-                }
-            }
-            else => break
-        }
-    }
-}
-
-/// Translate an agent-originated message into browser-facing events.
-///
-/// `suppress_session_updates` is set by the WS handler during a resume
-/// window. The browser seeds its log from `/history`, and forwarding the
-/// ACP replay's `session/update` events would duplicate every replayed
-/// chunk. Server-initiated requests (permission prompts) are still
-/// forwarded. Those only occur for live tool calls.
-///
-/// Currently understood:
-///
-/// - `session/update`:
-///     - `agent_message_chunk`   → append as `agent` text
-///     - `agent_thought_chunk`   → append as `sys` with a `(thinking)` prefix
-///     - `tool_call` / `tool_call_update` → append `[title: status]`
-/// - `session/request_permission` → forwarded to the browser as a
-///   `permission_request` event.
-/// - `_kiro.dev/commands/available` → trimmed and forwarded as a
-///   `commands` event (just the `commands` + `prompts` arrays; the big
-///   `tools` catalogue is dropped to keep the WS frame small).
-/// - `_kiro.dev/mcp/oauth_request` → forwarded as `mcp_oauth_request`
-///   so the browser can render an inline card with an Open button.
-///
-/// Everything else is silently dropped, including Kiro's other
-/// `_kiro.dev/*` extension notifications.
-pub async fn handle_agent_message(
-    tx: &mpsc::UnboundedSender<Message>,
-    msg: Value,
-    suppress_session_updates: bool,
-) {
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-    match method {
-        "_kiro.dev/commands/available" => {
-            // Kiro re-emits this notification as its catalogue warms up,
-            // MCP servers loading among the reasons. Each emission is
-            // treated as the full current catalogue, last-wins on the
-            // browser.
-            if let Some(params) = msg.get("params") {
-                let commands = params
-                    .get("commands")
-                    .cloned()
-                    .unwrap_or(Value::Array(vec![]));
-                let prompts = params
-                    .get("prompts")
-                    .cloned()
-                    .unwrap_or(Value::Array(vec![]));
-                let _ = tx.send(text_msg(json!({
-                    "type": "commands",
-                    "commands": commands,
-                    "prompts": prompts
-                })));
-            }
-        }
-        "_kiro.dev/mcp/oauth_request" => {
-            // An MCP server is asking the user to authorise at a URL out
-            // of band. Surfacing the request lets the browser render a
-            // card with an "Open" button. Kiro re-emits while waiting.
-            // An `id` is forwarded when present and the browser de-dups
-            // on it. Field shapes are best-effort: either `serverName`
-            // or `name`, and either `url` or `authUrl`.
-            if let Some(params) = msg.get("params") {
-                let server_name = params
-                    .get("serverName")
-                    .or_else(|| params.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("MCP server")
-                    .to_string();
-                let url = params
-                    .get("url")
-                    .or_else(|| params.get("authUrl"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if url.is_empty() {
-                    // Without a URL there is nothing actionable. Drop
-                    // silently; a card here would be dead on arrival.
-                    return;
-                }
-                let id = params
-                    .get("id")
-                    .or_else(|| params.get("requestId"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let _ = tx.send(text_msg(json!({
-                    "type": "mcp_oauth_request",
-                    "id": id,
-                    "serverName": server_name,
-                    "url": url
-                })));
-            }
-        }
-        "session/update" => {
-            if suppress_session_updates {
-                return;
-            }
-            let update = msg
-                .get("params")
-                .and_then(|p| p.get("update"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            let kind = update
-                .get("sessionUpdate")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            match kind {
-                "agent_message_chunk" => {
-                    if let Some(text) = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(Value::as_str)
-                    {
-                        let _ = tx.send(text_msg(
-                            json!({ "type": "append", "role": "agent", "text": text }),
-                        ));
-                    }
-                }
-                "user_message_chunk" => {
-                    // Only emitted during `session/load` replay. Live
-                    // prompts never double-render here; the browser
-                    // already echoes those locally.
-                    if let Some(text) = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(Value::as_str)
-                    {
-                        let _ = tx.send(text_msg(json!({
-                            "type": "append",
-                            "role": "user",
-                            "text": format!("> {text}\n")
-                        })));
-                    }
-                }
-                "agent_thought_chunk" => {
-                    // Reasoning tokens. Forwarded as a dedicated
-                    // `thought` event. The browser aggregates the
-                    // chunks into one collapsible block.
-                    if let Some(text) = update
-                        .get("content")
-                        .and_then(|c| c.get("text"))
-                        .and_then(Value::as_str)
-                    {
-                        let _ = tx.send(text_msg(json!({
-                            "type": "thought",
-                            "text": text
-                        })));
-                    }
-                }
-                "tool_call" | "tool_call_update" => {
-                    // Forward the full structured payload to the browser.
-                    // Both `tool_call` and `tool_call_update` emit the
-                    // same WS event type; the UI dedupes by `toolCallId`
-                    // and mutates the existing row in place on updates.
-                    //
-                    // Fields pass through as-is. The UI renders whatever
-                    // the agent supplied: title, status, kind, input
-                    // args, output content blocks, and the file
-                    // locations touched.
-                    let tool_call_id = update.get("toolCallId").cloned().unwrap_or(Value::Null);
-                    if tool_call_id.is_null() {
-                        // Nothing to key on. A sys line at least tells
-                        // the user something happened.
-                        let title = update
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .unwrap_or("tool");
-                        let status = update.get("status").and_then(Value::as_str).unwrap_or("");
-                        let line = if status.is_empty() {
-                            format!("\n[{title}]\n")
-                        } else {
-                            format!("\n[{title}: {status}]\n")
-                        };
-                        let _ = tx.send(text_msg(
-                            json!({ "type": "append", "role": "sys", "text": line }),
-                        ));
-                        return;
-                    }
-                    let _ = tx.send(text_msg(json!({
-                        "type": "tool_call",
-                        "toolCallId": tool_call_id,
-                        "title": update.get("title").cloned().unwrap_or(Value::Null),
-                        "status": update.get("status").cloned().unwrap_or(Value::Null),
-                        "kind": update.get("kind").cloned().unwrap_or(Value::Null),
-                        "rawInput": update.get("rawInput").cloned().unwrap_or(Value::Null),
-                        "content": update.get("content").cloned().unwrap_or(Value::Null),
-                        "locations": update.get("locations").cloned().unwrap_or(Value::Null)
-                    })));
-                }
-                _ => {}
-            }
-        }
-        "session/request_permission" => {
-            // Forward to the browser. The reply comes back as a
-            // `permission_response` browser message, handled in the WS
-            // select loop (see `handle_ws`). JSON-RPC id is passed through
-            // unchanged so we can respond to the agent with it.
-            if let Some(params) = msg.get("params") {
-                let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                let title = params
-                    .get("toolCall")
-                    .and_then(|tc| tc.get("title").or_else(|| tc.get("name")))
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .to_string();
-                let options = params
-                    .get("options")
-                    .cloned()
-                    .unwrap_or(Value::Array(vec![]));
-                let _ = tx.send(text_msg(json!({
-                    "type": "permission_request",
-                    "id": id,
-                    "title": title,
-                    "options": options
-                })));
-            }
-        }
-        _ => {
-            // Unhandled method: Kiro extensions like `_kiro.dev/commands/available`
-            // land here. Add arms as needed.
-        }
-    }
 }

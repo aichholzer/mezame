@@ -1,28 +1,33 @@
-//! Mezame: an ACP client that bridges a local agent to a browser UI.
+//! Mezame: an agent harness with a browser front end.
 //!
-//! One WebSocket connection = one agent subprocess = one ACP session.
-//! The agent is killed when the browser disconnects (`kill_on_drop(true)`).
+//! A browser opens a session over a WebSocket, sends a prompt, and reads
+//! the turn as it streams. Several browsers can attach to one session at
+//! once and see the same conversation; a session outlives a reconnect.
+//! What produces a turn sits behind one trait, `backend::Backend`, and
+//! this build ships an `EchoBackend` that answers with the text it was
+//! given and talks to no provider.
 //!
-//! See the README for architecture, wire protocol, transports, and
-//! extension points. In-code extension points are marked with `TODO:`.
+//! See the README for architecture, the wire protocol and transports.
+//! In-code extension points are marked with `TODO:`.
 //!
 //! Layout:
-//!   - `config`:  on-disk config and interactive setup
-//!   - `backend`: the Backend seam and the shipped EchoBackend
-//!   - `agent`:   ACP subprocess wrapper and JSON-RPC framing
-//!   - `session`: session resume and stale-lock recovery
-//!   - `http`:    cloudflared transport (HTTP/WS server, UI assets, /state, /history)
-//!   - `ws`:      per-WebSocket session loop and agent-message dispatch
+//!   - `backend`: the Backend seam, the transcript types, the shipped
+//!     `EchoBackend`
+//!   - `config`:  on-disk settings and interactive setup
+//!   - `http`:    cloudflared transport (HTTP/WS server, UI assets,
+//!     `/state`, `/history`)
+//!   - `hub`:     the per-session hub, its registry and its owner loop
+//!   - `ws`:      the upgrade, the per-attach loop and the client command
+//!     set
+//!   - `unix`:    the three libc calls this crate needs, on Unix only
 //!
 //! The crate is exposed as a library so integration tests in `tests/` can
 //! import internals. The thin binary in `src/main.rs` calls `run()`.
 
-pub mod agent;
 pub mod backend;
 pub mod config;
 pub mod http;
 pub mod hub;
-pub mod session;
 pub mod ws;
 
 #[cfg(unix)]
@@ -86,7 +91,7 @@ pub fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "mezame {version}: ACP client that bridges a local agent to a browser UI
+        "mezame {version}: an agent harness with a browser front end
 
 USAGE:
     mezame [SUBCOMMAND]
@@ -100,7 +105,7 @@ FLAGS:
     -V, --version   Print the version and exit
 
 ENVIRONMENT:
-    MEZAME_DEBUG_ACP=1     Echo every inbound ACP frame to stderr
+    HOME                   Resolves ~/.mezame/config.json and state.json
     MEZAME_SKIP_UI_BUILD=1 Skip the Vite build (developer use only)
 ",
         version = env!("CARGO_PKG_VERSION")

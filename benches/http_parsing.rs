@@ -1,16 +1,21 @@
-//! CodSpeed benchmarks for Mezame's pure HTTP-layer helpers.
+//! CodSpeed benchmarks for Mezame's pure, CPU-bound helpers.
 //!
-//! These cover the CPU-bound parsing/formatting functions on the hot
-//! path of serving the UI and replaying chat history:
-//!   - `mime_for`:            content-type lookup for every served asset
-//!   - `extract_text_blocks`: pull text out of ACP content arrays
-//!   - `parse_kiro_history`:  parse a Kiro session JSONL log on resume
+//! The file keeps its name and its `[[bench]]` entry: CodSpeed identifies
+//! a benchmark by `{file}::{function}`, so moving it would reset every
+//! baseline in it, `bench_mime_for` included.
 //!
-//! They are isolated, deterministic and allocation-light. CodSpeed's CPU
-//! simulation instrument suits that shape.
+//! Three subjects, each on a hot path and each isolated, deterministic and
+//! allocation-light, which is the shape CodSpeed's CPU simulation suits:
+//!   - `mime_for`:          the content-type lookup for every served asset
+//!   - `extract_user_text`: the derivation every prompt runs through, once
+//!     for the hub's echo and once for the Backend's transcript
+//!   - `HistoryEntry` serialisation: what `GET /history` costs per turn
 
-use mezame::http::{extract_text_blocks, mime_for, parse_kiro_history};
-use serde_json::json;
+use mezame::backend::{
+    extract_user_text, EntryBody, HistoryEntry, ToolCall, ToolCallStatus, ToolContent, ToolLocation,
+};
+use mezame::http::mime_for;
+use serde_json::{json, Value};
 
 fn main() {
     divan::main();
@@ -31,44 +36,72 @@ fn bench_mime_for(path: &str) -> &'static str {
     mime_for(divan::black_box(path))
 }
 
-#[divan::bench]
-fn bench_extract_text_blocks(bencher: divan::Bencher) {
-    let data = json!({
-        "content": [
-            { "kind": "text", "data": "first line" },
-            { "kind": "tool_call", "data": "ignored" },
-            { "kind": "text", "data": "second line" },
-            { "kind": "image", "data": "ignored too" },
-            { "kind": "text", "data": "third line" },
-        ]
-    });
-    bencher.bench(|| extract_text_blocks(divan::black_box(&data)));
+/// A prompt block list of `blocks` members, two thirds text and the rest
+/// attachments, which is the mix a composer with a pasted image produces.
+fn make_blocks(blocks: usize) -> Vec<Value> {
+    (0..blocks)
+        .map(|i| match i % 3 {
+            0 => json!({
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB"
+            }),
+            _ => json!({
+                "type": "text",
+                "text": format!("block number {i} with some surrounding context")
+            }),
+        })
+        .collect()
 }
 
-/// Build a realistic Kiro session JSONL log with `turns` prompt/reply
-/// pairs so the parser is exercised over a representative input size.
-fn make_history(turns: usize) -> String {
-    let mut out = String::new();
-    for i in 0..turns {
-        out.push_str(&format!(
-            r#"{{"kind":"Prompt","data":{{"content":[{{"kind":"text","data":"question number {i} with some surrounding context"}}],"meta":{{"timestamp":{ts}}}}}}}"#,
-            i = i,
-            ts = 1_700_000_000 + i as i64,
-        ));
-        out.push('\n');
-        out.push_str(r#"{"kind":"ToolResults","data":{}}"#);
-        out.push('\n');
-        out.push_str(&format!(
-            r#"{{"kind":"AssistantMessage","data":{{"content":[{{"kind":"text","data":"answer to question {i}"}}]}}}}"#,
-            i = i,
-        ));
-        out.push('\n');
-    }
-    out
+#[divan::bench(args = [1, 8, 64])]
+fn bench_extract_user_text(bencher: divan::Bencher, blocks: usize) {
+    let blocks = make_blocks(blocks);
+    bencher.bench(|| extract_user_text(divan::black_box(&blocks)));
+}
+
+/// A transcript of `entries` members cycling through the five roles, so
+/// the tagged enum, the flattened body and the tool-call payload are all
+/// measured.
+fn make_transcript(entries: usize) -> Vec<HistoryEntry> {
+    (0..entries)
+        .map(|i| {
+            let timestamp = 1_700_000_000_000 + i as i64;
+            let body = match i % 5 {
+                0 => EntryBody::User {
+                    text: format!("question number {i} with some surrounding context"),
+                },
+                1 => EntryBody::Agent {
+                    text: format!("answer to question {i}"),
+                },
+                2 => EntryBody::Thought {
+                    text: format!("reasoning about question {i}"),
+                },
+                3 => EntryBody::Sys {
+                    text: format!("a notice raised during turn {i}"),
+                },
+                _ => EntryBody::ToolCall(ToolCall {
+                    tool_call_id: format!("tool-{i}"),
+                    title: "Read".to_string(),
+                    status: ToolCallStatus::Completed,
+                    kind: Some("read".to_string()),
+                    raw_input: json!({ "path": format!("/src/file{i}.rs") }),
+                    content: Some(vec![ToolContent::Text {
+                        text: format!("the contents of file {i}"),
+                    }]),
+                    locations: Some(vec![ToolLocation {
+                        path: format!("/src/file{i}.rs"),
+                        line: Some(42),
+                    }]),
+                }),
+            };
+            HistoryEntry { body, timestamp }
+        })
+        .collect()
 }
 
 #[divan::bench(args = [1, 16, 128])]
-fn bench_parse_kiro_history(bencher: divan::Bencher, turns: usize) {
-    let raw = make_history(turns);
-    bencher.bench(|| parse_kiro_history(divan::black_box(&raw)));
+fn bench_serialise_transcript(bencher: divan::Bencher, entries: usize) {
+    let transcript = make_transcript(entries);
+    bencher.bench(|| serde_json::to_value(divan::black_box(&transcript)));
 }

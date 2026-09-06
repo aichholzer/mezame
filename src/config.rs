@@ -1,14 +1,14 @@
 //! On-disk configuration and interactive setup.
 //!
-//! Config lives at `~/.mezame/config.json`. A schema change breaks
-//! existing users. Add fields with `#[serde(default)]` and leave the
-//! existing ones where they are. Transports live in a list
-//! (`TransportConfig`) internally tagged on `kind`; see the README
-//! Configuration reference and todo #19.
+//! Config lives at `~/.mezame/config.json` and holds server settings
+//! only. A schema change breaks existing users: add fields with
+//! `#[serde(default)]` and leave the existing ones where they are.
+//! Transports live in a list (`TransportConfig`) internally tagged on
+//! `kind`; see the architecture document's configuration reference.
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +24,15 @@ const MEZAME_ART: &str = r#"
 
 pub const DEFAULT_PORT: u16 = 9510;
 
+/// Server settings, as they sit at `~/.mezame/config.json`.
+///
+/// One field. No `deny_unknown_fields`: a file written by 0.13.x carries
+/// keys this version knows nothing about, and they are ignored, the file
+/// is left on disk untouched, and the parsed bind address is served. No
+/// re-run of `mezame init` is needed to move onto this line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub transports: Vec<TransportConfig>,
-    pub agent_cmd: String,
-    #[serde(default)]
-    pub agent_args: Vec<String>,
 }
 
 /// Transport entries are internally tagged by `kind`. Each variant holds
@@ -56,41 +59,6 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn state_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join(".mezame/state.json"))
-}
-
-/// Read the durable "auto-allow all tool permissions" preference from
-/// the UI state store (`state.json`). The flag is written by the
-/// browser Settings pane through the existing `PUT /state` endpoint and
-/// read here on demand whenever the agent raises
-/// `session/request_permission`. Reads are human-paced and rare, and the
-/// per-request file read costs nothing measurable while always picking up
-/// the latest toggle without a restart. Any failure (missing file,
-/// malformed JSON, absent field) resolves to the safe default `false`. A
-/// permission request then falls back to prompting the human.
-pub async fn read_auto_allow_permissions() -> bool {
-    let Ok(path) = state_path() else {
-        return false;
-    };
-    let Ok(raw) = tokio::fs::read_to_string(&path).await else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    auto_allow_from_state(&value)
-}
-
-/// Pure extraction of the auto-allow flag from a parsed `state.json`
-/// value. Split from the IO in `read_auto_allow_permissions` to keep the
-/// lookup unit-testable without touching the filesystem. Defaults to
-/// `false` when `settings.autoAllowPermissions` is missing or not a
-/// boolean.
-pub fn auto_allow_from_state(state: &serde_json::Value) -> bool {
-    state
-        .get("settings")
-        .and_then(|s| s.get("autoAllowPermissions"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 pub fn load_config() -> Result<Config> {
@@ -138,57 +106,14 @@ pub(crate) fn init_config() -> Result<Config> {
         _ => {
             let s: String = Input::with_theme(&theme)
                 .with_prompt("Bind address")
-                .validate_with(|input: &String| -> Result<(), &str> {
-                    if input.trim().is_empty() {
-                        Err("Bind address is required")
-                    } else {
-                        Ok(())
-                    }
-                })
+                .validate_with(|input: &String| validate_bind_entry(input))
                 .interact_text()?;
             s.trim().to_string()
         }
     };
 
-    let agent_cmd: String;
-    let default_args: Vec<String>;
-    match pick_agent(&theme)? {
-        Some(picked) => {
-            agent_cmd = picked.path.to_string_lossy().into_owned();
-            default_args = picked.default_args;
-        }
-        None => {
-            let typed: String = Input::with_theme(&theme)
-                .with_prompt("ACP agent command (e.g. kiro-cli, claude, gemini, codex)")
-                .validate_with(|input: &String| -> Result<(), &str> {
-                    if input.trim().is_empty() {
-                        Err("Agent command is required")
-                    } else {
-                        Ok(())
-                    }
-                })
-                .interact_text()?;
-            agent_cmd = typed.trim().to_string();
-            if agent_cmd.is_empty() {
-                bail!("Agent command is required");
-            }
-            default_args = Vec::new();
-        }
-    }
-
-    let default_args_str = default_args.join(" ");
-    let args_raw: String = Input::with_theme(&theme)
-        .with_prompt("Agent args (space-separated, e.g. `acp` for Kiro CLI)")
-        .allow_empty(true)
-        .default(default_args_str.clone())
-        .show_default(!default_args_str.is_empty())
-        .interact_text()?;
-    let agent_args: Vec<String> = args_raw.split_whitespace().map(str::to_string).collect();
-
     let cfg = Config {
         transports: vec![TransportConfig::Cloudflared { bind }],
-        agent_cmd,
-        agent_args,
     };
 
     let path = config_path()?;
@@ -201,101 +126,51 @@ pub(crate) fn init_config() -> Result<Config> {
     Ok(cfg)
 }
 
-/// Known ACP agent CLI we probe for on `$PATH`. Entries here show up as a
-/// selectable menu in `mezame init` when the binary is present. Extending
-/// the list is a two-line change.
-struct KnownAgent {
-    /// Human-readable label shown in the init menu.
-    display: &'static str,
-    /// Binary name resolved against `$PATH`.
-    bin: &'static str,
-    /// Args we pre-fill when the user picks this agent. Only set it when
-    /// the subcommand is known to be correct. Kiro CLI uses `acp`; the
-    /// others are unconfirmed and stay empty.
-    default_args: &'static [&'static str],
+/// The check the free-form bind entry is held to.
+///
+/// A pure function so it has a test. `init_config`'s interactive body
+/// cannot be driven from one: `dialoguer` refuses a non-terminal, and the
+/// re-prompt it performs on a rejected entry is verified by hand.
+pub fn validate_bind_entry(input: &str) -> Result<(), &'static str> {
+    if input.trim().is_empty() {
+        Err("Bind address is required")
+    } else {
+        Ok(())
+    }
 }
 
-const KNOWN_AGENTS: &[KnownAgent] = &[
-    KnownAgent {
-        display: "Kiro CLI",
-        bin: "kiro-cli",
-        default_args: &["acp"],
-    },
-    KnownAgent {
-        display: "Claude Agent CLI",
-        bin: "claude",
-        default_args: &[],
-    },
-    KnownAgent {
-        display: "Gemini CLI",
-        bin: "gemini",
-        default_args: &[],
-    },
-    KnownAgent {
-        display: "Codex",
-        bin: "codex",
-        default_args: &[],
-    },
-];
+#[cfg(test)]
+mod tests {
+    use super::validate_bind_entry;
 
-/// Resolved agent picked from the menu. The path is the full
-/// `$PATH`-resolved location. The saved config names an exact binary and
-/// never re-resolves at run time. A machine with several installs keeps
-/// the one the user chose.
-struct PickedAgent {
-    path: PathBuf,
-    default_args: Vec<String>,
-}
-
-/// Offer known agents found on `$PATH` as a `Select`. Returns `Ok(None)`
-/// when the user chose "Other" or when none were discovered; the caller
-/// falls back to a free-form `Input`.
-fn pick_agent(theme: &ColorfulTheme) -> Result<Option<PickedAgent>> {
-    let mut found: Vec<(&KnownAgent, PathBuf)> = Vec::new();
-    for agent in KNOWN_AGENTS {
-        if let Some(path) = which(agent.bin) {
-            found.push((agent, path));
+    #[test]
+    fn an_empty_or_whitespace_entry_is_rejected() {
+        for refused in ["", " ", "   ", "\t", "\n", " \t \n "] {
+            assert!(
+                validate_bind_entry(refused).is_err(),
+                "should reject {refused:?}"
+            );
         }
     }
 
-    if found.is_empty() {
-        return Ok(None);
-    }
-
-    let mut items: Vec<String> = found
-        .iter()
-        .map(|(a, path)| format!("{} ({})", a.display, path.display()))
-        .collect();
-    items.push("Other (type a command)".to_string());
-
-    let idx = Select::with_theme(theme)
-        .with_prompt("ACP agent")
-        .items(&items)
-        .default(0)
-        .interact()?;
-
-    if idx == found.len() {
-        return Ok(None);
-    }
-
-    let (agent, path) = &found[idx];
-    Ok(Some(PickedAgent {
-        path: path.clone(),
-        default_args: agent.default_args.iter().map(|s| s.to_string()).collect(),
-    }))
-}
-
-/// Tiny `$PATH` lookup; mirrors the helper in `build.rs`. Avoids pulling
-/// in a `which` dep just for this one call. Public for the integration
-/// tests in `tests/`, which are the only way to reach it: every caller
-/// sits behind an interactive `dialoguer` prompt.
-pub fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+    #[test]
+    fn any_non_empty_entry_is_accepted() {
+        // The entry is not parsed here. A bind address that does not
+        // resolve fails at `TcpListener::bind` with the operating
+        // system's own message, which says more than a guess made here
+        // would.
+        for accepted in [
+            "127.0.0.1:9510",
+            "0.0.0.0:9510",
+            "[::1]:9510",
+            "localhost:9510",
+            " 127.0.0.1:9510 ",
+            "nonsense",
+        ] {
+            assert!(
+                validate_bind_entry(accepted).is_ok(),
+                "should accept {accepted:?}"
+            );
         }
     }
-    None
 }

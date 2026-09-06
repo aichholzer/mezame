@@ -108,7 +108,7 @@ fn empty_transports_config_bails() {
     // nothing in silence is the failure mode this guards. It exercises
     // the `[]` arm of run()'s transport match, plus the full
     // config-discovery and runtime-build path that precedes it.
-    let tmp = home_with_config(r#"{ "transports": [], "agent_cmd": "cat" }"#);
+    let tmp = home_with_config(r#"{ "transports": [] }"#);
     let out = run_with_home(&[], tmp.path());
 
     assert!(
@@ -131,8 +131,7 @@ fn multiple_transports_config_bails() {
         "transports": [
             { "kind": "cloudflared", "bind": "127.0.0.1:9510" },
             { "kind": "cloudflared", "bind": "127.0.0.1:9511" }
-        ],
-        "agent_cmd": "cat"
+        ]
     }"#;
     let tmp = home_with_config(body);
     let out = run_with_home(&[], tmp.path());
@@ -164,5 +163,11 @@ fn missing_config_reports_and_attempts_setup() {
     assert!(
         stderr.contains("No config at"),
         "should report the missing config path: {stderr}"
+    );
+    // A prompt that cannot be answered writes nothing. A half-written
+    // config would be served on the next start.
+    assert!(
+        !tmp.path().join(".mezame/config.json").exists(),
+        "no config.json is written when standard input cannot be read"
     );
 }

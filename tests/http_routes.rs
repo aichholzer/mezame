@@ -41,8 +41,6 @@ fn dummy_state() -> Arc<AppState> {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
             }],
-            agent_cmd: "/bin/true".to_string(),
-            agent_args: vec![],
         }),
         hubs: HubRegistry::new(),
         state_changes,
@@ -261,8 +259,6 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
             }],
-            agent_cmd: "/bin/true".to_string(),
-            agent_args: vec![],
         }),
         hubs,
         state_changes,
