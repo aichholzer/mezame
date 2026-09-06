@@ -42,8 +42,8 @@ type Props = {
   onClose: (id: string) => void;
   onRename: (id: string, label: string) => void;
   onNewTab: () => void;
-  onRestore: (acpSessionId: string) => void;
-  onForget: (acpSessionId: string) => void;
+  onRestore: (sessionId: string) => void;
+  onForget: (sessionId: string) => void;
   /** Drawer visibility on mobile. Ignored at desktop widths where the
    * sidebar is always rendered. */
   isOpen: boolean;
@@ -280,8 +280,8 @@ export const SideBar = ({
               ) : (
                 closed.map((entry) => (
                   <DropdownMenuItem
-                    key={entry.acpSessionId}
-                    onSelect={() => onRestore(entry.acpSessionId)}
+                    key={entry.sessionId}
+                    onSelect={() => onRestore(entry.sessionId)}
                     className="flex-col items-stretch gap-0.5"
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -292,7 +292,7 @@ export const SideBar = ({
                         onClick={(ev) => {
                           ev.stopPropagation();
                           ev.preventDefault();
-                          onForget(entry.acpSessionId);
+                          onForget(entry.sessionId);
                         }}
                         aria-label="Forget"
                       >
@@ -300,7 +300,6 @@ export const SideBar = ({
                       </button>
                     </div>
                     <div className="truncate text-[11px] text-muted-foreground">
-                      {entry.cwd ? `${entry.cwd} · ` : ''}
                       {timeAgo(entry.closedAt)}
                     </div>
                   </DropdownMenuItem>
@@ -445,7 +444,7 @@ export const SideBar = ({
                   </div>
                 </TooltipTrigger>
                 <TooltipContent side="right">
-                  <div>{s.cwd ? `${s.label} · ${s.cwd}` : s.label}</div>
+                  <div>{s.label}</div>
                   <div className="text-muted-foreground mt-2">{tabTooltipStatus(visual)}</div>
                   <div className="text-muted-foreground">Double-click to rename.</div>
                 </TooltipContent>

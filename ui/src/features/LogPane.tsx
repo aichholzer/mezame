@@ -1,7 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
-import { McpOauthCard } from '@/features/McpOauthCard';
 import { ToolCallCard } from '@/features/ToolCallCard';
 import { mezameActions } from '@/hooks/useMezame';
 import { useKeyboardInsetValue } from '@/hooks/useKeyboardInset';
@@ -24,19 +23,6 @@ const PermissionCard = ({
   options: PermissionOption[];
 }) => {
   const resolved = !!entry.resolution;
-  // "Remember for this session" tickbox state. Resets per card because
-  // each is its own React component instance.
-  const [remember, setRemember] = useState(false);
-  // Whether this card is connected to a remembered-policy slot, i.e.
-  // it either set the policy (`remembered`) or was auto-resolved by
-  // it (`auto`). Subsequent auto cards keep the badge until the user
-  // clicks Forget on any matching card.
-  const isRememberedCard = entry.remembered || entry.auto;
-  // Active while the policy is still live. The lookup goes against the
-  // live session state. A Forget click on any card with the same title
-  // clears the badge on every other card too. There is one policy per
-  // title.
-  const policyActive = entry.title in session.rememberedPermissions;
   const optionTone = (opt: PermissionOption) => {
     const kind = (opt.kind || opt.optionId || '').toString();
     if (kind.startsWith('allow')) {
@@ -60,37 +46,7 @@ const PermissionCard = ({
       </div>
       {resolved ? (
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span>
-            {`\u2192 ${entry.resolution}`}
-            {entry.auto && (
-              <span
-                className="ml-1 rounded-sm bg-muted px-1 py-0.5 text-[10px] uppercase text-muted-foreground"
-                title="Resolved automatically by a remembered policy"
-              >
-                auto
-              </span>
-            )}
-          </span>
-          {isRememberedCard && policyActive && (
-            <>
-              <span
-                className="rounded-sm bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground"
-                title="Future requests with this title auto-resolve until you disable the policy"
-              >
-                Remembered for this session
-              </span>
-              <button
-                type="button"
-                onClick={() =>
-                  mezameActions.forgetRememberedPermission(session.id, entry.title)
-                }
-                className="cursor-pointer rounded-sm border border-border px-1.5 py-0.5 text-[11px] hover:bg-accent"
-                title="Stop auto-resolving future requests with this title"
-              >
-                Forget
-              </button>
-            </>
-          )}
+          <span>{`\u2192 ${entry.resolution}`}</span>
         </div>
       ) : (
         <div className="flex flex-col gap-2">
@@ -99,7 +55,7 @@ const PermissionCard = ({
               <button
                 key={opt.optionId}
                 type="button"
-                onClick={() => mezameActions.resolvePermission(session.id, entry.id, opt, remember)}
+                onClick={() => mezameActions.resolvePermission(session.id, entry.id, opt)}
                 className={cn(
                   // Stacked on mobile with 44 px minimum height so each
                   // option has a clearly separate hit area; inline on
@@ -113,15 +69,6 @@ const PermissionCard = ({
               </button>
             ))}
           </div>
-          <label className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={remember}
-              onChange={(e) => setRemember(e.target.checked)}
-              className="size-3 cursor-pointer"
-            />
-            Remember my choice and apply automatically next time
-          </label>
         </div>
       )}
     </div>
@@ -343,9 +290,6 @@ export const LogPane = ({ session, isActive }: Props) => {
         }
         if (entry.kind === 'tool_call') {
           return <div key={entry.id} className={cn(AGENT_INDENT, 'max-w-[88%] sm:max-w-[78%]')}><ToolCallCard entry={entry} /></div>;
-        }
-        if (entry.kind === 'mcp_oauth') {
-          return <div key={entry.id} className={cn(AGENT_INDENT, 'max-w-[88%] sm:max-w-[78%]')}><McpOauthCard session={session} entry={entry} /></div>;
         }
         return (
           <div key={entry.id} className={cn(AGENT_INDENT, 'max-w-[88%] sm:max-w-[78%]')}><PermissionCard session={session} entry={entry} options={entry.options} /></div>

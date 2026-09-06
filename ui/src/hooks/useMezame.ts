@@ -22,7 +22,7 @@ import type {
 } from '@/types';
 import { getIdleSuspendMinutes } from '@/lib/settings';
 
-// Multi-session ACP store.
+// Multi-session store.
 //
 // Kept deliberately mutable behind `useSyncExternalStore`: every mutation
 // bumps a version counter and notifies listeners; components reading state
@@ -178,6 +178,21 @@ const scheduleSync = () => {
  *
  * @internal
  */
+/** True when a persisted session or closed entry carries a session id
+ * this build can attach to.
+ *
+ * Applied at every point a persisted entry is read. It also handles a
+ * `state.json` written by 0.13.x, whose ids sit under a key this version
+ * does not read: those entries are discarded, the UI starts with one fresh
+ * tab, and the next sync rewrites both lists under the new key.
+ *
+ * @internal
+ */
+export const hasSessionId = (entry: {
+  sessionId?: string | null;
+}): entry is { sessionId: string } =>
+  typeof entry.sessionId === 'string' && entry.sessionId.length > 0;
+
 export const mergeSessionsForSync = (
   localSessions: PersistedState['sessions'],
   localClosed: ClosedEntry[],
@@ -191,17 +206,17 @@ export const mergeSessionsForSync = (
   // A deliberately closed session must not be resurrected; honour both
   // our own `closed` history and the server's. A close that originated
   // on another device then also suppresses the carry-forward.
-  const closedAcpIds = new Set<string>();
+  const closedIds = new Set<string>();
   for (const c of localClosed) {
-    if (c && typeof c.acpSessionId === 'string') {
-      closedAcpIds.add(c.acpSessionId);
+    if (c && hasSessionId(c)) {
+      closedIds.add(c.sessionId);
     }
   }
   const serverClosed = existing?.closed;
   if (Array.isArray(serverClosed)) {
     for (const c of serverClosed) {
-      if (c && typeof c.acpSessionId === 'string') {
-        closedAcpIds.add(c.acpSessionId);
+      if (c && hasSessionId(c)) {
+        closedIds.add(c.sessionId);
       }
     }
   }
@@ -210,20 +225,19 @@ export const mergeSessionsForSync = (
     if (!entry || typeof entry.id !== 'string' || localIds.has(entry.id)) {
       continue;
     }
-    // Only carry resumable sessions (an on-disk Kiro session exists),
-    // matching the restore guard in `reconcileFromServer`. An unused tab
-    // from another browser has no acp id yet and no conversation on disk.
-    if (typeof entry.acpSessionId !== 'string' || entry.acpSessionId.length === 0) {
+    // Only carry entries that name a session, matching the restore guard
+    // in `reconcileFromServer`. A tab elsewhere that has not applied its
+    // first `ready` yet has no id, and there is nothing here to attach to.
+    if (!hasSessionId(entry)) {
       continue;
     }
-    if (closedAcpIds.has(entry.acpSessionId)) {
+    if (closedIds.has(entry.sessionId)) {
       continue;
     }
     carried.push({
       id: entry.id,
       label: typeof entry.label === 'string' ? entry.label : '?',
-      acpSessionId: entry.acpSessionId,
-      cwd: typeof entry.cwd === 'string' ? entry.cwd : null
+      sessionId: entry.sessionId
     });
   }
   return carried.length > 0 ? [...localSessions, ...carried] : localSessions;
@@ -235,13 +249,10 @@ export const doSync = async () => {
     sessions: sessions.map((s) => ({
       id: s.id,
       label: s.label,
-      // Only persist the ACP session id once the session has been
-      // used. Kiro writes the on-disk JSONL only on first prompt;
-      // persisting a never-used id makes a future `session/load`
-      // fail with "Session not found". Peer browsers therefore
-      // only see a fresh tab from us after the first prompt.
-      acpSessionId: s.used ? s.acpSessionId : null,
-      cwd: s.cwd
+      // Persisted with no gate. Mezame mints the id at upgrade time, so a
+      // tab holds a resumable one from its first `ready` and reaches peer
+      // browsers on its first connect.
+      sessionId: s.sessionId
     })),
     closed,
     activeId,
@@ -252,10 +263,9 @@ export const doSync = async () => {
     // writer. We own the session fields above; the settings store
     // (`lib/settings.ts`) owns `settings`. A blind PUT of only our
     // fields would clobber `settings` on every session event (open,
-    // rename, close, tab switch, first-prompt id record, cross-browser
-    // reconcile). A silently reset `autoAllowPermissions` re-prompts
-    // the user. Carry across whatever we do not own. `settings.ts`
-    // persist() preserves our fields the same way.
+    // rename, close, tab switch, cross-browser reconcile), silently
+    // resetting the user's preferences. Carry across whatever we do not
+    // own. `settings.ts` persist() preserves our fields the same way.
     //
     // The `sessions` array is ours, but a blind write of just the local
     // list has its own hazard: it drops a session another device opened
@@ -351,19 +361,16 @@ const reconcileFromServer = async () => {
     if (sessions.some((s) => s.id === entry.id)) {
       continue;
     }
-    // Only restore sessions that have an `acpSessionId` recorded;
-    // a fresh-but-unused tab on another browser has no on-disk
-    // Kiro session yet. Attaching here would spawn a separate
-    // agent. Once that browser sends a first prompt the id lands
-    // on the server and the next tick brings it across.
-    if (typeof entry.acpSessionId !== 'string' || entry.acpSessionId.length === 0) {
+    // Only restore entries that name a session. A tab elsewhere that has
+    // not applied its first `ready` yet has no id; once it does, the id
+    // lands on the server and the next tick brings it across.
+    if (!hasSessionId(entry)) {
       continue;
     }
     restoreSession({
       id: entry.id,
       label: typeof entry.label === 'string' ? entry.label : '?',
-      acpSessionId: entry.acpSessionId,
-      cwd: typeof entry.cwd === 'string' ? entry.cwd : null
+      sessionId: entry.sessionId
     });
     dirty = true;
   }
@@ -380,20 +387,20 @@ const reconcileFromServer = async () => {
   // with no trace.
   //
   // A deliberate close records the session in the server's `closed`
-  // history (see `closeSession`). A clobber does not. So we only
-  // close locally when the session's acp id shows up in the server's
-  // `closed` list; otherwise we keep it, and our next sync re-adds it
-  // to the server snapshot.
+  // history (see `closeSession`). A clobber does not. So we only close
+  // locally when the session's id shows up in the server's `closed`
+  // list; otherwise we keep it, and our next sync re-adds it to the
+  // server snapshot.
   //
   // Tradeoff: if a deliberate close is later evicted from the capped
   // `closed` history (HISTORY_MAX) before this browser reconciles, we
   // will keep a tab that was actually closed elsewhere. The stale tab
   // is benign and self-corrects on the next close.
-  const serverClosedAcpIds = new Set<string>();
+  const serverClosedIds = new Set<string>();
   if (Array.isArray(saved.closed)) {
     for (const entry of saved.closed) {
-      if (entry && typeof entry.acpSessionId === 'string') {
-        serverClosedAcpIds.add(entry.acpSessionId);
+      if (entry && hasSessionId(entry)) {
+        serverClosedIds.add(entry.sessionId);
       }
     }
   }
@@ -403,7 +410,7 @@ const reconcileFromServer = async () => {
     if (serverIds.has(s.id)) {
       continue;
     }
-    if (shouldCloseAbsentSession(s, serverClosedAcpIds)) {
+    if (shouldCloseAbsentSession(s, serverClosedIds)) {
       toClose.push(s.id);
     }
   }
@@ -439,7 +446,7 @@ const reconcileFromServer = async () => {
   // server snapshot the most-recently-closed entries stay consistent
   // across browsers with no ping-pong.
   if (Array.isArray(saved.closed)) {
-    const next = saved.closed.slice(0, HISTORY_MAX);
+    const next = saved.closed.filter((entry) => entry && hasSessionId(entry)).slice(0, HISTORY_MAX);
     if (JSON.stringify(next) !== JSON.stringify(closed)) {
       closed = next;
       dirty = true;
@@ -488,19 +495,16 @@ const reconcileFromServer = async () => {
  * @internal
  */
 export const shouldCloseAbsentSession = (
-  session: Pick<Session, 'used' | 'acpSessionId'>,
-  serverClosedAcpIds: Set<string>
+  session: Pick<Session, 'sessionId'>,
+  serverClosedIds: Set<string>
 ): boolean => {
-  // Never auto-close a tab that has not synced its acp id yet: it may
-  // simply predate our first PUT.
-  if (!session.used) {
+  // Never auto-close a tab that has no id yet: it may simply predate our
+  // first PUT.
+  if (!session.sessionId) {
     return false;
   }
   // Require positive evidence of a deliberate close.
-  if (!session.acpSessionId) {
-    return false;
-  }
-  return serverClosedAcpIds.has(session.acpSessionId);
+  return serverClosedIds.has(session.sessionId);
 };
 
 /** Local-only session removal used by reconcile. Mirrors the
@@ -557,9 +561,9 @@ const startStateEventStream = () => {
 
 // ---------- history rehydration ----------
 //
-// On resume, mezame suppresses the ACP replay stream and the browser seeds
-// its log from `/history?session=<id>`. The server reads Kiro's own JSONL
-// event log and returns compact entries with real per-turn timestamps.
+// The hub's broadcast has no replay, so a tab seeds its log from
+// `/history?session=<id>` on its first `ready`. The server answers from
+// the session's transcript, with a per-entry timestamp.
 
 type HistoryEntry =
   | {
@@ -568,15 +572,14 @@ type HistoryEntry =
      * the UI renders as a collapsible reasoning block. */
     role: 'user' | 'agent' | 'sys' | 'thought';
     text: string;
-    /** Unix epoch millis. May be null for turns Kiro didn't stamp. */
+    /** Unix epoch millis. */
     timestamp: number | null;
   }
   | {
-    /** Structured tool call rehydrated from JSONL. Mirrors the
-     * live `tool_call` wire shape so the client can push the same
-     * structured log entry on reload as it does during a live
-     * turn. `status` and `content` are filled in when the
-     * matching `ToolResults` entry is parsed; `null` until then. */
+    /** A tool call from the transcript. The same object as the live
+     * `tool_call` event, with `role` in place of `type` and a
+     * `timestamp` added, so the client pushes the same structured log
+     * entry on reload as it does during a live turn. */
     role: 'tool_call';
     toolCallId: string;
     title: string;
@@ -588,12 +591,26 @@ type HistoryEntry =
     timestamp: number | null;
   };
 
+/** How a text entry from the transcript is rendered into the log.
+ *
+ * A `user` entry is stored without the `> ` prefix and without a trailing
+ * newline, and both are added here. Agent markdown renders better if each
+ * turn ends in a newline, so the blank-line spacing pass does the right
+ * thing on the next turn.
+ *
+ * Exported because this formula is the third clause of the echo agreement
+ * property: the same string the hub broadcast as the live echo has to come
+ * back out of the transcript, byte for byte.
+ *
+ * @internal
+ */
+export const renderHistoryText = (entry: {
+  role: 'user' | 'agent' | 'sys' | 'thought';
+  text: string;
+}): string => (entry.role === 'user' ? `> ${entry.text}\n` : `${entry.text}\n`);
+
 const loadHistory = async (s: Session) => {
-  // History reflects the agent session actually backing this
-  // connection. On a clean resume that equals `acpSessionId`; the
-  // distinction only matters defensively. Fall back to the durable
-  // id when the live id has not been set yet.
-  const sessionId = s.liveSessionId ?? s.acpSessionId;
+  const sessionId = s.sessionId;
   if (!sessionId) {
     return;
   }
@@ -641,9 +658,7 @@ const loadHistory = async (s: Session) => {
       kind: 'text',
       id: newLogId(),
       role: e.role,
-      // Agent markdown renders better if each turn ends in a newline so
-      // the blank-line spacing pass does the right thing on next turn.
-      text: e.role === 'user' ? `> ${e.text}\n` : `${e.text}\n`,
+      text: renderHistoryText(e),
       timestamp: e.timestamp ?? Date.now()
     });
   }
@@ -652,20 +667,13 @@ const loadHistory = async (s: Session) => {
 
 // ---------- WebSocket lifecycle ----------
 
-const makeSession = (
-  id: string,
-  label: string,
-  acpSessionId: string | null,
-  cwd: string | null
-): Session => ({
+const makeSession = (id: string, label: string, sessionId: string | null): Session => ({
   id,
   label,
-  acpSessionId,
-  liveSessionId: null,
-  cwd,
-  effectiveCwd: cwd,
+  sessionId,
+  // Filled by the `ready` arm from the directory the server reports.
+  effectiveCwd: null,
   promptCapabilities: {},
-  used: acpSessionId !== null,
   log: [],
   hydrated: false,
   status: 'connecting',
@@ -673,13 +681,8 @@ const makeSession = (
   thinking: false,
   attention: null,
   pinnedToBottom: true,
-  modes: [],
-  currentModeId: null,
   models: [],
   currentModelId: null,
-  commands: [],
-  prompts: [],
-  rememberedPermissions: {},
   ws: null,
   reconnectAttempt: 0,
   reconnectTimer: null,
@@ -693,11 +696,8 @@ const makeSession = (
 const connect = (s: Session) => {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const params = new URLSearchParams();
-  if (s.acpSessionId) {
-    params.set('session', s.acpSessionId);
-  }
-  if (s.cwd) {
-    params.set('cwd', s.cwd);
+  if (s.sessionId) {
+    params.set('session', s.sessionId);
   }
   const query = params.toString();
   const url = query ? `${proto}//${location.host}/ws?${query}` : `${proto}//${location.host}/ws`;
@@ -724,7 +724,8 @@ const connect = (s: Session) => {
       return;
     }
     // Intentional idle-suspend: stay grey, do not reconnect. The server's
-    // grace timer reaps the agent; we reattach on the next interaction.
+    // grace timer reclaims the session; we reattach on the next
+    // interaction.
     if (s.suspended) {
       return;
     }
@@ -750,9 +751,9 @@ const connect = (s: Session) => {
 };
 
 /** Soft-suspend a session for idleness: drop its socket WITHOUT archiving
- * or auto-reconnecting. The server's grace timer then reaps the agent and
- * its MCP fleet. The tab stays in the sidebar (grey). Mutates in place;
- * the caller owns `notify()`. No-op when already suspended or closing. */
+ * or auto-reconnecting. The server's grace timer then reclaims the
+ * session. The tab stays in the sidebar (grey). Mutates in place; the
+ * caller owns `notify()`. No-op when already suspended or closing. */
 const suspendSessionNoNotify = (s: Session) => {
   if (s.suspended || s.closing) {
     return;
@@ -774,9 +775,8 @@ const suspendSessionNoNotify = (s: Session) => {
 };
 
 /** Resume a suspended session: clear the flag and reconnect, which
- * reattaches via `?session=` (a resume) and rehydrates as needed. The
- * in-memory log is kept and the tab stays `hydrated`. No-op when not
- * suspended. */
+ * reattaches via `?session=`. The in-memory log is kept and the tab stays
+ * `hydrated`. No-op when not suspended. */
 const resumeSession = (s: Session) => {
   if (!s.suspended) {
     return;
@@ -791,8 +791,8 @@ const resumeSession = (s: Session) => {
  * now? Split out from the scan so the branch logic is unit-testable
  * without timers, sockets, or the module singletons.
  *
- * All must hold: not already suspended/closing; used and resumable (has an
- * acp id); not mid-turn (`busy`/`inFlight`); on a healthy live socket
+ * All must hold: not already suspended/closing; resumable (it names a
+ * session); not mid-turn (`busy`/`inFlight`); on a healthy live socket
  * (`connected`); idle past the threshold. The active tab is exempt UNLESS
  * the browser tab itself is hidden; a visible active tab is "in use"
  * even without turns.
@@ -804,8 +804,7 @@ export const shouldSuspendIdle = (
     Session,
     | 'suspended'
     | 'closing'
-    | 'used'
-    | 'acpSessionId'
+    | 'sessionId'
     | 'busy'
     | 'inFlight'
     | 'status'
@@ -816,7 +815,7 @@ export const shouldSuspendIdle = (
   if (session.suspended || session.closing) {
     return false;
   }
-  if (!session.used || !session.acpSessionId) {
+  if (!session.sessionId) {
     return false;
   }
   if (session.busy || session.inFlight) {
@@ -863,7 +862,7 @@ const startIdleScan = () => {
 
 /** When the browser tab becomes visible again, resume the ACTIVE session
  * if it was suspended while hidden. Background suspended tabs stay
- * suspended until the user clicks them. Focus never respawns every agent
+ * suspended until the user clicks them. Focus never revives every session
  * at once. */
 const resumeActiveOnVisible = () => {
   if (typeof document === 'undefined' || document.visibilityState !== 'visible') {
@@ -883,9 +882,11 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     return;
   }
 
-  // Capture hydration state before the reducer flips it. The `/history`
-  // seed below can then tell a first load from a reconnect.
+  // Captured before the reducer flips them. The `/history` seed below can
+  // then tell a first load from a reconnect, and the sync latch can tell a
+  // first id from a reconnect that reports the same one.
   const wasHydrated = s.hydrated;
+  const hadSessionId = s.sessionId !== null;
 
   // Side effects that live outside the pure reducer: a stale build id
   // triggers a full page reload, and `ready { resumed: true }` kicks off
@@ -940,160 +941,17 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     if (msg.resumed && !wasHydrated) {
       void loadHistory(s);
     }
+    // A minted id has to reach the state endpoint even right after a
+    // peer's reconcile set the latch. Without this the id stays
+    // unpersisted until the next rename or close, and no peer browser
+    // learns about the tab.
+    if (!hadSessionId && s.sessionId !== null) {
+      suppressNextSync = false;
+    }
     scheduleSync();
   }
 
-  // After-the-fact side effect for the auto-resolve path: when
-  // `applyServerMessage` saw a permission_request with a remembered
-  // policy, it pushed a pre-resolved entry. We still owe the agent
-  // a WS reply here. Fire-and-forget; if the WS is gone the user
-  // will see a transport error from the next operation.
-  if (msg.type === 'permission_request') {
-    const last = s.log[s.log.length - 1];
-    if (last && last.kind === 'permission' && last.auto && last.requestId === msg.id) {
-      const remembered = s.rememberedPermissions[msg.title];
-      if (remembered) {
-        s.ws?.send(
-          JSON.stringify({
-            type: 'permission_response',
-            id: last.requestId,
-            optionId: remembered.optionId
-          })
-        );
-      }
-    }
-  }
-
-  // Tool calls that finish without streamed content: the agent
-  // flipped status to `completed` / `failed` over the live wire
-  // but the result text only landed on disk in the JSONL. Pull
-  // it back via `/tool-result` so the user can expand the card
-  // and read the output without reloading the page. Web search
-  // is the canonical example: Kiro emits the status update but
-  // not the search result body.
-  if (msg.type === 'tool_call') {
-    const finalStatuses = new Set(['completed', 'failed', 'cancelled']);
-    const status = typeof msg.status === 'string' ? msg.status : null;
-    if (status && finalStatuses.has(status)) {
-      const entry = s.log.find(
-        (e) => e.kind === 'tool_call' && e.toolCallId === msg.toolCallId
-      );
-      if (entry && entry.kind === 'tool_call' && entry.content === null) {
-        void backfillToolResult(s, entry.toolCallId);
-      }
-    }
-  }
-
-  // End-of-turn sweep: some tools (web_search again) only flush
-  // their result body to disk once the agent's whole response is
-  // done. By the time `prompt_done` lands, Kiro has written the
-  // JSONL for the entire turn. A sweep over any tool_call entries
-  // still missing content is the deterministic backstop for the
-  // mid-turn polling window.
-  if (msg.type === 'prompt_done') {
-    void sweepToolResultsOnPromptDone(s);
-  }
-
   notify();
-};
-
-// ---------- tool result backfill ----------
-//
-// Kiro writes the JSONL asynchronously: the live status flip can
-// land long before the on-disk `ToolResults` entry. Some tools
-// (notably web_search) only flush their result body once the
-// agent's overall turn finishes. A tight poll window after the
-// status flip can miss the write entirely.
-//
-// Two-stage approach:
-//
-// 1. After a `tool_call_update` flips to a final status, poll for
-//    up to ~5s with 500ms cadence. Catches fast tools so the
-//    output appears mid-turn without waiting for `prompt_done`.
-// 2. On `prompt_done`, sweep every tool_call entry in the session
-//    that still has no content and try once more. By then Kiro
-//    has flushed its JSONL for the turn. That makes the sweep the
-//    deterministic backstop.
-
-const FINAL_BACKFILL_ATTEMPTS = 10;
-const FINAL_BACKFILL_INTERVAL_MS = 500;
-
-const backfillToolResult = async (s: Session, toolCallId: string): Promise<void> => {
-  // Tool results live under the agent session actually running the
-  // turn (the live id), which diverges from `acpSessionId` only after
-  // a failed-resume fallback.
-  const sessionId = s.liveSessionId ?? s.acpSessionId;
-  if (!sessionId) {
-    return;
-  }
-  for (let attempt = 0; attempt < FINAL_BACKFILL_ATTEMPTS; attempt += 1) {
-    if (attempt > 0) {
-      await new Promise((resolve) => setTimeout(resolve, FINAL_BACKFILL_INTERVAL_MS));
-    }
-    if (await tryFetchToolResult(s, sessionId, toolCallId)) {
-      return;
-    }
-  }
-};
-
-/** One-shot pull, used by the prompt_done sweep. Returns true if a
- * result landed and was applied; false otherwise. The caller
- * decides whether to retry. */
-const tryFetchToolResult = async (
-  s: Session,
-  sessionId: string,
-  toolCallId: string
-): Promise<boolean> => {
-  let payload: { status?: string | null; content?: unknown } | null = null;
-  try {
-    const url = `/tool-result?session=${encodeURIComponent(sessionId)}&id=${encodeURIComponent(toolCallId)}`;
-    const res = await fetch(url);
-    if (res.status === 404) {
-      return false;
-    }
-    if (!res.ok) {
-      return false;
-    }
-    payload = (await res.json()) as { status?: string | null; content?: unknown };
-  } catch {
-    return false;
-  }
-  if (!payload || payload.content === null || payload.content === undefined) {
-    return false;
-  }
-  // The log may have grown but `toolCallId` is the contract. If
-  // the user closed the session between the dispatch and the
-  // result landing, drop the patch.
-  const entry = s.log.find(
-    (e) => e.kind === 'tool_call' && e.toolCallId === toolCallId
-  );
-  if (!entry || entry.kind !== 'tool_call') {
-    return false;
-  }
-  entry.content = payload.content;
-  if (typeof payload.status === 'string' && payload.status.length > 0) {
-    entry.status = payload.status;
-  }
-  notify();
-  return true;
-};
-
-/** End-of-turn sweep: walk every tool_call entry that is still
- * missing content and pull once. By `prompt_done` Kiro has
- * flushed its JSONL for the turn. This is the deterministic
- * backstop for tools whose result was not on disk during the
- * mid-turn polling window. */
-const sweepToolResultsOnPromptDone = async (s: Session): Promise<void> => {
-  const sessionId = s.liveSessionId ?? s.acpSessionId;
-  if (!sessionId) {
-    return;
-  }
-  const ids = s.log
-    .filter((e) => e.kind === 'tool_call' && e.content === null)
-    .map((e) => (e as Extract<LogEntry, { kind: 'tool_call' }>).toolCallId);
-  for (const id of ids) {
-    await tryFetchToolResult(s, sessionId, id);
-  }
 };
 
 /**
@@ -1120,36 +978,22 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         s.pinnedToBottom = true;
       }
       s.hydrated = true;
-      // The agent session actually backing this connection. Always the
-      // id the server just negotiated, whether that was a clean resume,
-      // a fresh new session, or a fallback after a failed resume.
-      s.liveSessionId = msg.sessionId;
-      // Durable identity. Only advance it when this was NOT a
-      // fallback-after-failed-resume. On a clean resume `msg.sessionId`
-      // equals the id we asked for and the assignment is a no-op; on a
-      // brand-new tab it adopts the freshly minted id. But when the
-      // server tells us the resume failed (`resumeFailedFor`), we keep
-      // the original id pinned so a transient failure (wrong host for an
-      // SMB-shared session, stale lock, agent restart) never overwrites
-      // the pointer to a real conversation with a throwaway empty
-      // session.
-      if (!msg.resumeFailedFor) {
-        s.acpSessionId = msg.sessionId;
-      }
-      s.effectiveCwd = msg.cwd ?? s.effectiveCwd ?? s.cwd;
+      // The session Mezame bound this connection to. Recorded
+      // unconditionally: on a reconnect it is the id we asked for and the
+      // assignment is a no-op, and on a tab's first connect it adopts the
+      // id the server just minted.
+      s.sessionId = msg.sessionId;
+      s.effectiveCwd = msg.cwd ?? s.effectiveCwd;
       s.promptCapabilities = msg.promptCapabilities ?? {};
-      // After a resume, clear any in-flight markers we set when the
-      // socket dropped. The agent will not replay the old
-      // `prompt_done` (the server suppresses the live replay during
-      // the resume window). Without this the composer would stay
-      // pinned to busy until the next turn naturally completed.
-      // Safe even on a fresh connect: a session that has not sent a
-      // prompt has both flags clear already.
-      if (msg.resumed) {
-        s.thinking = false;
-        s.inFlight = false;
-        setBusy(s, false);
-      }
+      // `busy` says whether a turn is in flight on this session right
+      // now. All three flags follow it, so an attach that lands mid-turn
+      // shows what an attach that saw the echo shows, and an attach that
+      // lands after a turn is not left pinned to busy by markers set when
+      // the socket dropped. The hub guarantees that an attach reading
+      // `busy` as true also receives that turn's `prompt_done`.
+      s.thinking = msg.busy === true;
+      s.inFlight = msg.busy === true;
+      setBusy(s, msg.busy === true);
       setStatus(s, 'connected');
       markActivity(s);
       break;
@@ -1198,26 +1042,8 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       break;
     }
     case 'permission_request': {
-      // If the user previously ticked "remember for this session" for
-      // a permission with this exact title, resolve the new request
-      // immediately with the stored option. The matching `permission_response`
-      // WS frame is sent by `handleMessage` after the reducer runs;
-      // the reducer itself stays free of side effects.
-      const remembered = s.rememberedPermissions[msg.title];
-      if (remembered) {
-        s.log.push({
-          kind: 'permission',
-          id: newLogId(),
-          requestId: msg.id,
-          title: msg.title,
-          options: msg.options,
-          timestamp: Date.now(),
-          resolution: remembered.name || remembered.optionId || 'option',
-          auto: true
-        });
-        // Deliberately no `raiseAttention`: the user already opted in.
-        break;
-      }
+      // Every card is put to the user. No `permission_response` frame is
+      // ever sent that no user action produced.
       raiseAttention(s, 'permission');
       s.log.push({
         kind: 'permission',
@@ -1229,33 +1055,9 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       });
       break;
     }
-    case 'mcp_oauth_request': {
-      // De-dupe re-emissions: Kiro keeps sending while the agent waits.
-      // Match by `requestId` when present, otherwise by serverName+url.
-      const existing = s.log.find(
-        (e) =>
-          e.kind === 'mcp_oauth' &&
-          ((msg.id !== null && e.requestId === msg.id) ||
-            (e.serverName === msg.serverName && e.url === msg.url))
-      );
-      if (existing) {
-        break;
-      }
-      raiseAttention(s, 'permission');
-      s.log.push({
-        kind: 'mcp_oauth',
-        id: newLogId(),
-        requestId: msg.id,
-        serverName: msg.serverName,
-        url: msg.url,
-        timestamp: Date.now(),
-        opened: false
-      });
-      break;
-    }
     case 'tool_call': {
-      // Merge with an existing tool-call entry if we have seen this id
-      // before (ACP `tool_call_update`); otherwise push a new row.
+      // Merge with an existing tool-call entry when this id has been seen
+      // before; otherwise push a new row.
       const existing = s.log.find(
         (e) => e.kind === 'tool_call' && e.toolCallId === msg.toolCallId
       );
@@ -1264,8 +1066,8 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       const nextKind = typeof msg.kind === 'string' && msg.kind.length > 0 ? msg.kind : null;
       const nextLocations = Array.isArray(msg.locations) ? (msg.locations as ToolCallLocation[]) : null;
       if (existing && existing.kind === 'tool_call') {
-        // ACP updates carry only the fields that changed. Fall back to
-        // the prior value when a field is absent or null.
+        // An update carries only the fields that changed, and a null
+        // field means "no change". Fall back to the prior value.
         if (nextTitle !== null) {
           existing.title = nextTitle;
         }
@@ -1334,14 +1136,8 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       markActivity(s);
       break;
     case 'session_info':
-      s.modes = msg.info.modes?.availableModes ?? [];
-      s.currentModeId = msg.info.modes?.currentModeId ?? null;
       s.models = msg.info.models?.availableModels ?? [];
       s.currentModelId = msg.info.models?.currentModelId ?? null;
-      break;
-    case 'commands':
-      s.commands = msg.commands;
-      s.prompts = msg.prompts;
       break;
   }
 };
@@ -1417,18 +1213,18 @@ if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', resumeActiveOnVisible);
 }
 
-const newSession = (cwd: string | null = null, name: string | null = null) => {
+const newSession = (name: string | null = null) => {
   const id = newId();
   const label = name && name.length > 0 ? name : String(nextLabel++);
-  const s = makeSession(id, label, null, cwd);
+  const s = makeSession(id, label, null);
   // New sessions appear leftmost, right after the fixed `+` button.
   sessions.unshift(s);
   connect(s);
   activate(id);
 };
 
-const restoreSession = (saved: { id: string; label: string; acpSessionId: string | null; cwd: string | null }) => {
-  const s = makeSession(saved.id, saved.label, saved.acpSessionId, saved.cwd);
+const restoreSession = (saved: { id: string; label: string; sessionId: string | null }) => {
+  const s = makeSession(saved.id, saved.label, saved.sessionId);
   // Init-time restore: preserve the order captured in persisted state by
   // appending. The UI's leftmost-insertion rule only applies to user-
   // initiated new sessions.
@@ -1462,14 +1258,13 @@ const closeSession = (id: string) => {
   } catch {
     // Already disconnected: fine.
   }
-  // Only archive sessions that reached a sessionId AND were actually used;
-  // unused sessions aren't on disk so restoring them would fail.
-  if (s.used && s.acpSessionId) {
+  // Only archive a session that names one: there is nothing to reattach
+  // to otherwise.
+  if (s.sessionId) {
     closed.unshift({
       id: s.id,
       label: s.label,
-      acpSessionId: s.acpSessionId,
-      cwd: s.cwd,
+      sessionId: s.sessionId,
       closedAt: Date.now()
     });
     if (closed.length > HISTORY_MAX) {
@@ -1491,13 +1286,13 @@ const closeSession = (id: string) => {
   scheduleSync();
 };
 
-const restoreFromHistory = (acpSessionId: string) => {
-  const i = closed.findIndex((e) => e.acpSessionId === acpSessionId);
+const restoreFromHistory = (sessionId: string) => {
+  const i = closed.findIndex((e) => e.sessionId === sessionId);
   if (i < 0) {
     return;
   }
   const entry = closed.splice(i, 1)[0];
-  const s = makeSession(entry.id, entry.label, entry.acpSessionId, entry.cwd);
+  const s = makeSession(entry.id, entry.label, entry.sessionId);
   // Restoring is user-initiated; place the tab leftmost alongside
   // freshly-created ones.
   sessions.unshift(s);
@@ -1506,8 +1301,8 @@ const restoreFromHistory = (acpSessionId: string) => {
   scheduleSync();
 };
 
-const forgetHistory = (acpSessionId: string) => {
-  const i = closed.findIndex((e) => e.acpSessionId === acpSessionId);
+const forgetHistory = (sessionId: string) => {
+  const i = closed.findIndex((e) => e.sessionId === sessionId);
   if (i < 0) {
     return;
   }
@@ -1516,9 +1311,9 @@ const forgetHistory = (acpSessionId: string) => {
   scheduleSync();
 };
 
-// Derive a short label from the user's first prompt. Pure heuristic:
-// no network, no model, Mezame stays "a dumb pipe". Numeric tab labels
-// stop being anonymous after the first turn.
+// Derive a short label from the user's first prompt. Pure heuristic: no
+// network and no model. Numeric tab labels stop being anonymous after the
+// first turn.
 //
 // Returns null when the prompt isn't useful as a label (empty, slash
 // command, attachments-only). The caller leaves the original label in
@@ -1577,12 +1372,11 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   if (!s || !s.ws || s.ws.readyState !== WebSocket.OPEN) {
     return;
   }
-  // Refuse to open a second turn while one is in flight. ACP allows
-  // only one outstanding `session/prompt` per session; a second one
-  // comes back as an "already received this request" error. The
-  // composer is already `readOnly` while busy, but guarding here too
-  // closes the races that bypass the textarea: a multi-attach peer
-  // having started the turn, an Enter fired in the gap before busy
+  // Refuse to open a second turn while one is in flight. The hub drops a
+  // second prompt in silence, so sending one would look like nothing
+  // happened. The composer is already `readOnly` while busy, and guarding
+  // here too closes the races that bypass the textarea: a multi-attach
+  // peer having started the turn, an Enter fired in the gap before busy
   // propagated, or a stuck readOnly.
   if (s.busy || s.inFlight) {
     return;
@@ -1601,8 +1395,8 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   // shows only the text portion; agents that surface uploaded files
   // do so via tool calls in their own time.
 
-  // Build the ACP-shaped prompt. Text always comes first when present.
-  // Attachments preserve the order the user added them.
+  // Text always comes first when present. Attachments preserve the order
+  // the user added them.
   const blocks: PromptBlock[] = [];
   if (text.length > 0) {
     blocks.push({ type: 'text', text });
@@ -1616,18 +1410,17 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   s.thinking = true;
   s.inFlight = true;
   setBusy(s, true);
-  if (!s.used) {
-    s.used = true;
-    // Auto-label new sessions from their first prompt. Only override
-    // the bare numeric placeholder (e.g. "3"); manual names set via
-    // NewSessionDialog or renameSession are non-numeric and survive.
-    if (/^\d+$/.test(s.label)) {
-      const derived = deriveLabel(text);
-      if (derived) {
-        s.label = derived;
-      }
+  // Auto-label from the prompt while the tab still carries its bare
+  // numeric placeholder (e.g. "3"). A manual name set through the new
+  // session dialog or a rename is non-numeric and survives. A prompt
+  // `deriveLabel` cannot make a label out of leaves the placeholder in
+  // place, so a later prompt gets another go.
+  if (/^\d+$/.test(s.label)) {
+    const derived = deriveLabel(text);
+    if (derived) {
+      s.label = derived;
+      scheduleSync();
     }
-    scheduleSync();
   }
   notify();
 };
@@ -1645,8 +1438,7 @@ const sendCancel = () => {
 const resolvePermission = (
   sessionId: string,
   logEntryId: string,
-  option: PermissionOption,
-  remember: boolean = false
+  option: PermissionOption
 ) => {
   const s = findSession(sessionId);
   if (!s) {
@@ -1657,13 +1449,6 @@ const resolvePermission = (
     return;
   }
   entry.resolution = option.name || option.optionId || 'option';
-  if (remember) {
-    entry.remembered = true;
-    s.rememberedPermissions = {
-      ...s.rememberedPermissions,
-      [entry.title]: option
-    };
-  }
   // User answered the prompt: drop any lingering permission attention
   // so the favicon/title badge de-escalates immediately, with no wait
   // for a turn end or tab switch.
@@ -1677,51 +1462,6 @@ const resolvePermission = (
       optionId: option.optionId
     })
   );
-  notify();
-};
-
-/** Drop a single remembered permission policy by title. The next
- * matching `permission_request` will prompt the user again. Does
- * not change anything already in the log. */
-const forgetRememberedPermission = (sessionId: string, title: string) => {
-  const s = findSession(sessionId);
-  if (!s) {
-    return;
-  }
-  if (!(title in s.rememberedPermissions)) {
-    return;
-  }
-  const next = { ...s.rememberedPermissions };
-  delete next[title];
-  s.rememberedPermissions = next;
-  notify();
-};
-
-/** Drop every remembered permission policy on the given session.
- * Surfaced as a small button on resolved cards that landed via auto;
- * the next matching `permission_request` will then prompt the user
- * again. Does not change anything already in the log. */
-const clearRememberedPermissions = (sessionId: string) => {
-  const s = findSession(sessionId);
-  if (!s) {
-    return;
-  }
-  if (Object.keys(s.rememberedPermissions).length === 0) {
-    return;
-  }
-  s.rememberedPermissions = {};
-  notify();
-};
-
-const setMode = (modeId: string) => {
-  const s = currentSession();
-  if (!s || !s.ws || s.ws.readyState !== WebSocket.OPEN) {
-    return;
-  }
-  s.ws.send(JSON.stringify({ type: 'set_mode', modeId }));
-  // Optimistic: update local state straight away. If the server rejects,
-  // we'll get an `error` message and the log will surface it.
-  s.currentModeId = modeId;
   notify();
 };
 
@@ -1746,24 +1486,6 @@ const setPinnedToBottom = (sessionId: string, pinned: boolean) => {
   }
 };
 
-const markOauthOpened = (sessionId: string, logEntryId: string) => {
-  const s = findSession(sessionId);
-  if (!s) {
-    return;
-  }
-  const entry = s.log.find((e) => e.id === logEntryId);
-  if (!entry || entry.kind !== 'mcp_oauth') {
-    return;
-  }
-  entry.opened = true;
-  // The card stays in the log (the URL may be needed again), but the
-  // attention dot can drop: the user has acknowledged the request.
-  if (s.attention === 'permission') {
-    s.attention = null;
-  }
-  notify();
-};
-
 // ---------- init ----------
 
 let initStarted = false;
@@ -1775,15 +1497,26 @@ const init = async () => {
   initStarted = true;
   const saved = await fetchState();
   if (saved?.closed && Array.isArray(saved.closed)) {
-    closed = saved.closed.slice(0, HISTORY_MAX);
+    closed = saved.closed.filter((entry) => entry && hasSessionId(entry)).slice(0, HISTORY_MAX);
   }
-  if (saved?.sessions && Array.isArray(saved.sessions) && saved.sessions.length > 0) {
-    nextLabel = saved.nextLabel ?? saved.sessions.length + 1;
-    for (const entry of saved.sessions) {
+  // Every persisted entry has to name a session; one that does not is
+  // discarded with no error and no tab is restored for it. Checking the
+  // filtered list rather than the raw one closes the hole a `sessions[0]`
+  // read leaves when the filter removed every entry.
+  const restorable = Array.isArray(saved?.sessions)
+    ? saved.sessions.filter(
+      (entry) => entry && typeof entry.id === 'string' && hasSessionId(entry)
+    )
+    : [];
+  if (restorable.length > 0) {
+    nextLabel = saved?.nextLabel ?? restorable.length + 1;
+    for (const entry of restorable) {
       restoreSession(entry);
     }
     const restoreActive =
-      saved.activeId && sessions.some((s) => s.id === saved.activeId) ? saved.activeId : sessions[0].id;
+      saved?.activeId && sessions.some((s) => s.id === saved.activeId)
+        ? saved.activeId
+        : sessions[0].id;
     activate(restoreActive);
   } else {
     newSession();
@@ -1817,10 +1550,6 @@ export const mezameActions = {
   sendPrompt,
   sendCancel,
   resolvePermission,
-  forgetRememberedPermission,
-  clearRememberedPermissions,
   setPinnedToBottom,
-  setMode,
-  setModel,
-  markOauthOpened
+  setModel
 };

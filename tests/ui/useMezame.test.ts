@@ -6,6 +6,7 @@
 import {
   applyServerMessage,
   deriveLabel,
+  renderHistoryText,
   shouldCloseAbsentSession,
   shouldSuspendIdle
 } from '@/hooks/useMezame';
@@ -16,12 +17,9 @@ function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: 's1',
     label: '1',
-    acpSessionId: null,
-    liveSessionId: null,
-    cwd: null,
+    sessionId: null,
     effectiveCwd: null,
     promptCapabilities: {},
-    used: false,
     log: [],
     hydrated: false,
     status: 'connecting',
@@ -29,13 +27,8 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     thinking: false,
     attention: null,
     pinnedToBottom: true,
-    modes: [],
-    currentModeId: null,
     models: [],
     currentModelId: null,
-    commands: [],
-    prompts: [],
-    rememberedPermissions: {},
     ws: null,
     reconnectAttempt: 0,
     reconnectTimer: null,
@@ -60,11 +53,12 @@ describe('applyServerMessage / ready', () => {
       type: 'ready',
       sessionId: 'abc',
       resumed: false,
+      busy: false,
       cwd: '/projects/x',
       promptCapabilities: { image: true }
     };
     applyServerMessage(s, msg);
-    expect(s.acpSessionId).toBe('abc');
+    expect(s.sessionId).toBe('abc');
     expect(s.effectiveCwd).toBe('/projects/x');
     expect(s.promptCapabilities).toEqual({ image: true });
     expect(s.status).toBe('connected');
@@ -86,7 +80,8 @@ describe('applyServerMessage / ready', () => {
     applyServerMessage(s, {
       type: 'ready',
       sessionId: 'abc',
-      resumed: true
+      resumed: true,
+      busy: false
     });
     expect(s.log).toEqual([]);
     expect(s.pinnedToBottom).toBe(true);
@@ -112,11 +107,10 @@ describe('applyServerMessage / ready', () => {
     expect(s.hydrated).toBe(true);
   });
 
-  it('clears busy / thinking / inFlight on resume', () => {
-    // Simulates the post-idle-drop path: the socket dropped while a
-    // turn was in flight, the close handler set busy=true, and now
-    // the reconnect succeeds. The historical `prompt_done` is not
-    // replayed. The reducer clears the flags itself.
+  it('clears busy / thinking / inFlight when the server reports no turn', () => {
+    // The post-idle-drop path: the socket dropped while a turn was in
+    // flight, the close handler set busy=true, and the reconnect lands
+    // after the turn ended. `busy: false` is what unpins the composer.
     const s = makeSession({
       busy: true,
       thinking: true,
@@ -125,55 +119,49 @@ describe('applyServerMessage / ready', () => {
     applyServerMessage(s, {
       type: 'ready',
       sessionId: 'abc',
-      resumed: true
+      resumed: true,
+      busy: false
     });
     expect(s.busy).toBe(false);
     expect(s.thinking).toBe(false);
     expect(s.inFlight).toBe(false);
   });
 
-  it('does not touch busy / thinking on a fresh (non-resume) ready', () => {
-    const s = makeSession({
-      busy: false,
-      thinking: false,
-      inFlight: false
-    });
+  it('locks the composer when the server reports a turn in flight', () => {
+    // An attach landing mid-turn shows what an attach that saw the echo
+    // shows. The hub guarantees this attach also receives that turn's
+    // prompt_done, which is what unlocks it again.
+    const s = makeSession();
     applyServerMessage(s, {
       type: 'ready',
       sessionId: 'abc',
-      resumed: false
+      resumed: true,
+      busy: true
     });
-    expect(s.busy).toBe(false);
-    expect(s.thinking).toBe(false);
-    expect(s.inFlight).toBe(false);
+    expect(s.busy).toBe(true);
+    expect(s.thinking).toBe(true);
+    expect(s.inFlight).toBe(true);
   });
 
-  it('advances the durable acpSessionId on a clean resume', () => {
-    const s = makeSession({ acpSessionId: 'real-id' });
+  it('records the session id on every ready', () => {
+    // Mezame mints the id at upgrade time, so a tab holds a resumable
+    // one from its first ready. A reconnect reports the same id and the
+    // assignment is a no-op.
+    const s = makeSession();
     applyServerMessage(s, {
       type: 'ready',
-      sessionId: 'real-id',
-      resumed: true
+      sessionId: 'minted-id',
+      resumed: true,
+      busy: false
     });
-    expect(s.acpSessionId).toBe('real-id');
-    expect(s.liveSessionId).toBe('real-id');
-  });
-
-  it('keeps acpSessionId pinned when a resume failed and fell back', () => {
-    // Regression for the vanishing/overwritten-session bug: a failed
-    // resume must NOT overwrite the durable pointer with the throwaway
-    // fallback id. The live id tracks the fallback for this connection;
-    // acpSessionId (persisted + used for the next ?session=) stays on
-    // the original so a later restart can retry the real conversation.
-    const s = makeSession({ acpSessionId: 'real-id', used: true });
+    expect(s.sessionId).toBe('minted-id');
     applyServerMessage(s, {
       type: 'ready',
-      sessionId: 'fallback-empty-id',
-      resumed: false,
-      resumeFailedFor: 'real-id'
+      sessionId: 'minted-id',
+      resumed: true,
+      busy: false
     });
-    expect(s.acpSessionId).toBe('real-id');
-    expect(s.liveSessionId).toBe('fallback-empty-id');
+    expect(s.sessionId).toBe('minted-id');
   });
 });
 
@@ -237,109 +225,8 @@ describe('applyServerMessage / permission_request', () => {
       expect(entry.title).toBe('Run shell command');
       expect(entry.options).toHaveLength(2);
       expect(entry.resolution).toBeUndefined();
-      expect(entry.auto).toBeFalsy();
     }
     expect(s.attention).toBe('permission');
-  });
-
-  it('auto-resolves a permission_request when a remembered policy matches', () => {
-    const remembered = { optionId: 'allow_once', name: 'Allow once' };
-    const s = makeSession({
-      rememberedPermissions: {
-        'Run shell command': remembered
-      }
-    });
-    applyServerMessage(s, {
-      type: 'permission_request',
-      id: 11,
-      title: 'Run shell command',
-      options: [
-        { optionId: 'allow_once', name: 'Allow once' },
-        { optionId: 'reject', name: 'Reject' }
-      ]
-    });
-    const entry = lastEntry(s);
-    expect(entry?.kind).toBe('permission');
-    if (entry?.kind === 'permission') {
-      expect(entry.resolution).toBe('Allow once');
-      expect(entry.auto).toBe(true);
-    }
-    // Auto-resolved requests do not raise attention; the user is
-    // not waiting on a click.
-    expect(s.attention).toBeNull();
-  });
-
-  it('does not auto-resolve when only the title differs', () => {
-    const s = makeSession({
-      rememberedPermissions: {
-        'Run shell command': { optionId: 'allow_once' }
-      }
-    });
-    applyServerMessage(s, {
-      type: 'permission_request',
-      id: 12,
-      title: 'Read file',
-      options: [{ optionId: 'allow', name: 'Allow' }]
-    });
-    const entry = lastEntry(s);
-    if (entry?.kind === 'permission') {
-      expect(entry.resolution).toBeUndefined();
-      expect(entry.auto).toBeFalsy();
-    }
-    expect(s.attention).toBe('permission');
-  });
-});
-
-// ---------- mcp_oauth_request ----------
-
-describe('applyServerMessage / mcp_oauth_request', () => {
-  it('appends an mcp_oauth entry and raises attention', () => {
-    const s = makeSession();
-    applyServerMessage(s, {
-      type: 'mcp_oauth_request',
-      id: 'r1',
-      serverName: 'github',
-      url: 'https://example.com/auth'
-    });
-    expect(s.log).toHaveLength(1);
-    const entry = lastEntry(s);
-    expect(entry?.kind).toBe('mcp_oauth');
-    if (entry?.kind === 'mcp_oauth') {
-      expect(entry.serverName).toBe('github');
-      expect(entry.url).toBe('https://example.com/auth');
-      expect(entry.opened).toBe(false);
-    }
-    expect(s.attention).toBe('permission');
-  });
-
-  it('dedupes by request id', () => {
-    const s = makeSession();
-    const msg: ServerMessage = {
-      type: 'mcp_oauth_request',
-      id: 'same-id',
-      serverName: 'github',
-      url: 'https://example.com/auth'
-    };
-    applyServerMessage(s, msg);
-    applyServerMessage(s, msg);
-    expect(s.log).toHaveLength(1);
-  });
-
-  it('falls back to serverName + url when id is null', () => {
-    const s = makeSession();
-    applyServerMessage(s, {
-      type: 'mcp_oauth_request',
-      id: null,
-      serverName: 'github',
-      url: 'https://example.com/auth'
-    });
-    applyServerMessage(s, {
-      type: 'mcp_oauth_request',
-      id: null,
-      serverName: 'github',
-      url: 'https://example.com/auth'
-    });
-    expect(s.log).toHaveLength(1);
   });
 });
 
@@ -424,59 +311,48 @@ describe('applyServerMessage / error', () => {
 // ---------- session_info ----------
 
 describe('applyServerMessage / session_info', () => {
-  it('hydrates modes and models', () => {
+  it('hydrates models', () => {
     const s = makeSession();
     applyServerMessage(s, {
       type: 'session_info',
       info: {
-        modes: {
-          currentModeId: 'kiro_default',
-          availableModes: [{ id: 'kiro_default', name: 'Default' }]
-        },
         models: {
           currentModelId: 'claude-sonnet',
           availableModels: [{ modelId: 'claude-sonnet', name: 'Sonnet' }]
         }
       }
     });
-    expect(s.modes).toHaveLength(1);
-    expect(s.currentModeId).toBe('kiro_default');
     expect(s.models).toHaveLength(1);
     expect(s.currentModelId).toBe('claude-sonnet');
   });
 
-  it('handles partial info (only modes)', () => {
-    const s = makeSession();
-    applyServerMessage(s, {
-      type: 'session_info',
-      info: { modes: { currentModeId: 'x', availableModes: [] }, models: null }
-    });
-    expect(s.currentModeId).toBe('x');
+  it('handles an info object with a null models key', () => {
+    const s = makeSession({ currentModelId: 'stale' });
+    applyServerMessage(s, { type: 'session_info', info: { models: null } });
+    expect(s.models).toEqual([]);
     expect(s.currentModelId).toBeNull();
   });
 });
 
-// ---------- commands ----------
+// ---------- history render ----------
+//
+// The formula the echo agreement property models on the Rust side. A
+// `user` entry is stored bare and both the prefix and the newline are
+// added here, so the string the hub broadcast as the live echo comes back
+// out of the transcript byte for byte.
 
-describe('applyServerMessage / commands', () => {
-  it('stores commands and prompts (last-wins on second emission)', () => {
-    const s = makeSession();
-    applyServerMessage(s, {
-      type: 'commands',
-      commands: [{ name: '/clear' }],
-      prompts: [{ name: 'summarise' }]
-    });
-    expect(s.commands).toHaveLength(1);
-    expect(s.prompts).toHaveLength(1);
+describe('renderHistoryText', () => {
+  it('prefixes a user entry once and terminates it once', () => {
+    expect(renderHistoryText({ role: 'user', text: 'hello' })).toBe('> hello\n');
+    expect(renderHistoryText({ role: 'user', text: '' })).toBe('> \n');
+    expect(renderHistoryText({ role: 'user', text: 'a\nb' })).toBe('> a\nb\n');
+    expect(renderHistoryText({ role: 'user', text: ' pad ' })).toBe('>  pad \n');
+  });
 
-    // Re-emission with fresh data: replace, do not merge.
-    applyServerMessage(s, {
-      type: 'commands',
-      commands: [{ name: '/clear' }, { name: '/help' }],
-      prompts: []
-    });
-    expect(s.commands).toHaveLength(2);
-    expect(s.prompts).toHaveLength(0);
+  it('terminates every other role without a prefix', () => {
+    expect(renderHistoryText({ role: 'agent', text: 'hello' })).toBe('hello\n');
+    expect(renderHistoryText({ role: 'sys', text: 'notice' })).toBe('notice\n');
+    expect(renderHistoryText({ role: 'thought', text: 'hmm' })).toBe('hmm\n');
   });
 });
 
@@ -492,28 +368,23 @@ describe('applyServerMessage / commands', () => {
 describe('shouldCloseAbsentSession', () => {
   const closedIds = (...ids: string[]) => new Set(ids);
 
-  it('closes a used session whose acp id is in the server closed history', () => {
-    const s = { used: true, acpSessionId: 'acp-1' };
-    expect(shouldCloseAbsentSession(s, closedIds('acp-1'))).toBe(true);
+  it('closes a session whose id is in the server closed history', () => {
+    const s = { sessionId: 'sid-1' };
+    expect(shouldCloseAbsentSession(s, closedIds('sid-1'))).toBe(true);
   });
 
-  it('keeps a used session absent from the snapshot but NOT in closed history', () => {
+  it('keeps a session absent from the snapshot but NOT in closed history', () => {
     // The clobber case: another browser PUT a partial list that
     // omitted this session. With no closed-history corroboration,
     // reconcile keeps it.
-    const s = { used: true, acpSessionId: 'acp-1' };
-    expect(shouldCloseAbsentSession(s, closedIds('acp-other'))).toBe(false);
+    const s = { sessionId: 'sid-1' };
+    expect(shouldCloseAbsentSession(s, closedIds('sid-other'))).toBe(false);
     expect(shouldCloseAbsentSession(s, closedIds())).toBe(false);
   });
 
-  it('keeps a used session that has no acp id yet', () => {
-    const s = { used: true, acpSessionId: null };
-    expect(shouldCloseAbsentSession(s, closedIds('acp-1'))).toBe(false);
-  });
-
-  it('keeps an unused (never-prompted) session regardless of closed history', () => {
-    const s = { used: false, acpSessionId: 'acp-1' };
-    expect(shouldCloseAbsentSession(s, closedIds('acp-1'))).toBe(false);
+  it('keeps a session that has no id yet', () => {
+    const s = { sessionId: null };
+    expect(shouldCloseAbsentSession(s, closedIds('sid-1'))).toBe(false);
   });
 });
 
@@ -580,8 +451,7 @@ describe('shouldSuspendIdle', () => {
   // A background session idle for 2 minutes against a 1-minute threshold.
   const idle = (over: Partial<Session> = {}) =>
     makeSession({
-      used: true,
-      acpSessionId: 'acp-1',
+      sessionId: 'sid-1',
       status: 'connected',
       busy: false,
       inFlight: false,
@@ -591,7 +461,7 @@ describe('shouldSuspendIdle', () => {
       ...over
     });
 
-  it('suspends an idle, used, connected background session', () => {
+  it('suspends an idle, connected background session', () => {
     expect(shouldSuspendIdle(idle(), ctx())).toBe(true);
   });
 
@@ -604,9 +474,8 @@ describe('shouldSuspendIdle', () => {
     expect(shouldSuspendIdle(idle({ busy: true }), ctx())).toBe(false);
   });
 
-  it('never suspends an unused or unresumable session', () => {
-    expect(shouldSuspendIdle(idle({ used: false }), ctx())).toBe(false);
-    expect(shouldSuspendIdle(idle({ acpSessionId: null }), ctx())).toBe(false);
+  it('never suspends an unresumable session', () => {
+    expect(shouldSuspendIdle(idle({ sessionId: null }), ctx())).toBe(false);
   });
 
   it('never suspends a session that is not on a healthy socket', () => {
@@ -636,7 +505,7 @@ describe('applyServerMessage idle anchor', () => {
 
   it('stamps lastActivityAt on ready', () => {
     const s = makeSession({ lastActivityAt: 1 });
-    applyServerMessage(s, { type: 'ready', sessionId: 'x', resumed: false });
+    applyServerMessage(s, { type: 'ready', sessionId: 'x', resumed: false, busy: false });
     expect(s.lastActivityAt).toBeGreaterThan(1);
   });
 });

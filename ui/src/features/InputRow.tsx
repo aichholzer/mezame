@@ -10,7 +10,6 @@ import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { CwdChip } from '@/features/CwdChip';
 import { ModeModelSelectors } from '@/features/ModeModelSelectors';
-import { SlashAutocomplete, type SlashAutocompleteHandle } from '@/features/SlashAutocomplete';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { mezameActions } from '@/hooks/useMezame';
 import {
@@ -72,7 +71,6 @@ export const InputRow = ({ session, onSubmit }: Props) => {
   const [notice, setNotice] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const slashRef = useRef<SlashAutocompleteHandle>(null);
 
   // Reactive read of the send-on-Enter preference. Drives both the key
   // handler and the textarea placeholder hint below.
@@ -238,9 +236,6 @@ export const InputRow = ({ session, onSubmit }: Props) => {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (slashRef.current?.onKeyDown(e)) {
-      return;
-    }
     if (e.key !== 'Enter') {
       return;
     }
@@ -313,11 +308,6 @@ export const InputRow = ({ session, onSubmit }: Props) => {
     }
   };
 
-  const handleCommit = (next: string) => {
-    setValue(next);
-    textareaRef.current?.focus();
-  };
-
   return (
     <form
       onSubmit={submit}
@@ -355,14 +345,6 @@ export const InputRow = ({ session, onSubmit }: Props) => {
           dragOver && 'ring-2 ring-[color:var(--primary)]/85'
         )}
       >
-        <SlashAutocomplete
-          ref={slashRef}
-          value={value}
-          commands={session?.commands ?? []}
-          prompts={session?.prompts ?? []}
-          onCommit={handleCommit}
-        />
-
         {attachments.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 px-3 pt-2.5">
             {attachments.map((att) => (
@@ -574,16 +556,15 @@ const formatBytes = (bytes: number): string => {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 };
 
-// Mobile-only trigger that opens a DropdownMenu containing the Agent
-// and Model pickers stacked vertically. Reuses the existing
-// `@radix-ui/react-dropdown-menu` primitive. Renders nothing when the
-// agent advertised no modes and no models (e.g., non-Kiro agents);
-// matches `ModeModelSelectors`'s own empty-state rule.
+// Mobile-only trigger that opens a DropdownMenu holding the model
+// picker. Reuses the existing `@radix-ui/react-dropdown-menu` primitive.
+// Renders nothing when no model is on offer; matches
+// `ModeModelSelectors`'s own empty-state rule.
 const MobileSettingsTrigger = ({ session }: { session: Session | null }) => {
   if (!session) {
     return null;
   }
-  if (session.modes.length === 0 && session.models.length === 0) {
+  if (session.models.length === 0) {
     return null;
   }
   return (

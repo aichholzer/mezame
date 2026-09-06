@@ -14,18 +14,16 @@ import { Label } from '@/components/ui/label';
 type Props = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onCreate: (cwd: string | null, name: string | null) => void;
+  onCreate: (name: string | null) => void;
 };
 
 export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
   const [name, setName] = useState('');
-  const [cwd, setCwd] = useState('');
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (open) {
       setName('');
-      setCwd('');
       // Radix auto-focuses the first focusable element; that's the close
       // button. Move focus to the name input on the next tick.
       setTimeout(() => nameRef.current?.focus(), 0);
@@ -34,7 +32,7 @@ export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    onCreate(cwd.trim() || null, name.trim() || null);
+    onCreate(name.trim() || null);
     onOpenChange(false);
   };
 
@@ -44,7 +42,7 @@ export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
         <DialogHeader>
           <DialogTitle>New session</DialogTitle>
           <DialogDescription>
-            A fresh agent subprocess is spawned per session.
+            A session holds its own conversation. Open as many as you like.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="flex flex-col gap-3">
@@ -56,17 +54,6 @@ export const NewSessionDialog = ({ open, onOpenChange, onCreate }: Props) => {
               value={name}
               onChange={(e) => setName(e.target.value)}
               autoComplete="off"
-              className="text-base md:text-sm"
-            />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="ns-cwd">Working directory (optional)</Label>
-            <Input
-              id="ns-cwd"
-              value={cwd}
-              onChange={(e) => setCwd(e.target.value)}
-              autoComplete="off"
-              placeholder="leave blank for mezame's directory"
               className="text-base md:text-sm"
             />
           </div>

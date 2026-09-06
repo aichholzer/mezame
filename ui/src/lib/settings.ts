@@ -2,9 +2,9 @@
 // endpoint, alongside the session list. Read on init, written on each
 // change.
 //
-// Holds the notification preference, the theme, the auto-allow flag,
-// the send-on-Enter chord and the idle-suspend threshold. More will land
-// here as other features (sounds, custom CSS) settle.
+// Holds the notification preference, the theme, the send-on-Enter chord
+// and the idle-suspend threshold. More will land here as other features
+// (sounds, custom CSS) settle.
 
 export type NotificationPreference = 'unset' | 'pending' | 'on' | 'off';
 
@@ -16,7 +16,6 @@ export type ThemePreference = 'system' | 'light' | 'dark';
 type Settings = {
   notifications: NotificationPreference;
   theme: ThemePreference;
-  autoAllowPermissions: boolean;
   sendOnEnter: boolean;
   idleSuspendMinutes: number;
 };
@@ -24,23 +23,17 @@ type Settings = {
 const DEFAULTS: Settings = {
   notifications: 'unset',
   theme: 'system',
-  // Auto-allow all tool permissions. Off by default: a new install
-  // always prompts for each tool call until the user opts in via the
-  // Settings pane. Read server-side per permission request (see
-  // `read_auto_allow_permissions` in the Rust core). Flipping it here
-  // takes effect on the next request without a reconnect.
-  autoAllowPermissions: false,
-  // Send-on-Enter. True (default) keeps the classic chat behaviour:
-  // a bare Enter submits and Shift+Enter inserts a newline. False
-  // flips it: Enter inserts a newline and the platform modifier
-  // (Cmd on macOS, Ctrl elsewhere) plus Enter submits. Purely a UI
-  // affordance: unlike autoAllowPermissions the Rust core never reads
-  // it. It rides the generic /state blob with no server change.
+  // Send-on-Enter. True (default) keeps the classic chat behaviour: a
+  // bare Enter submits and Shift+Enter inserts a newline. False flips it:
+  // Enter inserts a newline and the platform modifier (Cmd on macOS,
+  // Ctrl elsewhere) plus Enter submits. Purely a UI affordance; the Rust
+  // core never reads it. It rides the generic /state blob with no server
+  // change.
   sendOnEnter: true,
   // Minutes a backgrounded (or hidden active) session may sit idle after
-  // its last turn before Mezame suspends it and frees its agent + MCP
-  // fleet. Read by the idle scan in useMezame; rides the /state settings
-  // blob. The Rust core never reads it (no server change).
+  // its last turn before Mezame suspends it and releases its server-side
+  // resources. Read by the idle scan in useMezame; rides the /state
+  // settings blob. The Rust core never reads it (no server change).
   idleSuspendMinutes: 15
 };
 
@@ -113,18 +106,6 @@ export const setThemePreference = (next: ThemePreference): void => {
   }
   current = { ...current, theme: next };
   writeThemeToStorage(next);
-  notify();
-  void persist();
-};
-
-export const getAutoAllowPermissions = (): boolean =>
-  current.autoAllowPermissions;
-
-export const setAutoAllowPermissions = (next: boolean): void => {
-  if (current.autoAllowPermissions === next) {
-    return;
-  }
-  current = { ...current, autoAllowPermissions: next };
   notify();
   void persist();
 };
@@ -203,11 +184,6 @@ export const initSettings = async (): Promise<void> => {
       if (isThemePreference(theme) && theme !== current.theme) {
         current = { ...current, theme };
         writeThemeToStorage(theme);
-        notify();
-      }
-      const autoAllow = body.settings.autoAllowPermissions;
-      if (typeof autoAllow === 'boolean' && autoAllow !== current.autoAllowPermissions) {
-        current = { ...current, autoAllowPermissions: autoAllow };
         notify();
       }
       const sendOnEnter = body.settings.sendOnEnter;

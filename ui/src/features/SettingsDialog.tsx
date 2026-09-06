@@ -16,7 +16,6 @@ import {
   getSettingsSnapshot,
   IDLE_SUSPEND_MAX_MINUTES,
   IDLE_SUSPEND_MIN_MINUTES,
-  setAutoAllowPermissions,
   setIdleSuspendMinutes,
   setSendOnEnter,
   subscribeToSettings
@@ -24,24 +23,8 @@ import {
 
 // Settings pane. A cog button in the sidebar footer (beside the theme
 // picker) opens a dialog that hosts app-wide preferences. The pane is
-// built as a list of rows.
-//
-// The first row is "auto-allow all permissions": when on, Mezame
-// answers every agent permission request with an allow option and no
-// inline approval card is rendered. The decision is enforced
-// server-side (the hub reads the persisted flag from state.json on
-// each `session/request_permission`). It applies to every attached
-// device and to unattended sessions alike. Off by default; the copy
-// spells out the risk because the toggle removes the human approval
-// step for all tool calls, including file writes and shell commands.
-
-/** Reactive read of the auto-allow preference from the settings store. */
-const useAutoAllowPermissions = (): boolean =>
-  useSyncExternalStore(
-    subscribeToSettings,
-    () => getSettingsSnapshot().autoAllowPermissions,
-    () => getSettingsSnapshot().autoAllowPermissions
-  );
+// built as a list of rows. Every preference here is saved to `state.json`
+// through PUT /state, so it follows the user across devices.
 
 /** Reactive read of the send-on-Enter preference from the settings store. */
 const useSendOnEnter = (): boolean =>
@@ -93,7 +76,6 @@ const Switch = ({
 );
 
 export const SettingsDialog = () => {
-  const autoAllow = useAutoAllowPermissions();
   const sendOnEnter = useSendOnEnter();
   const idleMinutes = useIdleSuspendMinutes();
 
@@ -120,20 +102,6 @@ export const SettingsDialog = () => {
           <DialogDescription>Preferences are saved across all your sessions and devices.</DialogDescription>
         </DialogHeader>
         <div className="flex flex-col gap-4 pt-1">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex flex-col gap-0.5">
-              <span className="text-sm text-foreground">Auto-allow all permissions</span>
-              <span className="text-xs text-muted-foreground">
-                Approve every tool request automatically, without a prompt. This includes file
-                edits and shell commands. Leave off unless you trust the agent in this workspace.
-              </span>
-            </div>
-            <Switch
-              checked={autoAllow}
-              onChange={setAutoAllowPermissions}
-              label="Auto-allow all permissions"
-            />
-          </div>
           <div className="flex items-start justify-between gap-4">
             <div className="flex flex-col gap-0.5">
               <span className="text-sm text-foreground">Send message shortcut</span>

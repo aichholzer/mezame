@@ -1,22 +1,12 @@
 import { FolderIcon } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { mezameActions } from '@/hooks/useMezame';
 import { cn } from '@/lib/utils';
 import type { Session } from '@/types';
 
-// Shows the session's working directory next to the mode/model pickers
-// and lets the user spawn a sibling session pointed at a different
-// path. The current session is never rebound: ACP has no
-// `session/set_cwd`. Changing cwd after `session/new` means starting a
-// new session, and we do that in a new tab. The existing log stays
-// intact.
-//
-// Double-click (or Enter on focus) swaps the chip for an inline input
-// preseeded with the current cwd. Commit spawns a new tab via
-// mezameActions.newSession(cwd). Escape cancels.
+// Shows the directory Mezame is running in, as the `ready` event reported
+// it. Display only: the server's own process directory is its one source,
+// and no client can choose another.
 
 type Props = {
   session: Session | null;
@@ -25,7 +15,7 @@ type Props = {
 const SERVER_DEFAULT = 'server default';
 
 // Middle-ellipsis for long paths. The parent and the leaf both stay
-// visible: `/Users/stefan/.../repos/mezame`.
+// visible: `/Users/YOURUSER/.../repos/mezame`.
 const truncateMiddle = (value: string, max: number) => {
   if (value.length <= max) {
     return value;
@@ -41,72 +31,13 @@ const triggerClass = cn(
 );
 
 export const CwdChip = ({ session }: Props) => {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (editing) {
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    }
-  }, [editing]);
-
   if (!session) {
     return null;
   }
 
-  // Prefer the server-reported cwd (actual path the agent session opened
-  // at). Fall back to the user-supplied override, and finally to empty
-  // while the session is still connecting.
-  const cwd = session.effectiveCwd ?? session.cwd ?? '';
+  // Empty until the first `ready` lands.
+  const cwd = session.effectiveCwd ?? '';
   const display = cwd.length > 0 ? truncateMiddle(cwd, 48) : SERVER_DEFAULT;
-
-  const startEdit = () => {
-    setDraft(cwd);
-    setEditing(true);
-  };
-
-  const cancel = () => {
-    setEditing(false);
-    setDraft('');
-  };
-
-  const commit = () => {
-    const next = draft.trim();
-    if (next.length === 0 || next === cwd) {
-      cancel();
-      return;
-    }
-    // Spawn a sibling tab. The store places new tabs leftmost and
-    // activates them automatically.
-    mezameActions.newSession(next);
-    cancel();
-  };
-  if (editing) {
-    return (
-      <Input
-        ref={inputRef}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            commit();
-          } else if (e.key === 'Escape') {
-            e.preventDefault();
-            cancel();
-          }
-        }}
-        onBlur={cancel}
-        placeholder="/absolute/path"
-        className="h-7 w-[22rem] max-w-[60vw] bg-card px-2 text-base md:text-[11px]"
-        spellCheck={false}
-        autoCapitalize="off"
-        autoCorrect="off"
-      />
-    );
-  }
 
   return (
     <Tooltip>
@@ -115,15 +46,8 @@ export const CwdChip = ({ session }: Props) => {
           type="button"
           variant="ghost"
           size="sm"
-          onDoubleClick={startEdit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              startEdit();
-            }
-          }}
           className={cn(triggerClass, 'max-w-[60vw]')}
-          aria-label="Working directory (double-click to open a new session elsewhere)"
+          aria-label="Working directory Mezame is running in"
         >
           <FolderIcon className="size-3 shrink-0 text-[color:var(--primary)]" />
           <span className="truncate">{display}</span>
@@ -132,7 +56,7 @@ export const CwdChip = ({ session }: Props) => {
       <TooltipContent side="top" className="max-w-[60ch]">
         <div className="font-mono text-[11px]">{cwd || SERVER_DEFAULT}</div>
         <div className="text-[10px] text-muted-foreground">
-          Double-click to open a new session in a different directory
+          The directory Mezame is running in
         </div>
       </TooltipContent>
     </Tooltip>

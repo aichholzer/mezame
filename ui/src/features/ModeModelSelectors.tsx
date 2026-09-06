@@ -99,26 +99,19 @@ export const ModeModelSelectors = ({ session, layout = 'row' }: Props) => {
   if (!session) {
     return null;
   }
-  // Hide the group entirely when the agent didn't advertise any modes
-  // or models. Non-Kiro agents often don't, and the empty "none"
-  // dropdowns add noise.
-  if (session.modes.length === 0 && session.models.length === 0) {
+  // Hide the group entirely when no model is on offer. An empty "none"
+  // dropdown is noise.
+  if (session.models.length === 0) {
     return null;
   }
   const busy = session.busy;
 
-  const modeOptions = session.modes.map((m) => ({
-    id: m.id,
-    label: m.name || m.id,
-    description: m.description
-  }));
   const modelOptions = session.models.map((m) => ({
     id: m.modelId,
     label: m.name || m.modelId,
     description: m.description
   }));
 
-  const currentMode = session.modes.find((m) => m.id === session.currentModeId);
   const currentModel = session.models.find((m) => m.modelId === session.currentModelId);
 
   const containerClass =
@@ -126,15 +119,6 @@ export const ModeModelSelectors = ({ session, layout = 'row' }: Props) => {
 
   return (
     <div className={containerClass}>
-      <Picker
-        label="Agent"
-        options={modeOptions}
-        currentId={session.currentModeId}
-        onPick={mezameActions.setMode}
-        disabled={busy}
-        emptyLabel="none"
-        triggerLabel={currentMode?.name || currentMode?.id || 'none'}
-      />
       <Picker
         label="Model"
         options={modelOptions}
