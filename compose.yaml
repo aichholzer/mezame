@@ -2,19 +2,18 @@
 #
 # First-run setup (interactive, one-off):
 #   docker compose run --rm setup
-#   # inside the container:
-#   kiro-cli login --use-device-flow     # or: export KIRO_API_KEY=ksk_...
-#   mezame init
-#   exit
+#
+# That runs `mezame init`, which asks one question: the address to bind.
+# Choose 0.0.0.0:9510. The default, 127.0.0.1:9510, binds loopback inside
+# the container, and the published port below would then answer nothing.
 #
 # Normal run:
 #   docker compose up
 #   # or detached:
 #   docker compose up -d
 #
-# The `setup` and `mezame` services share the same image and volumes, so
-# credentials and config written during setup persist into the running
-# service.
+# Both services share the same image and the same volume, so the config
+# written during setup is what the running service reads.
 
 services:
   mezame:
@@ -25,18 +24,10 @@ services:
     ports:
       - "9510:9510"
     volumes:
-      - kiro-state:/root/.local/share/kiro-cli
-      - kiro-sessions:/root/.kiro
       - mezame-config:/root/.mezame
-    environment:
-      # Optional. Alternative to `kiro-cli login --use-device-flow`.
-      # Uncomment and set, or put KIRO_API_KEY in a .env file next to
-      # this compose file.
-      # KIRO_API_KEY: ${KIRO_API_KEY:-}
-      KIRO_LOG_LEVEL: ${KIRO_LOG_LEVEL:-info}
     restart: unless-stopped
 
-  # One-shot service for first-run setup. Same image, same volumes, but
+  # One-shot service for first-run setup. Same image, same volume, but
   # interactive and without publishing the port. Invoked explicitly via
   # `docker compose run --rm setup`; never started by `docker compose up`
   # thanks to the `setup` profile.
@@ -44,15 +35,11 @@ services:
     build: .
     image: mezame:local
     profiles: ["setup"]
-    command: ["bash"]
+    command: ["mezame", "init"]
     stdin_open: true
     tty: true
     volumes:
-      - kiro-state:/root/.local/share/kiro-cli
-      - kiro-sessions:/root/.kiro
       - mezame-config:/root/.mezame
 
 volumes:
-  kiro-state:
-  kiro-sessions:
   mezame-config:

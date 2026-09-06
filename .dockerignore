@@ -1,0 +1,8 @@
+# The build context is sent to the daemon in full, and a working tree
+# carries a multi-gigabyte target/ directory. build.rs reads nothing under
+# the two ui/ paths below: it copies ui/ minus both into $OUT_DIR and runs
+# `npm ci` there.
+target/
+ui/node_modules/
+ui/dist/
+.git/
