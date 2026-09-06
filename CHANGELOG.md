@@ -13,6 +13,13 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.14.0-alpha.1] - 2026-09-06
+
+The first alpha of the harness line. Mezame stops being a client for a
+local agent process and becomes the agent harness itself. This alpha
+ships the transport with no provider behind it: every prompt is answered
+with an echo, on every attached browser at once.
+
 ## [0.13.4] - 2026-09-04
 
 ### Changed

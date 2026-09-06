@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/harness]
   pull_request:
-    branches: [main]
+    branches: [main, feature/harness]
   workflow_dispatch:
   # Called by publish.yml as the gate in front of a release. A called
   # workflow only receives the permissions its caller grants, and the
@@ -86,7 +86,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -130,7 +130,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
@@ -190,6 +190,13 @@ jobs:
         # passes, and a drop of five points or more fails. Lift it
         # whenever a coverage gain lands.
         run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --fail-under-lines 60
+
+      - name: Print the coverage summary
+        # The lcov step prints no percentage when the floor passes. This
+        # reads the profile data it wrote and prints the per-file table
+        # with its TOTAL line, so the job log carries the line figure
+        # the floor is set from.
+        run: cargo llvm-cov report
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
