@@ -1,74 +1,66 @@
 //! Multi-attach session hub.
 //!
-//! The hub owns a single ACP `Agent` and broadcasts its outbound
-//! messages to every WebSocket attached to the same session id. The
-//! 1:1 mapping of WebSocket to subprocess we used to have is gone:
-//! browsers attach and detach freely, the agent stays warm across
-//! reconnects (within a configurable grace window), and Kiro's
-//! per-session lockfile is held only while at least one browser is
-//! interested.
+//! A hub owns one [`Backend`] and broadcasts what
+//! it produces to every WebSocket attached to the same session id.
+//! Browsers attach and detach freely, the session stays warm across
+//! reconnects within a grace window, and a laptop and a phone on one
+//! session see the same conversation.
 //!
 //! Concurrency model:
 //!
 //! - Each hub runs a single owner task (`run_hub_loop`) that reads
-//!   `HubCommand`s from an mpsc inbox and forwards them to the agent
-//!   via the existing `Agent` API. That serialises browser-originated
-//!   commands. Two browsers cannot race a `session/prompt` against each
-//!   other through the same channel.
-//! - Outbound events from the agent fan out via a `tokio::sync::broadcast`
-//!   sender. Each WS handler subscribes once on attach and forwards to
-//!   its own sink. A lagged subscriber (slow client) is reported and the
-//!   rest keep moving.
-//! - `HubRegistry` is a `RwLock<HashMap>` keyed by ACP session id.
-//!   Lookups are read-locked, hub creation takes the write lock for
-//!   the duration of the lookup-or-insert.
+//!   `HubCommand`s from an mpsc inbox. That serialises browser-originated
+//!   commands: two browsers cannot race a prompt against each other
+//!   through the same channel.
+//! - A turn runs in its own spawned task, so the owner loop keeps
+//!   draining commands while the Backend works. That task streams the
+//!   turn's events and reports the outcome back to the loop; it never
+//!   touches the in-flight count and never sends a terminal frame. The
+//!   loop is the single writer of both, which is what keeps a second
+//!   turn's echo from landing between the first turn's release and its
+//!   `prompt_done`.
+//! - Outbound events fan out through a `tokio::sync::broadcast` sender.
+//!   Each WS handler subscribes once on attach and forwards to its own
+//!   sink. A lagged subscriber is skipped and the rest keep moving.
+//! - `HubRegistry` is a `RwLock<HashMap>` keyed by session id. Lookups
+//!   are read-locked; a build takes a per-id gate so two browsers
+//!   arriving together with one id cannot both build a hub.
 //!
 //! Lifecycle:
 //!
-//! 1. First browser attaches: registry creates the hub, hub spawns the
-//!    agent, runs the negotiate phase, then the owner loop begins.
-//! 2. Subsequent browsers attach: registry returns the existing hub,
-//!    the new subscriber starts receiving events. The hub's snapshot
-//!    of the negotiation outcome is replayed once into the new
-//!    subscriber so it sees the same `ready` and `session_info` the
-//!    first browser saw.
-//! 3. A browser detaches: subscriber count decrements. If it hits zero,
-//!    the hub arms a grace timer (default 30 seconds). A new
-//!    subscriber arriving inside the window cancels the timer.
-//! 4. Grace timer fires: the hub shuts the agent down cleanly and
-//!    removes itself from the registry.
+//! 1. First browser attaches: the registry builds the hub with its own
+//!    Backend and starts the owner loop.
+//! 2. Later browsers attach: the registry returns the existing hub and
+//!    replays its `ready` snapshot, and its `session_info` snapshot when
+//!    there is one, so every browser sees the same session.
+//! 3. A browser detaches: the subscriber count decrements. At zero the
+//!    hub arms a grace timer. A fresh subscriber inside the window
+//!    cancels it.
+//! 4. The grace timer fires with nothing attached and no turn running:
+//!    the hub shuts its Backend down and removes itself from the
+//!    registry. A turn still in flight holds teardown off, up to a cap.
 
-use std::collections::HashMap;
+use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use futures_util::FutureExt;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::time::Instant;
 
-use crate::agent::{spawn_agent, Agent};
-use crate::config::Config;
-use crate::ws::handle_agent_message;
+use crate::backend::{user_echo_event, Backend, EchoBackend, HistoryEntry, TurnOutcome};
 
-/// How long the agent stays warm after the last browser detaches.
-/// 30s matches the WS reconnect-backoff cap on the client. A browser
-/// coming back from a transient drop lands well inside this window.
+/// How long a session stays warm after the last browser detaches. 30s
+/// matches the WS reconnect-backoff cap on the client. A browser coming
+/// back from a transient drop lands well inside this window.
 const GRACE_PERIOD: Duration = Duration::from_secs(30);
-
-/// Ceiling on the ACP handshake for a freshly spawned agent.
-///
-/// `initialize` plus `session/new` or `session/load` normally settles in
-/// well under a second, and a `session/load` replaying a long history is
-/// the slow case. An agent that execs and then answers nothing would
-/// otherwise hold this future for the life of the process, along with its
-/// `Arc<Agent>` and an unreaped child process. 60s matches
-/// `ws::HEARTBEAT_TIMEOUT` and leaves generous headroom over the
-/// handshake. See issue #9.
-const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many grace periods a detached hub may hold a running turn before
 /// teardown proceeds anyway. 60 periods is 30 minutes against the
@@ -77,133 +69,126 @@ const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_INFLIGHT_HOLD_PERIODS: u32 = 60;
 
 /// Ceiling on a single detached-but-busy hold. A turn that never resolves
-/// would otherwise keep its hub, agent and MCP fleet alive for the life
-/// of the process, which is the leak the process-group and session
-/// sweeps exist to prevent.
+/// would otherwise keep its hub and its Backend alive for the life of the
+/// process.
 fn max_inflight_hold(grace_period: Duration) -> Duration {
     grace_period * MAX_INFLIGHT_HOLD_PERIODS
 }
 
-/// Decrements the in-flight turn count on drop.
+/// Holds the single turn slot; releases it on drop.
 ///
-/// The count has to fall even if the prompt task panics before it can
-/// clear the marker itself. A count stuck above zero makes the hub
-/// immortal: every grace fire re-arms for the capped window, and past the
-/// cap the agent is reclaimed mid-turn on a session that was never busy.
+/// The slot has to be released even if the turn task dies with the guard
+/// still inside it. A count stuck above zero makes the hub immortal:
+/// every grace fire re-arms for the capped window, and past the cap the
+/// session is reclaimed mid-turn although it was never busy.
 struct InflightGuard(Arc<AtomicUsize>);
 
 impl InflightGuard {
-    fn arm(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(counter))
+    /// Claim the single turn slot. `None` when a turn is already in
+    /// flight, which is what makes a second prompt mid-turn a no-op.
+    fn claim(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        counter
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(Arc::clone(counter)))
     }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.store(0, Ordering::SeqCst);
     }
 }
 
 /// Process-static attach id counter. Bumped on every successful
 /// `subscribe`. It wraps eventually, and attach lifetimes never overlap
-/// a u64 worth of attaches. Equality checks against the "current
-/// prompter" id stay sound.
+/// a u64 worth of attaches, so equality checks against a turn's prompter
+/// stay sound.
 static NEXT_ATTACH_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Capacity of the outbound broadcast channel. High enough that a
 /// subscriber falling 1024 events behind is a genuine problem and no
-/// longer a momentary backlog. Streamed agent output bursts at a few
-/// hundred events per turn at most.
+/// longer a momentary backlog. A streamed turn bursts at a few hundred
+/// events at most.
 const BROADCAST_CAPACITY: usize = 1024;
 
-/// Capacity of the per-hub command inbox. Each browser sends commands
-/// at user pace (a prompt every few seconds at most), and the loop
-/// drains them as fast as the agent accepts. 256 leaves headroom for
-/// rapid clicks without any visible backpressure.
+/// Capacity of the per-hub command inbox. Each browser sends commands at
+/// user pace, and the loop drains them as fast as the Backend accepts.
+/// 256 leaves headroom for rapid clicks with no visible backpressure.
 const COMMAND_CAPACITY: usize = 256;
 
-/// Browser → hub commands. The hub owner loop drains these and
-/// forwards to the agent. Only one of these can be in flight at a time
-/// per hub; the loop processes them sequentially.
-///
-/// Each variant mirrors a JSON message the browser sends today. The hub
-/// is a thin re-shape from JSON into a typed enum, and the loop body
-/// reads as direct calls into the agent. No second match on string
-/// method names.
+/// Browser to hub commands. The owner loop drains these and calls into
+/// the Backend. The loop processes them one at a time, so two browsers
+/// cannot interleave halfway through one command.
 #[derive(Debug)]
 pub enum HubCommand {
-    /// Send a prompt to the agent. `blocks` is the ACP-shaped block
-    /// list (text, image, resource, and the rest). The hub forwards as
-    /// `session/prompt`. `attach_id` identifies the originating attach.
-    /// The loop stamps permission and oauth requests with a `_target`
-    /// field, and the WS side filters them to the sender. Out-of-band
-    /// messages (events with no target) still broadcast to every browser.
+    /// Run a turn for `blocks`. `attach_id` identifies the attach that
+    /// sent it, and the loop stamps that id on a permission request
+    /// raised during the turn so peer browsers never see a card they
+    /// were not asked to answer.
     Prompt { blocks: Vec<Value>, attach_id: u64 },
-    /// Reply to a `session/request_permission` we previously broadcast.
-    /// `id` matches the JSON-RPC id the agent sent. First reply wins;
-    /// later replies for the same id are dropped silently.
+    /// Answer a permission request the hub broadcast earlier. `id` is
+    /// the one the Backend minted. First answer wins; later answers for
+    /// the same id are dropped in silence.
     PermissionResponse { id: Value, option_id: String },
-    /// Cancel the in-flight turn.
+    /// Cancel the turn in flight.
     Cancel,
-    /// Switch agent mode (`session/set_mode`).
-    SetMode { mode_id: String },
-    /// Switch model (`session/set_model`).
+    /// Change the selected model.
     SetModel { model_id: String },
 }
 
-/// Outcome of the hub's negotiation phase. Replayed into each new
-/// subscriber. Every browser sees the same `ready` and, when there is
-/// one, the same `session_info`, whenever it attached.
+/// What every attach is sent on arrival. Replayed so a browser joining
+/// late sees the same session as the one that opened it.
 #[derive(Clone)]
-struct NegotiationSnapshot {
-    /// The `ready` event in its final wire shape, ready to forward.
+struct SessionSnapshot {
+    /// The `ready` event in its final wire shape, bar the per-attach
+    /// `resumed` and `busy` fields and the `buildId` the WS handler
+    /// stamps.
     ready: Value,
-    /// The `session_info` event when modes/models were available.
-    /// Subscribers receive this immediately after `ready`.
+    /// The most recent `session_info` frame, when the Backend has
+    /// supplied one. Sent immediately after `ready`.
     session_info: Option<Value>,
 }
 
-/// Public handle to a session hub. The handle is cheap to clone; all
-/// state lives behind the senders. The owner task is held alive by
-/// these senders plus the registry's `Arc`.
+/// Public handle to a session hub. Cheap to clone; all state lives behind
+/// the senders. The owner task is held alive by these senders plus the
+/// registry's `Arc`.
 pub struct SessionHub {
     /// Pushes commands into the owner loop.
     commands: mpsc::Sender<HubCommand>,
-    /// Subscribers receive outbound events from this. New subscribers
-    /// start at the current head; events emitted before subscription
-    /// are not replayed.
+    /// Subscribers receive outbound events from this. A new subscriber
+    /// starts at the current head; earlier events are not replayed.
     outbound: broadcast::Sender<Arc<Value>>,
-    /// `ready` and `session_info` snapshots. Replayed on every attach.
-    /// Behind a `Mutex` because mode and model changes mutate the
-    /// `session_info` half. A late-attaching browser sees the selection
-    /// as it stands at attach time.
-    snapshot: Arc<Mutex<NegotiationSnapshot>>,
-    /// The ACP session id this hub owns. Cached so callers can read it
-    /// without going through the snapshot.
+    /// The `ready` and `session_info` snapshots, replayed on every
+    /// attach. Behind a `Mutex` because a successful model change
+    /// replaces the `session_info` half.
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    /// The session id this hub is registered under.
     session_id: String,
-    /// Subscriber count for grace-timer logic. The `Counter` aborts
-    /// the grace timer on attach and arms it on the last detach.
+    /// Subscriber count for the grace timer.
     counter: Arc<Counter>,
+    /// Turns currently in flight, 0 or 1. Read by `subscribe` for the
+    /// per-attach `ready.busy` field, and claimed by the loop's prompt
+    /// arm.
+    inflight: Arc<AtomicUsize>,
+    /// Read by [`HubRegistry::history`] for `GET /history`.
+    backend: Arc<dyn Backend>,
 }
 
-/// Tracks attach/detach events and arms the grace timer. Lives behind
-/// an `Arc` so both the registry and the per-attach RAII guard can
-/// access it.
+/// Tracks attach and detach events and arms the grace timer. Lives behind
+/// an `Arc` so both the registry and the per-attach guard reach it.
 struct Counter {
     state: Mutex<CounterState>,
-    /// Pings the owner loop when the count hits zero. The loop arms the
-    /// grace timer with the right deadline from there. It also observes
-    /// attach events (count > 0) by inspecting the next command pull, and
-    /// the cancel side needs no notification of its own.
+    /// Pings the owner loop when the count hits zero, so the loop arms
+    /// the grace timer with the right deadline.
     grace_tx: mpsc::Sender<GraceEvent>,
 }
 
 #[derive(Default)]
 struct CounterState {
     count: usize,
-    /// One-shot used to wake the grace-cancel sleeper. Some(_) only
-    /// while the count is zero and we are inside the grace window.
+    /// Wakes the grace sleeper. `Some` only while the count is zero and
+    /// the grace window is open.
     cancel_grace: Option<oneshot::Sender<()>>,
 }
 
@@ -211,8 +196,8 @@ struct CounterState {
 enum GraceEvent {
     /// Subscriber count fell to zero; arm the grace timer.
     Empty,
-    /// Subscriber count climbed back above zero during the grace
-    /// window; cancel any pending shutdown.
+    /// Subscriber count climbed back above zero during the grace window;
+    /// cancel any pending teardown.
     Refilled,
 }
 
@@ -225,18 +210,15 @@ impl Counter {
     }
 
     /// Call when a new subscriber attaches. Returns the post-attach
-    /// count so callers can include it in the diagnostic event.
+    /// count.
     async fn increment(&self) -> usize {
         let mut state = self.state.lock().await;
         let was_zero = state.count == 0;
         state.count += 1;
         if was_zero {
-            // Cancel any pending grace shutdown.
             if let Some(tx) = state.cancel_grace.take() {
                 let _ = tx.send(());
             }
-            // Notify the owner loop so it can drop any in-flight
-            // grace state on its side too.
             let _ = self.grace_tx.send(GraceEvent::Refilled).await;
         }
         state.count
@@ -254,9 +236,9 @@ impl Counter {
         state.count
     }
 
-    /// Used by the grace timer to install its cancel handle. The
-    /// returned receiver completes when a fresh subscriber arrives,
-    /// at which point the timer should abandon the shutdown.
+    /// Install the grace timer's cancel handle. The returned receiver
+    /// completes when a fresh subscriber arrives, at which point the
+    /// timer abandons the teardown.
     async fn install_cancel(&self) -> oneshot::Receiver<()> {
         let (tx, rx) = oneshot::channel();
         let mut state = self.state.lock().await;
@@ -264,36 +246,47 @@ impl Counter {
         rx
     }
 
-    /// Returns the current subscriber count without mutating state.
+    /// The current subscriber count, without mutating anything.
     async fn count(&self) -> usize {
         self.state.lock().await.count
     }
 }
 
-/// Subscriber-side handle on an attached hub. Drop-on-detach: the
-/// `Drop` impl decrements the counter so the grace timer arms when
-/// the last attach goes away.
-///
-/// Public surface is just the broadcast receiver and the command
-/// sender; the WS handler reads outbound events via the receiver and
-/// pushes browser commands via the sender.
+/// Subscriber-side handle on an attached hub. Drop-on-detach: the `Drop`
+/// impl decrements the counter, so the grace timer arms when the last
+/// attach goes away.
 pub struct AttachedHub {
     pub commands: mpsc::Sender<HubCommand>,
     pub outbound: broadcast::Receiver<Arc<Value>>,
     pub snapshot_ready: Value,
     pub snapshot_session_info: Option<Value>,
     pub session_id: String,
-    /// Process-unique id for this attach. Used by the WS handler
-    /// to filter targeted broadcasts (permission and oauth
-    /// requests) so peers do not see prompts that were not theirs.
+    /// Process-unique id for this attach. The WS handler filters
+    /// targeted broadcasts on it, so a peer never renders a permission
+    /// card it was not asked to answer.
     pub attach_id: u64,
     counter: Arc<Counter>,
 }
 
+impl AttachedHub {
+    /// The receiver `subscribe` took, with everything it has buffered.
+    ///
+    /// Leaves a fresh, never-read receiver behind so `Drop` still has a
+    /// field to drop. The attach loop has to read *this* receiver:
+    /// `resubscribe` would start at the channel's tail and drop whatever
+    /// arrived between the subscribe and the hand-off, which is the
+    /// window a `prompt_done` lands in for an attach that read `busy` as
+    /// true.
+    pub fn take_outbound(&mut self) -> broadcast::Receiver<Arc<Value>> {
+        let fresh = self.outbound.resubscribe();
+        std::mem::replace(&mut self.outbound, fresh)
+    }
+}
+
 impl Drop for AttachedHub {
     fn drop(&mut self) {
-        // Spawn the decrement so we do not block the WS handler's
-        // shutdown. The counter is `Arc<...>` so the spawn keeps it
+        // Spawn the decrement so this does not block the WS handler's
+        // shutdown. The counter is behind an `Arc`, so the spawn keeps it
         // alive long enough.
         let counter = self.counter.clone();
         tokio::spawn(async move {
@@ -302,20 +295,16 @@ impl Drop for AttachedHub {
     }
 }
 
-/// Registry of live hubs keyed by ACP session id. Cheap to clone;
-/// `Arc<RwLock>` lets the WS handler do lookups without coordinating
-/// with the owner loop.
+/// Registry of live hubs keyed by session id. Cheap to clone;
+/// `Arc<RwLock>` lets the WS handler look hubs up without coordinating
+/// with any owner loop.
 ///
-/// `building` serialises slow-path attaches by session id so two
-/// browsers reconnecting at the same time with the same
-/// `?session=<id>` cannot both spawn an agent and race
-/// `session/load` against the same Kiro lockfile (the second loses
-/// with `Session is active in another process` and falls back to a
-/// fresh session, which clobbers the history view). Holding a
-/// per-key mutex across the build window means the second arrival
-/// finds the hub already in the registry on its re-check and takes
-/// the fast path. Fresh attaches (no resume id) don't go through
-/// this gate; they're independent by definition.
+/// `building` serialises hub construction by session id. Two browsers
+/// reconnecting at the same moment with the same id must not both build
+/// a hub: the second would replace the first in the registry, and the
+/// two halves of one conversation would run against two Backends.
+/// Holding a per-key mutex across the build window means the second
+/// arrival finds the hub on its re-check and subscribes to it instead.
 #[derive(Clone, Default)]
 pub struct HubRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<SessionHub>>>>,
@@ -327,89 +316,54 @@ impl HubRegistry {
         Self::default()
     }
 
-    /// Attach to an existing hub for `session_id`, or create one if
-    /// none is registered yet. Always returns an `AttachedHub` whose
-    /// `Drop` will decrement the counter.
-    ///
-    /// `resume_session_id` and `cwd_override` are used only when a
-    /// new hub is created; they are ignored when reusing an existing
-    /// hub (the existing hub's session is already negotiated).
-    pub async fn attach_or_create(
-        &self,
-        cfg: Arc<Config>,
-        resume_session_id: Option<String>,
-        cwd_override: Option<String>,
-        build_id: &str,
-    ) -> Result<AttachedHub> {
-        // Fast path: if the resume id matches an existing hub, attach
-        // directly without spawning a fresh agent. We can only do
-        // this when the browser supplied an explicit `?session=<id>`,
-        // because a fresh-session attach has no key to look up by.
-        if let Some(sid) = resume_session_id.as_deref() {
-            let map = self.inner.read().await;
-            if let Some(hub) = map.get(sid).cloned() {
-                drop(map);
-                return Ok(self.subscribe(hub).await);
-            }
+    /// Attach to the hub registered under `session_id`, building one if
+    /// none is. Always returns an `AttachedHub` whose `Drop` decrements
+    /// the counter.
+    pub async fn attach_or_create(&self, session_id: &str) -> Result<AttachedHub> {
+        // Fast path: a hub is already registered under this id.
+        if let Some(hub) = self.lookup(session_id).await {
+            return Ok(self.subscribe(hub).await);
         }
 
-        // Slow path with a per-session-id lock. Two browsers arriving
-        // at the same time with the same `?session=<id>` (typical at
-        // server startup) must not both call `build_hub`. Only one
-        // agent can hold Kiro's session lockfile, and the second would
-        // fail with "Session is active in another process".
-        // We acquire (or create) a per-key mutex, hold it across the
-        // build, and re-check the registry once we have the key
-        // mutex. The first arrival builds; the second finds the hub
-        // already there and falls into the fast path.
-        //
-        // Fresh attaches (no resume id) skip this gate entirely:
-        // they spawn independent sessions and there is nothing to
-        // serialise.
-        if let Some(sid) = resume_session_id.as_deref() {
+        // Slow path, behind the per-id gate. The gate and the local
+        // handle on it are both released before the cleanup below, so
+        // the cleanup can recognise itself as the last holder and the
+        // map stays bounded by the number of concurrent builds rather
+        // than by the number of session ids this process has seen.
+        let result = {
             let key_mutex = {
                 let mut building = self.building.lock().await;
                 building
-                    .entry(sid.to_string())
+                    .entry(session_id.to_string())
                     .or_insert_with(|| Arc::new(Mutex::new(())))
                     .clone()
             };
             let _guard = key_mutex.lock().await;
 
-            // Re-check now that we hold the key mutex; the first
-            // arrival registered the hub before releasing.
-            {
-                let map = self.inner.read().await;
-                if let Some(hub) = map.get(sid).cloned() {
-                    drop(map);
-                    let attached = self.subscribe(hub).await;
-                    self.cleanup_build_slot(sid).await;
-                    return Ok(attached);
-                }
+            // Re-check now that the gate is held: the first arrival
+            // registered its hub before releasing.
+            match self.lookup(session_id).await {
+                Some(hub) => Ok(self.subscribe(hub).await),
+                None => self.build_and_register(session_id).await,
             }
-
-            let result = self
-                .build_and_register(cfg, Some(sid.to_string()), cwd_override, build_id)
-                .await;
-            self.cleanup_build_slot(sid).await;
-            return result;
-        }
-
-        // Fresh-session attach: no key to coordinate on, just build.
-        self.build_and_register(cfg, None, cwd_override, build_id)
-            .await
+        };
+        self.cleanup_build_slot(session_id).await;
+        result
     }
 
-    /// Drop the per-key mutex from `building` once nobody else is
-    /// waiting on it. Cheap garbage collection that keeps the map
-    /// bounded. Without it the map leaks one mutex per session id ever
-    /// attached.
+    /// The hub registered under `session_id`, if there is one.
+    async fn lookup(&self, session_id: &str) -> Option<Arc<SessionHub>> {
+        self.inner.read().await.get(session_id).cloned()
+    }
+
+    /// Drop the per-key mutex once nobody else holds it. Without this the
+    /// map grows by one entry per session id the process has seen.
     async fn cleanup_build_slot(&self, sid: &str) {
         let mut building = self.building.lock().await;
         if let Some(entry) = building.get(sid) {
-            // strong_count == 1 means we are the last holder and the
-            // removal is safe. Anything above 1 means another waiter
-            // has cloned the Arc, and cleanup falls to whoever
+            // A strong count of 1 means the map holds the only handle
+            // and the removal is safe. Anything above 1 means another
+            // arrival has cloned it, and the cleanup falls to whoever
             // finishes last.
             if Arc::strong_count(entry) == 1 {
                 building.remove(sid);
@@ -417,50 +371,50 @@ impl HubRegistry {
         }
     }
 
-    /// Spawn the agent, run negotiation, register the hub, return
-    /// the first subscriber. Used by both the resume slow path (with
-    /// the key mutex held) and the fresh-attach path.
-    async fn build_and_register(
-        &self,
-        cfg: Arc<Config>,
-        resume_session_id: Option<String>,
-        cwd_override: Option<String>,
-        build_id: &str,
-    ) -> Result<AttachedHub> {
-        let hub = build_hub(cfg, resume_session_id, cwd_override, build_id, self.clone()).await?;
-        let session_id = hub.session_id.clone();
+    /// Build the hub, register it, and return its first subscriber.
+    /// Called with the per-id gate held.
+    async fn build_and_register(&self, session_id: &str) -> Result<AttachedHub> {
+        let hub = build_hub(session_id, self.clone()).await?;
         let mut map = self.inner.write().await;
-        let entry = map.entry(session_id).or_insert_with(|| Arc::new(hub));
+        // The gate above is what makes the occupied case unreachable
+        // here; `or_insert_with` keeps the insert atomic against
+        // `register_for_test` all the same.
+        let entry = map
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(hub));
         let hub = entry.clone();
         drop(map);
         Ok(self.subscribe(hub).await)
     }
 
-    /// Subscribe a fresh `AttachedHub` to an existing hub. Internal
-    /// helper used by both the fast and slow attach paths.
+    /// Subscribe a fresh `AttachedHub` to an existing hub.
     ///
-    /// The snapshot's `ready.resumed` field is rewritten to `true` for
-    /// every attach. With the hub model, an attach is always a join
-    /// to an existing conversation: even the very first browser to
-    /// reach a hub is, in effect, "resuming" the agent's perspective
-    /// that already exists from the negotiation handshake. The
-    /// client uses `resumed: true` to mean "clear any stale local
-    /// log and fetch /history to seed yourself", which is what we
-    /// want on every attach including reloads. The original
-    /// `session/new`-vs-`session/load` distinction matters to the
-    /// hub's negotiation phase, not to the attached browser.
+    /// The order matters. The broadcast receiver is taken before the
+    /// in-flight count is read, so a `busy` of `true` means the count was
+    /// above zero at a moment later than the subscribe. The loop
+    /// decrements before it broadcasts `prompt_done`, so that
+    /// `prompt_done` lands inside this receiver's window and the
+    /// composer this attach locked is unlocked again.
+    ///
+    /// `ready.resumed` is `true` on every attach. Under the hub model an
+    /// attach is always a join to a conversation that already exists,
+    /// and the client reads `resumed` as "clear any stale local log and
+    /// seed yourself from the history endpoint".
     async fn subscribe(&self, hub: Arc<SessionHub>) -> AttachedHub {
         hub.counter.increment().await;
+        let outbound = hub.outbound.subscribe();
+        let busy = hub.inflight.load(Ordering::SeqCst) > 0;
         let snapshot = hub.snapshot.lock().await;
         let mut snapshot_ready = snapshot.ready.clone();
         if let Some(map) = snapshot_ready.as_object_mut() {
             map.insert("resumed".into(), Value::Bool(true));
+            map.insert("busy".into(), Value::Bool(busy));
         }
         let snapshot_session_info = snapshot.session_info.clone();
         drop(snapshot);
         AttachedHub {
             commands: hub.commands.clone(),
-            outbound: hub.outbound.subscribe(),
+            outbound,
             snapshot_ready,
             snapshot_session_info,
             session_id: hub.session_id.clone(),
@@ -469,56 +423,60 @@ impl HubRegistry {
         }
     }
 
-    /// Remove a hub by session id. Called by the owner loop when the
-    /// grace window expires.
+    /// The transcript of the Backend behind `session_id`, or `None` when
+    /// no hub is registered under it. Creates nothing.
+    ///
+    /// The `Arc` on the Backend is cloned under the read lock and the
+    /// lock is released before the transcript is awaited. Holding it
+    /// across that await would let a slow Backend block every attach.
+    pub async fn history(&self, session_id: &str) -> Option<Vec<HistoryEntry>> {
+        let backend = {
+            let map = self.inner.read().await;
+            map.get(session_id).map(|hub| Arc::clone(&hub.backend))
+        }?;
+        Some(backend.history().await)
+    }
+
+    /// Remove a hub by session id. Called by the owner loop on exit.
     async fn remove(&self, session_id: &str) {
         let mut map = self.inner.write().await;
         map.remove(session_id);
     }
 
-    /// Test-only: report whether a hub is currently registered for
-    /// `session_id`, without attaching (attaching would increment the
-    /// subscriber count and disarm the grace timer). Lets tests observe
-    /// grace teardown.
+    /// Test-only: report whether a hub is registered for `session_id`
+    /// without attaching. Attaching would increment the subscriber count
+    /// and disarm the grace timer, so this is how a test observes
+    /// teardown.
     #[doc(hidden)]
     pub async fn is_registered_for_test(&self, session_id: &str) -> bool {
         self.inner.read().await.contains_key(session_id)
     }
 
-    /// Test-only: register a pre-built hub directly. Bypasses the
-    /// agent-spawn and ACP-negotiation phases so tests can exercise
-    /// the broadcast / counter / grace-timer flow with an agent
-    /// constructed via `Agent::from_io`.
+    /// Test-only: register a hub around a caller-supplied Backend, with
+    /// a caller-supplied `ready` and `session_info`. Bypasses
+    /// `build_hub` so a test drives the broadcast, the counter and the
+    /// grace timer against a scripted Backend.
     #[doc(hidden)]
     pub async fn register_for_test(
         &self,
-        agent: Arc<Agent>,
+        backend: Arc<dyn Backend>,
         session_id: String,
-        updates_rx: mpsc::UnboundedReceiver<Value>,
         ready: Value,
         session_info: Option<Value>,
     ) -> AttachedHub {
-        self.register_for_test_with_grace(
-            GRACE_PERIOD,
-            agent,
-            session_id,
-            updates_rx,
-            ready,
-            session_info,
-        )
-        .await
+        self.register_for_test_with_grace(GRACE_PERIOD, backend, session_id, ready, session_info)
+            .await
     }
 
     /// Test-only variant of `register_for_test` with an explicit grace
-    /// period. A test drives the grace timer with a short value and never
-    /// waits out the production `GRACE_PERIOD`.
+    /// period, so a test drives the timer with a short value instead of
+    /// waiting out the production one.
     #[doc(hidden)]
     pub async fn register_for_test_with_grace(
         &self,
         grace_period: Duration,
-        agent: Arc<Agent>,
+        backend: Arc<dyn Backend>,
         session_id: String,
-        updates_rx: mpsc::UnboundedReceiver<Value>,
         ready: Value,
         session_info: Option<Value>,
     ) -> AttachedHub {
@@ -526,8 +484,8 @@ impl HubRegistry {
         let (out_tx, _) = broadcast::channel::<Arc<Value>>(BROADCAST_CAPACITY);
         let (grace_tx, grace_rx) = mpsc::channel::<GraceEvent>(8);
         let counter = Arc::new(Counter::new(grace_tx));
-        let suppress_replay = Arc::new(Mutex::new(false));
-        let snapshot = Arc::new(Mutex::new(NegotiationSnapshot {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let snapshot = Arc::new(Mutex::new(SessionSnapshot {
             ready,
             session_info,
         }));
@@ -538,20 +496,21 @@ impl HubRegistry {
             snapshot: snapshot.clone(),
             session_id: session_id.clone(),
             counter: counter.clone(),
+            inflight: inflight.clone(),
+            backend: Arc::clone(&backend),
         };
 
         tokio::spawn(run_hub_loop(HubLoopState {
-            agent,
+            backend,
             session_id: session_id.clone(),
             outbound: out_tx,
             commands: cmd_rx,
-            updates: updates_rx,
-            suppress_replay,
             counter,
             grace_rx,
             registry: self.clone(),
             snapshot,
             grace_period,
+            inflight,
         }));
 
         let mut map = self.inner.write().await;
@@ -561,324 +520,174 @@ impl HubRegistry {
         self.subscribe(hub).await
     }
 
-    /// Attach a fresh subscriber to an already-registered hub. Used
-    /// by tests that want to assert multiple subscribers see the same
-    /// broadcast events; production code goes through `attach_or_create`.
+    /// Test-only: attach a fresh subscriber to an already-registered
+    /// hub. Production code goes through `attach_or_create`.
     #[doc(hidden)]
     pub async fn attach_existing_for_test(&self, session_id: &str) -> Option<AttachedHub> {
-        let map = self.inner.read().await;
-        let hub = map.get(session_id).cloned()?;
-        drop(map);
+        let hub = self.lookup(session_id).await?;
         Some(self.subscribe(hub).await)
     }
 }
 
-/// Spawn the agent, run negotiation, build the SessionHub and start
-/// the owner loop. Returns the hub ready for registry insertion.
-async fn build_hub(
-    cfg: Arc<Config>,
-    resume_session_id: Option<String>,
-    cwd_override: Option<String>,
-    build_id: &str,
-    registry: HubRegistry,
-) -> Result<SessionHub> {
-    let (agent, updates_rx) = spawn_agent(&cfg).await?;
-    let agent = Arc::new(agent);
-
-    // Run the negotiation phase and collect the outbound events into a
-    // local buffer. No WS sink is involved. The buffer becomes the
-    // snapshot subscribers replay on attach.
-    let (snapshot_tx, mut snapshot_rx) = mpsc::unbounded_channel::<axum::extract::ws::Message>();
-    let negotiation = tokio::time::timeout(
-        NEGOTIATION_TIMEOUT,
-        crate::ws::negotiate_session(
-            &agent,
-            &snapshot_tx,
-            resume_session_id,
-            cwd_override,
-            build_id,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!("Agent did not finish negotiation within {NEGOTIATION_TIMEOUT:?}")
-    });
-    // Both failure shapes land here, and either way `agent` drops on the
-    // way out: the child is killed and collected.
-    let _outcome = negotiation??;
-    drop(snapshot_tx);
-
-    // The negotiate helper writes WS-shaped `Message::Text` frames, and
-    // each is unwrapped to a JSON value here. The wire shape is stable
-    // and the helper is internal. A panic here would mean the helper
-    // changed contract behind our back.
-    let mut ready: Option<Value> = None;
-    let mut session_info: Option<Value> = None;
-    while let Some(msg) = snapshot_rx.recv().await {
-        let axum::extract::ws::Message::Text(text) = msg else {
-            continue;
-        };
-        let value: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        match value.get("type").and_then(Value::as_str) {
-            Some("ready") => ready = Some(value),
-            Some("session_info") => session_info = Some(value),
-            // The negotiate helper also emits a `sys` append on
-            // resume failure. Every attached subscriber should see
-            // that, re-emitted through the broadcast once the loop is
-            // up, stored alongside the session_info as a third
-            // snapshot slot.
-            //
-            // Implementation note: this collapses to the snapshot
-            // already published. The resume-failure notice is rare,
-            // the first browser receives it via the ready emission,
-            // and a late-arriving second browser has no use for it.
-            _ => {}
+/// Build the hub for `session_id` with its own Backend and start the
+/// owner loop. Returns the hub ready for registry insertion.
+///
+/// Fallible for one call: the working directory the `ready` template
+/// reports. The OS answers with an absolute path, and a browser cannot
+/// choose another one.
+async fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
+    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+    let ready = json!({
+        "type": "ready",
+        "sessionId": session_id,
+        "resumed": true,
+        "cwd": cwd,
+        "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true
         }
-    }
-    let ready = ready.ok_or_else(|| anyhow::anyhow!("Negotiation produced no `ready` event"))?;
-    let session_id = ready
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("`ready` missing sessionId"))?
-        .to_string();
-    let suppress_replay = Arc::new(Mutex::new(
-        ready
-            .get("resumed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    ));
+    });
 
-    // Channels.
+    // One Backend per hub. This is the line a later phase changes.
+    let backend: Arc<dyn Backend> = Arc::new(EchoBackend::new());
+
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(COMMAND_CAPACITY);
     let (out_tx, _) = broadcast::channel::<Arc<Value>>(BROADCAST_CAPACITY);
     let (grace_tx, grace_rx) = mpsc::channel::<GraceEvent>(8);
     let counter = Arc::new(Counter::new(grace_tx));
-
-    let snapshot = Arc::new(Mutex::new(NegotiationSnapshot {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let snapshot = Arc::new(Mutex::new(SessionSnapshot {
         ready,
-        session_info,
+        session_info: None,
     }));
 
-    // Use the ACP session id from negotiation for naming, but the
-    // hub itself only cares about its own slot in the registry. The
-    // registry keys by this id.
     let hub = SessionHub {
         commands: cmd_tx,
         outbound: out_tx.clone(),
         snapshot: snapshot.clone(),
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         counter: counter.clone(),
+        inflight: inflight.clone(),
+        backend: Arc::clone(&backend),
     };
 
-    // Spawn the owner loop.
     tokio::spawn(run_hub_loop(HubLoopState {
-        agent,
-        session_id,
+        backend,
+        session_id: session_id.to_string(),
         outbound: out_tx,
         commands: cmd_rx,
-        updates: updates_rx,
-        suppress_replay,
         counter,
         grace_rx,
         registry,
         snapshot,
         grace_period: GRACE_PERIOD,
+        inflight,
     }));
 
     Ok(hub)
 }
 
-/// Captured state the owner loop reads. Bundled into one struct so
-/// the spawn site reads cleanly without a 7-arg call.
+/// What a finished turn hands back to the loop.
+struct TurnDone {
+    /// The turn's own result, wrapped in the panic outcome
+    /// `catch_unwind` produces.
+    result: std::result::Result<Result<TurnOutcome>, Box<dyn Any + Send>>,
+    /// Still claimed. The loop drops it, then sends the terminal frames.
+    guard: InflightGuard,
+}
+
+/// Captured state the owner loop reads. Bundled into one struct so the
+/// spawn site reads cleanly.
 struct HubLoopState {
-    agent: Arc<Agent>,
+    backend: Arc<dyn Backend>,
     session_id: String,
     outbound: broadcast::Sender<Arc<Value>>,
     commands: mpsc::Receiver<HubCommand>,
-    updates: mpsc::UnboundedReceiver<Value>,
-    suppress_replay: Arc<Mutex<bool>>,
     counter: Arc<Counter>,
     grace_rx: mpsc::Receiver<GraceEvent>,
     registry: HubRegistry,
-    /// Shared with `SessionHub::snapshot`. The loop mutates the
-    /// `session_info` half on a successful set_mode or set_model, and
-    /// every later attach replays the current selection.
-    snapshot: Arc<Mutex<NegotiationSnapshot>>,
-    /// How long the agent stays warm after the last browser detaches.
-    /// Defaults to `GRACE_PERIOD`. Holding it on the loop state lets a
-    /// test drive the timer deterministically with a short period.
+    /// Shared with `SessionHub::snapshot`. The loop replaces the
+    /// `session_info` half on a successful model change, and every later
+    /// attach replays the current selection.
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    /// How long the session stays warm after the last browser detaches.
+    /// Held on the loop state so a test drives the timer with a short
+    /// period.
     grace_period: Duration,
+    /// Shared with `SessionHub::inflight`, so `subscribe` reads the same
+    /// count the loop claims.
+    inflight: Arc<AtomicUsize>,
 }
 
-/// Owner loop: serialises browser commands and broadcasts agent
-/// outbound events. Runs until the agent's update channel closes
-/// (subprocess exited) or the grace timer fires with no subscribers.
+/// Owner loop: serialises browser commands, sends the frames that end a
+/// turn, and tears the hub down when nothing needs it.
 async fn run_hub_loop(state: HubLoopState) {
     let HubLoopState {
-        agent,
+        backend,
         session_id,
         outbound,
         mut commands,
-        mut updates,
-        suppress_replay,
         counter,
         mut grace_rx,
         registry,
         snapshot,
         grace_period,
+        inflight,
     } = state;
 
-    // Adapter: `handle_agent_message` writes WS-shaped Text frames
-    // into an mpsc. A side-channel mpsc runs here, parses each frame
-    // back into JSON, and broadcasts to subscribers. Two extra serde
-    // calls per message, cheap at the typical event volume.
-    let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<axum::extract::ws::Message>();
+    // Permission ids already forwarded to the Backend. A duplicate
+    // answer from a second browser is dropped in silence: the second
+    // browser's card stays as it is until the Backend's own update
+    // resolves it.
+    let mut answered_permissions: HashSet<String> = HashSet::new();
 
-    // Track pending permission ids, and duplicate replies from a second
-    // browser drop silently. This is the stage-1 simplification of the
-    // original design. No targeted error goes back: the second browser's
-    // card stays in its current state until the agent's eventual
-    // `tool_call_update` resolves it.
-    let mut answered_permissions: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-
-    // Most-recent prompter's attach id. Set by the `Prompt` arm in
-    // `handle_command`; cleared when the spawned `session/prompt`
-    // task resolves (success or error). Stamps permission and oauth
-    // request broadcasts with a `_target` field. Peer browsers then
-    // never see a permission card they were not asked to answer.
-    let current_prompter: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-
-    // Number of turns currently in flight (spawned `session/prompt`
-    // tasks that have not yet resolved). The grace timer must not tear
-    // the agent down while this is non-zero: doing so sends
-    // `session/cancel` and aborts the user's turn (the "lose focus on
-    // mobile mid-turn -> Response was interrupted by the user" bug). A
-    // detached-but-busy session stays warm until its turn completes.
-    let inflight: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    // Turn outcomes come back here. The sender is cloned into every turn
+    // task and the loop holds this one, so the receiver never closes
+    // while the loop runs.
+    let (turn_done_tx, mut turn_done_rx) = mpsc::unbounded_channel::<TurnDone>();
 
     // When the current detached-but-busy hold began. `None` whenever a
-    // browser is attached or no turn is running. The grace branch reads
-    // it to cap how long a single hold may last.
+    // browser is attached or no turn is running.
     let mut inflight_hold_since: Option<Instant> = None;
 
     let mut grace_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
 
     loop {
         tokio::select! {
-            // Browser → agent.
+            // Browser to Backend.
             cmd = commands.recv() => {
                 match cmd {
                     Some(c) => handle_command(
-                        &agent,
+                        &backend,
                         &session_id,
                         c,
-                        &suppress_replay,
                         &mut answered_permissions,
                         &outbound,
                         &snapshot,
-                        &current_prompter,
                         &inflight,
+                        &turn_done_tx,
                     ).await,
-                    None => break, // all senders dropped: nobody can reach us
+                    None => break, // every sender dropped: nobody can reach us
                 }
             }
-            // Agent → browser. Tee through `handle_agent_message` first.
-            agent_msg = updates.recv() => {
-                let Some(msg) = agent_msg else {
-                    break; // agent stdout reader exited
-                };
-                // Auto-allow: when the user has enabled "auto-allow all
-                // permissions" in Settings (persisted in state.json),
-                // Mezame answers `session/request_permission` itself with
-                // an allow option and forwards no card to the browser. The
-                // flag is read on demand (see
-                // `read_auto_allow_permissions`). That read runs only for
-                // permission requests, which are rare and human-paced, and
-                // the per-message fast path below is untouched. The
-                // separate `tool_call` / `tool_call_update` notifications
-                // still stream. The user sees the tool run and its result
-                // with no prompt in between.
-                if msg.get("method").and_then(Value::as_str)
-                    == Some("session/request_permission")
-                    && crate::config::read_auto_allow_permissions().await
-                {
-                    if let (Some(id), Some(option_id)) =
-                        (msg.get("id").cloned(), pick_allow_option(&msg))
-                    {
-                        let agent = Arc::clone(&agent);
-                        tokio::spawn(async move {
-                            let _ = agent
-                                .respond(
-                                    id,
-                                    json!({
-                                        "outcome": {
-                                            "outcome": "selected",
-                                            "optionId": option_id
-                                        }
-                                    }),
-                                )
-                                .await;
-                        });
-                        continue; // card suppressed; never reaches a browser
-                    }
-                    // No option could be positively identified as an
-                    // allow: fall through and prompt the human as normal.
-                    // We never auto-select a reject on the user's behalf.
+            // A turn finished. This arm is synchronous from its first
+            // line to its last: the slot is released and `prompt_done`
+            // goes out with no await between them, so no second turn's
+            // echo can land in the gap and unlock a composer early.
+            Some(TurnDone { result, guard }) = turn_done_rx.recv() => {
+                drop(guard);
+                match result {
+                    Ok(Ok(_outcome)) => {}
+                    Ok(Err(e)) => broadcast_error(&outbound, format!("{e}")),
+                    Err(panic) => broadcast_error(
+                        &outbound,
+                        format!("The turn panicked: {}", panic_message(panic)),
+                    ),
                 }
-                let suppress = *suppress_replay.lock().await;
-                handle_agent_message(&relay_tx, msg, suppress).await;
-                while let Ok(frame) = relay_rx.try_recv() {
-                    if let axum::extract::ws::Message::Text(text) = frame {
-                        if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
-                            let event_type = value
-                                .get("type")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            // Stamp targeted broadcasts. The WS
-                            // handler drops them on peer browsers.
-                            // Permission and oauth requests are
-                            // user-input prompts; only the browser
-                            // that started the turn should see them.
-                            // Plain text, tool and thought events
-                            // stay untargeted and broadcast to
-                            // everyone.
-                            let target = *current_prompter.lock().await;
-                            if let Some(target) = target {
-                                if matches!(
-                                    event_type.as_str(),
-                                    "permission_request" | "mcp_oauth_request"
-                                ) {
-                                    if let Some(map) = value.as_object_mut() {
-                                        map.insert(
-                                            "_target".into(),
-                                            Value::Number(target.into()),
-                                        );
-                                    }
-                                }
-                            }
-                            // End of a turn clears the prompter. An
-                            // out-of-turn permission request (rare,
-                            // a background MCP refresh for
-                            // instance) is then never
-                            // mis-attributed to the previous sender.
-                            if event_type == "prompt_done" {
-                                *current_prompter.lock().await = None;
-                            }
-                            // A broadcast error only means no
-                            // subscribers are listening yet. The
-                            // ready/session_info snapshot covers
-                            // whoever arrives next.
-                            let _ = outbound.send(Arc::new(value));
-                        }
-                    }
-                }
+                let _ = outbound.send(Arc::new(json!({ "type": "prompt_done" })));
             }
-            // Subscriber attach/detach signals.
+            // Subscriber attach and detach signals.
             grace_evt = grace_rx.recv() => {
                 match grace_evt {
                     Some(GraceEvent::Empty) => {
@@ -896,10 +705,10 @@ async fn run_hub_loop(state: HubLoopState) {
                         // cap afresh.
                         inflight_hold_since = None;
                     }
-                    None => {} // counter dropped its sender; should not happen while we hold a strong ref
+                    None => {} // the counter dropped its sender, which cannot happen while we hold a strong ref
                 }
             }
-            // Grace timer fired with nobody attached → tear down.
+            // The grace timer fired with nobody attached.
             _ = async {
                 match grace_deadline.as_mut() {
                     Some(f) => f.await,
@@ -907,30 +716,28 @@ async fn run_hub_loop(state: HubLoopState) {
                 }
             }, if grace_deadline.is_some() => {
                 if counter.count().await != 0 {
-                    // Race: a fresh subscriber arrived between the timer
-                    // firing and the count read. Cancel the deadline and
-                    // keep going.
+                    // A fresh subscriber arrived between the timer
+                    // firing and the count read. Cancel and keep going.
                     grace_deadline = None;
                     inflight_hold_since = None;
                 } else if inflight.load(Ordering::SeqCst) == 0 {
                     break;
                 } else {
                     // Nobody is attached and a turn is still running.
-                    // Tearing down here sends `session/cancel` and aborts
-                    // the turn, which is the mobile "lose focus mid-turn"
-                    // bug. Hold the agent and re-arm; a later fire
-                    // reclaims it once the turn resolves.
+                    // Tearing down here would cancel the user's turn,
+                    // which is what losing focus on a phone mid-turn
+                    // used to do. Hold and re-arm; a later fire reclaims
+                    // the session once the turn resolves.
                     //
-                    // The hold is capped. A turn that never resolves (a
-                    // wedged agent, an MCP server that never answers)
-                    // would otherwise keep this hub, its agent and its
-                    // MCP fleet alive for the life of the process.
+                    // The hold is capped. A turn that never resolves
+                    // would otherwise keep this hub and its Backend
+                    // alive for the life of the process.
                     let held_since = *inflight_hold_since.get_or_insert_with(Instant::now);
                     let held_for = held_since.elapsed();
                     if held_for >= max_inflight_hold(grace_period) {
                         eprintln!(
                             "Session {session_id}: a turn has been in flight for {held_for:?} \
-                             with no browser attached. Reclaiming the agent."
+                             with no browser attached. Releasing the session."
                         );
                         break;
                     }
@@ -946,293 +753,184 @@ async fn run_hub_loop(state: HubLoopState) {
         }
     }
 
-    // Cooperative shutdown: tell the agent to stop, close stdin, wait
-    // a short window. Same path the previous `handle_ws` exit took.
-    agent.shutdown(Some(&session_id)).await;
-    // Remove ourselves from the registry. The next attach for this
-    // session id then triggers a fresh hub. Holding the registry handle
-    // until here closes the race where a fresh subscriber attaches to
-    // the slot just before we shut down.
+    // Release the Backend, then the registry slot. The next attach for
+    // this session id builds a fresh hub. Holding the registry handle
+    // until here closes the race where a subscriber attaches to the slot
+    // just before it goes.
+    backend.shutdown().await;
     registry.remove(&session_id).await;
+}
+
+/// Broadcast one `error` frame. A send failure only means no subscriber
+/// is listening.
+fn broadcast_error(outbound: &broadcast::Sender<Arc<Value>>, message: String) {
+    let _ = outbound.send(Arc::new(json!({
+        "type": "error",
+        "message": message
+    })));
+}
+
+/// The text a panic payload carries, or a stand-in when it carries none.
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
+    match panic.downcast::<String>() {
+        Ok(message) => *message,
+        Err(panic) => match panic.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "no message".to_string(),
+        },
+    }
+}
+
+/// Broadcast one streamed event, with its fields unchanged and in order.
+///
+/// A `permission_request` is stamped with the prompter's `attach_id`, and
+/// nothing else is. The attach loop drops a stamped frame on every other
+/// attach, so a peer never renders a card it was not asked to answer.
+fn forward(outbound: &broadcast::Sender<Arc<Value>>, mut event: Value, attach_id: u64) {
+    if event.get("type").and_then(Value::as_str) == Some("permission_request") {
+        if let Some(map) = event.as_object_mut() {
+            map.insert("_target".into(), Value::Number(attach_id.into()));
+        }
+    }
+    let _ = outbound.send(Arc::new(event));
+}
+
+/// Run one turn: stream its events, drain what is buffered, report the
+/// outcome to the loop.
+///
+/// This task never touches the in-flight count and never sends a terminal
+/// frame. The guard travels back inside the message, so a task that dies
+/// before sending still releases the count through the guard's `Drop`.
+#[allow(clippy::too_many_arguments)]
+async fn run_turn(
+    backend: Arc<dyn Backend>,
+    blocks: Vec<Value>,
+    events_tx: mpsc::UnboundedSender<Value>,
+    mut events_rx: mpsc::UnboundedReceiver<Value>,
+    outbound: broadcast::Sender<Arc<Value>>,
+    attach_id: u64,
+    guard: InflightGuard,
+    done: mpsc::UnboundedSender<TurnDone>,
+) {
+    // `catch_unwind` turns a panicking turn into an outcome this task can
+    // still report. Without it the task dies and every composer on the
+    // session stays locked. It covers the polled future and nothing the
+    // Backend spawns, which is what the trait's obligations say.
+    let mut turn = Box::pin(AssertUnwindSafe(backend.prompt(blocks, events_tx)).catch_unwind());
+    let mut drained = false;
+    let result = loop {
+        tokio::select! {
+            event = events_rx.recv(), if !drained => match event {
+                Some(event) => forward(&outbound, event, attach_id),
+                // The Backend dropped its sender ahead of resolving.
+                // The guard keeps this arm from spinning on a closed
+                // channel for the rest of the turn.
+                None => drained = true,
+            },
+            outcome = &mut turn => break outcome,
+        }
+    };
+
+    // The Hub, not the Backend, decides when the channel is over.
+    // `close` rejects every later send and `recv` then returns `None`
+    // once the buffer is empty, whether or not a clone of the sender is
+    // still alive somewhere inside the Backend.
+    events_rx.close();
+    while let Some(event) = events_rx.recv().await {
+        forward(&outbound, event, attach_id);
+    }
+
+    // A loop that has already exited dropped the receiver. The send then
+    // fails, the guard is released on the drop, and the Backend's
+    // shutdown obligation is what ended the turn.
+    let _ = done.send(TurnDone { result, guard });
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
-    agent: &Arc<Agent>,
+    backend: &Arc<dyn Backend>,
     session_id: &str,
     cmd: HubCommand,
-    suppress_replay: &Mutex<bool>,
-    answered: &mut std::collections::HashSet<String>,
+    answered: &mut HashSet<String>,
     outbound: &broadcast::Sender<Arc<Value>>,
-    snapshot: &Arc<Mutex<NegotiationSnapshot>>,
-    current_prompter: &Arc<Mutex<Option<u64>>>,
+    snapshot: &Arc<Mutex<SessionSnapshot>>,
     inflight: &Arc<AtomicUsize>,
+    turn_done_tx: &mpsc::UnboundedSender<TurnDone>,
 ) {
     match cmd {
         HubCommand::Prompt { blocks, attach_id } => {
             if blocks.is_empty() {
                 return;
             }
-            // Track the prompter. Permission and oauth requests raised
-            // during this turn get stamped with their attach id and
-            // land only on the originating browser.
-            *current_prompter.lock().await = Some(attach_id);
-            // Mark a turn in flight. The grace branch reads this and
-            // holds the agent until the turn resolves, even with no
-            // browser attached. Losing focus mid-turn no longer tears the
-            // agent down and cancels the turn.
-            let inflight_guard = InflightGuard::arm(inflight);
-            // First live prompt after a resume: stop hiding Kiro's
-            // session/update events. From here on everything the
-            // agent emits is real.
-            *suppress_replay.lock().await = false;
-
-            // Echo the user prompt to every attached browser via the
-            // broadcast, the sender included. The client used to append
-            // the user's text locally. Under multi-attach that hid the
-            // prompt from peer browsers and produced inconsistent
-            // timelines. The hub is now the single source of truth for
-            // "what was said in this session"; clients render only what
-            // the broadcast emits.
-            let echo_text = extract_user_text(&blocks);
-            if !echo_text.is_empty() {
-                let _ = outbound.send(Arc::new(json!({
-                    "type": "append",
-                    "role": "user",
-                    "text": format!("> {echo_text}\n")
-                })));
-            }
-
-            // Fire the agent request, then broadcast `prompt_done` (or
-            // an `error` event on failure). The previous implementation
-            // emitted neither. The sender's `busy`/`inFlight` flags never
-            // cleared and the composer stayed locked at "Agent is
-            // working" indefinitely. The broadcast goes to every attached
-            // browser. Peers that did not send already hold
-            // `busy: false`, where the broadcast is a no-op clear, and
-            // the sender flips back to a free composer.
-            let agent = Arc::clone(agent);
-            let sid = session_id.to_string();
-            let outbound_clone = outbound.clone();
-            let prompter_clone = current_prompter.clone();
-            tokio::spawn(async move {
-                let res = agent
-                    .request(
-                        "session/prompt",
-                        json!({ "sessionId": sid, "prompt": blocks }),
-                    )
-                    .await;
-                if let Err(e) = res {
-                    let _ = outbound_clone.send(Arc::new(json!({
-                        "type": "error",
-                        "message": format!("{e}")
-                    })));
-                }
-                // Clear the prompter. An out-of-turn permission
-                // request (rare, a background MCP refresh for
-                // instance) is then never mis-attributed to the
-                // previous sender.
-                *prompter_clone.lock().await = None;
-                // Turn finished. Clear the in-flight marker ahead of the
-                // prompt_done broadcast, which leaves a detached and now
-                // idle hub eligible for grace teardown on the next fire.
-                // The guard's `Drop` covers the same decrement if this
-                // task panics before reaching here.
-                drop(inflight_guard);
-                let _ = outbound_clone.send(Arc::new(json!({ "type": "prompt_done" })));
-            });
+            // The claim, the echo and the spawn hold no await between
+            // them, so no other command interleaves and the count is
+            // above zero from before the echo until the loop releases
+            // it.
+            let Some(guard) = InflightGuard::claim(inflight) else {
+                eprintln!("Session {session_id}: prompt discarded, a turn is already in flight");
+                return;
+            };
+            let _ = outbound.send(Arc::new(user_echo_event(&blocks)));
+            let (events_tx, events_rx) = mpsc::unbounded_channel::<Value>();
+            tokio::spawn(run_turn(
+                Arc::clone(backend),
+                blocks,
+                events_tx,
+                events_rx,
+                outbound.clone(),
+                attach_id,
+                guard,
+                turn_done_tx.clone(),
+            ));
         }
         HubCommand::PermissionResponse { id, option_id } => {
-            // First reply wins. Any further replies for the same id
-            // are dropped, including replies from the same browser
-            // (defensive against duplicate clicks).
-            let key = id.to_string();
-            if !answered.insert(key) {
+            // First answer wins, keyed on the id's JSON rendering so a
+            // numeric 1 and a string "1" stay distinct. Later answers
+            // for the same id are dropped, duplicate clicks from one
+            // browser included.
+            if !answered.insert(id.to_string()) {
                 return;
             }
-            let agent = Arc::clone(agent);
+            let backend = Arc::clone(backend);
             tokio::spawn(async move {
-                let _ = agent
-                    .respond(
-                        id,
-                        json!({
-                            "outcome": {
-                                "outcome": "selected",
-                                "optionId": option_id
-                            }
-                        }),
-                    )
-                    .await;
+                backend.permission_response(id, option_id).await;
             });
         }
         HubCommand::Cancel => {
-            let agent = Arc::clone(agent);
-            let sid = session_id.to_string();
+            // Spawned, so a slow Backend cannot stall the command inbox
+            // and the grace arm behind one call.
+            let backend = Arc::clone(backend);
             tokio::spawn(async move {
-                let _ = agent
-                    .notify("session/cancel", json!({ "sessionId": sid }))
-                    .await;
-            });
-        }
-        HubCommand::SetMode { mode_id } => {
-            let agent = Arc::clone(agent);
-            let sid = session_id.to_string();
-            let outbound_clone = outbound.clone();
-            let snapshot = snapshot.clone();
-            tokio::spawn(async move {
-                let res = agent
-                    .request(
-                        "session/set_mode",
-                        json!({ "sessionId": sid, "modeId": mode_id }),
-                    )
-                    .await;
-                if res.is_err() {
-                    // Agent rejected the change. A sys notice goes out
-                    // to every peer. The sender already shows the new
-                    // mode in its UI from the optimistic update, and
-                    // the notice tells everyone the change failed.
-                    if let Err(e) = res {
-                        let _ = outbound_clone.send(Arc::new(json!({
-                            "type": "append",
-                            "role": "sys",
-                            "text": format!("\n[set_mode failed: {e}]\n")
-                        })));
-                    }
-                    return;
-                }
-                // Mutate the snapshot's `session_info` for the benefit
-                // of a future attach, then broadcast the current
-                // `session_info` to bring peers up to date.
-                let next =
-                    update_session_info_field(snapshot.clone(), "modes", "currentModeId", &mode_id)
-                        .await;
-                if let Some(info) = next {
-                    let _ = outbound_clone.send(Arc::new(json!({
-                        "type": "session_info",
-                        "info": info
-                    })));
-                }
+                backend.cancel().await;
             });
         }
         HubCommand::SetModel { model_id } => {
-            let agent = Arc::clone(agent);
-            let sid = session_id.to_string();
-            let outbound_clone = outbound.clone();
-            let snapshot = snapshot.clone();
-            tokio::spawn(async move {
-                let res = agent
-                    .request(
-                        "session/set_model",
-                        json!({ "sessionId": sid, "modelId": model_id }),
-                    )
-                    .await;
-                if res.is_err() {
-                    if let Err(e) = res {
-                        let _ = outbound_clone.send(Arc::new(json!({
-                            "type": "append",
-                            "role": "sys",
-                            "text": format!("\n[set_model failed: {e}]\n")
-                        })));
-                    }
-                    return;
+            // Awaited inline, because the reply is the frame this arm
+            // broadcasts.
+            match backend.set_model(model_id).await {
+                Ok(info) => {
+                    let frame = json!({ "type": "session_info", "info": info });
+                    // Store and broadcast under one lock. An attach that
+                    // reads the snapshot before the store sees the old
+                    // value and receives the new frame on its receiver;
+                    // one that reads after sees the new value and
+                    // receives a harmless duplicate.
+                    let mut snap = snapshot.lock().await;
+                    snap.session_info = Some(frame.clone());
+                    let _ = outbound.send(Arc::new(frame));
+                    drop(snap);
                 }
-                let next = update_session_info_field(
-                    snapshot.clone(),
-                    "models",
-                    "currentModelId",
-                    &model_id,
-                )
-                .await;
-                if let Some(info) = next {
-                    let _ = outbound_clone.send(Arc::new(json!({
-                        "type": "session_info",
-                        "info": info
+                Err(e) => {
+                    // The sender already shows the new selection from its
+                    // optimistic update. The notice tells everyone it
+                    // did not take, and no `session_info` goes out.
+                    let _ = outbound.send(Arc::new(json!({
+                        "type": "append",
+                        "role": "sys",
+                        "text": format!("\n[The model change failed: {e}]\n")
                     })));
                 }
-            });
+            }
         }
     }
-}
-
-/// Choose the option to auto-select for a `session/request_permission`
-/// request when auto-allow is enabled. Mirrors the convention used by
-/// other ACP clients: prefer an option whose `kind` is `allow_once` or
-/// `allow_always`; when an option has no `kind`, fall back to its human
-/// name containing "allow". Returns `None` when no option can be
-/// positively identified as an allow. The caller then prompts the human.
-/// A malformed or reject-only option set never produces an unintended
-/// auto-answer.
-pub fn pick_allow_option(msg: &Value) -> Option<String> {
-    let options = msg.pointer("/params/options")?.as_array()?;
-    options
-        .iter()
-        .find(|opt| {
-            let kind = opt.get("kind").and_then(Value::as_str);
-            match kind {
-                Some("allow_once") | Some("allow_always") => true,
-                Some(_) => false,
-                None => opt
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.to_lowercase().contains("allow")),
-            }
-        })
-        .and_then(|opt| opt.get("optionId").and_then(Value::as_str))
-        .map(str::to_string)
-}
-
-/// Pull the user's plain text out of an ACP prompt-block array. The
-/// broadcast echo uses it to show peer browsers what the sender typed.
-/// Image and resource blocks are dropped from the echo: the client only
-/// renders the text portion of user turns. The agent still sees the full
-/// block payload via `session/prompt`.
-fn extract_user_text(blocks: &[Value]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| {
-            if block.get("type").and_then(Value::as_str)? == "text" {
-                block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Update the snapshot's cached `session_info` so a future attach
-/// sees the latest mode/model and return the updated value for the
-/// loop to broadcast to currently-attached peers. The
-/// `outer_field` selects which sub-object to mutate (`"modes"` for
-/// the mode toggle, `"models"` for the model toggle); the
-/// `current_field` is the corresponding `currentModeId` or
-/// `currentModelId` key.
-///
-/// Returns `None` when the hub never received a `session_info` at
-/// negotiation; in that case there is nothing to mutate or
-/// broadcast (the agent advertised neither modes nor models).
-async fn update_session_info_field(
-    snapshot: Arc<Mutex<NegotiationSnapshot>>,
-    outer_field: &str,
-    current_field: &str,
-    new_id: &str,
-) -> Option<Value> {
-    let mut snap = snapshot.lock().await;
-    let info_frame = snap.session_info.as_mut()?;
-    // The cached frame is the full WS-shaped event:
-    //   { "type": "session_info", "info": { "modes": {...}, "models": {...} } }
-    // The mutation target lives inside `info`, not at the top level,
-    // so we walk down one step before poking the `currentModeId` /
-    // `currentModelId` field.
-    let info = info_frame.get_mut("info")?;
-    let outer = info.get_mut(outer_field)?.as_object_mut()?;
-    outer.insert(current_field.into(), Value::String(new_id.to_string()));
-    // Return only the inner `info` object; the loop wraps it in the
-    // outer `{ "type": "session_info", "info": ... }` envelope so
-    // the broadcast matches what the negotiate-time frame looked
-    // like to the reducer.
-    Some(info.clone())
 }

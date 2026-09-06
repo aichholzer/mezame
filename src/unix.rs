@@ -36,10 +36,12 @@ pub fn send_signal(pid: i32, sig: i32) -> i32 {
 /// process-group leader. POSIX lists `setsid` as async-signal-safe, which
 /// is the requirement a `pre_exec` hook imposes.
 ///
-/// SAFETY: must only be called between fork() and exec(); calling it in
-/// the parent process would detach the parent from its controlling
-/// terminal. `Command::pre_exec` enforces that constraint by contract.
-pub(crate) unsafe fn new_session() -> i32 {
+/// # Safety
+///
+/// Must only be called between fork() and exec(); calling it in the
+/// parent process would detach the parent from its controlling terminal.
+/// `Command::pre_exec` enforces that constraint by contract.
+pub unsafe fn new_session() -> i32 {
     setsid()
 }
 

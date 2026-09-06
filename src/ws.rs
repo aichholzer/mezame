@@ -22,7 +22,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
@@ -295,23 +296,26 @@ fn spawn_with_error_report(
     });
 }
 
+/// The `/ws` handler. Decides the session id before the handshake, so a
+/// value Mezame would never bind a hub to is refused with no WebSocket
+/// established and no hub created.
+///
+/// The `cwd` query parameter is not read at all. A session opens against
+/// Mezame's own working directory, whatever a client sends.
 pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<crate::http::AppState>>,
 ) -> Response {
-    // `/ws?session=<acp-session-id>` asks Mezame to attach to an
-    // existing hub or create one with `session/load`. Absent =
-    // always new session.
-    // `/ws?cwd=<path>` overrides the working directory for this
-    // session; absent or empty = Mezame's own process cwd.
-    let resume = params.get("session").cloned();
-    let cwd_override = params
-        .get("cwd")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let session_id = match decide_session(params.get("session").map(String::as_str)) {
+        SessionDecision::Mint => new_session_id(),
+        SessionDecision::Accept(id) => id,
+        SessionDecision::Refuse => {
+            return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+        }
+    };
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws(socket, state, resume, cwd_override).await {
+        if let Err(e) = handle_ws(socket, state, session_id).await {
             eprintln!("WebSocket session ended: {e:?}");
         }
     })
@@ -326,17 +330,13 @@ fn text_msg(value: Value) -> Message {
 async fn handle_ws(
     ws: WebSocket,
     state: Arc<crate::http::AppState>,
-    resume_session_id: Option<String>,
-    cwd_override: Option<String>,
+    session_id: String,
 ) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
     let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
 
-    // Writer task: drain the outbound channel into the WS sink. Exits
-    // when the channel is closed (all senders dropped) or the sink
-    // errors. Same pattern the previous one-WS-per-agent design used;
-    // the only difference is now this task forwards events from a
-    // hub broadcast plus error notices we generate locally.
+    // Writer task: drain the outbound channel into the WS sink. Exits when
+    // the channel closes or the sink errors.
     let writer = tokio::spawn(async move {
         while let Some(msg) = to_ws_rx.recv().await {
             if sink.send(msg).await.is_err() {
@@ -345,20 +345,13 @@ async fn handle_ws(
         }
     });
 
-    // Attach to (or create) the hub for the requested session id. On
-    // failure tell the browser and exit cleanly.
-    let attached = match state
-        .hubs
-        .attach_or_create(
-            state.config.clone(),
-            resume_session_id,
-            cwd_override,
-            env!("MEZAME_BUILD_ID"),
-        )
-        .await
-    {
+    // Attach to the hub for this session id, building one if none is
+    // registered. The only failure is the working-directory lookup the
+    // `ready` template needs; log it, tell the browser, and close.
+    let mut attached = match state.hubs.attach_or_create(&session_id).await {
         Ok(a) => a,
         Err(e) => {
+            eprintln!("Session {session_id}: could not attach: {e:?}");
             let _ = to_ws_tx.send(text_msg(
                 json!({ "type": "error", "message": format!("{e}") }),
             ));
@@ -368,15 +361,25 @@ async fn handle_ws(
         }
     };
 
-    // Replay the negotiation snapshot to this subscriber so it sees
-    // the same `ready` (and optionally `session_info`) the first
-    // browser saw. Subsequent agent events come in via the broadcast.
-    let _ = to_ws_tx.send(text_msg(attached.snapshot_ready.clone()));
+    // `ready` first, then the `session_info` snapshot when there is one.
+    // `buildId` is one value per process, so the handler stamps it rather
+    // than the hub.
+    let mut ready = attached.snapshot_ready.clone();
+    if let Some(map) = ready.as_object_mut() {
+        map.insert(
+            "buildId".into(),
+            Value::String(env!("MEZAME_BUILD_ID").to_string()),
+        );
+    }
+    let _ = to_ws_tx.send(text_msg(ready));
     if let Some(info) = attached.snapshot_session_info.clone() {
         let _ = to_ws_tx.send(text_msg(info));
     }
 
-    let outbound = attached.outbound.resubscribe();
+    // The receiver `subscribe` took, not a fresh one: a `prompt_done`
+    // that landed between the subscribe and here has to reach this
+    // attach, or a composer this attach locked on `busy` never unlocks.
+    let outbound = attached.take_outbound();
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
 
@@ -391,9 +394,8 @@ async fn handle_ws(
     )
     .await;
 
-    // Drop `attached` first so the counter decrements before we
-    // close the writer. The grace timer arms here if we were the
-    // last subscriber.
+    // Drop `attached` first so the counter decrements before the writer
+    // closes. The grace timer arms here if this was the last subscriber.
     drop(attached);
     drop(to_ws_tx);
     let _ = writer.await;
@@ -457,7 +459,10 @@ pub async fn run_attach_loop<S, E>(
                 };
                 let v: Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => {
+                        eprintln!("Discarded a text frame that is not JSON");
+                        continue;
+                    }
                 };
                 if let Some(cmd) = parse_browser_command(&v, attach_id) {
                     if commands.send(cmd).await.is_err() {
@@ -517,41 +522,59 @@ pub async fn run_attach_loop<S, E>(
     }
 }
 
-/// Translate a parsed browser-message JSON into a `HubCommand`.
-/// Returns `None` for unknown types or malformed payloads; the
-/// caller treats that as "skip this frame".
+/// Translate a parsed browser frame into a `HubCommand`.
+///
+/// `None` means the frame is discarded: no event is emitted, no Backend
+/// method is invoked, and the attach stays open. Four faults share that
+/// one outcome, and they are indistinguishable to a client on purpose. An
+/// `error` frame would raise a notice for something the user never
+/// composed, and closing the attach would evict a browser over one bad
+/// frame during a version skew. One line goes to stderr so whoever reads
+/// the service log can tell a malformed command from an unknown one.
+///
+/// Unknown fields on a recognised command are ignored. Block members
+/// reach the Backend unchecked: the block vocabulary is a statement about
+/// what a client sends, not a server check.
 fn parse_browser_command(v: &Value, attach_id: u64) -> Option<crate::hub::HubCommand> {
-    match v.get("type").and_then(Value::as_str)? {
+    let Some(command_type) = v.get("type").and_then(Value::as_str) else {
+        eprintln!("Discarded a frame whose `type` is absent or is not a string");
+        return None;
+    };
+    let parsed = match command_type {
         "prompt" => {
-            let blocks: Vec<Value> = if let Some(blocks) = v.get("blocks").and_then(Value::as_array)
-            {
-                blocks.clone()
-            } else {
-                let text = v.get("text").and_then(Value::as_str)?;
-                vec![json!({ "type": "text", "text": text })]
-            };
-            Some(crate::hub::HubCommand::Prompt { blocks, attach_id })
+            v.get("blocks")
+                .and_then(Value::as_array)
+                .map(|blocks| crate::hub::HubCommand::Prompt {
+                    blocks: blocks.clone(),
+                    attach_id,
+                })
         }
         "permission_response" => {
-            let id = v.get("id").cloned()?;
-            let option_id = v
-                .get("optionId")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            Some(crate::hub::HubCommand::PermissionResponse { id, option_id })
+            let id = v
+                .get("id")
+                .filter(|id| id.is_string() || id.is_number())
+                .cloned();
+            let option_id = v.get("optionId").and_then(Value::as_str);
+            match (id, option_id) {
+                (Some(id), Some(option_id)) => Some(crate::hub::HubCommand::PermissionResponse {
+                    id,
+                    option_id: option_id.to_string(),
+                }),
+                _ => None,
+            }
         }
         "cancel" => Some(crate::hub::HubCommand::Cancel),
-        "set_mode" => {
-            let mode_id = v.get("modeId").and_then(Value::as_str)?.to_string();
-            Some(crate::hub::HubCommand::SetMode { mode_id })
-        }
-        "set_model" => {
-            let model_id = v.get("modelId").and_then(Value::as_str)?.to_string();
-            Some(crate::hub::HubCommand::SetModel { model_id })
-        }
+        "set_model" => v.get("modelId").and_then(Value::as_str).map(|model_id| {
+            crate::hub::HubCommand::SetModel {
+                model_id: model_id.to_string(),
+            }
+        }),
         _ => None,
+    };
+    if parsed.is_none() {
+        eprintln!("Discarded a `{command_type}` frame");
     }
+    parsed
 }
 
 /// Drive the per-session select loop until either the WS stream or the

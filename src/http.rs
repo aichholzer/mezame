@@ -5,10 +5,10 @@
 //! Mezame binds loopback by default.
 //!
 //! Also home to the plain HTTP endpoints: `/state` (cross-device browser
-//! state), `/history` (Kiro JSONL replay), and the embedded-asset fallback.
+//! state), `/history` (a session's transcript), and the embedded-asset
+//! fallback.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,7 +127,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/state", get(get_state).put(put_state))
         .route("/state/events", get(state_events))
         .route("/history", get(get_history))
-        .route("/tool-result", get(get_tool_result))
         // SPA fallback: /, /assets/*, and any unknown path resolve against
         // the embedded UI bundle, with index.html as the fallback for
         // client-side routes.
@@ -357,89 +356,28 @@ async fn state_events(
     )
 }
 
-/// `GET /history?session=<id>`: returns a compact history reconstructed
-/// from Kiro's own `~/.kiro/sessions/cli/<id>.jsonl` event log.
+/// `GET /history?session=<id>`: the transcript of the Backend behind that
+/// session id, as an `entries` array in recorded order with no cap and no
+/// pagination.
 ///
-/// Kiro records a `meta.timestamp` (Unix seconds) only on `Prompt` entries.
-/// Subsequent `AssistantMessage` / `ToolResults` inherit the timestamp of
-/// the most recent preceding `Prompt`. That is the right grouping: a turn
-/// and its reply share a single user-facing time.
+/// An absent or empty `session` answers 400 with a plain-text body. An id
+/// with no registered hub answers 200 with an empty array, which covers a
+/// value holding `/`, `\` or `..` with no separate validation step: no
+/// such value can be a registry key. Nothing here reads a file or
+/// consults `HOME`, and the endpoint answers 200 or 400 and nothing else.
 ///
-/// Returned JSON:
-///   { "entries": [{ "role": "user"|"agent"|"sys", "text": "...",
-///                   "timestamp": <ms since epoch> }, ...] }
-///
-/// A missing session file resolves to `{ "entries": [] }` and no error.
-/// Reading a file Kiro currently has open for append is safe; this only
-/// ever reads.
+/// A transcript lives as long as its hub. A reload inside the grace window
+/// shows the conversation so far; one after it shows an empty log.
 async fn get_history(
     Query(params): Query<HashMap<String, String>>,
+    State(app): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let Some(sid) = params.get("session") else {
+    let sid = params.get("session").map(String::as_str).unwrap_or("");
+    if sid.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "missing ?session=<id>".into()));
-    };
-    // Block path traversal defensively: Kiro session ids are UUIDs, and
-    // we only ever want a single file next to the others.
-    if sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains("..") {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".into()));
     }
-    let Ok(home) = std::env::var("HOME") else {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "HOME not set".into()));
-    };
-    let path = PathBuf::from(home).join(format!(".kiro/sessions/cli/{sid}.jsonl"));
-    let raw = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Json(json!({ "entries": [] })));
-        }
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
-    };
-
-    let entries = parse_kiro_history(&raw);
+    let entries = app.hubs.history(sid).await.unwrap_or_default();
     Ok(Json(json!({ "entries": entries })))
-}
-
-/// `GET /tool-result?session=<id>&id=<toolUseId>`: returns the result
-/// content for a single tool call from Kiro's session JSONL.
-///
-/// Live `session/update` events for `tool_call_update` flip status
-/// to `completed` or `failed` and do not stream the result content
-/// for some tools (web search among them). The data does land on disk
-/// in the `ToolResults` JSONL entry once Kiro finalises the turn. The
-/// client polls this endpoint after a status flip, and the user sees
-/// the result without reloading the page.
-///
-/// The response shape mirrors the fields the live wire would have
-/// carried: `{ "status": <string|null>, "content": <Value|null> }`. A
-/// missing entry returns 404, leaving the client to retry or give up.
-async fn get_tool_result(
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let Some(sid) = params.get("session") else {
-        return Err((StatusCode::BAD_REQUEST, "missing ?session=<id>".into()));
-    };
-    let Some(tool_use_id) = params.get("id") else {
-        return Err((StatusCode::BAD_REQUEST, "missing ?id=<toolUseId>".into()));
-    };
-    if sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains("..") {
-        return Err((StatusCode::BAD_REQUEST, "invalid session id".into()));
-    }
-    let Ok(home) = std::env::var("HOME") else {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "HOME not set".into()));
-    };
-    let path = PathBuf::from(home).join(format!(".kiro/sessions/cli/{sid}.jsonl"));
-    let raw = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err((StatusCode::NOT_FOUND, "session not found".into()));
-        }
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
-    };
-
-    let Some(found) = find_tool_result(&raw, tool_use_id) else {
-        return Err((StatusCode::NOT_FOUND, "tool result not found".into()));
-    };
-    Ok(Json(found))
 }
 
 /// Scan a Kiro JSONL document for the most recent `toolResult` block

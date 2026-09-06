@@ -51,7 +51,9 @@ strip = true
 
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["test-util"] }
+proptest = "1.11"
 tempfile = "3.13"
+tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 divan = { version = "5.0.0", package = "codspeed-divan-compat" }
 

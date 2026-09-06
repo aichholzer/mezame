@@ -9,16 +9,22 @@
 //! single process-wide `Mutex` serialises every test in this file so
 //! the env var is never observed mid-swap.
 
+mod support;
+
 use std::path::Path;
 use std::sync::OnceLock;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use mezame::backend::{
+    EntryBody, HistoryEntry, ToolCall, ToolCallStatus, ToolContent, ToolLocation,
+};
 use mezame::config::{Config, TransportConfig};
 use mezame::http::{build_router, AppState};
 use mezame::hub::HubRegistry;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use support::ScriptedBackend;
 use tempfile::TempDir;
 use tokio::sync::{broadcast, Mutex, Notify};
 use tower::ServiceExt;
@@ -153,199 +159,176 @@ async fn get_history_without_session_param_is_400() {
 }
 
 #[tokio::test]
-async fn get_history_with_traversal_id_is_400() {
+async fn get_history_with_an_empty_session_param_is_400() {
+    // The other branch of Requirement 13 criterion 2, which had no case.
+    // Both branches answer 400 with a plain-text body naming what is
+    // missing.
     let _g = home_lock().lock().await;
     let tmp = TempDir::new().unwrap();
     set_home(tmp.path());
 
-    // Each candidate exercises a distinct guard in the handler.
-    let candidates = [
-        "/history?session=..%2Fetc%2Fpasswd",
-        "/history?session=foo%2F..%2Fbar",
-        "/history?session=",
-        "/history?session=..",
+    let req = Request::get("/history?session=")
+        .body(Body::empty())
+        .unwrap();
+    let (status, bytes, headers) = run_request(req).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(bytes).expect("a UTF-8 body");
+    assert!(
+        body.contains("session"),
+        "the body names the missing parameter, got {body:?}"
+    );
+    let ct = headers
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    assert!(
+        ct.starts_with("text/plain"),
+        "the body is plain text, got {ct:?}"
+    );
+}
+
+#[tokio::test]
+async fn get_history_for_a_registered_hub_returns_its_transcript() {
+    // Requirement 13 criterion 3, with criterion 5's `HOME` clause: the
+    // answer is resolved from the registry alone, so it is the same answer
+    // with no `HOME` set at all and no file read.
+    //
+    // Self-contained on purpose: its own state, its own registry, and the
+    // attach held across the request so the hub cannot be torn down under
+    // it. `run_request` is untouched.
+    let _g = home_lock().lock().await;
+    unset_home();
+
+    let transcript = vec![
+        HistoryEntry {
+            body: EntryBody::User {
+                text: "ping".to_string(),
+            },
+            timestamp: 1_000,
+        },
+        HistoryEntry {
+            body: EntryBody::Agent {
+                text: "ping".to_string(),
+            },
+            timestamp: 1_000,
+        },
+        HistoryEntry {
+            body: EntryBody::Thought {
+                text: "thinking".to_string(),
+            },
+            timestamp: 1_100,
+        },
+        HistoryEntry {
+            body: EntryBody::Sys {
+                text: "a notice".to_string(),
+            },
+            timestamp: 1_200,
+        },
+        HistoryEntry {
+            body: EntryBody::ToolCall(ToolCall {
+                tool_call_id: "t-1".to_string(),
+                title: "Read".to_string(),
+                status: ToolCallStatus::Completed,
+                kind: None,
+                raw_input: json!({ "path": "/x" }),
+                content: Some(vec![ToolContent::Text {
+                    text: "ok".to_string(),
+                }]),
+                locations: Some(vec![ToolLocation {
+                    path: "/x".to_string(),
+                    line: Some(3),
+                }]),
+            }),
+            timestamp: 1_300,
+        },
     ];
-    for url in candidates {
-        let req = Request::get(url).body(Body::empty()).unwrap();
-        let (status, _, _) = run_request(req).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "expected 400 for traversal/empty id `{url}`"
-        );
+
+    let hubs = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new().transcript(transcript));
+    let _attached = hubs
+        .register_for_test(
+            backend,
+            "hist-session".to_string(),
+            json!({ "type": "ready", "sessionId": "hist-session" }),
+            None,
+        )
+        .await;
+
+    let (state_changes, _) = broadcast::channel(8);
+    let state = Arc::new(AppState {
+        config: Arc::new(Config {
+            transports: vec![TransportConfig::Cloudflared {
+                bind: "127.0.0.1:0".to_string(),
+            }],
+            agent_cmd: "/bin/true".to_string(),
+            agent_args: vec![],
+        }),
+        hubs,
+        state_changes,
+        shutdown: Arc::new(Notify::new()),
+    });
+
+    let app = build_router(state);
+    let res = app
+        .oneshot(
+            Request::get("/history?session=hist-session")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router did not respond");
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .expect("body read")
+        .to_vec();
+    let entries = json_body(&bytes)["entries"].clone();
+    let entries = entries.as_array().expect("an entries array");
+
+    assert_eq!(entries.len(), 5, "every recorded entry, in order");
+    assert_eq!(
+        entries[0],
+        json!({ "role": "user", "text": "ping", "timestamp": 1000 })
+    );
+    assert_eq!(
+        entries[2],
+        json!({ "role": "thought", "text": "thinking", "timestamp": 1100 })
+    );
+    assert_eq!(
+        entries[4],
+        json!({
+            "role": "tool_call",
+            "toolCallId": "t-1",
+            "title": "Read",
+            "status": "completed",
+            "kind": null,
+            "rawInput": { "path": "/x" },
+            "content": [{ "type": "text", "text": "ok" }],
+            "locations": [{ "path": "/x", "line": 3 }],
+            "timestamp": 1300
+        }),
+        "a tool-call entry serialises to the closed shape"
+    );
+}
+
+#[tokio::test]
+async fn get_history_for_an_unknown_session_returns_empty_entries() {
+    // Requirement 13 criterion 4. This is what a value holding `/`, `\`
+    // or `..` gets too: no such value can be a registry key, so no
+    // separate validation step is needed. Nothing is created.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    for id in ["nobody-here", "../etc/passwd", "a/b", "a%5Cb"] {
+        let req = Request::get(format!("/history?session={id}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, bytes, _) = run_request(req).await;
+        assert_eq!(status, StatusCode::OK, "id {id:?} answers 200");
+        assert_eq!(json_body(&bytes), json!({ "entries": [] }), "id {id:?}");
     }
-}
-
-#[tokio::test]
-async fn get_history_with_no_fixture_returns_empty_entries() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let req = Request::get("/history?session=00000000-0000-0000-0000-000000000000")
-        .body(Body::empty())
-        .unwrap();
-    let (status, bytes, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&bytes), json!({ "entries": [] }));
-}
-
-#[tokio::test]
-async fn get_history_with_fixture_returns_parsed_entries() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    // Drop a Kiro JSONL fixture in place. Two turns: a Prompt with a
-    // timestamp and an AssistantMessage that should inherit it.
-    let dir = tmp.path().join(".kiro/sessions/cli");
-    std::fs::create_dir_all(&dir).unwrap();
-    let sid = "abc";
-    let jsonl = "\
-{\"kind\":\"Prompt\",\"data\":{\"content\":[{\"kind\":\"text\",\"data\":\"hello\"}],\"meta\":{\"timestamp\":1700000000}}}
-{\"kind\":\"AssistantMessage\",\"data\":{\"content\":[{\"kind\":\"text\",\"data\":\"world\"}]}}
-";
-    std::fs::write(dir.join(format!("{sid}.jsonl")), jsonl).unwrap();
-
-    let req = Request::get(format!("/history?session={sid}"))
-        .body(Body::empty())
-        .unwrap();
-    let (status, bytes, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = json_body(&bytes);
-    let entries = body.get("entries").and_then(Value::as_array).unwrap();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0]["role"], "user");
-    assert_eq!(entries[0]["text"], "hello");
-    assert_eq!(entries[0]["timestamp"], 1_700_000_000_000_i64);
-    assert_eq!(entries[1]["role"], "agent");
-    assert_eq!(entries[1]["text"], "world");
-    assert_eq!(entries[1]["timestamp"], 1_700_000_000_000_i64);
-}
-
-#[tokio::test]
-async fn get_history_emits_thought_entry_before_agent_text() {
-    // Reasoning models produce assistant messages with a `thinking`
-    // block followed by a `text` block. The history endpoint must
-    // surface both, in order. The rehydrated log then shows the
-    // collapsible reasoning section above the answer, matching the live
-    // broadcast.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let dir = tmp.path().join(".kiro/sessions/cli");
-    std::fs::create_dir_all(&dir).unwrap();
-    let sid = "thinks";
-    let jsonl = "\
-{\"kind\":\"Prompt\",\"data\":{\"content\":[{\"kind\":\"text\",\"data\":\"why\"}],\"meta\":{\"timestamp\":1700000000}}}
-{\"kind\":\"AssistantMessage\",\"data\":{\"content\":[{\"kind\":\"thinking\",\"data\":{\"text\":\"because\"}},{\"kind\":\"text\",\"data\":\"42\"}]}}
-";
-    std::fs::write(dir.join(format!("{sid}.jsonl")), jsonl).unwrap();
-
-    let req = Request::get(format!("/history?session={sid}"))
-        .body(Body::empty())
-        .unwrap();
-    let (status, bytes, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = json_body(&bytes);
-    let entries = body.get("entries").and_then(Value::as_array).unwrap();
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0]["role"], "user");
-    assert_eq!(entries[1]["role"], "thought");
-    assert_eq!(entries[1]["text"], "because");
-    assert_eq!(entries[2]["role"], "agent");
-    assert_eq!(entries[2]["text"], "42");
-}
-
-#[tokio::test]
-async fn get_history_rehydrates_tool_calls_and_merges_results() {
-    // Kiro records a toolUse block on the AssistantMessage that
-    // triggered the call, then a ToolResults entry once the agent
-    // returned. The history endpoint should emit one tool_call
-    // history entry per toolUse and patch its `status` and
-    // `content` from the matching ToolResults so the rehydrated
-    // log renders the same card the live stream produced.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let dir = tmp.path().join(".kiro/sessions/cli");
-    std::fs::create_dir_all(&dir).unwrap();
-    let sid = "tools";
-    let jsonl = "\
-{\"kind\":\"Prompt\",\"data\":{\"content\":[{\"kind\":\"text\",\"data\":\"search\"}],\"meta\":{\"timestamp\":1700000000}}}
-{\"kind\":\"AssistantMessage\",\"data\":{\"content\":[{\"kind\":\"toolUse\",\"data\":{\"toolUseId\":\"tu-1\",\"name\":\"web_search\",\"input\":{\"q\":\"x\"}}}]}}
-{\"kind\":\"ToolResults\",\"data\":{\"content\":[{\"kind\":\"toolResult\",\"data\":{\"toolUseId\":\"tu-1\",\"content\":[{\"kind\":\"text\",\"data\":\"result text\"}],\"status\":\"success\"}}]}}
-";
-    std::fs::write(dir.join(format!("{sid}.jsonl")), jsonl).unwrap();
-
-    let req = Request::get(format!("/history?session={sid}"))
-        .body(Body::empty())
-        .unwrap();
-    let (status, bytes, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = json_body(&bytes);
-    let entries = body.get("entries").and_then(Value::as_array).unwrap();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[1]["role"], "tool_call");
-    assert_eq!(entries[1]["toolCallId"], "tu-1");
-    assert_eq!(entries[1]["title"], "web_search");
-    assert_eq!(entries[1]["status"], "success");
-    assert_eq!(entries[1]["rawInput"]["q"], "x");
-    let content_arr = entries[1]["content"].as_array().unwrap();
-    assert_eq!(content_arr[0]["data"], "result text");
-}
-
-// ---------- /tool-result ----------
-
-#[tokio::test]
-async fn get_tool_result_returns_status_and_content_for_known_id() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let dir = tmp.path().join(".kiro/sessions/cli");
-    std::fs::create_dir_all(&dir).unwrap();
-    let sid = "results";
-    let jsonl = "\
-{\"kind\":\"AssistantMessage\",\"data\":{\"content\":[{\"kind\":\"toolUse\",\"data\":{\"toolUseId\":\"tu-9\",\"name\":\"web_search\",\"input\":{\"q\":\"hi\"}}}]}}
-{\"kind\":\"ToolResults\",\"data\":{\"content\":[{\"kind\":\"toolResult\",\"data\":{\"toolUseId\":\"tu-9\",\"content\":[{\"kind\":\"text\",\"data\":\"answer\"}],\"status\":\"success\"}}]}}
-";
-    std::fs::write(dir.join(format!("{sid}.jsonl")), jsonl).unwrap();
-
-    let req = Request::get(format!("/tool-result?session={sid}&id=tu-9"))
-        .body(Body::empty())
-        .unwrap();
-    let (status, bytes, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::OK);
-    let body = json_body(&bytes);
-    assert_eq!(body["status"], "success");
-    assert_eq!(body["content"][0]["data"], "answer");
-}
-
-#[tokio::test]
-async fn get_tool_result_returns_404_when_id_not_found() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let dir = tmp.path().join(".kiro/sessions/cli");
-    std::fs::create_dir_all(&dir).unwrap();
-    let sid = "results-nope";
-    // File exists but has no matching toolResult yet (write delay
-    // between live status flip and JSONL flush).
-    std::fs::write(dir.join(format!("{sid}.jsonl")), "").unwrap();
-
-    let req = Request::get(format!("/tool-result?session={sid}&id=missing"))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 // ---------- SPA fallback / asset routing ----------
@@ -488,93 +471,6 @@ async fn put_state_returns_500_when_the_parent_cannot_be_created() {
 }
 
 #[tokio::test]
-async fn get_history_returns_500_when_home_is_unset() {
-    let _g = home_lock().lock().await;
-    unset_home();
-
-    let req = Request::get("/history?session=abc")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn get_history_returns_500_when_the_session_path_is_unreadable() {
-    // The session JSONL present as a directory. A missing file is an empty
-    // history; a broken one is an error.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let sid = "wedged";
-    std::fs::create_dir_all(tmp.path().join(format!(".kiro/sessions/cli/{sid}.jsonl"))).unwrap();
-
-    let req = Request::get(format!("/history?session={sid}"))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn get_tool_result_rejects_missing_or_invalid_params() {
-    // One guard per candidate, in the order the handler checks them:
-    // absent `session`, absent `id`, then the traversal and empty-id
-    // checks on the session value.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let candidates = [
-        "/tool-result",
-        "/tool-result?id=tu-1",
-        "/tool-result?session=abc",
-        "/tool-result?session=&id=tu-1",
-        "/tool-result?session=..&id=tu-1",
-        "/tool-result?session=foo%2F..%2Fbar&id=tu-1",
-        "/tool-result?session=..%2Fetc%2Fpasswd&id=tu-1",
-    ];
-    for url in candidates {
-        let req = Request::get(url).body(Body::empty()).unwrap();
-        let (status, _, _) = run_request(req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "expected 400 for `{url}`");
-    }
-}
-
-#[tokio::test]
-async fn get_tool_result_returns_500_when_home_is_unset() {
-    let _g = home_lock().lock().await;
-    unset_home();
-
-    let req = Request::get("/tool-result?session=abc&id=tu-1")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn get_tool_result_returns_404_when_the_session_file_is_missing() {
-    // The browser polls this endpoint after a live status flip arrived
-    // with no content. A 404 tells it to retry or give up, and it is
-    // distinct from the 400s above.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let req = Request::get("/tool-result?session=never-existed&id=tu-1")
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
 async fn get_state_serves_an_empty_object_for_malformed_json() {
     // A hand-edited or truncated `state.json` resolves to `{}`. The
     // browser then rebuilds its session list from scratch, and a corrupt
@@ -592,24 +488,4 @@ async fn get_state_serves_an_empty_object_for_malformed_json() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&bytes), json!({}));
-}
-
-#[tokio::test]
-async fn get_tool_result_returns_500_when_the_session_path_is_unreadable() {
-    // An absent session file is a 404; one that fails the read for any
-    // other reason is reported as a 500, and the client can tell the two
-    // apart.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let sid = "wedged-result";
-    std::fs::create_dir_all(tmp.path().join(format!(".kiro/sessions/cli/{sid}.jsonl"))).unwrap();
-
-    let req = Request::get(format!("/tool-result?session={sid}&id=tu-1"))
-        .body(Body::empty())
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
