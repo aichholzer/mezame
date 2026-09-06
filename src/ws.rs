@@ -54,6 +54,67 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 const PROTOCOL_VERSION: u32 = 1;
 
+/// Mint a session id: 16 bytes of OS entropy rendered as 32 lowercase
+/// hexadecimal characters.
+///
+/// The output matches the form [`is_session_id`] accepts. 128 bits puts
+/// the collision probability across the 20,000 ids two process runs mint
+/// somewhere around 1e-31, which is what makes the uniqueness guarantee
+/// hold across a restart: a browser holds its session id over one, and a
+/// per-process counter could mint an id another browser already has.
+///
+/// The panic on entropy failure is deliberate. On Unix it means
+/// `getrandom(2)` failed, and continuing with a predictable id would be
+/// worse than stopping.
+pub fn new_session_id() -> String {
+    use std::fmt::Write as _;
+
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("OS entropy source");
+    bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        // Writing into a String cannot fail.
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// The accepted session id form: 1 to 128 characters drawn from the ASCII
+/// letters, the digits, the hyphen and the underscore.
+///
+/// The charset is ASCII, so the byte length equals the character count. A
+/// value outside this form is never bound to a hub, which is what keeps a
+/// path separator or a dot segment out of every lookup key in the process.
+pub fn is_session_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// What to do with the `session` query parameter of an upgrade request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionDecision {
+    /// No id was supplied. Mint one.
+    Mint,
+    /// The supplied id is accepted, trimmed of surrounding whitespace.
+    Accept(String),
+    /// The supplied id is not a form Mezame binds a hub to. Refuse the
+    /// upgrade.
+    Refuse,
+}
+
+/// Decide what a `session` query parameter means.
+///
+/// A pure function, so the upgrade handler and its property test share one
+/// implementation rather than agreeing by inspection.
+pub fn decide_session(param: Option<&str>) -> SessionDecision {
+    match param.map(str::trim) {
+        None | Some("") => SessionDecision::Mint,
+        Some(id) if is_session_id(id) => SessionDecision::Accept(id.to_string()),
+        Some(_) => SessionDecision::Refuse,
+    }
+}
+
 /// Open a fresh ACP session and pull out the bits we forward to the
 /// browser. Returns `(sessionId, modes/models payload)`. Used both as
 /// the primary path when the browser does not request a resume, and as

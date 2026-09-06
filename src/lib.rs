@@ -8,6 +8,7 @@
 //!
 //! Layout:
 //!   - `config`:  on-disk config and interactive setup
+//!   - `backend`: the Backend seam and the shipped EchoBackend
 //!   - `agent`:   ACP subprocess wrapper and JSON-RPC framing
 //!   - `session`: session resume and stale-lock recovery
 //!   - `http`:    cloudflared transport (HTTP/WS server, UI assets, /state, /history)
@@ -17,6 +18,7 @@
 //! import internals. The thin binary in `src/main.rs` calls `run()`.
 
 pub mod agent;
+pub mod backend;
 pub mod config;
 pub mod http;
 pub mod hub;
