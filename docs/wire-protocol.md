@@ -1,79 +1,222 @@
 # Wire protocol
 
-Mezame speaks two protocols: JSON text frames to the browser over `/ws`, and ACP (JSON-RPC 2.0) to the agent over stdio. This document is for contributors or anyone plumbing a new client. The main README covers the higher-level architecture.
+Mezame speaks JSON text frames to the browser over `/ws`, plus three plain HTTP
+endpoints. This document is the catalogue of those messages, for contributors
+and for anyone plumbing a new client. The README covers the higher-level
+architecture.
+
+Eight server events, four client commands. Nothing outside those two sets is
+sent or accepted.
 
 ## Browser to Mezame (JSON text frames over `/ws`)
 
 ```json
-{ "type": "prompt", "text": "hello" }
 { "type": "prompt", "blocks": [{ "type": "text", "text": "look at this" },
                                { "type": "image", "mimeType": "image/png", "data": "iVBOR..." }] }
 { "type": "cancel" }
-{ "type": "permission_response", "id": <original id>, "optionId": "allow_once" }
-{ "type": "set_mode", "modeId": "kiro_planner" }
+{ "type": "permission_response", "id": <the id from the request>, "optionId": "allow_once" }
 { "type": "set_model", "modelId": "claude-sonnet-4.5" }
 ```
 
-`prompt` accepts either a legacy `text` string (wrapped into a single text block on the server) or a full ACP `blocks` array. The server forwards blocks unchanged. The agent validates types against its own capabilities.
+Required fields, and what happens without them:
+
+| Command | Requires |
+| --- | --- |
+| `prompt` | `blocks`, a JSON array |
+| `permission_response` | `id`, a string or a number, and `optionId`, a string |
+| `cancel` | nothing beyond `type` |
+| `set_model` | `modelId`, a string |
+
+A frame that is not a JSON object, whose `type` is absent, is not a string, or
+names no command above, or that names a command with a required field absent or
+of the wrong JSON type, is discarded. Nothing is emitted in response, nothing
+is invoked, and the connection stays open. One line goes to Mezame's stderr per
+discarded frame. The four faults are indistinguishable to a client on purpose:
+an error frame would raise a notice for something the user never composed, and
+closing the connection would evict a browser over one bad frame during a
+version skew.
+
+A field the set does not declare for its `type` is ignored, so a client one
+version ahead is tolerated.
+
+An empty `blocks` array is accepted and does nothing. A `prompt` arriving while
+a turn is already in flight on that session is discarded, so a client should
+keep its composer locked between the user echo and `prompt_done`.
+
+### The `prompt` block vocabulary
+
+```json
+{ "type": "text", "text": "..." }
+{ "type": "image", "mimeType": "image/png", "data": "<base64>" }
+{ "type": "resource", "resource": { "uri": "file:///x", "mimeType": "text/plain", "text": "..." } }
+{ "type": "resource", "resource": { "uri": "file:///x", "mimeType": "image/png", "blob": "<base64>" } }
+```
+
+A `resource` nests `uri`, an optional `mimeType`, and exactly one of `text` or
+`blob`. Mezame forwards every member of the array unchecked: this vocabulary
+describes what a client sends, not a server-side validation step.
 
 ## Mezame to browser
 
 ```json
-{ "type": "ready", "sessionId": "<uuid>", "resumed": true | false, "cwd": "<path>",
-   "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true } }
-{ "type": "session_info", "info": { "modes": { "currentModeId", "availableModes": [...] },
-                                    "models": { "currentModelId", "availableModels": [...] } } }
-{ "type": "commands", "commands": [...], "prompts": [...] }
+{ "type": "ready", "sessionId": "<32 hex characters>", "resumed": true, "busy": false,
+  "cwd": "<absolute path>", "buildId": "<token>",
+  "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true } }
+{ "type": "session_info", "info": { "models": { "currentModelId": "...", "availableModels": [...] } } }
 { "type": "append", "role": "user" | "agent" | "sys", "text": "..." }
-{ "type": "tool_call", "toolCallId": "...", "title": "...", "status": "in_progress" | "completed" | "failed" | ...,
-                       "kind": "...", "rawInput": {...}, "content": [...], "locations": [...] }
+{ "type": "thought", "text": "..." }
+{ "type": "tool_call", "toolCallId": "...", "title": "...",
+  "status": "pending" | "in_progress" | "completed" | "failed",
+  "kind": "..." | null, "rawInput": {...}, "content": [...] | null, "locations": [...] | null }
+{ "type": "permission_request", "id": <minted id>, "title": "...", "options": [...] }
 { "type": "prompt_done" }
-{ "type": "permission_request", "id": <original id>, "title": "...", "options": [...] }
-{ "type": "mcp_oauth_request", "id": <dedupe id>, "serverName": "...", "url": "https://..." }
 { "type": "error", "message": "..." }
 ```
 
+Each event's field list is closed. `append` declares exactly `type`, `role` and
+`text`. `thought` declares exactly `type` and `text`, though nothing streams one
+in this release. `error` declares exactly `type` and `message`. `prompt_done`
+declares nothing beyond `type`, and in particular no usage figures yet.
+`session_info.info` declares exactly one key, `models`.
+
+`permission_request` may carry one extra field, `_target`, holding the internal
+id of the connection that started the turn. Mezame drops the frame on every
+other connection, so a client only ever sees a card it was asked to answer. The
+field arrives on the forwarded frame and a client ignores it.
+
 Details:
 
-- `ready` fires once per (re)connect. `resumed: true` means the browser should clear the active log and seed from `/history`. The browser persists the `sessionId` so the next reconnect can pass `?session=<id>`. `promptCapabilities` is the agent's `initialize`-time advertisement (see [ACP protocol](https://agentclientprotocol.com/protocol/content)); the composer uses it to gate paste/drop/upload affordances.
-- `session_info` arrives immediately after `ready` whenever Kiro reported `modes` / `models` on `session/new` or `session/load`. Drives the mode and model selectors in the header.
-- `commands` forwards Kiro's `_kiro.dev/commands/available` catalogue (commands + prompts only; the massive tool catalogue is stripped on the server to keep WS frames light). Drives the `/` autocomplete.
-- `append` is the ACP streaming path for a live turn. During a resume window the server suppresses these so the browser's `/history`-seeded log doesn't get duplicated.
-- `tool_call` carries the full ACP tool-call payload (arguments, content, file locations). Updates for the same `toolCallId` merge into the existing UI row in place. No new row is appended.
-- `permission_request` renders an inline card with one button per option; the user's click returns a `permission_response` with the matching `optionId`, which Mezame forwards to the agent to unblock it. When the "auto-allow all permissions" setting is on (see Cross-device UI state), the server answers `session/request_permission` itself with an allow option and suppresses the card; the tool still streams its `tool_call` updates so the run stays visible.
-- `mcp_oauth_request` renders an inline card with an Open button when an MCP server needs out-of-band authorisation. Carries `serverName`, `url`, and a dedupe `id` (Kiro re-emits while waiting). Dropped silently when no `url` is present.
-- `cancel` triggers `session/cancel` on the agent.
+- **`ready`** is the first frame on every connection, before any other. Fields:
+  - `sessionId`, the id Mezame bound this connection to. Minted when the
+    upgrade carried no `session` query parameter; otherwise the value supplied.
+    A client persists it and sends it back as `?session=<id>` on reconnect.
+  - `resumed`, always `true`. A connection is always a join to a session that
+    already exists. A client reads it as "clear any stale local log and seed
+    from `/history`", and should do so only on the first `ready` after a page
+    load: a transient reconnect would otherwise rebuild the log underneath the
+    user.
+  - `busy`, whether a turn is in flight on this session at this moment. When
+    `true` the composer opens read-only, and Mezame guarantees that this
+    connection also receives that turn's `prompt_done`, which is what unlocks
+    it again. When `false` the composer opens editable.
+  - `cwd`, the absolute path of the directory the Mezame process runs in.
+    Display only.
+  - `promptCapabilities`, exactly
+    `{"image": true, "audio": false, "embeddedContext": true}`. The composer
+    gates its paste, drop and upload affordances on it.
+  - `buildId`, a non-empty token fixed at compile time. A client compares it
+    against its own to detect a stale cached bundle.
+- **`session_info`** arrives immediately after `ready` when a model set is
+  known, and again after every successful `set_model`. `info.models` carries
+  `currentModelId`, a string, and `availableModels`, an array whose members
+  carry `modelId` and optionally `name` and `description`. Drives the model
+  picker.
+- **`append`** with `role` `user` is the echo Mezame broadcasts when any
+  connected browser sends a prompt, and Mezame is its only producer. It is what
+  tells every other browser a turn has started; a client appends a user turn to
+  its log from this frame or from a history entry, never from its own send. The
+  echo text is the `text` fields of the prompt's text blocks in order, joined by
+  one newline, prefixed once with `> `, and followed by one newline. `image` and
+  `resource` blocks contribute nothing, so a prompt with no text block echoes
+  `"> \n"`.
+- **`append`** with `role` `agent` or `sys` is the streaming path for a turn and
+  for a notice. A failed `set_model` arrives as a `sys` append and no
+  `session_info` follows it.
+- **`thought`** carries reasoning text. A client merges consecutive frames into
+  one collapsible block and closes it on `prompt_done` or `error`.
+- **`tool_call`** carries the whole payload. Frames for one `toolCallId` merge
+  into the existing row rather than appending a new one, and a field holding
+  JSON null means "no change": a client keeps the value it already has for
+  `kind`, `rawInput`, `content` and `locations`. `content`, when present, is an
+  array whose members carry `type` `text` and a `text` string. `locations`, when
+  present, is an array whose members carry a `path` string and optionally a
+  `line` integer of zero or more.
+- **`permission_request`** renders an inline card, one button per option. An
+  option carries `optionId` and optionally `name` and `kind`. The `id` is minted
+  by Mezame and unique for the life of the session. The user's click returns a
+  `permission_response` naming the matching `optionId`. The first answer for an
+  id wins; later answers for it, including from another browser, are dropped in
+  silence.
+- **`prompt_done`** ends a turn. Every event the turn produced is broadcast
+  before it, and exactly one arrives per turn, after a failure as well as a
+  success. It is what unlocks every composer on the session.
+- **`error`** precedes `prompt_done` when a turn failed. `message` holds the
+  failure text.
+
+Nothing streams a `thought`, a `tool_call` or a `permission_request` in the
+0.14.0-alpha.1 release: it answers every prompt with an echo. Their shapes are
+fixed here so a client written now keeps working when the provider loop lands.
+
+## Session history
+
+`GET /history?session=<id>` returns the session's transcript.
+
+```json
+{ "entries": [
+  { "role": "user", "text": "hello", "timestamp": 1730000000000 },
+  { "role": "agent", "text": "hello", "timestamp": 1730000000000 },
+  { "role": "tool_call", "toolCallId": "...", "title": "...", "status": "completed",
+    "kind": null, "rawInput": {...}, "content": null, "locations": null,
+    "timestamp": 1730000000000 }
+] }
+```
+
+A text entry carries `role`, one of `user`, `agent`, `sys` or `thought`, a
+`text` string, and a `timestamp` in milliseconds since the Unix epoch. A `user`
+entry holds neither the `> ` prefix nor the trailing newline of the echo: a
+client adds both when it renders, so the rendered line matches the live echo
+byte for byte.
+
+A tool-call entry is the `tool_call` event with `type` renamed to `role` and a
+`timestamp` added, with the same nullability in every field.
+
+Entries come back in recorded order, with no cap and no pagination. An absent
+or empty `session` answers 400 with a plain-text body. An id with no live
+session answers 200 with an empty array, and creates nothing; that covers a
+value holding `/`, `\` or `..`, since no such value is ever bound to a session.
+The endpoint answers 200 or 400 and nothing else. It reads no file and never
+consults `HOME`.
+
+A transcript lives as long as its session, which outlives the last browser by
+the grace window and no longer. A reload inside that window shows the
+conversation; one after it shows an empty log.
+
+## Session identity
+
+A session id is 1 to 128 characters drawn from the ASCII letters, the digits,
+the hyphen and the underscore.
+
+`GET /ws` with no `session` query parameter mints one: 16 bytes of operating
+system entropy as 32 lowercase hexadecimal characters. With a `session`
+parameter whose trimmed value matches the form above, that value is used and
+nothing is minted. With a trimmed value that is non-empty and does not match,
+the upgrade is refused with a 400 before the handshake: no WebSocket is
+established and no session is created.
+
+A `cwd` query parameter is not read. A session always runs in Mezame's own
+working directory.
 
 ## Cross-device UI state
 
-`GET` / `PUT /state` persists the open-tabs list, recently-closed history, active tab, and numeric label counter. Backing file is `~/.mezame/state.json`. Any browser hitting this Mezame sees the same list, useful when moving between devices behind the same tunnel. Actual conversation content stays with the agent (Kiro at `~/.kiro/sessions/cli/`); Mezame only stores labels, cwds, and ACP session ids.
+`GET` and `PUT /state` persist the open-tabs list, the recently-closed history,
+the active tab, and the numeric label counter. The backing file is
+`~/.mezame/state.json`. Any browser reaching this Mezame sees the same list,
+which is what keeps your phone and your laptop in step. Mezame does not
+interpret the contents; it stores labels, session ids, and a `settings` object
+the client owns for app-wide preferences such as the theme and the notification
+choice.
 
-The same file holds a `settings` object for app-wide preferences (theme, notifications, and `autoAllowPermissions`). The server reads `settings.autoAllowPermissions` on each `session/request_permission` to decide whether to auto-allow; the rest are client-only.
+A `GET` with no file present, or with a file that does not parse as JSON,
+answers 200 with `{}`. A `PUT` with a body that parses as JSON writes a sibling
+temporary file and renames it over the target, so a reader never sees a partial
+file, and answers 204. A failed write leaves any existing file alone and fires
+no event.
 
-`GET /state/events` is a Server-Sent Events stream that emits a `state_changed` event each time `PUT /state` writes a new file. Browsers use it as a "go refetch `/state`" signal so a session opened in another browser shows up without a manual reload. A periodic keep-alive comment keeps intermediaries from idle-timing out the stream.
+`GET /state/events` is a Server-Sent Events stream that emits one
+`state_changed` event per successful `PUT /state`. Browsers read it as a "go
+refetch `/state`" signal, so a session opened in another browser shows up with
+no manual reload. A keep-alive comment every 15 seconds stops an intermediary
+idle-timing out the stream.
 
-`GET /tool-result?session=<id>&id=<toolUseId>` returns the result content for a single tool call from Kiro's session JSONL. Some tools (e.g. web search) flip status to `completed`/`failed` over the live wire without streaming their output; the client polls this endpoint after a status flip to fill in the result. Response shape is `{ "status": <string|null>, "content": <Value|null> }`; a missing entry returns 404.
-
-## Mezame to agent (stdio, ACP JSON-RPC 2.0)
-
-Requests Mezame sends:
-
-- `initialize` on spawn.
-- `session/new` when the browser opens a fresh tab.
-- `session/load` when the browser reconnects with `?session=<id>`. With recovery: retries the load with 250 ms back-off while the error is "Session is active in another process", stealing the lockfile whenever the holding PID is dead. Covers the browser-reload race and the stale-lock case after a dirty shutdown.
-- `session/prompt` for each user message.
-- `session/cancel` (notification) for explicit cancel and during cooperative shutdown.
-- `session/set_mode`, `session/set_model` when the user picks a new value in the header.
-
-Notifications Mezame handles:
-
-- `session/update`:
-  - `agent_message_chunk` to `append` with `role: "agent"`. Rendered as markdown in the chat pane.
-  - `user_message_chunk` to `append` with `role: "user"` during `session/load` replay (suppressed when we're seeding from `/history`, see above).
-  - `agent_thought_chunk` to `append` with `role: "sys"` and a `(thinking)` prefix. Kiro itself does not emit these today; reasoning-model agents do.
-  - `tool_call` / `tool_call_update` forwarded as a structured `tool_call` event keyed by `toolCallId`. Updates mutate the existing entry in place on the browser. One tool call equals one collapsible row, whatever the number of update notifications behind it.
-- `session/request_permission` to `permission_request` event for the browser.
-- `_kiro.dev/commands/available` to `commands` event (trimmed to `commands` + `prompts`).
-- `_kiro.dev/mcp/oauth_request` to `mcp_oauth_request` event (serverName + url + dedupe id).
-
-Other `_kiro.dev/*` notifications (compaction status, clear status) are currently ignored. Extension points live in `handle_agent_message` in `src/ws.rs`.
+Neither endpoint applies per-user scoping and neither requires
+authentication, which is the same posture the 0.13 release ships.

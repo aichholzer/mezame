@@ -4,11 +4,11 @@ version = "0.14.0-alpha.1"
 edition = "2021"
 rust-version = "1.86"
 build = "build.rs"
-description = "An ACP client that bridges a local agent (Kiro CLI, Claude Agent CLI, Gemini CLI, Codex, ...) to a browser UI over WebSockets."
+description = "An agent harness with a browser front end: one session, many devices, over WebSockets."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/aichholzer/mezame"
-keywords = ["acp", "agent", "cli", "kiro", "websocket"]
+keywords = ["agent", "harness", "assistant", "cli", "websocket"]
 categories = ["command-line-utilities", "web-programming::websocket"]
 # `ui/node_modules/` is populated by `build.rs` inside `$OUT_DIR` and
 # never reaches the source tree during a clean build. We also ignore it

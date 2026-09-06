@@ -71,7 +71,7 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
    WantedBy=multi-user.target
    ```
 
-   Replace `youruser` with the Unix account that has Mezame and the ACP agent (kiro-cli, claude, etc.) installed. The explicit `Environment=HOME=...` matters: system units do not inherit per-user env, and Mezame reads `$HOME/.mezame/config.json`.
+   Replace `youruser` with the Unix account Mezame is installed under. The explicit `Environment=HOME=...` matters: system units do not inherit per-user env, and Mezame reads `$HOME/.mezame/config.json`.
 
 2. Enable:
 
@@ -127,7 +127,7 @@ Install as a LaunchAgent under your user account. This runs Mezame whenever you 
    </plist>
    ```
 
-   `KeepAlive` with `SuccessfulExit=false` restarts on crash but not when Mezame exits cleanly (matches systemd's `Restart=on-failure`). `PATH` matters because Mezame spawns the ACP agent by name if you configured it that way; launchd's default PATH does not include Homebrew.
+   `KeepAlive` with `SuccessfulExit=false` restarts on crash but not when Mezame exits cleanly (matches systemd's `Restart=on-failure`). `PATH` is set because launchd's default does not include Homebrew, and Mezame's own build and run paths expect a normal login `PATH`.
 
 2. Load it (the modern verb is `bootstrap`; `load` is legacy but still works):
 
@@ -157,7 +157,7 @@ Install as a LaunchAgent under your user account. This runs Mezame whenever you 
 
 ## Shutdown behaviour
 
-Both systemd `stop` and launchd `bootout` send SIGTERM. Mezame catches it, stops accepting new WebSocket connections, and exits. Live browser sessions drop; the next connect recreates them. If Kiro was mid-turn when Mezame exited, its per-session lockfile may stick around briefly: the next resume attempt detects the dead PID and steals the lock automatically (see `src/session.rs`). No cleanup required from you.
+Both systemd `stop` and launchd `bootout` send SIGTERM. Mezame catches it, stops accepting new WebSocket connections, and exits. Live browser sessions drop, and the next connect recreates them. Nothing is left behind on disk to clean up: a session and its transcript live in memory only, so a restart starts every conversation fresh. Durable storage is planned; until it lands, treat a restart as losing the transcripts.
 
 ## A note on `--background`
 
