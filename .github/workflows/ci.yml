@@ -186,10 +186,12 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Run tests with coverage
-        # The floor sits below the current 65.57 figure. Routine drift
-        # passes, and a drop of five points or more fails. Lift it
-        # whenever a coverage gain lands.
-        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --fail-under-lines 60
+        # The floor is this job's own reading on d4b1f0d, 89.61% of lines,
+        # rounded down and less five. Read here rather than locally: the
+        # job runs on Linux and a reading differs by platform. Routine
+        # drift passes, and a drop of five points or more fails. Raise it
+        # whenever a coverage gain lands; it is never lowered.
+        run: cargo llvm-cov --all-targets --lcov --output-path lcov.info --fail-under-lines 84
 
       - name: Print the coverage summary
         # The lcov step prints no percentage when the floor passes. This
