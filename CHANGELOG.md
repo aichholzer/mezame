@@ -13,6 +13,19 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.14.0-alpha.2] - 2026-09-07
+
+This alpha assumes a fresh install. There is no migration from 0.13 or
+from an earlier alpha: remove `~/.mezame` (or the Docker volume) left by
+an earlier version and run `mezame init` again. The entries below say
+what changed; none of them describes a path from the old state.
+
+### Changed
+
+- The compiler floor rises to Rust 1.94.1, the floor of the AWS SDK
+  crates this line builds on; the CI `msrv` job now reads it from
+  `Cargo.toml`.
+
 ## [0.14.0-alpha.1] - 2026-09-06
 
 The first alpha of the harness line. Mezame stops being a client for a

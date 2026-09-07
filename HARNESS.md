@@ -94,7 +94,7 @@ tree at 0.13.4. Phases 0 through 2 add nothing beyond this list.
 
 | Phase | Addition | Crates |
 | --- | --- | --- |
-| 1 | `aws-config`, `aws-sdk-bedrockruntime` (inherent to Bedrock-first: the credential chain is the feature) | about +121 |
+| 1 | `aws-config`, `aws-sdk-bedrockruntime` (inherent to Bedrock-first: the credential chain is the feature), plus a direct `aws-smithy-types` line at zero cost | +100, measured 2026-09-07: 191 to 291 `Cargo.lock` entries with the SDK's legacy `rustls` feature off |
 | 2 | `rusqlite` bundled | +13 |
 | 2 | `argon2`, `chacha20poly1305`, `arc-swap`, `tower-http` | about +19 |
 | 3 | `reqwest` (first needed by web fetch; shared by the phase 4 adapters and rmcp) | about +58 |

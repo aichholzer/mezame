@@ -1,8 +1,8 @@
 [package]
 name = "mezame"
-version = "0.14.0-alpha.1"
+version = "0.14.0-alpha.2"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.94.1"
 build = "build.rs"
 description = "An agent harness with a browser front end: one session, many devices, over WebSockets."
 license = "MIT"
@@ -40,6 +40,21 @@ exclude = [
 
 [dependencies]
 anyhow = "1.0.103"
+# The AWS credential chain (profiles, SSO, assumed roles, the instance
+# metadata service) and the Bedrock Runtime client. Both set the
+# `rust-version` above. `default-features = false` on each: the
+# `rustls` feature of `aws-sdk-bedrockruntime` is the legacy HTTP path
+# (hyper 0.14, rustls 0.21 and a second TLS stack beside the default
+# client's) and stays off; on `aws-config` the feature of that name is an
+# alias of the default client and the legacy path is `legacy-client`,
+# also off. `default-https-client` is hyper 1.x over rustls 0.23.
+aws-config = { version = "1.12", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "sso", "credentials-process"] }
+aws-sdk-bedrockruntime = { version = "1.143", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# Already in the normal graph through the two crates above, so zero new
+# crates. Direct because the SDK does not re-export `Document`, the type
+# `additionalModelRequestFields` takes, and Cargo does not expose a
+# transitive crate by path.
+aws-smithy-types = "1.6.3"
 axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 dialoguer = { version = "0.12.0", default-features = false }
 futures-util = "0.3.31"

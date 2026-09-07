@@ -263,8 +263,8 @@ impl Counter {
     /// immortal. Returns the post-detach count.
     ///
     /// A compare-exchange loop rather than `fetch_update`, which Rust
-    /// 1.99 deprecates in favour of a `try_update` the 1.86 floor does
-    /// not have.
+    /// 1.99 deprecates in favour of a `try_update` the compiler floor
+    /// does not have.
     fn decrement(&self) -> usize {
         let mut current = self.count.load(Ordering::SeqCst);
         loop {

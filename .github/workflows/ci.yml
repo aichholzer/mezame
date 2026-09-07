@@ -31,9 +31,10 @@ env:
 # read the version comment, and a bump stays reviewable.
 #
 # `dtolnay/rust-toolchain` publishes no version tags. The pin is the
-# `master` head. The branch names it advertises (`@stable`, `@1.86.0`) are
+# `master` head. The branch names it advertises (`@stable` among them) are
 # branches whose only difference is a default for the `toolchain` input.
-# Pinning by SHA drops that default. Every job below names its toolchain.
+# Pinning by SHA drops that default. Every job below names its toolchain,
+# and the `msrv` job reads its own from `Cargo.toml`.
 
 jobs:
   test:
@@ -254,10 +255,16 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install Rust 1.86
+      # The floor lives in one place, `Cargo.toml`, and this job reads it
+      # there, so the manifest and the job cannot drift apart.
+      - name: Read the compiler floor from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master @ 2026-08-05
         with:
-          toolchain: 1.86.0
+          toolchain: ${{ steps.msrv.outputs.version }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
