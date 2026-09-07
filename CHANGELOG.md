@@ -37,7 +37,11 @@ what changed; none of them describes a path from the old state.
   region, or the echo.
 - Sessions announce the provider, the model and the thinking mode on
   attach, and `prompt_done` carries the turn's token counts (input,
-  output, cache read, cache write).
+  output, cache read, cache write). The browser shows them under the
+  answer as `65 in · 4 out · 0 cached`, adding `written` when the cache
+  took a write; counts from 10,000 shorten to `12.3k`, with the exact
+  figures in the tooltip. A reload shows none: `/history` carries no
+  usage in this alpha.
 - The loop refuses a request that would overflow the model's context
   with a clear message instead of a failed turn, drops an exchange the
   model refused or filtered so it never poisons the next turn, times a

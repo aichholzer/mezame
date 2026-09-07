@@ -282,6 +282,88 @@ describe('applyServerMessage / tool_call', () => {
 // ---------- prompt_done ----------
 
 describe('applyServerMessage / prompt_done', () => {
+  it('attaches usage to the last agent entry, not an earlier one', () => {
+    const s = makeSession();
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'first' });
+    applyServerMessage(s, { type: 'append', role: 'user', text: 'again' });
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'second' });
+    const usage = { input: 65, output: 4, cacheRead: 0, cacheWrite: 0 };
+    applyServerMessage(s, { type: 'prompt_done', usage });
+    const agents = s.log.filter(
+      (e): e is Extract<LogEntry, { kind: 'text' }> => e.kind === 'text' && e.role === 'agent'
+    );
+    expect(agents).toHaveLength(2);
+    expect(agents[0].usage).toBeUndefined();
+    expect(agents[1].usage).toEqual(usage);
+  });
+
+  it('attaches nothing when prompt_done carries no usage', () => {
+    const s = makeSession();
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'echo' });
+    applyServerMessage(s, { type: 'prompt_done' });
+    const agent = s.log.find((e) => e.kind === 'text' && e.role === 'agent');
+    expect(agent && agent.kind === 'text' ? agent.usage : 'missing').toBeUndefined();
+  });
+
+  it('leaves the previous answer alone when the turn produced no agent text', () => {
+    // Turn 1 answers and gets its counts. Turn 2 is reasoning-only or
+    // refused: its echo opens the turn, no agent text follows, and its
+    // counts must land nowhere, not on turn 1's bubble.
+    const s = makeSession();
+    applyServerMessage(s, { type: 'append', role: 'user', text: '> one\n' });
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'pong' });
+    const first = { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 };
+    applyServerMessage(s, { type: 'prompt_done', usage: first });
+    applyServerMessage(s, { type: 'append', role: 'user', text: '> two\n' });
+    applyServerMessage(s, { type: 'thought', text: 'hmm' });
+    applyServerMessage(s, { type: 'prompt_done', usage: { input: 99, output: 9, cacheRead: 9, cacheWrite: 9 } });
+    const agents = s.log.filter(
+      (e): e is Extract<LogEntry, { kind: 'text' }> => e.kind === 'text' && e.role === 'agent'
+    );
+    expect(agents).toHaveLength(1);
+    expect(agents[0].usage).toEqual(first);
+  });
+
+  it('attaches nothing to entries rebuilt from history when the turn was joined mid-flight', () => {
+    // A browser attaching while a turn runs sees no echo for it. The
+    // `ready` marker fences the rebuilt log off from that turn's counts.
+    const s = makeSession({
+      log: [
+        { kind: 'text', id: 'h1', role: 'user', text: '> old\n', timestamp: 1 },
+        { kind: 'text', id: 'h2', role: 'agent', text: 'old answer', timestamp: 2 }
+      ],
+      hydrated: true
+    });
+    applyServerMessage(s, { type: 'ready', sessionId: 'abc', resumed: true, busy: true });
+    applyServerMessage(s, { type: 'prompt_done', usage: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 } });
+    const old = s.log.find((e) => e.kind === 'text' && e.role === 'agent');
+    expect(old && old.kind === 'text' ? old.usage : 'missing').toBeUndefined();
+  });
+
+  it('ignores a usage object that is not four finite numbers', () => {
+    const s = makeSession();
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'pong' });
+    const malformed = { input: '65', output: 4, cacheRead: 0 } as unknown as {
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+    };
+    applyServerMessage(s, { type: 'prompt_done', usage: malformed });
+    const agent = s.log[0];
+    expect(agent.kind === 'text' ? agent.usage : 'missing').toBeUndefined();
+    expect(s.busy).toBe(false);
+  });
+
+  it('skips a trailing sys entry and lands on the agent one', () => {
+    const s = makeSession();
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'answer' });
+    applyServerMessage(s, { type: 'append', role: 'sys', text: 'note' });
+    applyServerMessage(s, { type: 'prompt_done', usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 } });
+    const agent = s.log[0];
+    expect(agent.kind === 'text' && agent.usage?.cacheWrite).toBe(4);
+  });
+
   it('clears thinking, clears busy, clears inFlight, raises attention to done', () => {
     const s = makeSession({ thinking: true, busy: true, inFlight: true });
     applyServerMessage(s, { type: 'prompt_done' });

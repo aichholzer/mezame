@@ -2,9 +2,10 @@ import { useEffect, useLayoutEffect, useRef } from 'react';
 import { CopyButton } from '@/components/CopyButton';
 import { Markdown } from '@/features/Markdown';
 import { ToolCallCard } from '@/features/ToolCallCard';
-import { mezameActions } from '@/hooks/useMezame';
+import { lastAgentTextIndex, mezameActions } from '@/hooks/useMezame';
 import { useKeyboardInsetValue } from '@/hooks/useKeyboardInset';
 import { useTick } from '@/hooks/useTick';
+import { exactUsage, formatUsage } from '@/lib/usage';
 import { cn } from '@/lib/utils';
 import type { LogEntry, PermissionOption, Session } from '@/types';
 
@@ -157,10 +158,28 @@ const TextEntry = ({
           <div className="rounded-2xl rounded-tl-[0px] bg-[color:var(--agent-bubble)] px-4 py-4 text-[color:var(--agent-bubble-foreground)] shadow-sm">
             <Markdown text={entry.text} />
           </div>
-          {/* Mobile-only copy control, sitting below the response. */}
-          {!isStreaming && (
-            <div className="mt-1.5 md:hidden">
-              <CopyButton text={copyText} title="Copy message" className="size-7" />
+          {/* The meta footer: the mobile-only copy control, which waits
+           * for the turn to end like the rail above, and the turn's token
+           * counts when `prompt_done` attached them to this entry. The
+           * counts are not gated on streaming: only `prompt_done` sets
+           * them, so a bubble that has them is finished, and the previous
+           * answer's counts must not blink out while the next turn is
+           * awaited. With no counts the row is hidden on desktop, where
+           * the copy button sits in the rail, so it adds no height. */}
+          {(!isStreaming || entry.usage) && (
+            <div className={cn('mt-1.5 flex items-center gap-2', !entry.usage && 'md:hidden')}>
+              {!isStreaming && (
+                <CopyButton text={copyText} title="Copy message" className="size-7 md:hidden" />
+              )}
+              {entry.usage && (
+                <span
+                  className="text-[11px] text-muted-foreground tabular-nums"
+                  title={exactUsage(entry.usage)}
+                  data-testid="usage-footer"
+                >
+                  {formatUsage(entry.usage)}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -194,14 +213,7 @@ export const LogPane = ({ session, isActive }: Props) => {
   // hidden until prompt_done lands. Earlier agent entries within
   // the same turn (interleaved with tool calls) are already final
   // and keep their footer.
-  let lastAgentTextIndex = -1;
-  for (let i = session.log.length - 1; i >= 0; i -= 1) {
-    const e = session.log[i];
-    if (e.kind === 'text' && e.role === 'agent') {
-      lastAgentTextIndex = i;
-      break;
-    }
-  }
+  const trailingAgentIndex = lastAgentTextIndex(session.log);
 
   // Auto-scroll when new content arrives if the user is pinned to the
   // bottom. useLayoutEffect so the scroll happens in the same frame as
@@ -282,7 +294,7 @@ export const LogPane = ({ session, isActive }: Props) => {
           // in the same turn (interleaved with tool calls) are
           // already final and keep their footer.
           const isStreaming =
-            session.thinking && entry.role === 'agent' && idx === lastAgentTextIndex;
+            session.thinking && entry.role === 'agent' && idx === trailingAgentIndex;
           return <TextEntry key={entry.id} entry={entry} isStreaming={isStreaming} />;
         }
         if (entry.kind === 'thought') {

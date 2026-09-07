@@ -18,7 +18,8 @@ import type {
   ServerMessage,
   Session,
   Status,
-  ToolCallLocation
+  ToolCallLocation,
+  Usage
 } from '@/types';
 import { getIdleSuspendMinutes } from '@/lib/settings';
 
@@ -718,6 +719,11 @@ const loadHistory = async (s: Session) => {
       timestamp: e.timestamp ?? Date.now()
     });
   }
+  // History holds finished turns only. A turn in flight at attach time
+  // starts after them, so its counts cannot land on a rebuilt entry.
+  if (s.inFlight) {
+    s.turnStart = s.log.length;
+  }
   notify();
 };
 
@@ -1018,6 +1024,32 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
  *
  * @internal
  */
+/** Index of the last `text` entry with role `agent` at or after `from`, or
+ * -1. Shared by the `prompt_done` reducer arm and the log pane's
+ * streaming gate so the two agree on which bubble is the trailing one. */
+export const lastAgentTextIndex = (log: LogEntry[], from = 0): number => {
+  for (let i = log.length - 1; i >= Math.max(from, 0); i -= 1) {
+    const e = log[i];
+    if (e.kind === 'text' && e.role === 'agent') {
+      return i;
+    }
+  }
+  return -1;
+};
+
+/** The wire's `usage` is trusted only in its declared shape: four finite
+ * numbers. A stale bundle against a newer binary, or a proxy rewrite,
+ * must not reach the formatters with a string or a missing field. */
+const isUsage = (u: unknown): u is Usage => {
+  if (typeof u !== 'object' || u === null) {
+    return false;
+  }
+  const r = u as Record<string, unknown>;
+  return ['input', 'output', 'cacheRead', 'cacheWrite'].every(
+    (k) => typeof r[k] === 'number' && Number.isFinite(r[k] as number)
+  );
+};
+
 export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
   switch (msg.type) {
     case 'ready':
@@ -1050,6 +1082,12 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       s.thinking = msg.busy === true;
       s.inFlight = msg.busy === true;
       setBusy(s, msg.busy === true);
+      // An attach into a running turn saw none of its echo; whatever the
+      // log holds now belongs to earlier turns. `loadHistory` moves the
+      // marker again once it has rebuilt the log.
+      if (msg.busy === true) {
+        s.turnStart = s.log.length;
+      }
       setStatus(s, 'connected');
       markActivity(s);
       break;
@@ -1078,6 +1116,10 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         text: msg.text,
         timestamp: Date.now()
       });
+      if (msg.role === 'user') {
+        // The turn's own entries follow the echo.
+        s.turnStart = s.log.length;
+      }
       break;
     case 'thought': {
       // Reasoning tokens stream as many small chunks. Merge into a
@@ -1159,6 +1201,19 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       break;
     }
     case 'prompt_done':
+      // The turn's token counts belong to the answer they paid for: the
+      // last agent text entry of this turn, and no earlier one. A turn
+      // that produced no text (reasoning only, or a refusal) attaches
+      // nothing. `/history` carries none, so a reload shows none
+      // (`loadHistory` never sets it).
+      if (isUsage(msg.usage)) {
+        const at = lastAgentTextIndex(s.log, s.turnStart ?? 0);
+        const entry = at >= 0 ? s.log[at] : undefined;
+        if (entry && entry.kind === 'text') {
+          entry.usage = msg.usage;
+        }
+      }
+      s.turnStart = undefined;
       s.thinking = false;
       s.inFlight = false;
       s.thoughtOpen = false;
@@ -1184,6 +1239,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
         text: `\n[Error: ${msg.message}]\n`,
         timestamp: Date.now()
       });
+      s.turnStart = undefined;
       s.thinking = false;
       s.inFlight = false;
       s.thoughtOpen = false;

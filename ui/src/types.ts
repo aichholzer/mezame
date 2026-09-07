@@ -26,8 +26,18 @@ export type ServerMessage =
   | { type: 'thought'; text: string }
   | { type: 'tool_call'; toolCallId: string; title?: string | null; status?: string | null; kind?: string | null; rawInput?: unknown; content?: unknown; locations?: unknown }
   | { type: 'permission_request'; id: number | string; title: string; options: PermissionOption[] }
-  | { type: 'prompt_done' }
+  | { type: 'prompt_done'; usage?: Usage }
   | { type: 'error'; message: string };
+
+/** Token counts for one turn, as `prompt_done` reports them. `input`
+ * counts uncached input tokens; `cacheRead` and `cacheWrite` count the
+ * prompt-cache traffic. */
+export type Usage = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
 
 export type ClientMessage =
   | { type: 'prompt'; blocks: PromptBlock[] }
@@ -91,7 +101,16 @@ export type ToolCallStatus = 'pending' | 'in_progress' | 'completed' | 'failed' 
  * tool-call progress) mutate the item in place.
  */
 export type LogEntry =
-  | { kind: 'text'; id: string; role: Role; text: string; timestamp: number }
+  | {
+    kind: 'text';
+    id: string;
+    role: Role;
+    text: string;
+    timestamp: number;
+    /** Set on the last agent entry of a live turn by `prompt_done`;
+     * `/history` carries no usage, so a reload shows none. */
+    usage?: Usage;
+  }
   | {
     kind: 'thought';
     id: string;
@@ -194,6 +213,12 @@ export type Session = {
    * entry. Cleared on `prompt_done` / `error` so the next turn opens a
    * fresh thought block. */
   thoughtOpen: boolean;
+  /** Index in `log` where the current turn's entries begin: set by the
+   * user echo that opens a turn, or by an attach that finds one in
+   * flight. `prompt_done` attaches usage only at or after it, so a turn
+   * that produced no agent text cannot stamp its counts on the previous
+   * answer. Cleared when the turn ends. */
+  turnStart?: number;
 };
 
 export type ClosedEntry = {
