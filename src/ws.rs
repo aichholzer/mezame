@@ -87,17 +87,18 @@ pub fn new_session_id() -> String {
     })
 }
 
-/// The accepted session id form: 1 to 128 characters drawn from the ASCII
-/// letters, the digits, the hyphen and the underscore.
+/// The accepted session id form: exactly 32 lowercase hexadecimal
+/// characters, which is what [`new_session_id`] mints and nothing else.
 ///
-/// The charset is ASCII, so the byte length equals the character count. A
-/// value outside this form is never bound to a hub, which is what keeps a
-/// path separator or a dot segment out of every lookup key in the process.
+/// A session id is the one thing gating an attach and a history read, so
+/// only an id this process or an earlier run minted is bound to a hub. A
+/// client-chosen name would make a session anyone could find by guessing
+/// it. The form is ASCII, so the byte length equals the character count,
+/// and no separator, dot segment or whitespace can reach a lookup key.
 pub fn is_session_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
+    s.len() == 32
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// What to do with the `session` query parameter of an upgrade request.

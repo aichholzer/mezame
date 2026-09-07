@@ -226,18 +226,15 @@ fn the_echo_text_for_a_block_list_holding_no_text_block_is_the_bare_prefix() {
 }
 
 #[test]
-fn is_session_id_accepts_the_documented_form() {
-    // Requirement 6 criterion 7: 1 to 128 characters drawn from the ASCII
-    // letters, the digits, the hyphen and the underscore.
+fn is_session_id_accepts_the_minted_form() {
+    // Requirement 6 criterion 7: exactly 32 lowercase hexadecimal
+    // characters, the form criterion 6's minting produces and nothing
+    // else.
     for accepted in [
-        "a",
-        "0",
-        "abc-1",
-        "abc_1",
-        "AbC-123_xyz",
-        "-",
-        "_",
-        &"a".repeat(128),
+        "0123456789abcdef0123456789abcdef",
+        &"0".repeat(32),
+        &"f".repeat(32),
+        &"a".repeat(32),
     ] {
         assert!(is_session_id(accepted), "should accept {accepted:?}");
     }
@@ -246,26 +243,41 @@ fn is_session_id_accepts_the_documented_form() {
 
 #[test]
 fn is_session_id_rejects_everything_else() {
-    for refused in [
-        "",
-        " ",
-        "a b",
-        " a",
-        "a\t",
-        "a\n",
-        "a/b",
-        "a\\b",
-        "..",
-        "../x",
-        "a/../b",
-        "./a",
-        "sessión",
-        "日本語",
-        "a.b",
-        "a:b",
-        "a%20b",
-        &"a".repeat(129),
-    ] {
+    // A client-chosen name would make a session anyone could find by
+    // guessing it, so a name, a shorter or longer hex string, the minted
+    // form in upper case, and anything carrying whitespace or a separator
+    // are all refused.
+    let minted = new_session_id();
+    let mut upper = minted.clone();
+    upper.make_ascii_uppercase();
+    let mut with_slash = minted.clone();
+    with_slash.replace_range(15..16, "/");
+    let mut with_space = minted.clone();
+    with_space.replace_range(15..16, " ");
+    let refused: Vec<String> = vec![
+        String::new(),
+        " ".into(),
+        "a".into(),
+        "test".into(),
+        "abc-1".into(),
+        "abc_1".into(),
+        "AbC-123_xyz".into(),
+        "g".repeat(32),
+        "-".repeat(32),
+        "_".repeat(32),
+        minted[..31].to_string(),
+        format!("{minted}0"),
+        upper,
+        with_slash,
+        with_space,
+        format!(" {minted}"),
+        format!("{minted}\n"),
+        "..".into(),
+        "../x".into(),
+        "日本語".into(),
+        "a".repeat(128),
+    ];
+    for refused in &refused {
         assert!(!is_session_id(refused), "should refuse {refused:?}");
     }
 }
@@ -274,21 +286,29 @@ fn is_session_id_rejects_everything_else() {
 fn decide_session_mints_accepts_and_refuses() {
     // Requirement 6 criteria 1, 2 and 8, through the pure decision the
     // upgrade handler and Property 6 share.
+    let id = new_session_id();
+    let mut upper = id.clone();
+    upper.make_ascii_uppercase();
+
     assert_eq!(decide_session(None), SessionDecision::Mint);
     assert_eq!(decide_session(Some("")), SessionDecision::Mint);
     assert_eq!(decide_session(Some("   ")), SessionDecision::Mint);
     assert_eq!(decide_session(Some("\t\n ")), SessionDecision::Mint);
     assert_eq!(
-        decide_session(Some(" abc-1 ")),
-        SessionDecision::Accept("abc-1".to_string())
+        decide_session(Some(&format!(" {id} "))),
+        SessionDecision::Accept(id.clone())
     );
     assert_eq!(
-        decide_session(Some("abc-1")),
-        SessionDecision::Accept("abc-1".to_string())
+        decide_session(Some(&id)),
+        SessionDecision::Accept(id.clone())
     );
-    assert_eq!(decide_session(Some("../x")), SessionDecision::Refuse);
-    assert_eq!(decide_session(Some("a b")), SessionDecision::Refuse);
-    assert_eq!(decide_session(Some("日本語")), SessionDecision::Refuse);
+    for refused in ["../x", "a b", "日本語", "abc-1", "test", &upper, &id[..31]] {
+        assert_eq!(
+            decide_session(Some(refused)),
+            SessionDecision::Refuse,
+            "{refused:?}"
+        );
+    }
 }
 
 /// Set in the child run of the cross-run uniqueness test below.

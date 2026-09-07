@@ -316,8 +316,22 @@ fn arb_history_entry() -> impl Strategy<Value = HistoryEntry> {
 
 /// Strings that stress the session id form: whitespace, path separators,
 /// dot segments, non-ASCII, and the lengths on either side of the bound.
+/// One lowercase hexadecimal character.
+fn arb_hex_char() -> impl Strategy<Value = char> {
+    prop_oneof![prop::char::range('0', '9'), prop::char::range('a', 'f')]
+}
+
 fn arb_loose_string() -> impl Strategy<Value = String> {
     prop_oneof![
+        // Hex strings of the minted length and one either side of it,
+        // some with one character lifted to upper case.
+        3 => prop::collection::vec(arb_hex_char(), 30..=34)
+            .prop_map(|chars| chars.into_iter().collect::<String>()),
+        1 => (prop::collection::vec(arb_hex_char(), 32), 0usize..32).prop_map(|(mut chars, at)| {
+            chars[at] = chars[at].to_ascii_uppercase();
+            chars.into_iter().collect::<String>()
+        }),
+        1 => Just(" 0123456789abcdef0123456789abcdef ".to_string()),
         6 => prop::collection::vec(
             prop_oneof![
                 6 => prop::char::range('a', 'z'),
@@ -843,9 +857,9 @@ proptest! {
     }
 
     // Feature: harness-strip-and-seam, Property 6: For any count n up to
-    // 10,000, minting n ids yields n distinct strings, each of 1 to 128
-    // characters drawn from the ASCII letters, the digits, the hyphen and
-    // the underscore. For any string s, decide_session(Some(s)) is Mint
+    // 10,000, minting n ids yields n distinct strings, each exactly 32
+    // lowercase hexadecimal characters, and that form is the only one
+    // accepted. For any string s, decide_session(Some(s)) is Mint
     // when s trims to empty, Accept of the trimmed value when that value
     // passes is_session_id, and Refuse in every other case;
     // decide_session(None) is Mint.
@@ -879,12 +893,13 @@ proptest! {
             SessionDecision::Accept(accepted) => {
                 prop_assert_eq!(accepted.as_str(), trimmed, "the trimmed value is accepted");
                 prop_assert!(is_session_id(&accepted), "an accepted id passes the form");
+                prop_assert_eq!(accepted.len(), 32, "the minted length: {:?}", accepted);
                 prop_assert!(
-                    !accepted.contains('/')
-                        && !accepted.contains('\\')
-                        && !accepted.contains('.')
-                        && !accepted.chars().any(char::is_whitespace),
-                    "no separator, dot segment or whitespace survives: {:?}",
+                    accepted
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "lowercase hex only, so no separator, dot segment, whitespace or \
+                     upper case survives: {:?}",
                     accepted
                 );
             }

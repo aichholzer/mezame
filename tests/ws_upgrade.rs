@@ -29,6 +29,10 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Ids of the minted form, the only form an upgrade accepts.
+const ACCEPTED_ID: &str = "fedcba9876543210fedcba9876543210";
+const SHARED_ID: &str = "0123456789abcdef0123456789abcdef";
+
 /// A router serving on an ephemeral port, with the state it was built
 /// from so a case can inspect the registry.
 struct Server {
@@ -145,47 +149,54 @@ async fn an_upgrade_with_an_accepted_session_parameter_uses_it_verbatim() {
     // Requirement 6 criterion 2: the trimmed value is the session id, and
     // nothing is minted.
     let server = serve().await;
-    let ready = first_frame(&server, "/ws?session=%20abc-1%20").await;
+    let ready = first_frame(&server, &format!("/ws?session=%20{ACCEPTED_ID}%20")).await;
 
     assert_eq!(ready["type"], "ready");
     assert_eq!(
-        ready["sessionId"], "abc-1",
+        ready["sessionId"], ACCEPTED_ID,
         "the surrounding whitespace is trimmed off"
     );
-    assert!(server.state.hubs.is_registered_for_test("abc-1").await);
+    assert!(server.state.hubs.is_registered_for_test(ACCEPTED_ID).await);
     assert!(
-        !server.state.hubs.is_registered_for_test(" abc-1 ").await,
+        !server
+            .state
+            .hubs
+            .is_registered_for_test(&format!(" {ACCEPTED_ID} "))
+            .await,
         "the untrimmed value is never a key"
     );
 }
 
 #[tokio::test]
 async fn an_upgrade_with_a_refused_session_parameter_is_rejected_before_the_handshake() {
-    // Requirement 6 criterion 8. The refusal happens ahead of the
-    // handshake, so no WebSocket exists, `attach_or_create` never runs,
-    // and no hub is created for the request.
+    // Requirement 6 criteria 7 and 8. Only the minted form is accepted:
+    // a path segment, a name a user typed, and the minted form in upper
+    // case are all refused ahead of the handshake, so no WebSocket exists,
+    // `attach_or_create` never runs, and no hub is created for the request.
     let server = serve().await;
-    let url = format!("ws://{}/ws?session=../x", server.addr);
-    let outcome = timeout(Duration::from_secs(5), connect_async(&url))
-        .await
-        .expect("the attempt settles within 5s");
+    for refused in ["../x", "test", "FEDCBA9876543210FEDCBA9876543210"] {
+        let url = format!("ws://{}/ws?session={refused}", server.addr);
+        let outcome = timeout(Duration::from_secs(5), connect_async(&url))
+            .await
+            .expect("the attempt settles within 5s");
 
-    match outcome {
-        Ok(_) => panic!("the handshake should have been refused"),
-        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
-            assert_eq!(
-                response.status(),
-                400,
-                "a value Mezame binds no hub to is a bad request"
-            );
+        match outcome {
+            Ok(_) => panic!("the handshake for {refused:?} should have been refused"),
+            Err(WsError::Http(response)) => {
+                assert_eq!(
+                    response.status(),
+                    400,
+                    "a value Mezame binds no hub to is a bad request: {refused:?}"
+                );
+            }
+            Err(other) => panic!("expected an HTTP 400 for {refused:?}, got {other:?}"),
         }
-        Err(other) => panic!("expected an HTTP 400, got {other:?}"),
-    }
 
-    assert!(
-        !server.state.hubs.is_registered_for_test("../x").await,
-        "no hub is created for a refused id"
-    );
+        assert!(
+            !server.state.hubs.is_registered_for_test(refused).await,
+            "no hub is created for a refused id: {refused:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -193,11 +204,11 @@ async fn two_attaches_naming_one_id_share_a_hub_over_real_sockets() {
     // Requirement 7 criterion 2 over the transport: the second browser
     // sees the same `ready` the first did, bar the per-attach fields.
     let server = serve().await;
-    let first = first_frame(&server, "/ws?session=shared-1").await;
-    let second = first_frame(&server, "/ws?session=shared-1").await;
+    let first = first_frame(&server, &format!("/ws?session={SHARED_ID}")).await;
+    let second = first_frame(&server, &format!("/ws?session={SHARED_ID}")).await;
 
-    assert_eq!(first["sessionId"], "shared-1");
-    assert_eq!(second["sessionId"], "shared-1");
+    assert_eq!(first["sessionId"], SHARED_ID);
+    assert_eq!(second["sessionId"], SHARED_ID);
     assert_eq!(first["cwd"], second["cwd"]);
     assert_eq!(first["buildId"], second["buildId"]);
     assert_eq!(

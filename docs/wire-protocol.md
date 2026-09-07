@@ -223,15 +223,16 @@ otherwise read it as same-origin.
 
 ## Session identity
 
-A session id is 1 to 128 characters drawn from the ASCII letters, the digits,
-the hyphen and the underscore.
+A session id is exactly 32 lowercase hexadecimal characters: the form `/ws`
+mints, and the only form it accepts.
 
 `GET /ws` with no `session` query parameter mints one: 16 bytes of operating
 system entropy as 32 lowercase hexadecimal characters. With a `session`
-parameter whose trimmed value matches the form above, that value is used and
-nothing is minted. With a trimmed value that is non-empty and does not match,
-the upgrade is refused with a 400 before the handshake: no WebSocket is
-established and no session is created.
+parameter whose trimmed value is of that form, that value is used and nothing
+is minted. With a trimmed value that is non-empty and of any other form, a
+name a user typed or the minted form in upper case included, the upgrade is
+refused with a 400 before the handshake: no WebSocket is established and no
+session is created.
 
 A `cwd` query parameter is not read. A session always runs in Mezame's own
 working directory.

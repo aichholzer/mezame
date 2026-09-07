@@ -37,6 +37,10 @@ with an echo, on every attached browser at once.
   the new key.
 - Building from source needs Node.js 24 or newer. `build.rs` refuses an
   older version.
+- A session id is the minted form only: 32 lowercase hexadecimal
+  characters. `/ws?session=` with any other value is refused with a 400,
+  as a path segment already was. The UI only ever sends ids the server
+  minted, so nothing it has persisted is affected.
 - Behind a Cloudflare Tunnel, or any proxy that passes the public
   hostname through in `Host`, that hostname must be listed under `hosts`
   in the transport entry of `~/.mezame/config.json`, or every request
