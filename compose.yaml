@@ -3,11 +3,23 @@
 # First-run setup (interactive, one-off):
 #   docker compose run --rm setup
 #
-# That runs `mezame init`, which asks one question: the address to bind.
-# Choose 0.0.0.0:9510. The default, 127.0.0.1:9510, binds loopback inside
-# the container, and the published port below would then answer nothing.
-# Without a terminal, `docker compose run -T --rm setup mezame init --bind
-# 0.0.0.0:9510` writes the same config with no prompt.
+# That runs `mezame init`, which asks for the address to bind, then the
+# Bedrock model, region and profile. Choose 0.0.0.0:9510 for the bind. The
+# default, 127.0.0.1:9510, binds loopback inside the container, and the
+# published port below would then answer nothing. Without a terminal,
+# `docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510 --model
+# global.anthropic.claude-sonnet-5` writes the same config with no prompt.
+#
+# Credentials never live in the image or the volume. The `environment`
+# list on the `mezame` service names the AWS variables bare, which passes
+# each one through from the host's environment when it is set and sets
+# nothing when it is not, so the file stays valid on a host with none. For
+# a profile, uncomment the `~/.aws` mount: it is read-only, which the
+# read-only root filesystem permits. Read-only also means the SDK cannot
+# refresh an `sso-session` token as it nears expiry, so log in again on
+# the host when turns start failing for credentials, or mount
+# `~/.aws/sso/cache` writable. Mounting a credentials directory into a
+# container is your call, which is why it ships commented.
 #
 # The port is published on the host's loopback only: the browser on the
 # host reaches it at http://127.0.0.1:9510 and nothing else does. Mezame
@@ -48,8 +60,17 @@ services:
     command: ["mezame"]
     ports:
       - "127.0.0.1:9510:9510"
+    environment:
+      - AWS_PROFILE
+      - AWS_REGION
+      - AWS_DEFAULT_REGION
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AWS_BEARER_TOKEN_BEDROCK
     volumes:
       - mezame-config:/home/mezame/.mezame
+      # - ~/.aws:/home/mezame/.aws:ro
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

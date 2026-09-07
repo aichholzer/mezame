@@ -69,15 +69,15 @@ describes what a client sends, not a server-side validation step.
   "status": "pending" | "in_progress" | "completed" | "failed",
   "kind": "..." | null, "rawInput": {...}, "content": [...] | null, "locations": [...] | null }
 { "type": "permission_request", "id": <minted id>, "title": "...", "options": [...] }
-{ "type": "prompt_done" }
+{ "type": "prompt_done", "usage": { "input": 65, "output": 4, "cacheRead": 0, "cacheWrite": 0 } }
 { "type": "error", "message": "..." }
 ```
 
 Each event's field list is closed. `append` declares exactly `type`, `role` and
-`text`. `thought` declares exactly `type` and `text`, though nothing streams one
-in this release. `error` declares exactly `type` and `message`. `prompt_done`
-declares nothing beyond `type`, and in particular no usage figures yet.
-`session_info.info` declares exactly one key, `models`.
+`text`. `thought` declares exactly `type` and `text`. `error` declares exactly
+`type` and `message`. `prompt_done` declares `type` and optionally `usage`, an
+object of exactly four non-negative integers. `session_info.info` declares
+exactly one key, `models`.
 
 `permission_request` may carry one extra field, `_target`, holding the internal
 id of the connection that started the turn. Mezame drops the frame on every
@@ -122,8 +122,9 @@ Details:
 - **`append`** with `role` `agent` or `sys` is the streaming path for a turn and
   for a notice. A failed `set_model` arrives as a `sys` append and no
   `session_info` follows it.
-- **`thought`** carries reasoning text. A client merges consecutive frames into
-  one collapsible block and closes it on `prompt_done` or `error`.
+- **`thought`** carries reasoning text, streamed as the model produces it on a
+  model whose thinking is on. A client merges consecutive frames into one
+  collapsible block and closes it on `prompt_done` or `error`.
 - **`tool_call`** carries the whole payload. Frames for one `toolCallId` merge
   into the existing row rather than appending a new one, and a field holding
   JSON null means "no change": a client keeps the value it already has for
@@ -139,13 +140,19 @@ Details:
   silence.
 - **`prompt_done`** ends a turn. Every event the turn produced is broadcast
   before it, and exactly one arrives per turn, after a failure as well as a
-  success. It is what unlocks every composer on the session.
+  success. It is what unlocks every composer on the session. `usage` is
+  present when the provider reported the turn's token counts, and absent on
+  a failed turn and on the echo. `input` counts the uncached input tokens,
+  `cacheRead` the input tokens served from the prompt cache and `cacheWrite`
+  the input tokens written to it, so the whole input is
+  `input + cacheRead + cacheWrite`; `output` counts the reply, reasoning
+  included. A client shows it under the answer; `/history` does not carry it.
 - **`error`** precedes `prompt_done` when a turn failed. `message` holds the
   failure text.
 
-Nothing streams a `thought`, a `tool_call` or a `permission_request` in the
-0.14.0-alpha.1 release: it answers every prompt with an echo. Their shapes are
-fixed here so a client written now keeps working when the provider loop lands.
+No `tool_call` or `permission_request` frame is sent in the 0.14.0-alpha.2
+release: tools arrive with a later alpha. Their shapes are fixed here so a
+client written now keeps working when they land.
 
 ## Session history
 

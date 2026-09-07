@@ -47,11 +47,38 @@ what changed; none of them describes a path from the old state.
   model refused or filtered so it never poisons the next turn, times a
   stalled stream out after five minutes, and answers a cancel at once.
 
+- The container passes `AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`,
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and
+  `AWS_BEARER_TOKEN_BEDROCK` through from the host when set, and
+  `compose.yaml` carries a commented read-only mount of `~/.aws`. The
+  Container workflow also starts the image with a `bedrock` section and no
+  credentials and checks that it serves.
+- Three `#[ignore]` live tests in `tests/live_bedrock.rs` run by hand
+  against a real model; `cargo test` and CI need no credentials.
+
 ### Changed
 
+- `mezame init` asks four questions instead of one: the bind address, then
+  the Bedrock model (an empty answer keeps the echo), the AWS region and the
+  AWS profile. A rerun over an existing file keeps what it finds.
 - The compiler floor rises to Rust 1.94.1, the floor of the AWS SDK
   crates this line builds on; the CI `msrv` job now reads it from
   `Cargo.toml`.
+- With no `bedrock` section the echo backend's model picker says how to
+  connect Bedrock instead of reporting that no model is selectable.
+
+### Notes
+
+- Credentials never live in `config.json`. The SDK finds them where the
+  AWS CLI does: `~/.aws`, the `AWS_*` variables, or a Bedrock API key in
+  `AWS_BEARER_TOKEN_BEDROCK`. Model access is enabled per account and
+  region in the Bedrock console.
+- Startup does not resolve credentials or reach Bedrock; the first turn
+  does, so a wrong profile or a missing region shows as a failed turn with
+  a message naming the cause, and a service unit with no credentials still
+  starts and serves.
+- The dependency tree grows by 100 packages to 291, all from the two AWS
+  crates; no `hyper` 0.14 or `rustls` 0.21 is in the lock.
 
 ## [0.14.0-alpha.1] - 2026-09-06
 

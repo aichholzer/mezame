@@ -20,9 +20,10 @@ back online from across town.
 ## What it does
 
 Mezame is an **agent harness**. It serves a browser UI, keeps one session per
-conversation, and runs a turn when you send a prompt. Several browsers can
-attach to one session at the same time; a session survives a reload and a
-reconnect.
+conversation, and runs each prompt as a turn against an Anthropic model on
+Amazon Bedrock, streaming the answer and the model's reasoning back as they
+arrive. Several browsers can attach to one session at the same time; a session
+survives a reload and a reconnect.
 
 ## What Mezame is not
 
@@ -72,16 +73,28 @@ mezame init
 mezame
 ```
 
-`mezame init` asks one question, the address to bind. Access control for the
-browser is pushed to the edge: bind an address in your network, put a
-Cloudflare Tunnel in front, and let Cloudflare Access gate the hostname with
-your existing identity provider. You already trust that stack with the rest of
-your self-hosted tools.
+`mezame init` asks for the address to bind and for the Bedrock model, region
+and profile; the credentials are the ones your AWS CLI already has. Access
+control for the browser is pushed to the edge: bind an address in your network,
+put a Cloudflare Tunnel in front, and let Cloudflare Access gate the hostname
+with your existing identity provider. You already trust that stack with the
+rest of your self-hosted tools.
 
 ## Features
 
 What this build does today:
 
+- Runs each turn against an Anthropic model on Amazon Bedrock through
+  `ConverseStream`, with the answer streaming into the log and the model's
+  reasoning into a collapsible block as they arrive. The Claude 4.6 line and
+  later think adaptively; the models before it take a token budget.
+- Keeps the conversation across turns with a prompt-cache checkpoint on the
+  latest message, so a long conversation is billed mostly as cache reads. Each
+  answer carries its token counts (input, output, cached, written) under the
+  bubble.
+- Lets you pick among the models listed in the config, shared across every
+  attached browser; cancel a turn mid-stream; and attach images and documents
+  to a prompt.
 - Several sessions per browser, each its own conversation, in tabs.
 - One session on several devices: open the same conversation on a phone and a
   laptop, and every turn lands on both as it happens.
@@ -93,10 +106,9 @@ What this build does today:
 - Idle sessions release their resources 30 seconds after the last browser
   leaves.
 
-What the browser already renders, waiting on a provider to feed it: model
-selection shared across every attached browser, reasoning in a collapsible
-block, tool calls as expandable cards with arguments and output, and
-permission prompts. See [Roadmap](#roadmap).
+What the browser already renders, waiting on a later alpha to feed it: tool
+calls as expandable cards with arguments and output, and permission prompts.
+See [Roadmap](#roadmap).
 
 ## Install
 
@@ -106,8 +118,45 @@ mezame init
 mezame
 ```
 
-`mezame init --bind 127.0.0.1:9510` writes the same file with no prompt, for a
-service unit or a container started before setup.
+`mezame init` asks four questions: the address to bind, the Bedrock model id,
+the AWS region and the AWS profile. An empty model keeps the echo backend, which
+returns what you type and reaches no provider; an empty region or profile
+leaves the SDK's defaults in force. The same file with no prompt, for a service
+unit or a container started before setup:
+
+```sh
+mezame init --bind 127.0.0.1:9510 --model global.anthropic.claude-sonnet-5 --region us-east-1 --profile work
+```
+
+The section it writes holds `model`, `region` and `profile`. A hand-edited
+`~/.mezame/config.json` with a second model for the picker:
+
+```json
+{
+  "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }],
+  "bedrock": {
+    "model": "global.anthropic.claude-sonnet-5",
+    "models": ["global.anthropic.claude-sonnet-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"],
+    "region": "us-east-1",
+    "profile": "work"
+  }
+}
+```
+
+`models` is the list the browser's picker offers; `init` writes none, so the
+picker offers `model` alone until you add the list. The optional `thinking`,
+`thinking_budget` and `max_output_tokens` keys are in the
+[configuration reference](./docs/architecture.md#configuration-reference).
+
+Mezame holds no credentials. The AWS SDK finds them where the AWS CLI does:
+`~/.aws/credentials` and `~/.aws/config` under the account Mezame runs as,
+including SSO profiles after `aws sso login`, or the `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` variables, or
+`AWS_BEARER_TOKEN_BEDROCK` for a Bedrock API key. The model must be enabled for
+the account in the Bedrock console under Model access, in the region the config
+names, and the credentials need `bedrock:InvokeModelWithResponseStream` on it.
+Startup prints a `Backend:` line naming the model, region and profile in force,
+or `Backend: echo` when the section is absent.
 
 This alpha assumes a fresh install. There is no migration from 0.13 or from an
 earlier alpha: remove `~/.mezame` left by an earlier version first.
@@ -187,8 +236,18 @@ docker compose run --rm setup
 That runs `mezame init` interactively. **Choose `0.0.0.0:9510` at the bind
 prompt.** The default, `127.0.0.1:9510`, binds loopback inside the container,
 and a published port then answers nothing. Without a terminal,
-`docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510` writes the
-same config with no prompt.
+`docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510 --model
+global.anthropic.claude-sonnet-5` writes the same config with no prompt.
+
+Credentials reach the container from the host: `compose.yaml` passes
+`AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_BEARER_TOKEN_BEDROCK`
+through from your environment when they are set, and carries a commented
+read-only mount of `~/.aws` at `/home/mezame/.aws` for a profile. Export the
+variables, or uncomment the mount, before `docker compose up`. A read-only
+mount stops the SDK from refreshing an SSO token as it nears expiry, so with an
+`sso-session` profile run `aws sso login` on the host again when turns start
+failing for credentials, or mount `~/.aws/sso/cache` writable.
 
 Then:
 
@@ -226,10 +285,12 @@ Stderr carries Mezame's own logs. One environment variable is worth knowing:
 
 ## Known gaps
 
-1. **No provider.** The 0.14.0-alpha.1 build answers every prompt with an echo
-   of what you typed and talks to no provider. It exists to prove the
-   transport: connect two browsers to one session, send a prompt, and watch it
-   land on both. The provider loop is the next release on this line.
+1. **One provider, no tools, no disk.** This build talks to Amazon Bedrock and
+   nothing else; a second provider arrives with the provider seam's next
+   tenant. The model can read and write nothing but the conversation: no file
+   access, no shell, no web, so a prompt that asks for those gets an answer
+   in words. A transcript lives in memory only (gap 3), and so does the usage
+   footer: a reload shows the conversation without its counts.
 2. **Auth enforcement.** Mezame has no notion of who is connected. What it
    does check, in `src/guard.rs`, is that a WebSocket upgrade or a write comes
    from a page it served (`Origin`) and that every request names a host it
@@ -252,9 +313,9 @@ Stderr carries Mezame's own logs. One environment variable is worth knowing:
 
 None of these ship today, and none block the core loop.
 
-1. **The provider loop.** Streaming turns against a real provider, with model
-   selection, cancellation, and token accounting reported per turn. The seam it
-   drops into already exists: one trait, six operations.
+1. **A second provider and a store for credentials.** The Anthropic API
+   directly, then others, behind the same `Provider` trait, with the keys
+   kept in the local database rather than the environment.
 2. **Durable storage and accounts.** A local database for transcripts,
    settings, and credentials, and a login so an installation can serve more
    than one person.
@@ -286,6 +347,33 @@ under, and start it again.
 **Browser connects, the composer is read-only**
 A turn is in flight on that session, started here or on another device. It
 unlocks when that turn ends.
+
+**The turn fails with "Bedrock refused the request"**
+Access was denied. Either the model is not enabled for this account in this
+region (Bedrock console, Model access), or the credentials the SDK found lack
+`bedrock:InvokeModelWithResponseStream` on it, or the SDK picked up a different
+profile than you meant. The `Backend:` line at startup names the profile and
+region in force; `aws sts get-caller-identity --profile <name>` shows who the
+credentials are.
+
+**The turn fails naming "on-demand throughput"**
+The model id names a version Bedrock does not serve on demand in this region.
+Use the cross-region id (the `global.` or `us.` prefix, as the model card
+lists it), or a version that has on-demand throughput, and put that id under
+`model` and in `models`.
+
+**The turn fails with "No AWS region is set"**
+Neither the config, `AWS_REGION` nor the profile names a region, so the SDK
+has nowhere to send the request. Startup does not check this; the first turn
+does. Add `"region": "us-east-1"` (or yours) to the `bedrock` section, or
+export `AWS_REGION`.
+
+**The turn fails with "No AWS credentials were found"**
+Startup does not resolve credentials; the first turn does, and the SDK's chain
+came up empty under the account Mezame runs as. Run
+`aws configure` or `aws sso login` as that account, or set `AWS_PROFILE` or the
+`AWS_ACCESS_KEY_ID` variables in its environment; for a service unit see
+[Running as a service](./docs/service.md).
 
 **Cloudflare hostname returns 502**
 The `cloudflared` machine cannot reach the Mezame machine. Check that

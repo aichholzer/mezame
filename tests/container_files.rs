@@ -278,3 +278,125 @@ fn the_port_is_published_on_the_host_s_loopback_only() {
         "the setup service publishes nothing"
     );
 }
+
+#[test]
+fn the_service_passes_the_aws_variables_through_and_carries_the_commented_mount() {
+    // Requirement 14 criterion 2 of the Bedrock spec: the seven names,
+    // bare, on the `mezame` service alone, so a host value passes through
+    // when set and nothing is set otherwise; and the `~/.aws` mount
+    // present as a comment, read-only, at the SDK's path under the
+    // image's HOME.
+    let compose = repo_file("compose.yaml");
+    let lines = code_lines(&compose);
+    let mezame_at = lines
+        .iter()
+        .position(|l| *l == "  mezame:")
+        .expect("the mezame service");
+    let setup_at = lines
+        .iter()
+        .position(|l| *l == "  setup:")
+        .expect("the setup service");
+    let block = &lines[mezame_at..setup_at];
+    let env_at = block
+        .iter()
+        .position(|l| *l == "    environment:")
+        .expect("an environment list on the mezame service");
+    let names: Vec<&str> = block[env_at + 1..]
+        .iter()
+        .take_while(|l| l.starts_with("      - "))
+        .map(|l| l.trim_start_matches("      - "))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+        ],
+        "the pass-through list, bare names only"
+    );
+    assert!(
+        !lines[setup_at..].contains(&"    environment:"),
+        "the setup service passes nothing through"
+    );
+    assert!(
+        compose
+            .lines()
+            .any(|l| l.trim() == "# - ~/.aws:/home/mezame/.aws:ro"),
+        "the read-only ~/.aws mount is present, commented, at the SDK's path under HOME"
+    );
+}
+
+#[test]
+fn the_builder_installs_what_the_sdk_s_tls_library_compiles_with() {
+    // Requirement 14 criterion 1 of the Bedrock spec: aws-lc-rs compiles
+    // its C sources in the builder with gcc and musl-dev, and no other
+    // package was needed. The line is pinned so an addition arrives with
+    // its comment and its reason.
+    let dockerfile = repo_file("Dockerfile");
+    let apk: Vec<&str> = code_lines(&dockerfile)
+        .into_iter()
+        .filter(|l| l.starts_with("RUN apk add"))
+        .collect();
+    assert_eq!(apk.len(), 2, "one apk line per stage");
+    assert_eq!(
+        apk[0], "RUN apk add --no-cache musl-dev nodejs npm",
+        "the builder's package line"
+    );
+    let comment = dockerfile
+        .lines()
+        .take_while(|l| !l.starts_with("RUN apk add"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        comment.contains("aws-lc-rs") && comment.contains("musl-dev"),
+        "the builder comment names the TLS library and what it compiles with"
+    );
+}
+
+#[test]
+fn ci_runs_no_ignored_test_and_holds_no_aws_secret() {
+    // Requirement 12.6 of the Bedrock spec: the live cases in
+    // `tests/live_bedrock.rs` are `#[ignore]` and run by hand; CI never
+    // bills anyone. Read as text, comments included, so a `--ignored`
+    // flag or an `AWS_` secret cannot arrive quietly.
+    let ci = repo_file(".github/workflows/ci.yml");
+    assert!(
+        !ci.contains("--ignored") && !ci.contains("--include-ignored"),
+        "ci.yml runs an ignored test"
+    );
+    let lower = ci.to_ascii_lowercase();
+    for marker in [
+        "aws_access_key",
+        "aws_secret",
+        "aws_session_token",
+        "aws_bearer_token",
+        "secrets.aws",
+        "secrets.bedrock",
+        "aws-actions/",
+        "role-to-assume",
+    ] {
+        assert!(
+            !lower.contains(marker),
+            "ci.yml holds an AWS credential: {marker}"
+        );
+    }
+    let live = repo_file("tests/live_bedrock.rs");
+    // Attribute lines only: the module doc mentions the attribute too.
+    let attribute_lines = |prefix: &str| {
+        live.lines()
+            .filter(|l| l.trim_start().starts_with(prefix))
+            .count()
+    };
+    let cases = attribute_lines("#[tokio::test") + attribute_lines("#[test");
+    assert!(cases >= 3, "three live cases");
+    assert_eq!(
+        attribute_lines("#[ignore"),
+        cases,
+        "every live case is #[ignore], with or without a reason"
+    );
+}

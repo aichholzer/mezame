@@ -42,6 +42,16 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
 
    `%h` expands to `$HOME`. Adjust the `ExecStart` path if you installed Mezame somewhere else.
 
+   With a `bedrock` section in the config, Mezame needs AWS credentials as the
+   service runs, and the unit has no shell profile to hand them over. The SDK
+   reads `~/.aws/config` and `~/.aws/credentials` under the unit's `HOME`, so a
+   profile that works in your shell works here: name it with `profile` in the
+   config or with `Environment=AWS_PROFILE=work` in `[Service]`. Static keys
+   go in `[Service]` as `Environment=AWS_ACCESS_KEY_ID=...` and
+   `Environment=AWS_SECRET_ACCESS_KEY=...`, or in a root-owned file named by
+   `EnvironmentFile=`. An SSO profile needs `aws sso login` run as the same
+   account before the service starts and again when the token expires.
+
 2. Reload, enable, start:
 
    ```sh
@@ -88,7 +98,7 @@ Mezame has no auth of its own; on a host with other accounts, every one of them 
    WantedBy=multi-user.target
    ```
 
-   Replace `youruser` with the Unix account Mezame is installed under. The explicit `Environment=HOME=...` matters: system units do not inherit per-user env, and Mezame reads `$HOME/.mezame/config.json`.
+   Replace `youruser` with the Unix account Mezame is installed under. The explicit `Environment=HOME=...` matters: system units do not inherit per-user env, and Mezame reads `$HOME/.mezame/config.json`. The same `HOME` is where the AWS SDK looks for `.aws/config` and `.aws/credentials`, so credentials written by `aws configure` as `youruser` are found; alternatively add `Environment=AWS_PROFILE=...` or the `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` lines, or point `EnvironmentFile=` at a root-owned file holding them.
 
 2. Enable:
 
@@ -150,6 +160,8 @@ Install as a LaunchAgent under your user account. This runs Mezame whenever you 
    ```
 
    `KeepAlive` with `SuccessfulExit=false` restarts on crash but not when Mezame exits cleanly (matches systemd's `Restart=on-failure`). `PATH` is set because launchd's default does not include Homebrew, and Mezame's own build and run paths expect a normal login `PATH`. `NumberOfFiles` raises launchd's default soft limit of 256 descriptors; see "Resource limits" below.
+
+   The `HOME` in `EnvironmentVariables` is also where the AWS SDK finds `~/.aws`, so a profile that works in your Terminal works for the agent. To pin one, or to hand over static keys, add `AWS_PROFILE`, or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, as further `<key>`/`<string>` pairs in that dict. An SSO profile needs `aws sso login` in your own shell before the agent starts and again when the token expires.
 
 2. Load it (the modern verb is `bootstrap`; `load` is legacy but still works):
 

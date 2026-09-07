@@ -10,7 +10,12 @@ install details.
 cargo check
 cargo build --release
 cargo clippy --all-targets -- -D warnings   # gate on this in CI
+cargo +1.94.1 check --all-targets --locked  # the compiler floor, as CI's msrv job runs it
 ```
+
+The floor is the `rust-version` in `Cargo.toml`, which the AWS SDK crates set;
+`rustup toolchain install 1.94.1` once, and `MEZAME_SKIP_UI_BUILD=1` keeps the
+check to Rust.
 
 Inside `ui/`:
 
@@ -76,8 +81,28 @@ digest from the registry without Docker.
 Most integration tests drive the hub through `ScriptedBackend` in
 `tests/support/mod.rs`: a Backend whose every answer the test supplies up
 front, and whose invocation log the test reads back while a turn is still
-open. It reaches no process, no socket and no file, and it is compiled into
-the test binaries that declare `mod support;` and into nothing else.
+open. Its sibling `ScriptedProvider` does the same one layer down, for the
+turn loop: a Provider whose stream the test scripts as `TurnEvent`s, or holds
+open until released, or fails before the first event, and which records every
+request it was handed so a test can read the messages, the model and the
+settings back. Neither reaches a process, a socket or a file, and both are
+compiled into the test binaries that declare `mod support;` and into nothing
+else.
+
+Nothing in `cargo test` needs AWS credentials. The Bedrock code is covered by
+feeding the normaliser events built with the SDK's own builders
+(`tests/provider_bedrock.rs`), so the request shape, the stop reasons, the
+usage figures and the error classes are pinned without a network. Three
+`#[ignore]` cases in `tests/live_bedrock.rs` do call a real model, by hand:
+
+```sh
+MEZAME_LIVE_BEDROCK_MODEL=global.anthropic.claude-sonnet-5 \
+  cargo test --test live_bedrock -- --ignored --nocapture
+```
+
+`MEZAME_LIVE_BEDROCK_REGION` and `MEZAME_LIVE_BEDROCK_PROFILE` narrow where
+they run; with the model variable unset each case prints why it skipped and
+passes. `ci.yml` runs no `--ignored` test and holds no AWS secret.
 
 Notable coverage already in place:
 
@@ -88,10 +113,21 @@ Notable coverage already in place:
   writers; `tests/cli_init.rs` covers `mezame init --bind`; and
   `tests/http_state_writes.rs` covers `/state` under concurrent and failing
   writes.
-- **The seam.** `tests/backend.rs` covers the shipped `EchoBackend`, the echo
-  text derivation, the session id form, and the upgrade decision. Session id
+- **The seam.** `tests/backend.rs` covers the `EchoBackend`, the echo text
+  derivation, the session id form, and the upgrade decision. Session id
   uniqueness is bounded past one process run, so that case re-executes its own
   test binary twice.
+- **The provider.** `tests/provider_bedrock.rs` feeds the normaliser
+  builder-made stream events and checks the request builder, the thinking
+  rule per model id, the cache point, the block conversion and the error
+  classifier. `tests/prompt.rs` and `tests/conversation.rs` cover the system
+  prompt and the conversation budget. `tests/config_bedrock.rs` and
+  `tests/cli_init.rs` cover the `bedrock` section and the three `init` flags.
+- **The loop.** `tests/turn_loop.rs` drives `LoopBackend` through
+  `ScriptedProvider`: the mapping and limits, cancel before and during the
+  stream, the idle timeout, refusals and filtered replies, the stop and usage
+  ordering, and the log line. `tests/cli_binary.rs` starts the binary with a
+  `bedrock` section and no credentials and reads the `Backend:` line.
 - **Hub plumbing.** `tests/hub.rs` drives the multi-attach hub: broadcast
   fan-out, `_target` stamping, the grace counter and its capped in-flight hold,
   the frames that end a turn, and the mid-turn second-prompt drop.
@@ -108,12 +144,17 @@ Notable coverage already in place:
   and 403 answers over the router and over a real socket.
 - **The container.** `tests/container_files.rs` pins the Dockerfile, the
   compose file and the build-context allowlist as text.
-- **Invariants.** `tests/properties.rs` holds nine `proptest` properties at 100
-  cases each: broadcast fidelity, targeted delivery, turn ordering, the
-  in-flight trajectory, grace and shutdown, session ids, the echo agreement,
-  the serialisation shape, and the `busy` pairing. Each is tagged with the
-  design property it validates. The async ones run on a paused clock, which is
-  what keeps them cheap.
+- **Invariants.** `tests/properties.rs` holds fourteen `proptest` properties
+  at 100 cases each: the nine of alpha.1 (broadcast fidelity, targeted
+  delivery, turn ordering, the in-flight trajectory, grace and shutdown,
+  session ids, the echo agreement, the serialisation shape, and the `busy`
+  pairing) and five for the Bedrock line (the normaliser's text is the text
+  the builders were fed, a request built from any conversation alternates
+  roles from `user`, the thinking rule is total over model ids and agrees
+  with its table, the conversation and the transcript evict together, and
+  the system prompt's assembly is a function of its inputs). Each is tagged
+  with the design property it validates. The async ones run on a paused
+  clock, which is what keeps them cheap.
 
 ## Debugging
 

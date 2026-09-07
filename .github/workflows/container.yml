@@ -94,6 +94,21 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:9510/)" = 421
           test "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:9510/state)" = 204
 
+      - name: Write a Bedrock configuration and start with no credentials
+        # Requirement 14 criterion 3 of the Bedrock spec: a `bedrock`
+        # section with no credentials anywhere must still start and serve
+        # the UI; the credential lookup is lazy and a turn is what would
+        # fail. The runner holds no AWS secret. `init` on the existing
+        # volume keeps the bind and adds the section.
+        shell: bash
+        run: |
+          docker compose down mezame
+          docker compose run --rm -T setup mezame init --bind 0.0.0.0:9510 --model anthropic.claude-sonnet-5 --region us-east-1
+          docker compose up -d --wait --wait-timeout 120 mezame
+          test "$(docker inspect -f '{{.State.Health.Status}}' mezame)" = healthy
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9510/)" = 200
+          docker compose logs mezame | grep -F 'Backend: Bedrock anthropic.claude-sonnet-5'
+
       - name: Logs on failure
         if: failure()
         run: docker compose logs mezame

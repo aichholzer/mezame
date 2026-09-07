@@ -7,9 +7,12 @@
 #
 # First run, one-off setup:
 #   docker compose run --rm setup
-#   # answer the bind prompt with 0.0.0.0:9510
+#   # answer the bind prompt with 0.0.0.0:9510, then the model, region and profile
 #   # or, with no terminal:
-#   docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510
+#   docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510 --model global.anthropic.claude-sonnet-5
+#
+# AWS credentials reach the container from the host through the variables
+# compose.yaml passes through, or the commented ~/.aws mount there.
 #
 # Subsequent runs, and after pulling a new version:
 #   docker compose up -d --build
@@ -35,8 +38,12 @@ FROM rust:1-alpine3.23@sha256:4743b6231029d726d7a0f81d730a7c9f4eff23225a4499c01e
 
 # musl-dev supplies the C runtime headers and static archives the musl
 # target links against; the image already carries gcc as the linker
-# driver. nodejs and npm are for the UI build: nodejs comes from Alpine's
-# main repository and npm from community, and the image enables both.
+# driver. The AWS SDK's TLS library, aws-lc-rs, compiles its C sources
+# during the build with that same gcc and musl-dev through the `cc`
+# crate, and ships pregenerated bindings for the musl targets, so it
+# needs no cmake, no clang and no bindgen here. nodejs and npm are for
+# the UI build: nodejs comes from Alpine's main repository and npm from
+# community, and the image enables both.
 RUN apk add --no-cache musl-dev nodejs npm
 
 WORKDIR /src
@@ -52,8 +59,8 @@ ARG MEZAME_GID=1000
 
 # The whole install list. The musl target links the Rust standard
 # library, the unwinder and the C runtime statically, so the binary needs
-# nothing else from the image. The certificate bundle is what an outbound
-# HTTPS call will read. The user comes from busybox, no package: uid 1000
+# nothing else from the image. The certificate bundle is what the SDK's
+# HTTPS calls to Bedrock verify against. The user comes from busybox, no package: uid 1000
 # so a future workspace bind mount lines up with the usual first Linux
 # account; rebuild with --build-arg MEZAME_UID=$(id -u) for another. Its
 # .mezame directory is created and owned here, before VOLUME, so a fresh

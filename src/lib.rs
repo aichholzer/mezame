@@ -6,7 +6,7 @@
 //! What produces a turn sits behind one trait, `backend::Backend`. With a
 //! `bedrock` section in the configuration a session runs `turn::LoopBackend`
 //! over Amazon Bedrock; without one it runs `backend::EchoBackend`, which
-//! answers with the text it was given and talks to no provider.
+//! returns each prompt's text as the reply and reaches no provider.
 //!
 //! See the README for architecture, the wire protocol and transports.
 //! In-code extension points are marked with `TODO:`.

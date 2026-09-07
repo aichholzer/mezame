@@ -9,8 +9,8 @@
 //! the Hub's echo and a Backend's transcript are defined against.
 //!
 //! [`EchoBackend`] is the implementation a session gets when no `bedrock`
-//! section is configured. It answers every prompt with the text it was
-//! given and talks to no provider.
+//! section is configured. It returns each prompt's text as the reply and
+//! reaches no provider.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -315,7 +315,7 @@ pub const TRANSCRIPT_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 pub const TRANSCRIPT_MAX_ENTRIES: usize = 10_000;
 
 /// The Backend a session gets when no `bedrock` section is configured: it
-/// answers every prompt with the text it was given.
+/// returns each prompt's text as the reply.
 ///
 /// It exists to prove the transport. A browser connects, sends a prompt,
 /// and sees its own words come back as an agent turn, on every attached
