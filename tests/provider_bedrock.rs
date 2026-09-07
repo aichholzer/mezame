@@ -555,6 +555,26 @@ fn service_rows_are_keyed_on_the_variant_not_on_metadata() {
         }
     );
 
+    // The service refusing the request as too long is the history, not
+    // the new message: not a rejection, and the browser gets the
+    // context-window advice.
+    let too_long = classify_service(
+        &ConverseStreamError::ValidationException(
+            ValidationException::builder()
+                .message("Input is too long for requested model.")
+                .build(),
+        ),
+        MODEL,
+    );
+    assert_eq!(
+        too_long,
+        Classified {
+            retryable: false,
+            rejected: false,
+            text: mezame::provider::CONTEXT_WINDOW_ERROR.into()
+        }
+    );
+
     let throttled = classify_service(
         &ConverseStreamError::ThrottlingException(ThrottlingException::builder().build()),
         MODEL,

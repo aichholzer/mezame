@@ -28,9 +28,16 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
 use futures_util::future::BoxFuture;
+use futures_util::StreamExt;
 use mezame::backend::{Backend, HistoryEntry, TurnOutcome};
+use mezame::conversation::{Message, Role};
+use mezame::provider::{
+    Provider, ProviderError, ProviderRequest, ThinkingMode, TurnEvent, TurnStream,
+};
 use serde_json::Value;
 use tokio::sync::{mpsc, Notify};
 
@@ -445,6 +452,151 @@ impl Backend for ScriptedBackend {
             if self.shutdown_blocks {
                 self.shutdown_release.take().await;
             }
+        })
+    }
+}
+
+// ---------- ScriptedProvider ----------
+
+/// One scripted stream: what `Provider::stream` returns for one request.
+pub enum ScriptedStream {
+    /// Yield every event, then end.
+    Events(Vec<TurnEvent>),
+    /// Yield `first`, then hold the stream open until
+    /// [`ScriptedProvider::release_stream`] supplies the rest, after which
+    /// the stream ends.
+    Pending { first: Vec<TurnEvent> },
+    /// Park the `stream()` future itself until
+    /// [`ScriptedProvider::release_send`] supplies a script, or until it is
+    /// dropped. Stands in for a request the SDK is still retrying.
+    PendingSend,
+    /// Fail before any event.
+    BeforeStream {
+        retryable: bool,
+        rejected: bool,
+        message: String,
+    },
+    /// Panic when the `stream()` future is polled.
+    Panicking(String),
+}
+
+/// What one request looked like, for a test to assert on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestLog {
+    pub model: String,
+    pub thinking: ThinkingMode,
+    pub thinking_budget: u32,
+    pub max_output_tokens: u32,
+    pub roles: Vec<Role>,
+    pub messages: Vec<Message>,
+    pub system_static: String,
+    pub date_line: String,
+}
+
+/// A Provider whose every stream a test supplies up front.
+#[derive(Default)]
+pub struct ScriptedProvider {
+    streams: Mutex<VecDeque<ScriptedStream>>,
+    requests: Mutex<Vec<RequestLog>>,
+    stream_release: Arc<Slot<Vec<TurnEvent>>>,
+    send_release: Arc<Slot<ScriptedStream>>,
+}
+
+impl ScriptedProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_streams(streams: Vec<ScriptedStream>) -> Self {
+        Self {
+            streams: Mutex::new(streams.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_stream(stream: ScriptedStream) -> Self {
+        Self::with_streams(vec![stream])
+    }
+
+    pub fn push_stream(&self, stream: ScriptedStream) {
+        self.streams.lock().expect("scripts").push_back(stream);
+    }
+
+    /// Supply the rest of a `Pending` stream; the stream ends after them.
+    pub fn release_stream(&self, rest: Vec<TurnEvent>) {
+        self.stream_release.put(rest);
+    }
+
+    /// Supply the script a `PendingSend` request resolves to.
+    pub fn release_send(&self, script: ScriptedStream) {
+        self.send_release.put(script);
+    }
+
+    /// Every request received, in order.
+    pub fn requests(&self) -> Vec<RequestLog> {
+        self.requests.lock().expect("requests").clone()
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.requests.lock().expect("requests").len()
+    }
+
+    fn record(&self, request: &ProviderRequest) {
+        self.requests.lock().expect("requests").push(RequestLog {
+            model: request.model.clone(),
+            thinking: request.thinking,
+            thinking_budget: request.thinking_budget,
+            max_output_tokens: request.max_output_tokens,
+            roles: request.messages.iter().map(|m| m.role).collect(),
+            messages: request.messages.clone(),
+            system_static: request.system.static_text.clone(),
+            date_line: request.system.date_line.clone(),
+        });
+    }
+
+    fn open(&self, script: ScriptedStream) -> Result<TurnStream, ProviderError> {
+        match script {
+            ScriptedStream::Events(events) => Ok(Box::pin(futures_util::stream::iter(events))),
+            ScriptedStream::Pending { first } => {
+                let release = Arc::clone(&self.stream_release);
+                let rest = futures_util::stream::once(async move { release.take().await })
+                    .flat_map(futures_util::stream::iter);
+                Ok(Box::pin(futures_util::stream::iter(first).chain(rest)))
+            }
+            ScriptedStream::BeforeStream {
+                retryable,
+                rejected,
+                message,
+            } => Err(ProviderError::BeforeStream {
+                retryable,
+                rejected,
+                message,
+            }),
+            ScriptedStream::Panicking(message) => panic!("{message}"),
+            ScriptedStream::PendingSend => unreachable!("resolved by the caller"),
+        }
+    }
+}
+
+impl Provider for ScriptedProvider {
+    fn stream(&self, request: ProviderRequest) -> BoxFuture<'_, Result<TurnStream, ProviderError>> {
+        Box::pin(async move {
+            self.record(&request);
+            let script = self
+                .streams
+                .lock()
+                .expect("scripts")
+                .pop_front()
+                .unwrap_or_else(|| ScriptedStream::BeforeStream {
+                    retryable: false,
+                    rejected: false,
+                    message: "no stream was scripted for this request".to_string(),
+                });
+            let script = match script {
+                ScriptedStream::PendingSend => self.send_release.take().await,
+                other => other,
+            };
+            self.open(script)
         })
     }
 }

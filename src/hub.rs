@@ -383,6 +383,30 @@ pub struct HubRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<SessionHub>>>>,
     building: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     capacity: usize,
+    /// Builds one Backend per hub, with the `session_info` that hub
+    /// replays on attach.
+    factory: BackendFactory,
+}
+
+/// What the factory hands a new hub: its Backend and the `session_info`
+/// `info` object the hub replays on every attach, or `None` when the
+/// Backend has no model to name.
+pub struct NewBackend {
+    pub backend: Arc<dyn Backend>,
+    pub session_info: Option<Value>,
+}
+
+/// Builds the Backend for a session id. The registry holds one and calls
+/// it under its write lock, so it awaits nothing and returns at once.
+pub type BackendFactory = Arc<dyn Fn(&str) -> NewBackend + Send + Sync>;
+
+/// The factory a registry has when none is given: an [`EchoBackend`] per
+/// hub and no `session_info`.
+pub fn echo_factory() -> BackendFactory {
+    Arc::new(|_session_id| NewBackend {
+        backend: Arc::new(EchoBackend::new()),
+        session_info: None,
+    })
 }
 
 impl Default for HubRegistry {
@@ -392,16 +416,24 @@ impl Default for HubRegistry {
 }
 
 impl HubRegistry {
-    /// A registry holding at most [`MAX_LIVE_HUBS`] hubs.
+    /// A registry holding at most [`MAX_LIVE_HUBS`] hubs, each over an
+    /// [`EchoBackend`].
     pub fn new() -> Self {
-        Self::with_capacity(MAX_LIVE_HUBS)
+        Self::with_factory(echo_factory())
     }
 
-    fn with_capacity(capacity: usize) -> Self {
+    /// A registry holding at most [`MAX_LIVE_HUBS`] hubs built by
+    /// `factory`.
+    pub fn with_factory(factory: BackendFactory) -> Self {
+        Self::with_capacity(MAX_LIVE_HUBS, factory)
+    }
+
+    fn with_capacity(capacity: usize, factory: BackendFactory) -> Self {
         Self {
             inner: Arc::default(),
             building: Arc::default(),
             capacity,
+            factory,
         }
     }
 
@@ -409,7 +441,7 @@ impl HubRegistry {
     /// cap with a handful of hubs.
     #[doc(hidden)]
     pub fn with_capacity_for_test(capacity: usize) -> Self {
-        Self::with_capacity(capacity)
+        Self::with_capacity(capacity, echo_factory())
     }
 
     /// Whether an upgrade naming `session_id` can be served now: a live
@@ -704,8 +736,12 @@ fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
         }
     });
 
-    // One Backend per hub. This is the line a later phase changes.
-    let backend: Arc<dyn Backend> = Arc::new(EchoBackend::new());
+    // One Backend per hub, from the registry's factory, with the
+    // `session_info` the hub replays on every attach.
+    let NewBackend {
+        backend,
+        session_info,
+    } = (registry.factory)(session_id);
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(COMMAND_CAPACITY);
     let (out_tx, _) = broadcast::channel::<Arc<Value>>(BROADCAST_CAPACITY);
@@ -713,7 +749,7 @@ fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
     let inflight = Arc::new(AtomicUsize::new(0));
     let snapshot = Arc::new(Mutex::new(SessionSnapshot {
         ready,
-        session_info: None,
+        session_info: session_info.map(session_info_frame),
     }));
 
     let hub = SessionHub {
@@ -904,15 +940,21 @@ async fn drive(state: HubLoopState) {
                 // A permission the turn left unanswered has no turn to
                 // answer into now.
                 lock_outstanding(&outstanding).clear();
-                match result {
-                    Ok(Ok(_outcome)) => {}
-                    Ok(Err(e)) => broadcast_error(&outbound, format!("{e}")),
-                    Err(panic) => broadcast_error(
-                        &outbound,
-                        format!("The turn panicked: {}", panic_message(panic)),
-                    ),
-                }
-                let _ = outbound.send(Arc::new(json!({ "type": "prompt_done" })));
+                                let usage = match result {
+                    Ok(Ok(outcome)) => outcome.usage,
+                    Ok(Err(e)) => {
+                        broadcast_error(&outbound, format!("{e}"));
+                        None
+                    }
+                    Err(panic) => {
+                        broadcast_error(
+                            &outbound,
+                            format!("The turn panicked: {}", panic_message(panic)),
+                        );
+                        None
+                    }
+                };
+                let _ = outbound.send(Arc::new(prompt_done_frame(usage)));
             }
             // A model change resolved. Apply it, then run the pending one
             // if a browser asked for another in the meantime.
@@ -988,6 +1030,36 @@ async fn drive(state: HubLoopState) {
 pub(crate) fn warn(line: &str) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// [`warn`] for a line that reports rather than warns: the per-turn log
+/// line. Same writer, same promise not to panic.
+pub(crate) fn log(line: &str) {
+    warn(line);
+}
+
+/// The `session_info` frame around an `info` object: what a successful
+/// model change broadcasts and what a fresh hub seeds its snapshot with,
+/// from one place so the two cannot differ.
+pub fn session_info_frame(info: Value) -> Value {
+    json!({ "type": "session_info", "info": info })
+}
+
+/// The frame that closes a turn: bare, or carrying the four usage counts
+/// when the Backend reported them.
+pub fn prompt_done_frame(usage: Option<crate::provider::Usage>) -> Value {
+    match usage {
+        Some(usage) => json!({
+            "type": "prompt_done",
+            "usage": {
+                "input": usage.input,
+                "output": usage.output,
+                "cacheRead": usage.cache_read,
+                "cacheWrite": usage.cache_write
+            }
+        }),
+        None => json!({ "type": "prompt_done" }),
+    }
 }
 
 /// Broadcast one `error` frame. A send failure only means no subscriber
@@ -1126,7 +1198,7 @@ async fn apply_model_change(
 ) {
     match result {
         Ok(info) => {
-            let frame = json!({ "type": "session_info", "info": info });
+            let frame = session_info_frame(info);
             // Store and broadcast under one lock. An attach that reads
             // the snapshot before the store sees the old value and
             // receives the new frame on its receiver; one that reads

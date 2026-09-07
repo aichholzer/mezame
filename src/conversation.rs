@@ -630,17 +630,23 @@ impl Conversation {
         true
     }
 
-    /// Mark the open exchange as rejected by the service. Its user entry
-    /// stays in the transcript; its message leaves every later request.
-    /// Returns `false` when no exchange is open.
-    pub fn reject_open(&mut self) -> bool {
-        match self.exchanges.back_mut() {
-            Some(back) if back.status == ExchangeStatus::Open => {
-                back.status = ExchangeStatus::Rejected;
-                true
-            }
-            _ => false,
+    /// Mark the open exchange as rejected: refused by the service before
+    /// any event, or refused by the model at the end of its reply. Its
+    /// user entry stays in the transcript, `entries` (what the browser was
+    /// already shown) are recorded after it, and the exchange leaves every
+    /// later request. Returns `false` when no exchange is open.
+    pub fn reject_open(&mut self, entries: Vec<HistoryEntry>) -> bool {
+        let Some(back) = self.exchanges.back_mut() else {
+            return false;
+        };
+        if back.status != ExchangeStatus::Open {
+            return false;
         }
+        back.status = ExchangeStatus::Rejected;
+        back.entries += entries.len();
+        self.transcript.record(entries);
+        self.enforce_budget();
+        true
     }
 
     /// The messages the next request is built from, in order, with the

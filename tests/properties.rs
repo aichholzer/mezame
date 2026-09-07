@@ -22,7 +22,7 @@ use mezame::backend::{
     extract_user_text, user_echo_event, user_text_len, Backend, EchoBackend, EntryBody,
     HistoryEntry, ToolCall, ToolCallStatus, ToolContent, ToolLocation,
 };
-use mezame::conversation::{Block, Message as CanonicalMessage, Role};
+use mezame::conversation::{Block, Conversation, Message as CanonicalMessage, Role};
 use mezame::hub::{AttachedHub, HubCommand, HubRegistry};
 use mezame::prompt::{assemble, Date, Part};
 use mezame::provider::bedrock::{thinking_rule, to_bedrock_messages, Normaliser};
@@ -1421,5 +1421,74 @@ proptest! {
         prop_assert_eq!(&first, &second);
         prop_assert_eq!(&first.date_line, &format!("Today's date is {date}."));
         prop_assert!(!first.static_text.contains("Today's date is"));
+    }
+}
+
+fn payload_block() -> impl Strategy<Value = Block> {
+    prop_oneof![
+        "[a-z ]{1,256}".prop_map(|text| Block::Text { text }),
+        prop::collection::vec(any::<u8>(), 0..1024).prop_map(|data| Block::Image {
+            media_type: "image/png".to_string(),
+            data,
+        }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: bedrock-end-to-end, Property 4: The two stores evict together
+    #[test]
+    fn property_p4_the_two_stores_evict_together(
+        exchanges in prop::collection::vec(
+            (
+                prop::collection::vec(payload_block(), 1..3),
+                "[a-z ]{0,256}",
+                prop::option::of("[a-z ]{0,256}"),
+            ),
+            1..60,
+        )
+    ) {
+        // A lowered budget and cap so eviction happens within the run. A
+        // reply that never came (`None`) closes the exchange with one entry
+        // and one message; a reply adds one of each.
+        let mut conversation = Conversation::with_budget_for_test(4 * 1024, 24);
+        let mut expected: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for (i, (blocks, user_text, agent_text)) in exchanges.into_iter().enumerate() {
+            let stamp = i as i64;
+            conversation.begin(
+                CanonicalMessage { role: Role::User, blocks },
+                HistoryEntry { body: EntryBody::User { text: user_text }, timestamp: stamp },
+            );
+            expected.push_back(1);
+            let held = conversation.exchange_count();
+            prop_assert!(conversation.bytes() <= 4 * 1024 || held == 1);
+            prop_assert!(conversation.history().len() <= 24 || held == 1);
+            let assistant = agent_text.map(|text| (
+                CanonicalMessage { role: Role::Assistant, blocks: vec![Block::Text { text: text.clone() }] },
+                HistoryEntry { body: EntryBody::Agent { text }, timestamp: stamp },
+            ));
+            match assistant {
+                Some((message, entry)) => {
+                    conversation.complete(Some(message), vec![entry]);
+                    *expected.back_mut().unwrap() = 2;
+                }
+                None => {
+                    conversation.complete(None, Vec::new());
+                }
+            }
+            let held = conversation.exchange_count();
+            prop_assert!(conversation.bytes() <= 4 * 1024 || held == 1);
+            prop_assert!(conversation.history().len() <= 24 || held == 1);
+            while expected.len() > held {
+                expected.pop_front();
+            }
+            // Both stores hold the same exchanges, entry for message.
+            let sum: usize = expected.iter().sum();
+            prop_assert_eq!(conversation.history().len(), sum);
+            prop_assert_eq!(conversation.messages().len(), sum);
+            let users = conversation.messages().iter().filter(|m| m.role == Role::User).count();
+            prop_assert_eq!(users, held);
+        }
     }
 }

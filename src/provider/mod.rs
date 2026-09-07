@@ -156,6 +156,12 @@ pub struct ProviderRequest {
     pub max_output_tokens: u32,
 }
 
+/// What a browser is told when the conversation no longer fits the model,
+/// whether the model said so at the end of a reply or the service refused
+/// the request as too long before any event.
+pub const CONTEXT_WINDOW_ERROR: &str =
+    "The conversation no longer fits the model's context window; start a new session.";
+
 /// The events of one reply, in order. Dropping it aborts the request.
 pub type TurnStream = Pin<Box<dyn Stream<Item = TurnEvent> + Send>>;
 

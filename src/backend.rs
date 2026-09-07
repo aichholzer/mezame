@@ -8,8 +8,9 @@
 //! is built from, and the one derivation of the user's plain text that both
 //! the Hub's echo and a Backend's transcript are defined against.
 //!
-//! [`EchoBackend`] is the implementation this build ships. It answers every
-//! prompt with the text it was given and talks to no provider.
+//! [`EchoBackend`] is the implementation a session gets when no `bedrock`
+//! section is configured. It answers every prompt with the text it was
+//! given and talks to no provider.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -20,13 +21,17 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::provider::Usage;
+
 /// What a resolved turn reports to the Hub.
 ///
-/// Empty in this phase. The Hub reads it when building `prompt_done`, and a
-/// later phase adds fields here to populate `prompt_done.usage` with no
-/// change to any signature and no change to any call site.
+/// The Hub reads it when building `prompt_done`: with `usage` set the
+/// frame carries the four counts, without it the frame is bare.
 #[derive(Debug, Default)]
-pub struct TurnOutcome {}
+pub struct TurnOutcome {
+    /// The turn's token counts, when the provider reported them.
+    pub usage: Option<Usage>,
+}
 
 /// Everything that stands between the Hub and whatever produces a turn.
 ///
@@ -285,7 +290,7 @@ pub fn user_echo_event(blocks: &[Value]) -> Value {
 const NO_TEXT_BLOCK_REPLY: &str = "The prompt held no text block, so there is nothing to echo.";
 
 /// Milliseconds since the Unix epoch, or 0 for a clock set before it.
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -309,8 +314,8 @@ pub const TRANSCRIPT_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// grow the entry count without bound.
 pub const TRANSCRIPT_MAX_ENTRIES: usize = 10_000;
 
-/// The Backend this build ships: it answers every prompt with the text it
-/// was given.
+/// The Backend a session gets when no `bedrock` section is configured: it
+/// answers every prompt with the text it was given.
 ///
 /// It exists to prove the transport. A browser connects, sends a prompt,
 /// and sees its own words come back as an agent turn, on every attached
@@ -497,7 +502,8 @@ impl Backend for EchoBackend {
 
     fn set_model(&self, _model_id: String) -> BoxFuture<'_, Result<Value>> {
         Box::pin(std::future::ready(Err(anyhow!(
-            "No model is selectable: this build answers every prompt with an echo and talks to no provider."
+            "No model is selectable: no `bedrock` section is configured, so this session answers \
+             with an echo. Run `mezame init --model ID` to connect Bedrock."
         ))))
     }
 

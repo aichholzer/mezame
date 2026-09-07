@@ -98,12 +98,12 @@ struct UiAssets;
 // checks in `guard_request`, compared in constant time, with a 401 that
 // echoes nothing and a UI that stops reconnecting on it.
 
-pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
+pub(crate) async fn run_cloudflared(cfg: Config, bind: String, hubs: HubRegistry) -> Result<()> {
     let (state_changes, _) = broadcast::channel(64);
     let shutdown = Arc::new(Notify::new());
     let state = Arc::new(AppState {
         config: Arc::new(cfg),
-        hubs: HubRegistry::new(),
+        hubs,
         state_changes,
         shutdown: shutdown.clone(),
     });

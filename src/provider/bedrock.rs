@@ -45,7 +45,7 @@ use serde_json::json;
 use crate::conversation::{self, base64_decode, base64_encode, Block, Message, Role};
 use crate::provider::{
     Provider, ProviderError, ProviderRequest, StopReason, ThinkingMode, TurnEvent, TurnStream,
-    Usage,
+    Usage, CONTEXT_WINDOW_ERROR,
 };
 
 /// The provider tag on the canonical blocks this adapter produces.
@@ -398,9 +398,16 @@ where
             .or_else(|| err.code().map(str::to_string))
             .unwrap_or_else(|| chain_text(err))
     };
-    let names_throughput = message
+    let lower = message.as_deref().map(str::to_ascii_lowercase);
+    let names_throughput = lower
         .as_deref()
-        .is_some_and(|m| m.to_ascii_lowercase().contains("on-demand throughput"));
+        .is_some_and(|m| m.contains("on-demand throughput"));
+    // The service refusing the whole request as too long is the history,
+    // not the new message: marking the new exchange rejected would leave
+    // the oversized prefix in place and fail every later turn the same way.
+    let too_long = lower
+        .as_deref()
+        .is_some_and(|m| m.contains("too long") || m.contains("context window"));
     match err.service_kind() {
         ServiceKind::AccessDenied => Classified {
             retryable: false,
@@ -418,6 +425,11 @@ where
                 "`{model}` needs an inference profile id here: try `global.{model}` or a geo \
                  prefix such as `us.`."
             ),
+        },
+        ServiceKind::Validation if too_long => Classified {
+            retryable: false,
+            rejected: false,
+            text: CONTEXT_WINDOW_ERROR.to_string(),
         },
         ServiceKind::Validation => Classified {
             retryable: false,

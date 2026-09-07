@@ -107,7 +107,7 @@ fn complete_with_no_reply_closes_the_exchange_too() {
         Some(assistant(vec![text("late")])),
         vec![entry("agent", "late", 2)]
     ));
-    assert!(!conversation.reject_open());
+    assert!(!conversation.reject_open(Vec::new()));
     assert_eq!(
         texts(&conversation),
         vec!["User:q"],
@@ -129,10 +129,10 @@ fn a_rejected_exchange_stays_in_the_transcript_and_leaves_the_requests() {
         vec![entry("agent", "fine", 2)],
     );
     conversation.begin(user(vec![text("refused")]), entry("user", "refused", 3));
-    assert!(conversation.reject_open());
+    assert!(conversation.reject_open(vec![entry("agent", "partial", 4)]));
     assert!(!conversation.has_open_exchange());
     assert!(
-        !conversation.reject_open(),
+        !conversation.reject_open(Vec::new()),
         "rejecting twice changes nothing"
     );
     assert!(
@@ -142,7 +142,8 @@ fn a_rejected_exchange_stays_in_the_transcript_and_leaves_the_requests() {
     assert_eq!(texts(&conversation), vec!["User:ok", "Assistant:fine"]);
     assert_eq!(
         history_texts(&conversation),
-        vec!["user:ok", "agent:fine", "user:refused"]
+        vec!["user:ok", "agent:fine", "user:refused", "agent:partial"],
+        "the browser saw the partial reply, so the transcript keeps it"
     );
     assert_eq!(
         conversation
@@ -160,7 +161,7 @@ fn complete_and_reject_on_an_empty_or_cleared_conversation_do_nothing() {
         Some(assistant(vec![text("x")])),
         vec![entry("agent", "x", 1)]
     ));
-    assert!(!conversation.reject_open());
+    assert!(!conversation.reject_open(Vec::new()));
     assert_eq!(conversation.exchange_count(), 0);
     assert!(conversation.history().is_empty());
 

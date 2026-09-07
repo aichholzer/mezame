@@ -171,3 +171,104 @@ fn missing_config_reports_and_attempts_setup() {
         "no config.json is written when standard input cannot be read"
     );
 }
+
+// ---------- phase 1: startup with a Bedrock section ----------
+
+/// Spawn the binary on `body` with no AWS credentials in its environment
+/// and a region set, read stderr until `Backend:` and the listening line
+/// appear, fetch `/`, and return the backend line, the response status
+/// line, and the child (killed on drop).
+fn start_and_fetch_root(body: &str, port: u16) -> (String, String) {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let tmp = home_with_config(body);
+    let mut child = Command::new(bin())
+        .env("HOME", tmp.path())
+        // No credentials: startup must not need any. A region, so the
+        // SDK's chain never probes the instance metadata service.
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_BEARER_TOKEN_BEDROCK")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mezame");
+    let stderr = child.stderr.take().unwrap();
+    let mut lines = BufReader::new(stderr).lines();
+    let mut backend_line = String::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the binary did not report startup in time"
+        );
+        let line = lines.next().expect("stderr stays open").expect("a line");
+        if line.starts_with("Backend:") {
+            backend_line = line.clone();
+        }
+        if line.contains("listening on") {
+            break;
+        }
+    }
+    let mut status = String::new();
+    for _ in 0..50 {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                stream,
+                "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            let _ = stream.read_to_string(&mut response);
+            status = response.lines().next().unwrap_or_default().to_string();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    (backend_line, status)
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn a_bedrock_configuration_starts_with_no_credentials_and_names_its_backend() {
+    let port = free_port();
+    let body = format!(
+        r#"{{"transports":[{{"kind":"cloudflared","bind":"127.0.0.1:{port}"}}],"bedrock":{{"model":"anthropic.claude-sonnet-5","region":"us-east-1"}}}}"#
+    );
+    let (backend, status) = start_and_fetch_root(&body, port);
+    assert!(
+        backend.starts_with("Backend: Bedrock anthropic.claude-sonnet-5"),
+        "{backend}"
+    );
+    assert!(backend.contains("region: us-east-1"), "{backend}");
+    assert!(backend.contains("profile: default chain"), "{backend}");
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+}
+
+#[test]
+fn a_configuration_without_a_bedrock_section_names_the_echo() {
+    let port = free_port();
+    let body = format!(r#"{{"transports":[{{"kind":"cloudflared","bind":"127.0.0.1:{port}"}}]}}"#);
+    let (backend, status) = start_and_fetch_root(&body, port);
+    assert!(backend.starts_with("Backend: echo"), "{backend}");
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+}

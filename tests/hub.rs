@@ -14,9 +14,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mezame::backend::Backend;
-use mezame::hub::{HubCommand, HubRegistry, RegistryFull, MAX_PROMPT_TEXT_BYTES};
+use mezame::conversation::Role;
+use mezame::hub::{HubCommand, HubRegistry, NewBackend, RegistryFull, MAX_PROMPT_TEXT_BYTES};
+use mezame::provider::{LoopSettings, Provider, StopReason, TurnEvent, Usage};
+use mezame::turn::LoopBackend;
 use serde_json::{json, Value};
-use support::{Invocation, Release, Resolution, ScriptedBackend, ScriptedTurn};
+use support::{
+    Invocation, Release, Resolution, ScriptedBackend, ScriptedProvider, ScriptedStream,
+    ScriptedTurn,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -1989,4 +1995,278 @@ async fn taking_the_outbound_receiver_leaves_no_second_one_behind() {
         "with the loop's receiver gone nothing pins the ring"
     );
     drop(guard);
+}
+
+// ---------- phase 1: the loop behind the hub ----------
+
+const SONNET: &str = "anthropic.claude-sonnet-5";
+
+fn loop_settings() -> LoopSettings {
+    LoopSettings {
+        model: SONNET.to_string(),
+        models: vec![SONNET.to_string()],
+        thinking: None,
+        thinking_budget: 4096,
+        max_output_tokens: 16384,
+    }
+}
+
+fn loop_backend(provider: &Arc<ScriptedProvider>) -> Arc<LoopBackend> {
+    Arc::new(LoopBackend::new(
+        Arc::clone(provider) as Arc<dyn Provider>,
+        loop_settings(),
+        SESSION_ID,
+    ))
+}
+
+async fn prompt_through_the_hub(
+    provider: Arc<ScriptedProvider>,
+    backend: Arc<LoopBackend>,
+) -> (
+    Vec<Value>,
+    mezame::hub::AttachedHub,
+    HubRegistry,
+    Arc<ScriptedProvider>,
+) {
+    let registry = HubRegistry::new();
+    let attached = registry
+        .register_for_test(
+            backend.clone() as Arc<dyn Backend>,
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+    let mut rx = attached.outbound.resubscribe();
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("hello")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .unwrap();
+    let events = collect_until(&mut rx, "prompt_done").await;
+    (events, attached, registry, provider)
+}
+
+#[tokio::test]
+async fn prompt_done_carries_the_usage_the_loop_reports_and_is_bare_without_one() {
+    let provider = Arc::new(ScriptedProvider::with_stream(ScriptedStream::Events(vec![
+        TurnEvent::TextDelta("hi".into()),
+        TurnEvent::Stop(StopReason::EndTurn),
+        TurnEvent::Usage(Usage {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+        }),
+    ])));
+    let (events, ..) = prompt_through_the_hub(provider.clone(), loop_backend(&provider)).await;
+    let done = events.last().unwrap();
+    assert_eq!(
+        done,
+        &json!({ "type": "prompt_done", "usage": { "input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4 } })
+    );
+    assert!(events
+        .iter()
+        .any(|e| e == &json!({ "type": "append", "role": "agent", "text": "hi" })));
+
+    let failing = Arc::new(ScriptedProvider::with_stream(
+        ScriptedStream::BeforeStream {
+            retryable: false,
+            rejected: false,
+            message: "no credentials".into(),
+        },
+    ));
+    let (events, ..) = prompt_through_the_hub(failing.clone(), loop_backend(&failing)).await;
+    assert_eq!(
+        events.last().unwrap(),
+        &json!({ "type": "prompt_done" }),
+        "bare on an error"
+    );
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "error" && e["message"] == "no credentials"));
+}
+
+#[tokio::test]
+async fn a_factory_registry_replays_the_session_info_frame_on_attach_and_the_default_replays_none()
+{
+    let provider = Arc::new(ScriptedProvider::new());
+    let settings = loop_settings();
+    let registry = HubRegistry::with_factory(Arc::new(move |session_id| {
+        let backend = LoopBackend::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            settings.clone(),
+            session_id,
+        );
+        NewBackend {
+            session_info: Some(backend.session_info()),
+            backend: Arc::new(backend),
+        }
+    }));
+    let attached = registry.attach_or_create("factory-session").await.unwrap();
+    let frame = attached
+        .snapshot_session_info
+        .clone()
+        .expect("a session_info frame");
+    assert_eq!(frame["type"], "session_info");
+    assert_eq!(frame["info"]["models"]["currentModelId"], SONNET);
+    assert_eq!(
+        frame["info"]["models"]["availableModels"][0]["modelId"],
+        SONNET
+    );
+    assert_eq!(attached.snapshot_ready["type"], "ready");
+
+    let plain = HubRegistry::new();
+    let attached = plain.attach_or_create("echo-session").await.unwrap();
+    assert!(attached.snapshot_session_info.is_none());
+}
+
+#[tokio::test]
+async fn every_failure_of_the_loop_ends_in_prompt_done() {
+    // Requirement 8 criterion 6: pre-stream error, mid-stream error, idle
+    // timeout, provider panic, cancel and shutdown.
+    let pre = ScriptedStream::BeforeStream {
+        retryable: true,
+        rejected: false,
+        message: "throttled".into(),
+    };
+    let mid = ScriptedStream::Events(vec![
+        TurnEvent::TextDelta("a".into()),
+        TurnEvent::Error {
+            retryable: false,
+            message: "reset".into(),
+        },
+    ]);
+    let panicking = ScriptedStream::Panicking("boom".into());
+    for (label, script) in [
+        ("pre-stream", pre),
+        ("mid-stream", mid),
+        ("panic", panicking),
+    ] {
+        let provider = Arc::new(ScriptedProvider::with_stream(script));
+        let (events, ..) = prompt_through_the_hub(provider.clone(), loop_backend(&provider)).await;
+        assert_eq!(
+            events.last().unwrap()["type"],
+            "prompt_done",
+            "{label}: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e["type"] == "error"),
+            "{label}: {events:?}"
+        );
+    }
+
+    // The idle timeout, on a short setting in real time.
+    let provider = Arc::new(ScriptedProvider::with_stream(ScriptedStream::Pending {
+        first: vec![TurnEvent::TextDelta("a".into())],
+    }));
+    let backend = Arc::new(
+        LoopBackend::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            loop_settings(),
+            SESSION_ID,
+        )
+        .with_idle_timeout_for_test(Duration::from_millis(50)),
+    );
+    let (events, ..) = prompt_through_the_hub(provider.clone(), backend).await;
+    assert_eq!(
+        events.last().unwrap()["type"],
+        "prompt_done",
+        "idle: {events:?}"
+    );
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "error" && e["message"].as_str().unwrap().contains("cut off")));
+
+    // Cancel and shutdown, each landing on a pending stream.
+    for through_shutdown in [false, true] {
+        let provider = Arc::new(ScriptedProvider::with_stream(ScriptedStream::Pending {
+            first: vec![TurnEvent::TextDelta("a".into())],
+        }));
+        let backend = loop_backend(&provider);
+        let registry = HubRegistry::new();
+        let attached = registry
+            .register_for_test(
+                backend.clone() as Arc<dyn Backend>,
+                SESSION_ID.into(),
+                ready_event(),
+                None,
+            )
+            .await;
+        let mut rx = attached.outbound.resubscribe();
+        attached
+            .commands
+            .send(HubCommand::Prompt {
+                blocks: vec![text_block("q")],
+                attach_id: attached.attach_id,
+            })
+            .await
+            .unwrap();
+        // The echo, then the first delta.
+        assert_eq!(next_event(&mut rx).await.unwrap()["role"], "user");
+        assert_eq!(next_event(&mut rx).await.unwrap()["text"], "a");
+        if through_shutdown {
+            backend.shutdown().await;
+        } else {
+            attached.commands.send(HubCommand::Cancel).await.unwrap();
+        }
+        let events = collect_until(&mut rx, "prompt_done").await;
+        assert_eq!(
+            events.last().unwrap(),
+            &json!({ "type": "prompt_done" }),
+            "shutdown={through_shutdown}: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn after_a_provider_panic_the_next_prompt_streams_and_carries_both_questions() {
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        ScriptedStream::Panicking("boom".into()),
+        ScriptedStream::Events(vec![
+            TurnEvent::TextDelta("fine".into()),
+            TurnEvent::Stop(StopReason::EndTurn),
+        ]),
+    ]));
+    let backend = loop_backend(&provider);
+    let registry = HubRegistry::new();
+    let attached = registry
+        .register_for_test(
+            backend.clone() as Arc<dyn Backend>,
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+    let mut rx = attached.outbound.resubscribe();
+    for question in ["first", "second"] {
+        attached
+            .commands
+            .send(HubCommand::Prompt {
+                blocks: vec![text_block(question)],
+                attach_id: attached.attach_id,
+            })
+            .await
+            .unwrap();
+        let events = collect_until(&mut rx, "prompt_done").await;
+        assert_eq!(
+            events.last().unwrap()["type"],
+            "prompt_done",
+            "{question}: {events:?}"
+        );
+    }
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].roles,
+        vec![Role::User, Role::User],
+        "the panicked turn's question rides along"
+    );
+    assert_eq!(requests[1].messages[0].text(), "first");
+    assert_eq!(requests[1].messages[1].text(), "second");
+    let history = registry.history(SESSION_ID).await.unwrap();
+    assert_eq!(history.len(), 3, "user, user, agent");
 }

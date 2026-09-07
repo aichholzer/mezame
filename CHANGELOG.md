@@ -20,6 +20,29 @@ from an earlier alpha: remove `~/.mezame` (or the Docker volume) left by
 an earlier version and run `mezame init` again. The entries below say
 what changed; none of them describes a path from the old state.
 
+### Added
+
+- A `bedrock` section in `config.json` (`model`, `region`, `profile`,
+  optional `models`, `thinking`, `thinking_budget`, `max_output_tokens`)
+  puts an Anthropic model on Amazon Bedrock behind every session.
+  `mezame init` asks for the model, the region and the profile, or takes
+  them as `--model`, `--region` and `--profile`, and validates the
+  section before writing it.
+- With that section present, a prompt runs a turn against the model
+  through `ConverseStream`: the answer streams into the log, extended
+  thinking streams into the thought pane where the model allows it, and
+  the conversation is carried from turn to turn with a cache point on
+  the last user message. Without it, sessions still answer with an echo
+  and say so. Startup prints a `Backend:` line naming the model and
+  region, or the echo.
+- Sessions announce the provider, the model and the thinking mode on
+  attach, and `prompt_done` carries the turn's token counts (input,
+  output, cache read, cache write).
+- The loop refuses a request that would overflow the model's context
+  with a clear message instead of a failed turn, drops an exchange the
+  model refused or filtered so it never poisons the next turn, times a
+  stalled stream out after five minutes, and answers a cancel at once.
+
 ### Changed
 
 - The compiler floor rises to Rust 1.94.1, the floor of the AWS SDK

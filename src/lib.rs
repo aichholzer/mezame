@@ -3,16 +3,17 @@
 //! A browser opens a session over a WebSocket, sends a prompt, and reads
 //! the turn as it streams. Several browsers can attach to one session at
 //! once and see the same conversation; a session outlives a reconnect.
-//! What produces a turn sits behind one trait, `backend::Backend`, and
-//! this build ships an `EchoBackend` that answers with the text it was
-//! given and talks to no provider.
+//! What produces a turn sits behind one trait, `backend::Backend`. With a
+//! `bedrock` section in the configuration a session runs `turn::LoopBackend`
+//! over Amazon Bedrock; without one it runs `backend::EchoBackend`, which
+//! answers with the text it was given and talks to no provider.
 //!
 //! See the README for architecture, the wire protocol and transports.
 //! In-code extension points are marked with `TODO:`.
 //!
 //! Layout:
-//!   - `backend`: the Backend seam, the transcript types, the shipped
-//!     `EchoBackend`
+//!   - `backend`: the Backend seam, the transcript types, the `EchoBackend`
+//!     a session gets with no provider configured
 //!   - `config`:  on-disk settings and interactive setup
 //!   - `conversation`: the canonical content blocks, the wire-to-block
 //!     mapping, and the conversation store coupled to the transcript
@@ -24,6 +25,7 @@
 //!   - `prompt`:  the system prompt assembly, date last
 //!   - `provider`: the `TurnEvent` vocabulary, the `Provider` trait and
 //!     the Bedrock implementation
+//!   - `turn`:    the turn loop, a Backend over a Provider
 //!   - `ws`:      the upgrade, the per-attach loop and the client command
 //!     set
 //!   - `unix`:    the three libc calls this crate needs, on Unix only
@@ -39,6 +41,7 @@ pub mod http;
 pub mod hub;
 pub mod prompt;
 pub mod provider;
+pub mod turn;
 pub mod ws;
 
 #[cfg(unix)]
@@ -46,10 +49,17 @@ pub mod unix;
 
 use anyhow::{bail, Context, Result};
 
+use std::sync::Arc;
+
 use crate::config::{
-    config_path, init_config, init_config_with_args, load_config, parse_init_args, TransportConfig,
+    config_path, init_config, init_config_with_args, load_config, parse_init_args, BedrockConfig,
+    TransportConfig,
 };
 use crate::http::run_cloudflared;
+use crate::hub::{HubRegistry, NewBackend};
+use crate::provider::bedrock::{build_client, BedrockProvider};
+use crate::provider::Provider;
+use crate::turn::LoopBackend;
 
 /// Top-level CLI entry point. Synchronous because `init_config` reads
 /// stdin and we do not want a tokio runtime blocking a thread on that.
@@ -104,11 +114,16 @@ pub fn run() -> Result<()> {
     rt.block_on(async move {
         // Single-transport runtime for now: pick the first entry, bail on
         // empty or multi-entry configs. When multi-transport lands
-        // (todo #19), iterate the list and spawn one task per entry.
+        // (todo #19), iterate the list and spawn one task per entry. The
+        // registry is built inside the served arm, so a config error is
+        // reported before the SDK's region lookup runs.
         match cfg.transports.as_slice() {
             [] => bail!("No transports configured. Re-run `mezame init`."),
             [one] => match one.clone() {
-                TransportConfig::Cloudflared { bind, .. } => run_cloudflared(cfg, bind).await,
+                TransportConfig::Cloudflared { bind, .. } => {
+                    let hubs = build_registry(cfg.bedrock.as_ref(), &path).await;
+                    run_cloudflared(cfg, bind, hubs).await
+                }
             },
             _ => bail!(
                 "Running more than one transport at once is not yet supported. \
@@ -116,6 +131,38 @@ pub fn run() -> Result<()> {
             ),
         }
     })
+}
+
+/// The registry every session is built from: hubs over Bedrock when the
+/// configuration names a model, over the echo otherwise. One line on
+/// stderr says which.
+///
+/// Building the client reads files and the environment and makes no
+/// request for credentials; those resolve on the first turn, so a machine
+/// with no AWS setup still serves the browser and reports the problem
+/// there. With no region anywhere the SDK's chain ends at the instance
+/// metadata service, which costs about a second here outside EC2.
+async fn build_registry(bedrock: Option<&BedrockConfig>, path: &std::path::Path) -> HubRegistry {
+    let Some(section) = bedrock else {
+        eprintln!("Backend: echo (no `bedrock` section in {})", path.display());
+        return HubRegistry::new();
+    };
+    let client = build_client(section.region.as_deref(), section.profile.as_deref()).await;
+    eprintln!(
+        "Backend: Bedrock {} (region: {}, profile: {})",
+        section.model,
+        section.region.as_deref().unwrap_or("AWS default"),
+        section.profile.as_deref().unwrap_or("default chain")
+    );
+    let provider: Arc<dyn Provider> = Arc::new(BedrockProvider::new(client));
+    let settings = section.settings();
+    HubRegistry::with_factory(Arc::new(move |session_id| {
+        let backend = LoopBackend::new(Arc::clone(&provider), settings.clone(), session_id);
+        NewBackend {
+            session_info: Some(backend.session_info()),
+            backend: Arc::new(backend),
+        }
+    }))
 }
 
 fn print_help() {
