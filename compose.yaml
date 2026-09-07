@@ -19,30 +19,20 @@
 #
 # The container runs as user `mezame` (uid 1000) with its config at
 # /home/mezame/.mezame, on a read-only root filesystem, with every
-# capability dropped and no privilege escalation. Earlier images ran as
-# root at /root/.mezame. A volume created by one of those is owned by
-# root: this image reads it, so sessions work, but cannot write it, so the
-# tab list stops being saved and `mezame init` is refused with "Permission
-# denied"; Mezame logs one line about the failed write. Fix the ownership
-# once, with the stack stopped:
-#   docker run --rm -v <project>_mezame-config:/data alpine:3.23 chown -R 1000:1000 /data
-# where <project> is the compose project name, this directory's name in
-# lower case; `docker volume ls` shows it. With plain `docker run`, change
-# the mount to /home/mezame/.mezame as well. Docker lets the container
-# bind any port without a capability, so nothing refuses a custom port;
-# but a bind on a port other than 9510 needs the `ports:` mapping below
-# and the image's health check changed to match, or the published port
-# answers nothing and the container reports unhealthy.
+# capability dropped and no privilege escalation. Start from a fresh
+# volume: one created by an earlier version is not carried over, and
+# `docker compose down -v` removes it. Docker lets the container bind any
+# port without a capability, so nothing refuses a custom port; but a bind
+# on a port other than 9510 needs the `ports:` mapping below and the
+# image's health check changed to match, or the published port answers
+# nothing and the container reports unhealthy.
 #
 # Normal run, and after pulling a new version:
 #   docker compose up -d --build
 #
-# `up -d` alone starts whatever `mezame:local` is already on this machine.
-# An image built before this release runs as root and reads /root/.mezame,
-# finds nothing at the new mount, and restart-loops on "No config at
-# /root/.mezame/config.json" followed by "not a terminal"; `--build`
-# rebuilds it first. `docker compose run --rm --build setup` does the same
-# before first-run setup.
+# `up -d` alone starts whatever `mezame:local` is already on this machine;
+# `--build` rebuilds it first. `docker compose run --rm --build setup` does
+# the same before first-run setup.
 #
 # Both services share the same image and the same volume, so the config
 # written during setup is what the running service reads. The image's

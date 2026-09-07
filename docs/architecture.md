@@ -118,8 +118,7 @@ file written by an earlier release loads with no edit and no re-run of
 
 `~/.mezame`, and any missing parent, is created owner-only (`0700`) on Unix, and
 `config.json` and `state.json` are written `0600`, each through a fresh
-temporary sibling renamed into place. A directory an earlier release created
-keeps its mode; `chmod 700 ~/.mezame` brings it in line. Because the target is
-never opened for writing, a symlink at `config.json` or `state.json` is replaced
-by the rename rather than written through, and the directory itself must be
-writable by the account Mezame runs as.
+temporary sibling renamed into place; an existing directory keeps its mode.
+Because the target is never opened for writing, a symlink at `config.json` or
+`state.json` is replaced by the rename rather than written through, and the
+directory itself must be writable by the account Mezame runs as.

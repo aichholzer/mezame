@@ -87,6 +87,16 @@ struct UiAssets;
 // What is enforced today lives in `guard.rs`: the `Host` allowlist and the
 // `Origin` check, which stop a page in the user's own browser from reaching
 // a loopback Mezame, and need no identity to do it.
+//
+// Not built, on purpose: an interim shared bearer token for non-loopback
+// binds. The accounts phase replaces it wholesale with users and a signed
+// session cookie; a static token shared by every device crosses a
+// plain-HTTP LAN in the clear and, carried as a cookie, reaches every other
+// service on the same host; and enabling it by default would lock every
+// container deployment out on upgrade, since the container binds 0.0.0.0
+// by design. If it is ever wanted before then, it belongs after the two
+// checks in `guard_request`, compared in constant time, with a 401 that
+// echoes nothing and a UI that stops reconnecting on it.
 
 pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
     let (state_changes, _) = broadcast::channel(64);

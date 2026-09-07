@@ -20,11 +20,15 @@ local agent process and becomes the agent harness itself. This alpha
 ships the transport with no provider behind it: every prompt is answered
 with an echo, on every attached browser at once.
 
+This alpha assumes a fresh install. There is no migration from 0.13 or
+from an earlier alpha: remove `~/.mezame` (or the Docker volume) left by
+an earlier version and run `mezame init` again. The entries below say
+what changed; none of them describes a path from the old state.
+
 ### Breaking
 
 - Mezame no longer starts or drives a separate agent process. The
-  `agent_cmd` and `agent_args` keys in `~/.mezame/config.json` are read
-  and ignored; the file is left on disk as it is.
+  `agent_cmd` and `agent_args` keys of a 0.13 `config.json` are ignored.
 - Every prompt is answered with an echo of its text. No provider is
   contacted and no model is selectable: the picker is still there, and a
   change is refused with a notice in the log.
@@ -32,9 +36,7 @@ with an echo, on every attached browser at once.
   a session is released 30 seconds after the last browser leaves, and a
   restart loses every conversation. The 0.13 history reader over the
   agent's on-disk JSONL went with the agent.
-- The tab list a 0.13 `state.json` holds is discarded on first load. The
-  UI starts with one fresh tab and the next sync rewrites the file under
-  the new key.
+- A 0.13 `state.json` is not read; the UI starts with one fresh tab.
 - Building from source needs Node.js 24 or newer. `build.rs` refuses an
   older version.
 - A session id is the minted form only: 32 lowercase hexadecimal
@@ -52,24 +54,17 @@ with an echo, on every attached browser at once.
   but answers 403 to the WebSocket and to every write until the page's
   hostname is listed. `mezame init` keeps an existing `hosts` list when it
   rewrites the file. The Cloudflare guide has the step.
-- The container runs as user `mezame` (uid 1000) and keeps its config at
-  `/home/mezame/.mezame`; it was root and `/root/.mezame`. A volume an
-  earlier image created is owned by root, and the new image can read it
-  but not write it: sessions work, and the tab list stops being saved,
-  with `mezame init` refused with "Permission denied". `compose.yaml` and
-  the README carry the one-off `chown`. Rebuild the image with
-  `docker compose up -d --build`: `up -d` alone reuses the previous root
-  image, which looks for its config at `/root/.mezame` and restarts on
-  `not a terminal`. Both compose services now run with a read-only root
-  filesystem, every capability dropped and no privilege escalation.
+- The container runs as user `mezame` (uid 1000) with its config at
+  `/home/mezame/.mezame`, on a read-only root filesystem with every
+  capability dropped and no privilege escalation. Start from a fresh
+  volume and rebuild the image with `docker compose up -d --build`: a
+  volume or image from an earlier version is not carried over.
 - `compose.yaml` publishes the container's port on the host's loopback
-  only, `127.0.0.1:9510:9510`; it was `9510:9510`, every interface the
-  host has. A browser on another machine, or a `cloudflared` on another
-  host pointed at `http://<docker-host>:9510`, is refused until the
-  mapping is changed to `"0.0.0.0:9510:9510"`, as the README's Docker
-  section describes; nothing reaches Mezame, so its log shows nothing and
-  `docker ps` still reports `healthy`. A `cloudflared` on the Docker host
-  itself reaches the loopback mapping as it is.
+  only, `127.0.0.1:9510:9510`. A browser on another machine, or a
+  `cloudflared` on another host, reaches it only once the mapping is
+  changed to `"0.0.0.0:9510:9510"`, as the README's Docker section
+  describes; a `cloudflared` on the Docker host itself reaches the
+  loopback mapping as it is.
 - `cargo install mezame` still installs 0.13.4 from crates.io. This alpha
   installs from the `feature/harness` branch.
 

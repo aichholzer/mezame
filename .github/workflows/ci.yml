@@ -178,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           LIST="$(cargo package --list --locked)"
-          if grep -Ex 'HARNESS\.md|reference\.html|findings\.md|\.kiro/.*' <<<"$LIST"; then
+          if grep -Ex 'HARNESS\.md|findings\.md|\.kiro/.*' <<<"$LIST"; then
             echo "::error::a repository-only file is in the crate; add it to exclude in Cargo.toml"
             exit 1
           fi

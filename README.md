@@ -109,6 +109,9 @@ mezame
 `mezame init --bind 127.0.0.1:9510` writes the same file with no prompt, for a
 service unit or a container started before setup.
 
+This alpha assumes a fresh install. There is no migration from 0.13 or from an
+earlier alpha: remove `~/.mezame` left by an earlier version first.
+
 Then point a browser at `http://127.0.0.1:9510` (or whatever address and port
 you set) to run locally, or at your public hostname once your tunnel is wired.
 
@@ -200,19 +203,8 @@ the full flow.
 
 The container runs as user `mezame` (uid 1000) with its config at
 `/home/mezame/.mezame`, on a read-only root filesystem with every capability
-dropped. Earlier images ran as root at `/root/.mezame`, and a volume one of them
-created is owned by root: the new image reads it, so sessions work, but cannot
-write it, so the tab list stops being saved and `mezame init` is refused with
-"Permission denied"; Mezame logs one line about the failed write. Fix the
-ownership once, with the stack stopped:
-
-```sh
-docker run --rm -v <project>_mezame-config:/data alpine:3.23 chown -R 1000:1000 /data
-```
-
-`<project>` is the compose project name, this directory's name in lower case;
-`docker volume ls` shows it. With plain `docker run`, change the mount to
-`/home/mezame/.mezame` as well.
+dropped. Start from a fresh volume: one created by an earlier version is not
+carried over (`docker compose down -v` removes it).
 
 The image declares a health check that fetches `/` on `127.0.0.1:9510` inside
 the container; `docker ps` shows `healthy` once Mezame answers. It confirms the
@@ -241,10 +233,17 @@ Stderr carries Mezame's own logs. One environment variable is worth knowing:
 2. **Auth enforcement.** Mezame has no notion of who is connected. What it
    does check, in `src/guard.rs`, is that a WebSocket upgrade or a write comes
    from a page it served (`Origin`) and that every request names a host it
-   serves (`Host`). When fronted by Cloudflare Access, validating the
-   `Cf-Access-Jwt-Assertion` header (JWKS at
-   `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`) is the next
-   step; the TODO sits in `src/http.rs`.
+   serves (`Host`). Identity arrives with the accounts work: users, a signed
+   session cookie, and a login in the browser. An interim shared token for
+   non-loopback binds was weighed for this alpha and deliberately not built:
+   it would be replaced wholesale by that work, a static token shared by
+   every device crosses a plain-HTTP LAN in the clear and, as a cookie, is
+   sent to every other service on the same host, and switching it on by
+   default would lock out every container deployment on upgrade. Until then
+   a non-loopback bind is for a network you trust end to end, as the section
+   above says. Validating Cloudflare Access's `Cf-Access-Jwt-Assertion`
+   header (JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`)
+   is the other path; the TODO sits in `src/http.rs`.
 3. **A transcript lives as long as its session.** Nothing is written to disk,
    so a reload after the grace period shows an empty log and a restart loses
    every conversation. Durable storage is planned.

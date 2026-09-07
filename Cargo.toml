@@ -14,10 +14,10 @@ categories = ["command-line-utilities", "web-programming::websocket"]
 # never reaches the source tree during a clean build. We also ignore it
 # via `.gitignore`. Excluded explicitly here for belt-and-braces. Assets
 # and the changelog are not needed at build time; the README links to
-# raw.githubusercontent.com for the banner image. The plan (`HARNESS.md`),
-# the review (`findings.md`) and the UI design reference (`reference.html`)
-# are repository documents, not crate contents; the `docs` CI job fails if
-# `cargo package --list` names one of them.
+# raw.githubusercontent.com for the banner image. The plan (`HARNESS.md`)
+# and the review (`findings.md`) are repository documents, not crate
+# contents; the `docs` CI job fails if `cargo package --list` names one of
+# them.
 exclude = [
     "ui/node_modules/**",
     "ui/dist/**",
@@ -35,7 +35,6 @@ exclude = [
     "benches/**",
     "HARNESS.md",
     "findings.md",
-    "reference.html",
     "ui/tsconfig.test.json"
 ]
 
