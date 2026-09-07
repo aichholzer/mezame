@@ -141,6 +141,7 @@ mod tests {
     extern "C" {
         fn fork() -> i32;
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        fn _exit(status: i32) -> !;
     }
 
     /// Exercise `new_session` in a forked child, the only context where
@@ -151,11 +152,16 @@ mod tests {
     /// terminal, and the real production path (inside `Command::pre_exec`)
     /// runs between fork and exec where llvm-cov cannot observe it.
     ///
-    /// The child exits via `std::process::exit` to flush the coverage
-    /// profile before it goes; `_exit` would skip that. The lib unit-test
-    /// binary has no other tests, and the fork happens with effectively
-    /// one active thread, keeping clear of the usual fork-without-exec
-    /// hazards.
+    /// The child leaves through `_exit`, never `std::process::exit`. The
+    /// test binary is multithreaded: libtest runs each test on a thread
+    /// of its own, and a thread starting or finishing at the instant of
+    /// the fork may hold one of the runtime's locks. The child inherits
+    /// that lock held by a thread it does not have, and `exit` runs the
+    /// runtime's cleanup, which takes the lock and waits forever; that
+    /// hung a `cargo test` run once. `_exit` skips the cleanup. The cost
+    /// is the child's coverage profile, which is never written, so
+    /// `new_session`'s body reads as uncovered; the production path,
+    /// inside `Command::pre_exec`, was never observable there either.
     #[test]
     fn new_session_succeeds_in_a_forked_child() {
         unsafe {
@@ -165,7 +171,7 @@ mod tests {
                 // Child: setsid must return a valid (non-negative) session
                 // id. Map success to exit code 0, failure to 1.
                 let sid = new_session();
-                std::process::exit(if sid >= 0 { 0 } else { 1 });
+                _exit(if sid >= 0 { 0 } else { 1 });
             }
             // Parent: reap the child and assert it exited cleanly.
             let mut status: i32 = 0;
