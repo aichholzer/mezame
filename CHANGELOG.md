@@ -77,6 +77,13 @@ with an echo, on every attached browser at once.
   session is always joinable. Without the cap every unseen id cost a hub
   kept for the grace window, so live hubs equalled the handshake rate
   times 30 seconds.
+- The frames waiting for one browser are bounded at 256, and one frame
+  may wait 60 seconds to be accepted. A peer that sent frames but never
+  read any used to accumulate every broadcast without bound, since any
+  inbound frame satisfies the heartbeat, and its writer task was awaited
+  forever on exit. Such a peer is now disconnected and the writer is
+  aborted after a 5-second drain; a live browser that trips the limit
+  reconnects and reloads its transcript.
 - A permission answer reaches the Backend only for a request the Backend
   raised in the turn in flight, and only the first answer does. The hub
   no longer remembers every id a browser answers with.

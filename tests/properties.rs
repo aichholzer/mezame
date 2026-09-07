@@ -83,11 +83,14 @@ async fn frames_until_prompt_done(rx: &mut broadcast::Receiver<Arc<Value>>) -> V
 /// Run this attach's loop against a socket that never speaks, and return
 /// the sink it writes to. The `AttachedHub` moves into the task, so the
 /// subscriber count holds for as long as the loop runs.
-fn spawn_attach_loop(mut attached: AttachedHub) -> (u64, mpsc::UnboundedReceiver<Message>) {
+fn spawn_attach_loop(mut attached: AttachedHub) -> (u64, mpsc::Receiver<Message>) {
     let attach_id = attached.attach_id;
     let outbound = attached.take_outbound();
     let commands = attached.commands.clone();
-    let (to_ws_tx, to_ws_rx) = mpsc::unbounded_channel::<Message>();
+    // The same capacity as the hub's broadcast ring, so no property's
+    // sink can be the smaller buffer: a full queue ends the attach, and
+    // the properties are about what the loop forwards, not about that.
+    let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(1024);
     tokio::spawn(async move {
         let mut stream = Box::pin(futures_util::stream::pending::<Result<Message, Infallible>>());
         run_attach_loop(
@@ -109,7 +112,7 @@ fn spawn_attach_loop(mut attached: AttachedHub) -> (u64, mpsc::UnboundedReceiver
 
 /// Drain a sink until its `prompt_done`, returning the JSON of every text
 /// frame.
-async fn sink_until_prompt_done(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<Value> {
+async fn sink_until_prompt_done(rx: &mut mpsc::Receiver<Message>) -> Vec<Value> {
     let mut seen = Vec::new();
     loop {
         let Ok(Some(frame)) = timeout(PATIENCE, rx.recv()).await else {

@@ -13,6 +13,12 @@
 //! public `run_attach_loop`. No Backend is involved: the loop needs a
 //! command sender, a broadcast receiver and a frame stream, and this file
 //! supplies all three itself.
+//!
+//! The same harness covers the loop's exit arms that need no Backend: the
+//! inbound stream ending, the hub's inbox going away, the broadcast
+//! channel closing, and a lagged receiver skipping ahead rather than
+//! ending. A regression that turned one of those `break`s into a
+//! `continue` shipped once before (0.8.7), and nothing asserted them.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -37,13 +43,18 @@ fn channel_stream(
     }))
 }
 
-/// A running attach loop with its inbound frame channel and its command
-/// receiver. Every field is held for the length of the test: dropping the
-/// broadcast sender would end the loop through its closed-channel arm.
+/// A running attach loop with its inbound frame channel, its command
+/// receiver, its broadcast sender and its sink. Every field is held for
+/// the length of a test unless the case is about dropping one: the loop
+/// ends when the browser channel closes, when the command receiver goes,
+/// or when the broadcast sender goes.
 struct Harness {
     browser: mpsc::UnboundedSender<Message>,
     commands: mpsc::Receiver<HubCommand>,
-    _outbound: broadcast::Sender<Arc<Value>>,
+    outbound: broadcast::Sender<Arc<Value>>,
+    /// What the loop writes to the browser. Held so the bounded queue
+    /// stays open; the exit-arm cases read it.
+    sink: mpsc::Receiver<Message>,
     handle: JoinHandle<()>,
 }
 
@@ -51,7 +62,7 @@ fn harness() -> Harness {
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(8);
     let (out_tx, out_rx) = broadcast::channel::<Arc<Value>>(16);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
-    let (to_ws_tx, _to_ws_rx) = mpsc::unbounded_channel::<Message>();
+    let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(32);
     let handle = tokio::spawn(async move {
         let mut stream = channel_stream(browser_rx);
         // A long heartbeat: nothing here should be evicted mid-test.
@@ -69,7 +80,8 @@ fn harness() -> Harness {
     Harness {
         browser: browser_tx,
         commands: cmd_rx,
-        _outbound: out_tx,
+        outbound: out_tx,
+        sink: to_ws_rx,
         handle,
     }
 }
@@ -231,4 +243,137 @@ async fn the_four_surviving_commands_are_forwarded() {
         other => panic!("expected a SetModel, got {other:?}"),
     }
     assert!(matches!(forwarded[3], HubCommand::Cancel));
+}
+
+#[tokio::test]
+async fn the_loop_returns_when_the_inbound_stream_ends() {
+    // Requirement 8 criterion 8, first clause. `channel_stream` is an
+    // `unfold`, which panics if polled after its `None`; a `continue` on
+    // the stream-ended arm therefore fails the join rather than spinning,
+    // which is why the join result is asserted and the stream is not
+    // fused. The other channels stay alive so no other arm can be the
+    // one that ended the loop.
+    let Harness {
+        browser,
+        commands: _commands,
+        outbound: _outbound,
+        sink: _sink,
+        handle,
+    } = harness();
+    drop(browser);
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("the loop returns within 2s once the stream ends")
+        .expect("the loop returned without panicking");
+}
+
+#[tokio::test]
+async fn the_loop_returns_when_the_hub_inbox_is_gone() {
+    // Requirement 8 criterion 14. With the command receiver dropped, the
+    // next forwarded command fails to send and the loop returns. The
+    // browser sender stays alive for the whole wait: were it dropped the
+    // stream would end and mask a `continue` on this arm.
+    let Harness {
+        browser,
+        commands,
+        outbound: _outbound,
+        sink: _sink,
+        handle,
+    } = harness();
+    drop(commands);
+    browser
+        .send(Message::Text(json!({ "type": "cancel" }).to_string()))
+        .expect("the loop is still reading");
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("the loop returns within 2s once the inbox is gone")
+        .expect("the loop returned without panicking");
+    drop(browser);
+}
+
+#[tokio::test]
+async fn the_loop_returns_when_the_broadcast_channel_closes() {
+    // Requirement 8 criterion 13. With every broadcast sender gone the
+    // receiver reports `Closed` and the loop returns. A `continue` there
+    // would spin; tokio's cooperative budget makes it yield, so this
+    // case times out instead of hanging.
+    let Harness {
+        browser: _browser,
+        commands: _commands,
+        outbound,
+        sink: _sink,
+        handle,
+    } = harness();
+    drop(outbound);
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("the loop returns within 2s once the broadcast closes")
+        .expect("the loop returned without panicking");
+}
+
+#[tokio::test]
+async fn a_lagged_receiver_skips_ahead_and_keeps_forwarding() {
+    // Requirement 8 criterion 7. The loop task was only queued by
+    // `harness()`: on this current-thread runtime it has not been polled
+    // yet, so the twenty sends below overflow the 16-slot ring by four
+    // before its first `recv`. The receiver then reports `Lagged(4)`, and
+    // the loop must skip ahead and forward the sixteen that remain, in
+    // order, with no frame describing the lag, and stay open for more.
+    let Harness {
+        browser: _browser,
+        commands: _commands,
+        outbound,
+        mut sink,
+        handle,
+    } = harness();
+    for i in 1..=20u32 {
+        outbound
+            .send(Arc::new(
+                json!({ "type": "append", "role": "agent", "text": i.to_string() }),
+            ))
+            .expect("the loop holds a receiver");
+    }
+
+    let mut received: Vec<u32> = Vec::new();
+    loop {
+        let frame = timeout(Duration::from_secs(2), sink.recv())
+            .await
+            .expect("a frame within 2s")
+            .expect("the loop is still writing");
+        let Message::Text(text) = frame else {
+            panic!("expected a text frame, got {frame:?}");
+        };
+        let value: Value = serde_json::from_str(&text).expect("the sink carries JSON");
+        assert_eq!(value["type"], "append", "no frame describes the lag");
+        let n: u32 = value["text"]
+            .as_str()
+            .expect("the text field")
+            .parse()
+            .expect("a published number");
+        received.push(n);
+        if n == 20 {
+            break;
+        }
+    }
+    assert_eq!(
+        received,
+        (5..=20).collect::<Vec<u32>>(),
+        "the four evicted events are skipped and the rest arrive in order"
+    );
+
+    outbound
+        .send(Arc::new(
+            json!({ "type": "append", "role": "agent", "text": "21" }),
+        ))
+        .expect("the loop still holds a receiver");
+    let frame = timeout(Duration::from_secs(2), sink.recv())
+        .await
+        .expect("the next frame within 2s")
+        .expect("the loop is still writing");
+    let Message::Text(text) = frame else {
+        panic!("expected a text frame, got {frame:?}");
+    };
+    let value: Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(value["text"], "21", "the loop keeps forwarding after a lag");
+    assert!(!handle.is_finished(), "a lag does not end the attach");
 }

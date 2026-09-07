@@ -206,6 +206,12 @@ reachable from the composer in ordinary use.
   upgrade naming a live session is unaffected, and `/history` creates nothing.
   A peer sustaining about four handshakes a second can hold the cap and deny
   new sessions for as long as it keeps going; it cannot touch live ones.
+- For each attached browser at most 256 frames wait to be written, and one
+  frame may wait 60 seconds for the browser's TCP stack to accept it. A browser
+  that lets the queue fill, or accepts no frame for a minute, has stopped
+  reading: its connection is closed, the session is untouched, and its
+  reconnect seeds from `/history`. A live browser on a slow link receiving a
+  large echo can trip the minute; it reconnects the same way.
 
 ## Request checks
 

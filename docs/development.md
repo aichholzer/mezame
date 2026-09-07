@@ -70,10 +70,14 @@ Notable coverage already in place:
 - **Hub plumbing.** `tests/hub.rs` drives the multi-attach hub: broadcast
   fan-out, `_target` stamping, the grace counter and its capped in-flight hold,
   the frames that end a turn, and the mid-turn second-prompt drop.
-- **The socket.** `tests/ws_heartbeat.rs` covers half-open eviction and
-  targeted forwarding, `tests/ws_commands.rs` the four discarded-frame faults,
-  and `tests/ws_upgrade.rs` the three upgrade arms over a real socket, which is
-  the only way to reach the extractor axum's upgrade needs.
+- **The socket.** `tests/ws_heartbeat.rs` covers half-open eviction, targeted
+  forwarding, the transport-error and `Close` exits, the eviction of a peer
+  that stops reading, and the writer's write timeout; `tests/ws_commands.rs`
+  the four discarded-frame faults and the exits on a closed stream, inbox or
+  broadcast channel plus the lag that is not an exit; and `tests/ws_upgrade.rs`
+  the three upgrade arms, the message and text ceilings, the session cap and
+  the `Host` and `Origin` refusals over a real socket, which is the only way to
+  reach the extractor axum's upgrade needs.
 - **Invariants.** `tests/properties.rs` holds nine `proptest` properties at 100
   cases each: broadcast fidelity, targeted delivery, turn ordering, the
   in-flight trajectory, grace and shutdown, session ids, the echo agreement,

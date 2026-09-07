@@ -9,7 +9,10 @@
 //!   503 the same way.
 //! - `handle_ws` splits the socket into a sink owned by a writer task and
 //!   a stream polled by the attach loop. Sends to the browser go through
-//!   an unbounded channel, so no handler contends on the sink.
+//!   a bounded queue, so no handler contends on the sink, and a peer that
+//!   lets the queue fill, or accepts no frame for the write timeout, has
+//!   stopped reading and is disconnected. Its reconnect seeds from
+//!   `/history`, so nothing is lost.
 //! - `run_attach_loop` is one attach: it forwards this browser's commands
 //!   to its hub, forwards the hub's broadcast to this socket, and evicts a
 //!   peer that has gone silent. Everything about the turn itself belongs
@@ -27,9 +30,10 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::{SinkExt, Stream, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
 use crate::hub::GRACE_PERIOD;
@@ -53,6 +57,36 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 /// `AttachedHub` never drops, the grace timer never arms, and the session
 /// is never reclaimed. See GitHub issue #4.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many frames may wait for one attached browser, 256.
+///
+/// The hub's broadcast ring holds 1024 events and a streamed turn bursts
+/// a few hundred; a live peer drains at line rate, so the queue holds a
+/// handful. 256 absorbs a whole burst while a phone's TCP window is
+/// momentarily zero, and a peer that lets 256 pile up has stopped
+/// reading. The attach loop ends when a send finds the queue full; the
+/// browser reconnects and seeds from `/history`, so nothing is lost.
+/// Before this the queue was unbounded, and a peer that sent frames but
+/// never read any accumulated every broadcast as a serialised string for
+/// as long as it liked, since any inbound frame keeps the heartbeat
+/// satisfied.
+pub const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+
+/// How long one frame may wait for the peer's TCP stack to accept it,
+/// 60 seconds.
+///
+/// Sized from the largest frame rather than from the reconnect cap: the
+/// user echo carries the whole prompt text, up to 1 MiB, and a live phone
+/// on a slow link needs tens of seconds for it. A frame not accepted in
+/// a minute means nobody is reading. The writer ends, and the attach
+/// loop learns on its next send.
+pub const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a normal exit waits for the queue to flush into the socket
+/// before the writer is aborted. The queue holds at most the close frame
+/// and whatever was in flight; a writer stuck past this is stuck on a
+/// peer that is not reading, and waiting on it leaked the connection.
+const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ceiling on one inbound WebSocket message, 32 MiB.
 ///
@@ -181,18 +215,9 @@ async fn handle_ws(
     state: Arc<crate::http::AppState>,
     session_id: String,
 ) -> Result<()> {
-    let (mut sink, mut stream) = ws.split();
-    let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
-
-    // Writer task: drain the outbound channel into the WS sink. Exits when
-    // the channel closes or the sink errors.
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = to_ws_rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (sink, mut stream) = ws.split();
+    let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
+    let mut writer = tokio::spawn(run_writer(sink, to_ws_rx, OUTBOUND_WRITE_TIMEOUT));
 
     // Attach to the hub for this session id, building one if none is
     // registered. The only failure is the working-directory lookup the
@@ -201,11 +226,12 @@ async fn handle_ws(
         Ok(a) => a,
         Err(e) => {
             eprintln!("Session {session_id}: could not attach: {e:?}");
-            let _ = to_ws_tx.send(text_msg(
+            // The queue is empty here, so `try_send` cannot find it full.
+            let _ = to_ws_tx.try_send(text_msg(
                 json!({ "type": "error", "message": format!("{e}") }),
             ));
             drop(to_ws_tx);
-            let _ = writer.await;
+            finish_writer(&mut writer).await;
             return Ok(());
         }
     };
@@ -220,9 +246,10 @@ async fn handle_ws(
             Value::String(env!("MEZAME_BUILD_ID").to_string()),
         );
     }
-    let _ = to_ws_tx.send(text_msg(ready));
+    // Two frames into an empty queue: `try_send` cannot find it full.
+    let _ = to_ws_tx.try_send(text_msg(ready));
     if let Some(info) = attached.snapshot_session_info.clone() {
-        let _ = to_ws_tx.send(text_msg(info));
+        let _ = to_ws_tx.try_send(text_msg(info));
     }
 
     // The receiver `subscribe` took, not a fresh one: a `prompt_done`
@@ -247,8 +274,41 @@ async fn handle_ws(
     // closes. The grace timer arms here if this was the last subscriber.
     drop(attached);
     drop(to_ws_tx);
-    let _ = writer.await;
+    finish_writer(&mut writer).await;
     Ok(())
+}
+
+/// The writer task: drains the outbound queue into the socket sink, one
+/// frame at a time, each under `write_timeout`.
+///
+/// Returns when the queue closes, when the sink errors, or when one frame
+/// is not accepted within the timeout. Returning drops the receiver,
+/// which is what makes the attach loop's next send fail and end the
+/// attach. Public for the tests, which drive it with a sink that never
+/// accepts a frame.
+#[doc(hidden)]
+pub async fn run_writer<S>(mut sink: S, mut rx: mpsc::Receiver<Message>, write_timeout: Duration)
+where
+    S: Sink<Message> + Unpin,
+{
+    while let Some(msg) = rx.recv().await {
+        match tokio::time::timeout(write_timeout, sink.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+}
+
+/// Wait for the writer to flush what is queued, then abort it if it has
+/// not. Awaiting it unconditionally leaked the connection, two tasks and
+/// the queued frames whenever the peer had stopped reading.
+async fn finish_writer(writer: &mut JoinHandle<()>) {
+    if tokio::time::timeout(WRITER_DRAIN_TIMEOUT, &mut *writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
 }
 
 /// The per-WebSocket attach loop, extracted from `handle_ws` so it can be
@@ -262,13 +322,14 @@ async fn handle_ws(
 /// to this socket, dropping any frame stamped for another attach. The
 /// heartbeat branch pings the peer and returns when it has been silent
 /// past `heartbeat_timeout`, which is the only thing that ends the loop
-/// for a half-open socket. The caller drops its attach when this
-/// returns.
+/// for a half-open socket. A send that finds the outbound queue full, or
+/// closed because the writer gave up, ends the loop too: that peer has
+/// stopped reading. The caller drops its attach when this returns.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_attach_loop<S, E>(
     stream: &mut S,
-    to_ws_tx: &mpsc::UnboundedSender<Message>,
+    to_ws_tx: &mpsc::Sender<Message>,
     mut outbound: tokio::sync::broadcast::Receiver<Arc<Value>>,
     commands: mpsc::Sender<crate::hub::HubCommand>,
     attach_id: u64,
@@ -331,9 +392,10 @@ pub async fn run_attach_loop<S, E>(
                 // Otherwise prod it. A live peer answers with a Pong
                 // (handled by the stream arm above, which bumps
                 // `last_seen`). The send goes through the writer task;
-                // if that channel is gone the connection is already
-                // tearing down.
-                if to_ws_tx.send(Message::Ping(Vec::new())).is_err() {
+                // a full queue means the peer has stopped reading and a
+                // closed one means the writer gave up on it, and either
+                // way this attach is over.
+                if to_ws_tx.try_send(Message::Ping(Vec::new())).is_err() {
                     break;
                 }
             }
@@ -353,7 +415,12 @@ pub async fn run_attach_loop<S, E>(
                                 continue;
                             }
                         }
-                        let _ = to_ws_tx.send(text_msg((*value).clone()));
+                        // A full queue means the peer has stopped
+                        // reading; a closed one means the writer gave up
+                        // on it. Either way this attach is over.
+                        if to_ws_tx.try_send(text_msg((*value).clone())).is_err() {
+                            break;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Slow subscriber; let the next recv pick up

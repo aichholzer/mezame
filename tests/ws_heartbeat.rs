@@ -8,17 +8,25 @@
 //!
 //! The loop is driven directly with a fake stream so we never need a
 //! real socket. Short heartbeat durations keep the tests fast.
+//!
+//! The same helpers cover the other ways an attach ends: a transport
+//! error or a `Close` frame on the stream, an outbound queue the peer has
+//! let fill, and a writer that gave up on a frame the peer never
+//! accepted. The remaining exit arms, the stream ending and the hub or
+//! broadcast channels closing, live in `tests/ws_commands.rs`.
 
 mod support;
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message};
-use futures_util::Stream;
+use futures_util::{Sink, Stream, StreamExt};
 use mezame::hub::{AttachedHub, HubRegistry};
-use mezame::ws::run_attach_loop;
+use mezame::ws::{run_attach_loop, run_writer};
 use serde_json::{json, Value};
 use support::{Release, ScriptedBackend, ScriptedTurn};
 use tokio::sync::mpsc;
@@ -53,6 +61,44 @@ fn channel_stream(
     }))
 }
 
+/// A stream that yields one transport error and then pends forever. The
+/// pending tail is what keeps a `continue` on the error arm from exiting
+/// through the stream-ended arm instead.
+fn erroring_stream() -> impl Stream<Item = Result<Message, &'static str>> + Unpin {
+    Box::pin(
+        futures_util::stream::iter([Err::<Message, &'static str>("connection reset")])
+            .chain(futures_util::stream::pending()),
+    )
+}
+
+/// A sink that never becomes ready: the TCP stack of a peer that has
+/// stopped reading, as the writer sees it.
+struct PendingSink;
+
+impl Sink<Message> for PendingSink {
+    type Error = Infallible;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Pending
+    }
+
+    fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Pending
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Pending
+    }
+}
+
+fn agent_append(text: &str) -> Value {
+    json!({ "type": "append", "role": "agent", "text": text })
+}
+
 /// Register a hub around a scripted Backend and return the attach.
 ///
 /// The caller holds the `AttachedHub` for the length of the test: dropping
@@ -72,7 +118,7 @@ async fn silent_socket_is_evicted_after_the_heartbeat_timeout() {
     let outbound = attached.take_outbound();
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
-    let (to_ws_tx, _to_ws_rx) = mpsc::unbounded_channel::<Message>();
+    let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
     let mut stream = silent_stream();
 
     // 50 ms ping interval, 150 ms silence budget. A live peer would be
@@ -114,7 +160,7 @@ async fn pings_are_sent_to_the_peer_on_the_interval() {
     let outbound = attached.take_outbound();
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
-    let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
+    let (to_ws_tx, mut to_ws_rx) = mpsc::channel::<Message>(16);
     let mut stream = silent_stream();
 
     let handle = tokio::spawn(async move {
@@ -154,7 +200,7 @@ async fn an_active_peer_is_not_evicted() {
     let outbound = attached.take_outbound();
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
-    let (to_ws_tx, _to_ws_rx) = mpsc::unbounded_channel::<Message>();
+    let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
     let mut stream = channel_stream(browser_rx);
 
@@ -224,7 +270,7 @@ async fn a_frame_targeted_at_this_attach_is_forwarded_with_its_target_field() {
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
 
-    let (to_ws_tx, mut to_ws_rx) = mpsc::unbounded_channel::<Message>();
+    let (to_ws_tx, mut to_ws_rx) = mpsc::channel::<Message>(16);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
     let mut stream = channel_stream(browser_rx);
     let handle = tokio::spawn(async move {
@@ -274,4 +320,189 @@ async fn a_frame_targeted_at_this_attach_is_forwarded_with_its_target_field() {
     backend.release_turn(Release::Ok);
     drop(browser_tx);
     let _ = timeout(Duration::from_secs(2), handle).await;
+}
+
+#[tokio::test]
+async fn a_transport_error_ends_the_loop() {
+    // Requirement 8 criterion 8, second clause. The stream yields one
+    // error and then pends, the heartbeat is far beyond the budget and
+    // the broadcast is quiet, so only the error arm can end the loop.
+    let (_registry, mut attached) = attach(Arc::new(ScriptedBackend::new())).await;
+    let outbound = attached.take_outbound();
+    let commands = attached.commands.clone();
+    let attach_id = attached.attach_id;
+    let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
+    let mut stream = erroring_stream();
+
+    let done = timeout(
+        Duration::from_secs(2),
+        run_attach_loop(
+            &mut stream,
+            &to_ws_tx,
+            outbound,
+            commands,
+            attach_id,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        ),
+    )
+    .await;
+    assert!(done.is_ok(), "a transport error must end the attach");
+}
+
+#[tokio::test]
+async fn a_close_frame_ends_the_loop_while_the_stream_stays_open() {
+    // Requirement 8 criterion 8, third clause. The browser sender stays
+    // alive across the await, so the stream never ends on its own and a
+    // `continue` on the Close arm would leave the loop pending.
+    let (_registry, mut attached) = attach(Arc::new(ScriptedBackend::new())).await;
+    let outbound = attached.take_outbound();
+    let commands = attached.commands.clone();
+    let attach_id = attached.attach_id;
+    let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
+    let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
+    let mut stream = channel_stream(browser_rx);
+    browser_tx
+        .send(Message::Close(None))
+        .expect("the stream is open");
+
+    let done = timeout(
+        Duration::from_secs(2),
+        run_attach_loop(
+            &mut stream,
+            &to_ws_tx,
+            outbound,
+            commands,
+            attach_id,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        ),
+    )
+    .await;
+    assert!(done.is_ok(), "a Close frame must end the attach");
+    drop(browser_tx);
+}
+
+#[tokio::test]
+async fn a_peer_that_stops_reading_is_evicted_when_its_queue_fills() {
+    // Requirement 8 criterion 18. A peer that keeps sending frames but
+    // never reads any satisfies the heartbeat forever; the bounded queue
+    // is what ends its attach. The queue is held and never drained, the
+    // pongs keep coming from a feeder that outlives the loop, and the
+    // heartbeat is far out, so the full queue is the only way out.
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::success(
+        (0..8).map(|_| agent_append("x")).collect(),
+    )));
+    let (_registry, mut attached) = attach(backend).await;
+    let outbound = attached.take_outbound();
+    let commands = attached.commands.clone();
+    let attach_id = attached.attach_id;
+    let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(4);
+    let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
+    let mut stream = channel_stream(browser_rx);
+    let feeder = tokio::spawn({
+        let browser_tx = browser_tx.clone();
+        async move {
+            loop {
+                if browser_tx.send(Message::Pong(Vec::new())).is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    });
+    browser_tx
+        .send(Message::Text(
+            json!({ "type": "prompt", "blocks": [{ "type": "text", "text": "fill it" }] })
+                .to_string(),
+        ))
+        .expect("send the prompt frame");
+
+    let started = Instant::now();
+    let done = timeout(
+        Duration::from_secs(2),
+        run_attach_loop(
+            &mut stream,
+            &to_ws_tx,
+            outbound,
+            commands,
+            attach_id,
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+        ),
+    )
+    .await;
+    assert!(done.is_ok(), "the loop returns once the queue is full");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the eviction came from the full queue, not the heartbeat"
+    );
+    assert_eq!(to_ws_rx.len(), 4, "the queue holds exactly its capacity");
+    feeder.abort();
+    drop(browser_tx);
+}
+
+#[tokio::test]
+async fn a_closed_writer_ends_the_attach_loop_on_its_next_broadcast() {
+    // Requirement 8 criterion 19. The writer gave up (a sink error or a
+    // frame past the write timeout) and dropped its receiver; the loop
+    // learns on its next broadcast send. The heartbeat is far out, so
+    // the ping arm cannot be what ends it.
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::success(vec![])));
+    let (_registry, mut attached) = attach(backend).await;
+    let outbound = attached.take_outbound();
+    let commands = attached.commands.clone();
+    let attach_id = attached.attach_id;
+    let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(16);
+    drop(to_ws_rx);
+    let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
+    let mut stream = channel_stream(browser_rx);
+    browser_tx
+        .send(Message::Text(
+            json!({ "type": "prompt", "blocks": [{ "type": "text", "text": "hello" }] })
+                .to_string(),
+        ))
+        .expect("send the prompt frame");
+
+    let done = timeout(
+        Duration::from_secs(1),
+        run_attach_loop(
+            &mut stream,
+            &to_ws_tx,
+            outbound,
+            commands,
+            attach_id,
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        ),
+    )
+    .await;
+    assert!(
+        done.is_ok(),
+        "the echo finds the queue closed and the loop returns"
+    );
+    drop(browser_tx);
+}
+
+#[tokio::test]
+async fn a_write_that_never_completes_ends_the_writer_after_the_write_timeout() {
+    // Requirement 8 criterion 19. A frame the peer's TCP stack never
+    // accepts ends the writer after the write timeout, and the receiver
+    // goes with it, which is what the loop's next send observes.
+    let (tx, rx) = mpsc::channel::<Message>(4);
+    tx.try_send(Message::Text("stuck".into()))
+        .expect("room in the queue");
+    let done = timeout(
+        Duration::from_secs(1),
+        run_writer(PendingSink, rx, Duration::from_millis(100)),
+    )
+    .await;
+    assert!(
+        done.is_ok(),
+        "the writer gives up on a frame the peer never accepts"
+    );
+    assert!(
+        tx.is_closed(),
+        "the writer's receiver went with it, so the loop's next send fails"
+    );
 }

@@ -104,11 +104,12 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
 /// connections inherit the listener's keepalive setting on Linux. A
 /// half-open socket the kernel can detect (no ACKs for the probes) is
 /// eventually torn down even with the app-level ping task wedged. The app
-/// heartbeat is the primary defence, and it also catches peers that ACK at
-/// the TCP layer but have stopped reading. This keeps the kernel from
-/// holding a truly dead socket `ESTABLISHED` forever. Best-effort: a
-/// failure here is logged and ignored, and startup continues. See GitHub
-/// issue #4.
+/// heartbeat is the primary defence against a peer that has stopped
+/// sending; a peer that has stopped reading is caught by the bounded
+/// outbound queue and the write timeout in `src/ws.rs`. This keeps the
+/// kernel from holding a truly dead socket `ESTABLISHED` forever.
+/// Best-effort: a failure here is logged and ignored, and startup
+/// continues. See GitHub issue #4.
 ///
 /// Public for the integration tests in `tests/`. Its only caller is
 /// `run_cloudflared`, which serves until a signal arrives.
