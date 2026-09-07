@@ -186,8 +186,8 @@ conversation; one after it shows an empty log.
 
 ## Limits
 
-Three ceilings bound what one browser can put into Mezame's memory. None of
-them is reachable from the composer in ordinary use.
+These ceilings bound what a peer can put into Mezame's memory. None of them is
+reachable from the composer in ordinary use.
 
 - One inbound WebSocket message is at most 32 MiB. The browser allows 20 MB of
   attachments per prompt, which base64 renders as a little under 27 MiB, and
@@ -200,6 +200,12 @@ them is reachable from the composer in ordinary use.
   not text; the message ceiling bounds them.
 - A transcript retains at most 16 MiB of entry text and 10,000 entries, the
   oldest turn evicted first and the newest always kept.
+- At most 128 sessions are live at once, a session counting from its first
+  attach to the end of its 30-second grace window. An upgrade for a new session
+  past that is answered 503 with `Retry-After: 30` before the handshake; an
+  upgrade naming a live session is unaffected, and `/history` creates nothing.
+  A peer sustaining about four handshakes a second can hold the cap and deny
+  new sessions for as long as it keeps going; it cannot touch live ones.
 
 ## Request checks
 

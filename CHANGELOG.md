@@ -72,6 +72,11 @@ with an echo, on every attached browser at once.
   prompt (refused to its sender with an `error` frame), and 16 MiB or
   10,000 entries per transcript (the oldest turn evicted first). See the
   Limits section of the wire protocol document.
+- At most 128 sessions are live at once. A new session past that is
+  answered 503 with `Retry-After: 30` before the handshake, and a live
+  session is always joinable. Without the cap every unseen id cost a hub
+  kept for the grace window, so live hubs equalled the handshake rate
+  times 30 seconds.
 - A permission answer reaches the Backend only for a request the Backend
   raised in the turn in flight, and only the first answer does. The hub
   no longer remembers every id a browser answers with.

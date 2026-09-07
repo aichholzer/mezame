@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use mezame::config::{Config, TransportConfig};
 use mezame::http::{build_router, AppState};
-use mezame::hub::{HubRegistry, MAX_PROMPT_TEXT_BYTES};
+use mezame::hub::{HubRegistry, GRACE_PERIOD, MAX_PROMPT_TEXT_BYTES};
 use mezame::ws::MAX_WS_MESSAGE_BYTES;
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
@@ -41,6 +41,12 @@ struct Server {
 }
 
 async fn serve() -> Server {
+    serve_with_registry(HubRegistry::new()).await
+}
+
+/// `serve` around a caller-supplied registry, so a case can start from a
+/// small capacity.
+async fn serve_with_registry(hubs: HubRegistry) -> Server {
     let (state_changes, _) = broadcast::channel(8);
     let state = Arc::new(AppState {
         config: Arc::new(Config {
@@ -49,7 +55,7 @@ async fn serve() -> Server {
                 hosts: vec![],
             }],
         }),
-        hubs: HubRegistry::new(),
+        hubs,
         state_changes,
         shutdown: Arc::new(Notify::new()),
     });
@@ -379,4 +385,48 @@ async fn an_upgrade_for_a_hostname_this_server_does_not_serve_is_misdirected() {
         .await
         .expect_err("the handshake should have been refused");
     assert_eq!(status, 421, "a name this server does not serve");
+}
+
+#[tokio::test]
+async fn an_upgrade_for_a_new_session_is_answered_503_before_the_handshake_when_the_registry_is_full(
+) {
+    // Requirement 6 criterion 10. With every slot held, a new session is
+    // refused ahead of the handshake with a 503 and a `Retry-After` of one
+    // grace period, so the browser backs off instead of seeing a socket
+    // that closes at once. A live session is joined as before.
+    let server = serve_with_registry(HubRegistry::with_capacity_for_test(1)).await;
+    let mut first = connect(&server, "/ws").await;
+    let ready = next_text(&mut first).await;
+    let first_id = ready["sessionId"]
+        .as_str()
+        .expect("a sessionId string")
+        .to_string();
+
+    let url = format!("ws://{}/ws", server.addr);
+    match timeout(Duration::from_secs(5), connect_async(&url))
+        .await
+        .expect("the attempt settles within 5s")
+    {
+        Ok(_) => panic!("a second session should have been refused"),
+        Err(WsError::Http(response)) => {
+            assert_eq!(response.status(), 503, "the registry is full");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok()),
+                Some(GRACE_PERIOD.as_secs().to_string().as_str()),
+                "the browser is told when a slot may free"
+            );
+        }
+        Err(other) => panic!("expected an HTTP 503, got {other:?}"),
+    }
+
+    let again = first_frame(&server, &format!("/ws?session={first_id}")).await;
+    assert_eq!(
+        again["sessionId"], first_id,
+        "a live session is always joinable"
+    );
+    assert!(server.state.hubs.is_registered_for_test(&first_id).await);
+    drop(first);
 }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mezame::backend::Backend;
-use mezame::hub::{HubCommand, HubRegistry, MAX_PROMPT_TEXT_BYTES};
+use mezame::hub::{HubCommand, HubRegistry, RegistryFull, MAX_PROMPT_TEXT_BYTES};
 use serde_json::{json, Value};
 use support::{Invocation, Release, Resolution, ScriptedBackend, ScriptedTurn};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -1822,4 +1822,134 @@ async fn a_shutdown_with_no_turn_open_leaves_the_next_turn_untouched() {
             Invocation::Prompt(vec![text_block("later")]),
         ]
     );
+}
+
+#[tokio::test]
+async fn a_new_session_is_refused_once_the_registry_holds_its_capacity() {
+    // Requirement 7 criterion 15 as amended: the registry holds at most
+    // its capacity of hubs. A new id past that is refused with
+    // `RegistryFull`; a live session stays joinable, since joining adds
+    // no hub. The production path builds `EchoBackend` hubs here.
+    let registry = HubRegistry::with_capacity_for_test(2);
+    let ids = [
+        "00000000000000000000000000000001",
+        "00000000000000000000000000000002",
+        "00000000000000000000000000000003",
+    ];
+    let first = registry
+        .attach_or_create(ids[0])
+        .await
+        .expect("the first session");
+    let second = registry
+        .attach_or_create(ids[1])
+        .await
+        .expect("the second session");
+
+    let refused = match registry.attach_or_create(ids[2]).await {
+        Ok(_) => panic!("a third session should have been refused"),
+        Err(e) => e,
+    };
+    let full = refused
+        .downcast_ref::<RegistryFull>()
+        .expect("the refusal is a RegistryFull");
+    assert_eq!(full.capacity, 2);
+    assert!(
+        !registry.is_registered_for_test(ids[2]).await,
+        "a refused session builds nothing"
+    );
+
+    let rejoin = registry
+        .attach_or_create(ids[0])
+        .await
+        .expect("a live session is always joinable");
+    assert_ne!(rejoin.attach_id, first.attach_id);
+    drop((first, second, rejoin));
+}
+
+#[tokio::test]
+async fn a_slot_freed_by_teardown_admits_the_next_session() {
+    // The cap counts live hubs, not ids ever seen: once a hub's grace
+    // window ends and its entry goes, the next new session gets its slot.
+    let registry = HubRegistry::with_capacity_for_test(1);
+    let backend = Arc::new(ScriptedBackend::new());
+    let held = registry
+        .register_for_test_with_grace(
+            Duration::from_millis(10),
+            backend,
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+    let new_id = "00000000000000000000000000000009";
+    assert!(
+        registry.attach_or_create(new_id).await.is_err(),
+        "the one slot is held"
+    );
+
+    drop(held);
+    assert!(wait_until_unregistered(&registry, SESSION_ID).await);
+    let admitted = registry
+        .attach_or_create(new_id)
+        .await
+        .expect("the freed slot admits the next session");
+    assert_eq!(admitted.session_id, new_id);
+}
+
+#[tokio::test]
+async fn an_attach_during_a_slow_shutdown_builds_a_fresh_hub_instead_of_joining_the_dead_one() {
+    // Requirement 3 criterion 12 as amended: the loop frees its registry
+    // slot before it runs the Backend's shutdown. Under the old order an
+    // attach arriving during a slow shutdown found the dead hub, sent
+    // into its closed inbox and was dropped; the browser then reconnected
+    // into a fresh session. Now it builds the fresh hub at once.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new().shutdown_pending());
+    let attached = registry
+        .register_for_test_with_grace(
+            Duration::from_millis(20),
+            backend.clone(),
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+
+    drop(attached);
+    assert!(
+        wait_for_invocation(&backend, &Invocation::Shutdown).await,
+        "the loop exited and its shutdown is parked"
+    );
+    assert!(
+        !registry.is_registered_for_test(SESSION_ID).await,
+        "the slot is freed before the shutdown runs"
+    );
+
+    let mut fresh = registry
+        .attach_or_create(SESSION_ID)
+        .await
+        .expect("a fresh hub is built while the old shutdown is parked");
+    fresh
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("alive")],
+            attach_id: fresh.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let seen = collect_until(&mut fresh.outbound, "prompt_done").await;
+    assert!(
+        seen.iter()
+            .any(|e| e["role"] == "agent" && e["text"] == "alive"),
+        "the fresh hub answers"
+    );
+
+    backend.release_shutdown();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        registry.is_registered_for_test(SESSION_ID).await,
+        "the old hub's teardown removed nothing but its own entry"
+    );
+    assert_eq!(backend.count_of(&Invocation::Shutdown), 1);
+    drop(fresh);
 }

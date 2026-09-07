@@ -5,7 +5,8 @@
 //!
 //! - `ws_upgrade` decides the session id before the handshake, so a value
 //!   Mezame would never bind a hub to is refused with no socket
-//!   established.
+//!   established, and a new session past the registry's cap is answered
+//!   503 the same way.
 //! - `handle_ws` splits the socket into a sink owned by a writer task and
 //!   a stream polled by the attach loop. Sends to the browser go through
 //!   an unbounded channel, so no handler contends on the sink.
@@ -23,13 +24,15 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
+
+use crate::hub::GRACE_PERIOD;
 
 /// How often the server sends a WebSocket `Ping` to each attached
 /// browser. A live peer answers with a `Pong` (or sends any other
@@ -127,7 +130,9 @@ pub fn decide_session(param: Option<&str>) -> SessionDecision {
 
 /// The `/ws` handler. Decides the session id before the handshake, so a
 /// value Mezame would never bind a hub to is refused with no WebSocket
-/// established and no hub created.
+/// established and no hub created. A new session while the registry is
+/// full is refused the same way, with a 503 and a `Retry-After` of one
+/// grace period; a live session is always joinable.
 ///
 /// The `cwd` query parameter is not read at all. A session opens against
 /// Mezame's own working directory, whatever a client sends.
@@ -143,6 +148,20 @@ pub(crate) async fn ws_upgrade(
             return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
         }
     };
+    // Advisory: the registry decides again under its lock when the hub
+    // is built, and a loser of that race gets an `error` frame from
+    // `handle_ws`. Deciding here spares the handshake.
+    if !state.hubs.admits(&session_id).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                header::RETRY_AFTER,
+                HeaderValue::from(GRACE_PERIOD.as_secs()),
+            )],
+            "session limit reached; retry after the grace window\n",
+        )
+            .into_response();
+    }
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {

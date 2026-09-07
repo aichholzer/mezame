@@ -254,6 +254,11 @@ open on the Mezame host.
 Cloudflare Access policy is rejecting the upgrade. Hit the hostname in a
 browser first to satisfy Access, then retry.
 
+**A new tab stays on "reconnecting" and the server answers `/ws` with 503**
+Mezame holds at most 128 live sessions, each kept for 30 seconds after its
+last browser leaves. Something is opening sessions faster than they expire;
+existing tabs keep working, and the new one connects once a slot frees.
+
 ## Licence
 
 [MIT](./LICENSE).

@@ -239,9 +239,14 @@ pub struct ScriptedBackend {
     /// [`ScriptedBackend::release_set_model`]. Stands in for a Backend
     /// whose model change does I/O.
     set_model_blocks: bool,
+    /// When set, every `shutdown` parks after recording its invocation
+    /// until the test calls [`ScriptedBackend::release_shutdown`]. Stands
+    /// in for a Backend whose shutdown does I/O.
+    shutdown_blocks: bool,
     transcript: Mutex<Vec<HistoryEntry>>,
     turn: TurnSlot,
     model_release: Slot<Result<Value, String>>,
+    shutdown_release: Slot<()>,
 }
 
 impl ScriptedBackend {
@@ -288,6 +293,18 @@ impl ScriptedBackend {
     /// End the `set_model` call that is parked, with `outcome`.
     pub fn release_set_model(&self, outcome: Result<Value, String>) {
         self.model_release.put(outcome);
+    }
+
+    /// Make every `shutdown` park until [`ScriptedBackend::release_shutdown`]
+    /// is called, one release per call.
+    pub fn shutdown_pending(mut self) -> Self {
+        self.shutdown_blocks = true;
+        self
+    }
+
+    /// End the `shutdown` call that is parked.
+    pub fn release_shutdown(&self) {
+        self.shutdown_release.put(());
     }
 
     /// Append a turn to the script. Usable while a turn is unresolved.
@@ -425,6 +442,9 @@ impl Backend for ScriptedBackend {
             // Idempotent: a second call finds no turn open and stores
             // nothing.
             self.turn.put_if_open(Release::Err("cancelled".to_string()));
+            if self.shutdown_blocks {
+                self.shutdown_release.take().await;
+            }
         })
     }
 }

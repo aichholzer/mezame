@@ -46,10 +46,14 @@
 //!    wakes. At zero the loop arms a grace timer. A fresh subscriber
 //!    inside the window wakes the loop again, which drops the timer.
 //! 4. The grace timer fires with nothing attached and no turn running:
-//!    the hub shuts its Backend down and removes itself from the
-//!    registry. A turn still in flight holds teardown off, up to a cap.
-//!    The same two steps run if the loop dies with a panic, so a slot in
-//!    the registry never outlives the loop that drives it.
+//!    the hub removes itself from the registry, then shuts its Backend
+//!    down. A turn still in flight holds teardown off, up to a cap. The
+//!    same two steps run if the loop dies with a panic, so a slot in the
+//!    registry never outlives the loop that drives it.
+//!
+//! The registry holds at most `MAX_LIVE_HUBS` hubs. An upgrade naming an
+//! id with no live hub is answered 503 while it is full; a live session
+//! is always joinable.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -72,7 +76,24 @@ use crate::backend::{
 /// How long a session stays warm after the last browser detaches. 30s
 /// matches the WS reconnect-backoff cap on the client. A browser coming
 /// back from a transient drop lands well inside this window.
-const GRACE_PERIOD: Duration = Duration::from_secs(30);
+pub const GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// How many hubs the registry holds at once, counting each session from
+/// its first attach to the end of its grace window.
+///
+/// One idle hub costs about 40 KB (its broadcast ring, its inbox, its
+/// task and an empty transcript) and the loop that drives it, and a hub
+/// outlives its last socket by `GRACE_PERIOD`. With no cap, live hubs
+/// equal the handshake rate times 30 seconds, and every unseen id costs
+/// one. A person keeps tens of tabs across a few devices, not hundreds.
+/// The worst case one peer can hold is this many transcripts at their
+/// byte budget, 2 GiB of prompt text at 16 MiB each, all of it
+/// bandwidth-bound and released 30 seconds after the peer stops. While
+/// the cap is held, every new session is refused with a 503 and every
+/// existing one stays joinable: a peer sustaining about four handshakes
+/// a second can deny new sessions to the user, and cannot touch live
+/// ones or the process.
+pub const MAX_LIVE_HUBS: usize = 128;
 
 /// How many grace periods a detached hub may hold a running turn before
 /// teardown proceeds anyway. 60 periods is 30 minutes against the
@@ -308,6 +329,28 @@ impl Drop for AttachedHub {
     }
 }
 
+/// The registry is full: it holds `capacity` hubs and none is registered
+/// under the id that asked. Answered 503 before the handshake by
+/// `ws_upgrade`, and by an `error` frame from `handle_ws` if the cap is
+/// reached between the pre-check and the build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryFull {
+    pub capacity: usize,
+}
+
+impl std::fmt::Display for RegistryFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this Mezame is serving its maximum of {} sessions; try again in {} seconds",
+            self.capacity,
+            GRACE_PERIOD.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for RegistryFull {}
+
 /// Registry of live hubs keyed by session id. Cheap to clone;
 /// `Arc<RwLock>` lets the WS handler look hubs up without coordinating
 /// with any owner loop.
@@ -318,15 +361,51 @@ impl Drop for AttachedHub {
 /// two halves of one conversation would run against two Backends.
 /// Holding a per-key mutex across the build window means the second
 /// arrival finds the hub on its re-check and subscribes to it instead.
-#[derive(Clone, Default)]
+///
+/// `capacity` bounds the map. It is read under the write lock at the one
+/// point a hub is inserted, so the bound holds whatever the pre-check in
+/// `ws_upgrade` saw.
+#[derive(Clone)]
 pub struct HubRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<SessionHub>>>>,
     building: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    capacity: usize,
+}
+
+impl Default for HubRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HubRegistry {
+    /// A registry holding at most [`MAX_LIVE_HUBS`] hubs.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(MAX_LIVE_HUBS)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Arc::default(),
+            building: Arc::default(),
+            capacity,
+        }
+    }
+
+    /// Test-only: a registry with a small capacity, so a test reaches the
+    /// cap with a handful of hubs.
+    #[doc(hidden)]
+    pub fn with_capacity_for_test(capacity: usize) -> Self {
+        Self::with_capacity(capacity)
+    }
+
+    /// Whether an upgrade naming `session_id` can be served now: a live
+    /// session is always joinable, and a new one needs a free slot. An
+    /// advisory read for `ws_upgrade`, so a full registry is answered
+    /// before the handshake; `build_and_register` decides under the lock.
+    pub async fn admits(&self, session_id: &str) -> bool {
+        let map = self.inner.read().await;
+        map.contains_key(session_id) || map.len() < self.capacity
     }
 
     /// Attach to the hub registered under `session_id`, building one if
@@ -412,9 +491,20 @@ impl HubRegistry {
 
     /// Build the hub, register it, and return its first subscriber.
     /// Called with the per-id gate held.
+    ///
+    /// The cap is checked and the hub built under the write lock, so no
+    /// two builds can both see a free slot. `build_hub` awaits nothing,
+    /// so the lock is held for microseconds. Building before the check
+    /// would spawn a loop whose teardown removes the id from the map.
     async fn build_and_register(&self, session_id: &str) -> Result<AttachedHub> {
-        let hub = build_hub(session_id, self.clone()).await?;
         let mut map = self.inner.write().await;
+        if map.len() >= self.capacity {
+            return Err(RegistryFull {
+                capacity: self.capacity,
+            }
+            .into());
+        }
+        let hub = build_hub(session_id, self.clone())?;
         // The gate above is what makes the occupied case unreachable
         // here; `or_insert_with` keeps the insert atomic against
         // `register_for_test` all the same.
@@ -422,6 +512,7 @@ impl HubRegistry {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(hub));
         let hub = entry.clone();
+        // Released before `subscribe`, which awaits the snapshot lock.
         drop(map);
         Ok(self.subscribe(hub).await)
     }
@@ -571,8 +662,9 @@ impl HubRegistry {
 ///
 /// Fallible for one call: the working directory the `ready` template
 /// reports. The OS answers with an absolute path, and a browser cannot
-/// choose another one.
-async fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
+/// choose another one. Synchronous, so the caller may hold the registry
+/// lock across it.
+fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
     let ready = json!({
         "type": "ready",
@@ -659,7 +751,7 @@ struct HubLoopState {
 ///
 /// The two teardown steps at the bottom run however the loop ends.
 /// `drive` holds the loop proper under `catch_unwind`, so a panic on the
-/// owner task still shuts the Backend down and frees the registry slot.
+/// owner task still frees the registry slot and shuts the Backend down.
 /// Without that the slot would hold a hub nobody drives, every later
 /// attach for the id would join it and hang, and only a restart would
 /// clear it.
@@ -675,12 +767,16 @@ async fn run_hub_loop(state: HubLoopState) {
         ));
     }
 
-    // Release the Backend, then the registry slot. The next attach for
-    // this session id builds a fresh hub. Holding the registry handle
-    // until here closes the race where a subscriber attaches to the slot
-    // just before it goes.
-    backend.shutdown().await;
+    // Free the registry slot first, then release the Backend. The loop
+    // has returned, so its inbox is closed: an attach that found this
+    // hub in the registry now would send into a dead inbox and be
+    // dropped, and the browser would reconnect into a fresh session. With
+    // the slot gone before the shutdown runs, an attach arriving during
+    // a slow shutdown builds a fresh hub instead. The window that is
+    // left is the write lock below, not the shutdown's latency, and an
+    // attach caught in it self-heals the same way.
     registry.remove(&session_id).await;
+    backend.shutdown().await;
 }
 
 /// Permission ids the Backend has raised in the turn in flight and no

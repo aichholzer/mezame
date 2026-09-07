@@ -17,7 +17,9 @@ flowchart LR
   phone, laptop, and desktop. A hub is built when the first browser attaches and
   stays warm for a grace window (30s) after the last one detaches, so a reload
   or a transient drop reattaches to the session that was already running. A turn
-  still in flight holds that teardown off, up to a cap. See `src/hub.rs`.
+  still in flight holds that teardown off, up to a cap. The registry holds at
+  most 128 hubs; a new session past that is answered 503 until a grace window
+  frees a slot, and a live session is always joinable. See `src/hub.rs`.
 - What produces a turn sits behind one trait, `backend::Backend`, with six
   operations: run a turn, cancel it, answer a permission request, change the
   model, report the transcript, shut down. The hub owns the wire and knows
