@@ -19,6 +19,15 @@
 //!   loop is the single writer of both, which is what keeps a second
 //!   turn's echo from landing between the first turn's release and its
 //!   `prompt_done`.
+//! - The loop awaits nothing a Backend implements. `set_model`, `cancel`
+//!   and `permission_response` each run on a spawned task, and the one
+//!   with a reply reports it through a channel the loop selects on. A
+//!   Backend that stalls on I/O therefore never stalls the inbox, the
+//!   grace timer or a peer's cancel.
+//! - The subscriber count is an atomic with a `Notify` beside it. An
+//!   attach or a detach bumps the count and wakes the loop; the loop
+//!   reads the count when it wakes. Nothing on that path takes a lock or
+//!   waits on channel capacity, so nothing on it can wait on the loop.
 //! - Outbound events fan out through a `tokio::sync::broadcast` sender.
 //!   Each WS handler subscribes once on attach and forwards to its own
 //!   sink. A lagged subscriber is skipped and the rest keep moving.
@@ -33,16 +42,17 @@
 //! 2. Later browsers attach: the registry returns the existing hub and
 //!    replays its `ready` snapshot, and its `session_info` snapshot when
 //!    there is one, so every browser sees the same session.
-//! 3. A browser detaches: the subscriber count decrements. At zero the
-//!    hub arms a grace timer. A fresh subscriber inside the window
-//!    cancels it.
+//! 3. A browser detaches: the subscriber count decrements and the loop
+//!    wakes. At zero the loop arms a grace timer. A fresh subscriber
+//!    inside the window wakes the loop again, which drops the timer.
 //! 4. The grace timer fires with nothing attached and no turn running:
 //!    the hub shuts its Backend down and removes itself from the
 //!    registry. A turn still in flight holds teardown off, up to a cap.
+//!    The same two steps run if the loop dies with a panic, so a slot in
+//!    the registry never outlives the loop that drives it.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -52,8 +62,8 @@ use std::time::Duration;
 use anyhow::Result;
 use futures_util::FutureExt;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
-use tokio::time::Instant;
+use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
+use tokio::time::{Instant, Sleep};
 
 use crate::backend::{user_echo_event, Backend, EchoBackend, HistoryEntry, TurnOutcome};
 
@@ -133,7 +143,10 @@ pub enum HubCommand {
     PermissionResponse { id: Value, option_id: String },
     /// Cancel the turn in flight.
     Cancel,
-    /// Change the selected model.
+    /// Change the selected model. One change runs at a time. A request
+    /// arriving while one runs waits as the single pending request, and a
+    /// later request replaces it, so the last selection a browser made is
+    /// the one that runs next.
     SetModel { model_id: String },
 }
 
@@ -175,80 +188,59 @@ pub struct SessionHub {
     backend: Arc<dyn Backend>,
 }
 
-/// Tracks attach and detach events and arms the grace timer. Lives behind
-/// an `Arc` so both the registry and the per-attach guard reach it.
+/// Tracks attaches and detaches for the grace timer. Lives behind an
+/// `Arc` so both the registry and the per-attach guard reach it.
+///
+/// Two fields and no lock. The count is an atomic and the wake is a
+/// `Notify`, so neither `increment` nor `decrement` waits on anything:
+/// not on the owner loop, not on channel capacity, not on each other. An
+/// earlier shape held a mutex across a bounded-channel send the loop had
+/// to drain under that same mutex, and a Backend call awaited inline on
+/// the loop plus one browser reconnecting a few times was enough to
+/// wedge the session id until restart.
+///
+/// The loop reads the count when it wakes rather than trusting the change
+/// that woke it, so two changes that coalesce into one wake, or two wakes
+/// that land out of order, come to the same decision the count does.
 struct Counter {
-    state: Mutex<CounterState>,
-    /// Pings the owner loop when the count hits zero, so the loop arms
-    /// the grace timer with the right deadline.
-    grace_tx: mpsc::Sender<GraceEvent>,
-}
-
-#[derive(Default)]
-struct CounterState {
-    count: usize,
-    /// Wakes the grace sleeper. `Some` only while the count is zero and
-    /// the grace window is open.
-    cancel_grace: Option<oneshot::Sender<()>>,
-}
-
-#[derive(Debug)]
-enum GraceEvent {
-    /// Subscriber count fell to zero; arm the grace timer.
-    Empty,
-    /// Subscriber count climbed back above zero during the grace window;
-    /// cancel any pending teardown.
-    Refilled,
+    count: AtomicUsize,
+    /// Wakes the owner loop on every change to `count`.
+    changed: Notify,
 }
 
 impl Counter {
-    fn new(grace_tx: mpsc::Sender<GraceEvent>) -> Self {
+    fn new() -> Self {
         Self {
-            state: Mutex::new(CounterState::default()),
-            grace_tx,
+            count: AtomicUsize::new(0),
+            changed: Notify::new(),
         }
     }
 
     /// Call when a new subscriber attaches. Returns the post-attach
     /// count.
-    async fn increment(&self) -> usize {
-        let mut state = self.state.lock().await;
-        let was_zero = state.count == 0;
-        state.count += 1;
-        if was_zero {
-            if let Some(tx) = state.cancel_grace.take() {
-                let _ = tx.send(());
-            }
-            let _ = self.grace_tx.send(GraceEvent::Refilled).await;
-        }
-        state.count
+    fn increment(&self) -> usize {
+        let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        self.changed.notify_one();
+        count
     }
 
-    /// Call when a subscriber detaches.
-    async fn decrement(&self) -> usize {
-        let mut state = self.state.lock().await;
-        if state.count > 0 {
-            state.count -= 1;
-        }
-        if state.count == 0 {
-            let _ = self.grace_tx.send(GraceEvent::Empty).await;
-        }
-        state.count
+    /// Call when a subscriber detaches. Saturates at zero: a count that
+    /// dipped below would read as "attached" forever and make the hub
+    /// immortal. Returns the post-detach count.
+    fn decrement(&self) -> usize {
+        let previous = self
+            .count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                Some(c.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        self.changed.notify_one();
+        previous.saturating_sub(1)
     }
 
-    /// Install the grace timer's cancel handle. The returned receiver
-    /// completes when a fresh subscriber arrives, at which point the
-    /// timer abandons the teardown.
-    async fn install_cancel(&self) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        let mut state = self.state.lock().await;
-        state.cancel_grace = Some(tx);
-        rx
-    }
-
-    /// The current subscriber count, without mutating anything.
-    async fn count(&self) -> usize {
-        self.state.lock().await.count
+    /// The current subscriber count.
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
     }
 }
 
@@ -285,13 +277,9 @@ impl AttachedHub {
 
 impl Drop for AttachedHub {
     fn drop(&mut self) {
-        // Spawn the decrement so this does not block the WS handler's
-        // shutdown. The counter is behind an `Arc`, so the spawn keeps it
-        // alive long enough.
-        let counter = self.counter.clone();
-        tokio::spawn(async move {
-            counter.decrement().await;
-        });
+        // Synchronous and lock-free, so it runs to completion inside the
+        // drop whatever the runtime is doing.
+        self.counter.decrement();
     }
 }
 
@@ -401,7 +389,7 @@ impl HubRegistry {
     /// and the client reads `resumed` as "clear any stale local log and
     /// seed yourself from the history endpoint".
     async fn subscribe(&self, hub: Arc<SessionHub>) -> AttachedHub {
-        hub.counter.increment().await;
+        hub.counter.increment();
         let outbound = hub.outbound.subscribe();
         let busy = hub.inflight.load(Ordering::SeqCst) > 0;
         let snapshot = hub.snapshot.lock().await;
@@ -482,8 +470,7 @@ impl HubRegistry {
     ) -> AttachedHub {
         let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(COMMAND_CAPACITY);
         let (out_tx, _) = broadcast::channel::<Arc<Value>>(BROADCAST_CAPACITY);
-        let (grace_tx, grace_rx) = mpsc::channel::<GraceEvent>(8);
-        let counter = Arc::new(Counter::new(grace_tx));
+        let counter = Arc::new(Counter::new());
         let inflight = Arc::new(AtomicUsize::new(0));
         let snapshot = Arc::new(Mutex::new(SessionSnapshot {
             ready,
@@ -506,7 +493,6 @@ impl HubRegistry {
             outbound: out_tx,
             commands: cmd_rx,
             counter,
-            grace_rx,
             registry: self.clone(),
             snapshot,
             grace_period,
@@ -554,8 +540,7 @@ async fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(COMMAND_CAPACITY);
     let (out_tx, _) = broadcast::channel::<Arc<Value>>(BROADCAST_CAPACITY);
-    let (grace_tx, grace_rx) = mpsc::channel::<GraceEvent>(8);
-    let counter = Arc::new(Counter::new(grace_tx));
+    let counter = Arc::new(Counter::new());
     let inflight = Arc::new(AtomicUsize::new(0));
     let snapshot = Arc::new(Mutex::new(SessionSnapshot {
         ready,
@@ -578,7 +563,6 @@ async fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub
         outbound: out_tx,
         commands: cmd_rx,
         counter,
-        grace_rx,
         registry,
         snapshot,
         grace_period: GRACE_PERIOD,
@@ -605,7 +589,6 @@ struct HubLoopState {
     outbound: broadcast::Sender<Arc<Value>>,
     commands: mpsc::Receiver<HubCommand>,
     counter: Arc<Counter>,
-    grace_rx: mpsc::Receiver<GraceEvent>,
     registry: HubRegistry,
     /// Shared with `SessionHub::snapshot`. The loop replaces the
     /// `session_info` half on a successful model change, and every later
@@ -622,36 +605,101 @@ struct HubLoopState {
 
 /// Owner loop: serialises browser commands, sends the frames that end a
 /// turn, and tears the hub down when nothing needs it.
+///
+/// The two teardown steps at the bottom run however the loop ends.
+/// `drive` holds the loop proper under `catch_unwind`, so a panic on the
+/// owner task still shuts the Backend down and frees the registry slot.
+/// Without that the slot would hold a hub nobody drives, every later
+/// attach for the id would join it and hang, and only a restart would
+/// clear it.
 async fn run_hub_loop(state: HubLoopState) {
+    let backend = Arc::clone(&state.backend);
+    let registry = state.registry.clone();
+    let session_id = state.session_id.clone();
+
+    if let Err(panic) = AssertUnwindSafe(drive(state)).catch_unwind().await {
+        warn(&format!(
+            "Session {session_id}: the hub loop panicked: {}. Releasing the session.",
+            panic_message(panic)
+        ));
+    }
+
+    // Release the Backend, then the registry slot. The next attach for
+    // this session id builds a fresh hub. Holding the registry handle
+    // until here closes the race where a subscriber attaches to the slot
+    // just before it goes.
+    backend.shutdown().await;
+    registry.remove(&session_id).await;
+}
+
+/// Permission ids the Backend has raised in the turn in flight and no
+/// browser has answered yet.
+///
+/// `forward` adds an id when it broadcasts the request. The first answer
+/// removes it and reaches the Backend; every other answer, for that id or
+/// for one never raised, is dropped. The set is cleared when the turn
+/// ends. It is bounded by what the Backend asks, not by what a browser
+/// sends: an earlier shape remembered every id a browser ever answered
+/// with, which let one attached peer grow the hub's memory without bound.
+///
+/// A `std::sync::Mutex`, held for one insert, remove or clear and never
+/// across an await. The turn task and the loop both reach it.
+type Outstanding = Arc<std::sync::Mutex<HashSet<String>>>;
+
+/// Lock the outstanding set, recovering from poison. A holder panicking
+/// mid-operation is a bug elsewhere; it must not also wedge every later
+/// permission on the session.
+fn lock_outstanding(outstanding: &Outstanding) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    outstanding
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Where the hub is with model changes.
+///
+/// One runs at a time. A request arriving mid-change waits as the single
+/// pending one, and a later request replaces it: the last selection a
+/// browser made is the one that runs next, and a burst of clicks spawns
+/// one task per completed change rather than one per click.
+#[derive(Default)]
+struct ModelChange {
+    in_flight: bool,
+    pending: Option<String>,
+}
+
+/// The loop proper. Returns when every command sender is gone or when
+/// the grace timer decides the hub is done; `run_hub_loop` tears down.
+async fn drive(state: HubLoopState) {
     let HubLoopState {
         backend,
         session_id,
         outbound,
         mut commands,
         counter,
-        mut grace_rx,
-        registry,
+        registry: _,
         snapshot,
         grace_period,
         inflight,
     } = state;
 
-    // Permission ids already forwarded to the Backend. A duplicate
-    // answer from a second browser is dropped in silence: the second
-    // browser's card stays as it is until the Backend's own update
-    // resolves it.
-    let mut answered_permissions: HashSet<String> = HashSet::new();
+    let outstanding: Outstanding = Arc::default();
 
     // Turn outcomes come back here. The sender is cloned into every turn
     // task and the loop holds this one, so the receiver never closes
     // while the loop runs.
     let (turn_done_tx, mut turn_done_rx) = mpsc::unbounded_channel::<TurnDone>();
 
+    // Model-change replies come back here. At most one change is in
+    // flight, so the channel never holds more than one message.
+    let (model_done_tx, mut model_done_rx) = mpsc::unbounded_channel::<Result<Value>>();
+    let mut model_change = ModelChange::default();
+
     // When the current detached-but-busy hold began. `None` whenever a
     // browser is attached or no turn is running.
     let mut inflight_hold_since: Option<Instant> = None;
 
-    let mut grace_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
+    // `Some` while nobody is attached and the grace window is open.
+    let mut grace_deadline: Option<Pin<Box<Sleep>>> = None;
 
     loop {
         tokio::select! {
@@ -659,15 +707,18 @@ async fn run_hub_loop(state: HubLoopState) {
             cmd = commands.recv() => {
                 match cmd {
                     Some(c) => handle_command(
-                        &backend,
-                        &session_id,
+                        CommandContext {
+                            backend: &backend,
+                            session_id: &session_id,
+                            outbound: &outbound,
+                            inflight: &inflight,
+                            turn_done_tx: &turn_done_tx,
+                            outstanding: &outstanding,
+                            model_change: &mut model_change,
+                            model_done_tx: &model_done_tx,
+                        },
                         c,
-                        &mut answered_permissions,
-                        &outbound,
-                        &snapshot,
-                        &inflight,
-                        &turn_done_tx,
-                    ).await,
+                    ),
                     None => break, // every sender dropped: nobody can reach us
                 }
             }
@@ -677,6 +728,9 @@ async fn run_hub_loop(state: HubLoopState) {
             // echo can land in the gap and unlock a composer early.
             Some(TurnDone { result, guard }) = turn_done_rx.recv() => {
                 drop(guard);
+                // A permission the turn left unanswered has no turn to
+                // answer into now.
+                lock_outstanding(&outstanding).clear();
                 match result {
                     Ok(Ok(_outcome)) => {}
                     Ok(Err(e)) => broadcast_error(&outbound, format!("{e}")),
@@ -687,37 +741,43 @@ async fn run_hub_loop(state: HubLoopState) {
                 }
                 let _ = outbound.send(Arc::new(json!({ "type": "prompt_done" })));
             }
-            // Subscriber attach and detach signals.
-            grace_evt = grace_rx.recv() => {
-                match grace_evt {
-                    Some(GraceEvent::Empty) => {
-                        let cancel_rx = counter.install_cancel().await;
-                        grace_deadline = Some(Box::pin(async move {
-                            tokio::select! {
-                                _ = tokio::time::sleep(grace_period) => {}
-                                _ = cancel_rx => {}
-                            }
-                        }));
+            // A model change resolved. Apply it, then run the pending one
+            // if a browser asked for another in the meantime.
+            Some(result) = model_done_rx.recv() => {
+                apply_model_change(result, &snapshot, &outbound).await;
+                match model_change.pending.take() {
+                    Some(model_id) => spawn_set_model(&backend, model_id, &model_done_tx),
+                    None => model_change.in_flight = false,
+                }
+            }
+            // A subscriber attached or detached. Read the count rather
+            // than trust the wake: two changes can coalesce into one.
+            _ = counter.changed.notified() => {
+                if counter.count() == 0 {
+                    // Arm once. A second detach-to-zero inside an open
+                    // window (two attaches gone within milliseconds)
+                    // must not push the deadline out.
+                    if grace_deadline.is_none() {
+                        grace_deadline = Some(Box::pin(tokio::time::sleep(grace_period)));
                     }
-                    Some(GraceEvent::Refilled) => {
-                        grace_deadline = None;
-                        // A browser is back. Any later hold starts its
-                        // cap afresh.
-                        inflight_hold_since = None;
-                    }
-                    None => {} // the counter dropped its sender, which cannot happen while we hold a strong ref
+                } else {
+                    // A browser is back. Drop the window, and any later
+                    // hold starts its cap afresh.
+                    grace_deadline = None;
+                    inflight_hold_since = None;
                 }
             }
             // The grace timer fired with nobody attached.
             _ = async {
                 match grace_deadline.as_mut() {
-                    Some(f) => f.await,
+                    Some(deadline) => deadline.await,
                     None => std::future::pending().await,
                 }
             }, if grace_deadline.is_some() => {
-                if counter.count().await != 0 {
+                if counter.count() != 0 {
                     // A fresh subscriber arrived between the timer
-                    // firing and the count read. Cancel and keep going.
+                    // firing and the count read, and its wake is still
+                    // queued. Cancel and keep going.
                     grace_deadline = None;
                     inflight_hold_since = None;
                 } else if inflight.load(Ordering::SeqCst) == 0 {
@@ -735,30 +795,25 @@ async fn run_hub_loop(state: HubLoopState) {
                     let held_since = *inflight_hold_since.get_or_insert_with(Instant::now);
                     let held_for = held_since.elapsed();
                     if held_for >= max_inflight_hold(grace_period) {
-                        eprintln!(
+                        warn(&format!(
                             "Session {session_id}: a turn has been in flight for {held_for:?} \
                              with no browser attached. Releasing the session."
-                        );
+                        ));
                         break;
                     }
-                    let cancel_rx = counter.install_cancel().await;
-                    grace_deadline = Some(Box::pin(async move {
-                        tokio::select! {
-                            _ = tokio::time::sleep(grace_period) => {}
-                            _ = cancel_rx => {}
-                        }
-                    }));
+                    grace_deadline = Some(Box::pin(tokio::time::sleep(grace_period)));
                 }
             }
         }
     }
+}
 
-    // Release the Backend, then the registry slot. The next attach for
-    // this session id builds a fresh hub. Holding the registry handle
-    // until here closes the race where a subscriber attaches to the slot
-    // just before it goes.
-    backend.shutdown().await;
-    registry.remove(&session_id).await;
+/// Write one line to stderr, ignoring a failure to. `eprintln!` panics
+/// when stderr is a closed pipe, and a panic on the owner task costs the
+/// session; a log line is not worth that.
+fn warn(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 /// Broadcast one `error` frame. A send failure only means no subscriber
@@ -785,9 +840,21 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 ///
 /// A `permission_request` is stamped with the prompter's `attach_id`, and
 /// nothing else is. The attach loop drops a stamped frame on every other
-/// attach, so a peer never renders a card it was not asked to answer.
-fn forward(outbound: &broadcast::Sender<Arc<Value>>, mut event: Value, attach_id: u64) {
+/// attach, so a peer never renders a card it was not asked to answer. The
+/// request's id also joins the outstanding set, which is what lets an
+/// answer for it through later.
+fn forward(
+    outbound: &broadcast::Sender<Arc<Value>>,
+    mut event: Value,
+    attach_id: u64,
+    outstanding: &Outstanding,
+) {
     if event.get("type").and_then(Value::as_str) == Some("permission_request") {
+        // Keyed on the id's JSON rendering, the same key the answer is
+        // matched on, so a numeric 1 and a string "1" stay distinct.
+        if let Some(id) = event.get("id") {
+            lock_outstanding(outstanding).insert(id.to_string());
+        }
         if let Some(map) = event.as_object_mut() {
             map.insert("_target".into(), Value::Number(attach_id.into()));
         }
@@ -809,6 +876,7 @@ async fn run_turn(
     mut events_rx: mpsc::UnboundedReceiver<Value>,
     outbound: broadcast::Sender<Arc<Value>>,
     attach_id: u64,
+    outstanding: Outstanding,
     guard: InflightGuard,
     done: mpsc::UnboundedSender<TurnDone>,
 ) {
@@ -821,7 +889,7 @@ async fn run_turn(
     let result = loop {
         tokio::select! {
             event = events_rx.recv(), if !drained => match event {
-                Some(event) => forward(&outbound, event, attach_id),
+                Some(event) => forward(&outbound, event, attach_id, &outstanding),
                 // The Backend dropped its sender ahead of resolving.
                 // The guard keeps this arm from spinning on a closed
                 // channel for the rest of the turn.
@@ -837,7 +905,7 @@ async fn run_turn(
     // still alive somewhere inside the Backend.
     events_rx.close();
     while let Some(event) = events_rx.recv().await {
-        forward(&outbound, event, attach_id);
+        forward(&outbound, event, attach_id, &outstanding);
     }
 
     // A loop that has already exited dropped the receiver. The send then
@@ -846,17 +914,84 @@ async fn run_turn(
     let _ = done.send(TurnDone { result, guard });
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_command(
+/// Run `set_model` on its own task and report the reply to the loop.
+///
+/// A panic inside the Backend's future is reported as an `Err`, so the
+/// loop always hears back and the in-flight flag is always cleared. A
+/// change that never reported would leave every later change pending
+/// forever.
+fn spawn_set_model(
     backend: &Arc<dyn Backend>,
-    session_id: &str,
-    cmd: HubCommand,
-    answered: &mut HashSet<String>,
-    outbound: &broadcast::Sender<Arc<Value>>,
-    snapshot: &Arc<Mutex<SessionSnapshot>>,
-    inflight: &Arc<AtomicUsize>,
-    turn_done_tx: &mpsc::UnboundedSender<TurnDone>,
+    model_id: String,
+    done: &mpsc::UnboundedSender<Result<Value>>,
 ) {
+    let backend = Arc::clone(backend);
+    let done = done.clone();
+    tokio::spawn(async move {
+        let result = match AssertUnwindSafe(backend.set_model(model_id))
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(panic) => Err(anyhow::anyhow!(
+                "the model change panicked: {}",
+                panic_message(panic)
+            )),
+        };
+        // A closed receiver means the loop is gone, and so is the hub.
+        let _ = done.send(result);
+    });
+}
+
+/// Apply a resolved model change: store and broadcast the new
+/// `session_info`, or tell every browser the change did not take.
+async fn apply_model_change(
+    result: Result<Value>,
+    snapshot: &Arc<Mutex<SessionSnapshot>>,
+    outbound: &broadcast::Sender<Arc<Value>>,
+) {
+    match result {
+        Ok(info) => {
+            let frame = json!({ "type": "session_info", "info": info });
+            // Store and broadcast under one lock. An attach that reads
+            // the snapshot before the store sees the old value and
+            // receives the new frame on its receiver; one that reads
+            // after sees the new value and receives a harmless
+            // duplicate.
+            let mut snap = snapshot.lock().await;
+            snap.session_info = Some(frame.clone());
+            let _ = outbound.send(Arc::new(frame));
+            drop(snap);
+        }
+        Err(e) => {
+            // The sender already shows the new selection from its
+            // optimistic update. The notice tells everyone it did not
+            // take, and no `session_info` goes out.
+            let _ = outbound.send(Arc::new(json!({
+                "type": "append",
+                "role": "sys",
+                "text": format!("\n[The model change failed: {e}]\n")
+            })));
+        }
+    }
+}
+
+/// What `handle_command` reads and writes, borrowed from the loop for
+/// the length of one command.
+struct CommandContext<'a> {
+    backend: &'a Arc<dyn Backend>,
+    session_id: &'a str,
+    outbound: &'a broadcast::Sender<Arc<Value>>,
+    inflight: &'a Arc<AtomicUsize>,
+    turn_done_tx: &'a mpsc::UnboundedSender<TurnDone>,
+    outstanding: &'a Outstanding,
+    model_change: &'a mut ModelChange,
+    model_done_tx: &'a mpsc::UnboundedSender<Result<Value>>,
+}
+
+/// Act on one browser command. Synchronous: nothing here waits on the
+/// Backend, so no Backend can hold the inbox.
+fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
     match cmd {
         HubCommand::Prompt { blocks, attach_id } => {
             if blocks.is_empty() {
@@ -866,32 +1001,42 @@ async fn handle_command(
             // them, so no other command interleaves and the count is
             // above zero from before the echo until the loop releases
             // it.
-            let Some(guard) = InflightGuard::claim(inflight) else {
-                eprintln!("Session {session_id}: prompt discarded, a turn is already in flight");
+            let Some(guard) = InflightGuard::claim(ctx.inflight) else {
+                warn(&format!(
+                    "Session {}: prompt discarded, a turn is already in flight",
+                    ctx.session_id
+                ));
                 return;
             };
-            let _ = outbound.send(Arc::new(user_echo_event(&blocks)));
+            let _ = ctx.outbound.send(Arc::new(user_echo_event(&blocks)));
             let (events_tx, events_rx) = mpsc::unbounded_channel::<Value>();
             tokio::spawn(run_turn(
-                Arc::clone(backend),
+                Arc::clone(ctx.backend),
                 blocks,
                 events_tx,
                 events_rx,
-                outbound.clone(),
+                ctx.outbound.clone(),
                 attach_id,
+                Arc::clone(ctx.outstanding),
                 guard,
-                turn_done_tx.clone(),
+                ctx.turn_done_tx.clone(),
             ));
         }
         HubCommand::PermissionResponse { id, option_id } => {
-            // First answer wins, keyed on the id's JSON rendering so a
-            // numeric 1 and a string "1" stay distinct. Later answers
-            // for the same id are dropped, duplicate clicks from one
-            // browser included.
-            if !answered.insert(id.to_string()) {
+            // First answer wins: the id leaves the outstanding set with
+            // the answer that takes it. A later answer for the same id,
+            // a duplicate click from one browser included, finds nothing
+            // and is dropped. So is an answer for an id the Backend never
+            // raised, which is the only way the set stays bounded by the
+            // Backend's requests rather than by a browser's frames.
+            if !lock_outstanding(ctx.outstanding).remove(&id.to_string()) {
+                warn(&format!(
+                    "Session {}: dropped an answer for a permission that is not outstanding",
+                    ctx.session_id
+                ));
                 return;
             }
-            let backend = Arc::clone(backend);
+            let backend = Arc::clone(ctx.backend);
             tokio::spawn(async move {
                 backend.permission_response(id, option_id).await;
             });
@@ -899,37 +1044,20 @@ async fn handle_command(
         HubCommand::Cancel => {
             // Spawned, so a slow Backend cannot stall the command inbox
             // and the grace arm behind one call.
-            let backend = Arc::clone(backend);
+            let backend = Arc::clone(ctx.backend);
             tokio::spawn(async move {
                 backend.cancel().await;
             });
         }
         HubCommand::SetModel { model_id } => {
-            // Awaited inline, because the reply is the frame this arm
-            // broadcasts.
-            match backend.set_model(model_id).await {
-                Ok(info) => {
-                    let frame = json!({ "type": "session_info", "info": info });
-                    // Store and broadcast under one lock. An attach that
-                    // reads the snapshot before the store sees the old
-                    // value and receives the new frame on its receiver;
-                    // one that reads after sees the new value and
-                    // receives a harmless duplicate.
-                    let mut snap = snapshot.lock().await;
-                    snap.session_info = Some(frame.clone());
-                    let _ = outbound.send(Arc::new(frame));
-                    drop(snap);
-                }
-                Err(e) => {
-                    // The sender already shows the new selection from its
-                    // optimistic update. The notice tells everyone it
-                    // did not take, and no `session_info` goes out.
-                    let _ = outbound.send(Arc::new(json!({
-                        "type": "append",
-                        "role": "sys",
-                        "text": format!("\n[The model change failed: {e}]\n")
-                    })));
-                }
+            // Never awaited here. The reply is applied by the loop when it
+            // arrives, one change at a time; a change that stalls on I/O
+            // stalls nothing else on the session.
+            if ctx.model_change.in_flight {
+                ctx.model_change.pending = Some(model_id);
+            } else {
+                ctx.model_change.in_flight = true;
+                spawn_set_model(ctx.backend, model_id, ctx.model_done_tx);
             }
         }
     }

@@ -41,6 +41,19 @@ fn agent_append(text: &str) -> Value {
     json!({ "type": "append", "role": "agent", "text": text })
 }
 
+/// One `permission_request` under `id`, the shape a Backend streams.
+fn permission_request(id: Value) -> Value {
+    json!({
+        "type": "permission_request",
+        "id": id,
+        "title": "Allow?",
+        "options": [
+            { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+            { "optionId": "reject", "name": "Reject", "kind": "reject_once" }
+        ]
+    })
+}
+
 /// Collect broadcast events until one of type `stop_type` arrives or two
 /// seconds pass. The stopping event is included.
 async fn collect_until(rx: &mut broadcast::Receiver<Arc<Value>>, stop_type: &str) -> Vec<Value> {
@@ -170,9 +183,14 @@ async fn agent_updates_broadcast_to_every_subscriber() {
 #[tokio::test]
 async fn first_permission_response_wins_silently() {
     // Requirement 7 criterion 12: neither answer produces a broadcast, and
-    // only the first reaches the Backend.
+    // only the first reaches the Backend. The Backend raises the request
+    // first: the hub lets an answer through for a request it broadcast
+    // and for nothing else.
     let registry = HubRegistry::new();
-    let backend = Arc::new(ScriptedBackend::new());
+    let id = json!(42);
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![
+        permission_request(id.clone()),
+    ])));
     let mut attached_a = registry
         .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
         .await;
@@ -181,7 +199,20 @@ async fn first_permission_response_wins_silently() {
         .await
         .expect("hub registered");
 
-    let id = json!(42);
+    attached_a
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("do it")],
+            attach_id: attached_a.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let raised = collect_until(&mut attached_a.outbound, "permission_request").await;
+    assert!(
+        raised.iter().any(|e| e["type"] == "permission_request"),
+        "the request is broadcast before anyone answers"
+    );
+
     attached_a
         .commands
         .send(HubCommand::PermissionResponse {
@@ -220,6 +251,10 @@ async fn first_permission_response_wins_silently() {
         !backend.saw(&rejected),
         "the second answer for the same id is dropped"
     );
+
+    backend.release_turn(Release::Ok);
+    let tail = collect_until(&mut attached_a.outbound, "prompt_done").await;
+    assert!(tail.iter().any(|e| e["type"] == "prompt_done"));
 }
 
 #[tokio::test]
@@ -1076,4 +1111,297 @@ async fn a_scripted_pending_turn_resolves_on_release_and_not_on_a_timer() {
         ScriptedTurn::pending(vec![]).resolution,
         Resolution::Pending
     ));
+}
+
+#[tokio::test]
+async fn an_answer_for_a_permission_never_raised_reaches_no_backend() {
+    // The outstanding set is fed by the Backend's requests alone. An
+    // answer for an id nothing raised is dropped: no Backend hears it and
+    // the hub remembers nothing about it, which is what keeps one
+    // attached peer from growing the hub's memory one id at a time.
+    let registry = HubRegistry::new();
+    let raised_id = json!("raised");
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![
+        permission_request(raised_id.clone()),
+    ])));
+    let mut attached = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+
+    // With no turn open.
+    attached
+        .commands
+        .send(HubCommand::PermissionResponse {
+            id: json!("never-raised"),
+            option_id: "allow".into(),
+        })
+        .await
+        .expect("send an answer with no turn open");
+
+    // With a turn open that raised a different id.
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("go")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let raised = collect_until(&mut attached.outbound, "permission_request").await;
+    assert!(raised.iter().any(|e| e["type"] == "permission_request"));
+    attached
+        .commands
+        .send(HubCommand::PermissionResponse {
+            id: json!("other"),
+            option_id: "allow".into(),
+        })
+        .await
+        .expect("send an answer for an id never raised");
+    // A number is not the string: the key is the id's JSON rendering.
+    attached
+        .commands
+        .send(HubCommand::PermissionResponse {
+            id: json!(0),
+            option_id: "allow".into(),
+        })
+        .await
+        .expect("send an answer with an id of another type");
+
+    // The raised one still goes through, and it was queued behind the
+    // three dropped ones, so its arrival proves those were processed.
+    attached
+        .commands
+        .send(HubCommand::PermissionResponse {
+            id: raised_id.clone(),
+            option_id: "allow".into(),
+        })
+        .await
+        .expect("send the real answer");
+    let real = Invocation::PermissionResponse {
+        id: raised_id,
+        option_id: "allow".into(),
+    };
+    assert!(wait_for_invocation(&backend, &real).await);
+    let stray: Vec<Invocation> = backend
+        .invocations()
+        .into_iter()
+        .filter(|i| matches!(i, Invocation::PermissionResponse { .. }) && *i != real)
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "no answer for an unraised id reached the Backend: {stray:?}"
+    );
+
+    backend.release_turn(Release::Ok);
+    let tail = collect_until(&mut attached.outbound, "prompt_done").await;
+    assert!(tail.iter().any(|e| e["type"] == "prompt_done"));
+}
+
+#[tokio::test]
+async fn an_answer_arriving_after_its_turn_ended_is_dropped() {
+    // The outstanding set is cleared when the turn ends. A card left on
+    // screen by a turn that resolved without its answer has no turn to
+    // answer into, and the session goes on taking prompts.
+    let registry = HubRegistry::new();
+    let id = json!("late");
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![
+        permission_request(id.clone()),
+    ])));
+    let mut attached = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("first")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let raised = collect_until(&mut attached.outbound, "permission_request").await;
+    assert!(raised.iter().any(|e| e["type"] == "permission_request"));
+
+    // The turn resolves with the request unanswered.
+    backend.release_turn(Release::Ok);
+    let tail = collect_until(&mut attached.outbound, "prompt_done").await;
+    assert!(tail.iter().any(|e| e["type"] == "prompt_done"));
+
+    attached
+        .commands
+        .send(HubCommand::PermissionResponse {
+            id: id.clone(),
+            option_id: "allow".into(),
+        })
+        .await
+        .expect("send the late answer");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !backend.saw(&Invocation::PermissionResponse {
+            id,
+            option_id: "allow".into(),
+        }),
+        "an answer for a turn that has ended reaches no Backend"
+    );
+
+    // The session is still usable.
+    backend.push_turn(ScriptedTurn::success(vec![agent_append("still here")]));
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("second")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send a second Prompt");
+    let second = collect_until(&mut attached.outbound, "prompt_done").await;
+    assert!(second
+        .iter()
+        .any(|e| e["role"] == "agent" && e["text"] == "still here"));
+}
+
+#[tokio::test]
+async fn a_stalled_model_change_stalls_nothing_else_on_the_session() {
+    // The regression this pins: `set_model` was awaited inline on the
+    // owner loop, and the subscriber counter held its lock across a send
+    // on a bounded channel only that loop drained. A Backend whose model
+    // change stalled on I/O, plus one browser reconnecting a few times,
+    // wedged the session id until restart. The loop now awaits nothing a
+    // Backend implements, and attaching takes no lock and waits on
+    // nothing.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new().set_model_pending());
+    let attached = registry
+        .register_for_test_with_grace(
+            Duration::from_millis(50),
+            backend.clone(),
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::SetModel {
+            model_id: "slow".into(),
+        })
+        .await
+        .expect("send SetModel");
+    assert!(
+        wait_for_invocation(&backend, &Invocation::SetModel("slow".into())).await,
+        "the change is under way and parked"
+    );
+
+    // One browser flapping while the change is parked: 32 attach and
+    // detach pairs, well past the eight slots the old channel had.
+    let flapped = timeout(Duration::from_secs(5), async {
+        for _ in 0..32 {
+            let peer = registry
+                .attach_existing_for_test(SESSION_ID)
+                .await
+                .expect("hub registered");
+            drop(peer);
+        }
+    })
+    .await;
+    assert!(flapped.is_ok(), "attaching never waits on the owner loop");
+
+    // The inbox is live: a cancel reaches the Backend with the change
+    // still parked.
+    attached
+        .commands
+        .send(HubCommand::Cancel)
+        .await
+        .expect("send Cancel");
+    assert!(
+        wait_for_invocation(&backend, &Invocation::Cancel).await,
+        "the loop is not held behind the model change"
+    );
+
+    // The grace timer is live too: detach the last browser and the hub is
+    // reclaimed on its 50ms window, the change still parked.
+    drop(attached);
+    assert!(
+        wait_until_unregistered(&registry, SESSION_ID).await,
+        "grace teardown runs with the change still parked"
+    );
+    assert!(backend.saw(&Invocation::Shutdown));
+
+    // Releasing the change afterwards is harmless: the loop is gone and
+    // the reply has nowhere to go.
+    backend.release_set_model(Ok(json!({ "models": {} })));
+}
+
+#[tokio::test]
+async fn model_changes_run_one_at_a_time_and_the_latest_request_runs_next() {
+    // A burst of selections runs one change at a time. The request that
+    // was made last is the one that runs next; the ones between are
+    // superseded and never reach the Backend.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new().set_model_pending());
+    let mut attached = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+
+    for model_id in ["a", "b", "c"] {
+        attached
+            .commands
+            .send(HubCommand::SetModel {
+                model_id: model_id.into(),
+            })
+            .await
+            .expect("send SetModel");
+    }
+    assert!(wait_for_invocation(&backend, &Invocation::SetModel("a".into())).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let changes_started = |backend: &ScriptedBackend| {
+        backend
+            .invocations()
+            .iter()
+            .filter(|i| matches!(i, Invocation::SetModel(_)))
+            .count()
+    };
+    assert_eq!(changes_started(&backend), 1, "one change runs at a time");
+
+    backend.release_set_model(Ok(json!({ "models": { "currentModelId": "a" } })));
+    let frame = next_event(&mut attached.outbound)
+        .await
+        .expect("the reply for a");
+    assert_eq!(frame["type"], "session_info");
+    assert_eq!(frame["info"]["models"]["currentModelId"], "a");
+
+    assert!(
+        wait_for_invocation(&backend, &Invocation::SetModel("c".into())).await,
+        "the request made last runs next"
+    );
+    assert!(
+        !backend.saw(&Invocation::SetModel("b".into())),
+        "the superseded request never runs"
+    );
+    backend.release_set_model(Err("refused".into()));
+    let notice = next_event(&mut attached.outbound)
+        .await
+        .expect("the notice for c");
+    assert_eq!(notice["type"], "append");
+    assert_eq!(notice["role"], "sys");
+    assert!(notice["text"]
+        .as_str()
+        .is_some_and(|t| t.contains("refused")));
+
+    // Nothing is left in flight or pending: a fresh request runs at once.
+    attached
+        .commands
+        .send(HubCommand::SetModel {
+            model_id: "d".into(),
+        })
+        .await
+        .expect("send SetModel");
+    assert!(wait_for_invocation(&backend, &Invocation::SetModel("d".into())).await);
+    assert_eq!(changes_started(&backend), 3, "a, c and d ran; b did not");
+    backend.release_set_model(Ok(json!({ "models": { "currentModelId": "d" } })));
+    let frame = next_event(&mut attached.outbound)
+        .await
+        .expect("the reply for d");
+    assert_eq!(frame["info"]["models"]["currentModelId"], "d");
 }

@@ -110,29 +110,38 @@ pub enum Invocation {
     Shutdown,
 }
 
-/// The hand-off a `Pending` turn waits on.
+/// The hand-off a blocked call waits on: a `Pending` turn, or a
+/// `set_model` on a Backend built with `set_model_pending`.
 ///
-/// `Notify` stores one permit, so a release that lands before the turn has
+/// `Notify` stores one permit, so a release that lands before the call has
 /// parked is not lost. The waiting side checks the slot before it waits,
-/// so a permit consumed by an earlier turn cannot leave a later one
+/// so a permit consumed by an earlier call cannot leave a later one
 /// parked.
-#[derive(Default)]
-struct ReleaseSlot {
-    slot: Mutex<Option<Release>>,
+struct Slot<T> {
+    slot: Mutex<Option<T>>,
     notify: Notify,
 }
 
-impl ReleaseSlot {
-    fn put(&self, release: Release) {
-        *self.slot.lock().expect("release slot") = Some(release);
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+}
+
+impl<T> Slot<T> {
+    fn put(&self, value: T) {
+        *self.slot.lock().expect("release slot") = Some(value);
         self.notify.notify_one();
     }
 
-    async fn take(&self) -> Release {
+    async fn take(&self) -> T {
         loop {
             let taken = self.slot.lock().expect("release slot").take();
-            if let Some(release) = taken {
-                return release;
+            if let Some(value) = taken {
+                return value;
             }
             self.notify.notified().await;
         }
@@ -145,8 +154,13 @@ pub struct ScriptedBackend {
     turns: Mutex<VecDeque<ScriptedTurn>>,
     invocations: Mutex<Vec<Invocation>>,
     set_model: Mutex<Option<Result<Value, String>>>,
+    /// When set, every `set_model` parks until the test calls
+    /// [`ScriptedBackend::release_set_model`]. Stands in for a Backend
+    /// whose model change does I/O.
+    set_model_blocks: bool,
     transcript: Mutex<Vec<HistoryEntry>>,
-    release: ReleaseSlot,
+    release: Slot<Release>,
+    model_release: Slot<Result<Value, String>>,
 }
 
 impl ScriptedBackend {
@@ -181,6 +195,18 @@ impl ScriptedBackend {
     pub fn set_model_outcome(mut self, outcome: Result<Value, String>) -> Self {
         self.set_model = Mutex::new(Some(outcome));
         self
+    }
+
+    /// Make every `set_model` park until [`ScriptedBackend::release_set_model`]
+    /// is called, one release per call.
+    pub fn set_model_pending(mut self) -> Self {
+        self.set_model_blocks = true;
+        self
+    }
+
+    /// End the `set_model` call that is parked, with `outcome`.
+    pub fn release_set_model(&self, outcome: Result<Value, String>) {
+        self.model_release.put(outcome);
     }
 
     /// Append a turn to the script. Usable while a turn is unresolved.
@@ -284,6 +310,12 @@ impl Backend for ScriptedBackend {
                 .lock()
                 .expect("invocations")
                 .push(Invocation::SetModel(model_id));
+            if self.set_model_blocks {
+                return match self.model_release.take().await {
+                    Ok(info) => Ok(info),
+                    Err(message) => Err(anyhow!(message)),
+                };
+            }
             let configured = self.set_model.lock().expect("set_model").clone();
             match configured {
                 Some(Ok(info)) => Ok(info),
