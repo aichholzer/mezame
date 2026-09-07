@@ -545,11 +545,33 @@ async fn shutdown_closes_the_listener_and_serve_returns() {
         .await
     });
 
-    // One live connection first, so the shutdown has something to drain.
+    // A WebSocket first. It is handed off at the upgrade and its hyper
+    // connection future completes there, so it is not what the drain
+    // waits for; it proves the upgrade path is live across the shutdown.
     let server = Server { addr, state };
     let mut socket = connect(&server, "/ws").await;
     let ready = next_text(&mut socket).await;
     assert_eq!(ready["type"], "ready");
+
+    // And one idle keep-alive HTTP connection: its request answered, its
+    // connection task parked on hyper's header read. That task holds a
+    // `close_rx`, so `serve` returns only once the shutdown has asked hyper
+    // to finish it, which closes an idle connection at once; without that
+    // arm the drain would wait out HEADER_READ_TIMEOUT. Reading the status
+    // line first guarantees the connection was accepted and is idle before
+    // the shutdown fires.
+    let mut idle = TcpStream::connect(addr)
+        .await
+        .expect("connect a plain peer");
+    idle.write_all(b"GET /history?session=x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .expect("send one request");
+    let mut head = [0u8; 12];
+    timeout(Duration::from_secs(2), idle.read_exact(&mut head))
+        .await
+        .expect("the request is answered within 2s")
+        .expect("read the status line");
+    assert_eq!(&head, b"HTTP/1.1 200");
 
     shutdown_tx.send(()).expect("the serve task is waiting");
     let outcome = timeout(Duration::from_secs(2), serving)
@@ -560,6 +582,12 @@ async fn shutdown_closes_the_listener_and_serve_returns() {
     assert!(
         TcpStream::connect(addr).await.is_err(),
         "the listener is closed: a new connection is refused"
+    );
+    assert!(
+        read_until_closed(&mut idle, Duration::from_secs(2))
+            .await
+            .is_some(),
+        "the idle keep-alive connection was closed by the drain"
     );
     drop(socket);
 }

@@ -83,9 +83,11 @@ pub const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 pub const OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a normal exit waits for the queue to flush into the socket
-/// before the writer is aborted. The queue holds at most the close frame
-/// and whatever was in flight; a writer stuck past this is stuck on a
-/// peer that is not reading, and waiting on it leaked the connection.
+/// before the writer is aborted. Nothing is queued after the attach loop
+/// returns and no close frame is sent, so the queue holds only whatever
+/// was in flight when it did, up to one 1 MiB echo; the peer sees the TCP
+/// close. A writer stuck past this is stuck on a peer that is not
+/// reading, and waiting on it leaked the connection.
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ceiling on one inbound WebSocket message, 32 MiB.
@@ -222,7 +224,7 @@ async fn handle_ws(
     // Attach to the hub for this session id, building one if none is
     // registered. The only failure is the working-directory lookup the
     // `ready` template needs; log it, tell the browser, and close.
-    let mut attached = match state.hubs.attach_or_create(&session_id).await {
+    let attached = match state.hubs.attach_or_create(&session_id).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("Session {session_id}: could not attach: {e:?}");
@@ -255,9 +257,11 @@ async fn handle_ws(
     // The receiver `subscribe` took, not a fresh one: a `prompt_done`
     // that landed between the subscribe and here has to reach this
     // attach, or a composer this attach locked on `busy` never unlocks.
-    let outbound = attached.take_outbound();
+    // Taking it consumes the handle, so nothing keeps a second receiver
+    // that would pin every event in the ring.
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, guard) = attached.take_outbound();
 
     run_attach_loop(
         &mut stream,
@@ -270,9 +274,9 @@ async fn handle_ws(
     )
     .await;
 
-    // Drop `attached` first so the counter decrements before the writer
+    // Drop the guard first so the counter decrements before the writer
     // closes. The grace timer arms here if this was the last subscriber.
-    drop(attached);
+    drop(guard);
     drop(to_ws_tx);
     finish_writer(&mut writer).await;
     Ok(())

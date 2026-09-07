@@ -114,10 +114,10 @@ async fn attach(backend: Arc<ScriptedBackend>) -> (HubRegistry, AttachedHub) {
 
 #[tokio::test]
 async fn silent_socket_is_evicted_after_the_heartbeat_timeout() {
-    let (_registry, mut attached) = attach(Arc::new(ScriptedBackend::new())).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(Arc::new(ScriptedBackend::new())).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
     let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
     let mut stream = silent_stream();
 
@@ -156,10 +156,10 @@ async fn silent_socket_is_evicted_after_the_heartbeat_timeout() {
 
 #[tokio::test]
 async fn pings_are_sent_to_the_peer_on_the_interval() {
-    let (_registry, mut attached) = attach(Arc::new(ScriptedBackend::new())).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(Arc::new(ScriptedBackend::new())).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
     let (to_ws_tx, mut to_ws_rx) = mpsc::channel::<Message>(16);
     let mut stream = silent_stream();
 
@@ -196,10 +196,10 @@ async fn an_active_peer_is_not_evicted() {
     // the liveness clock and is never evicted. We drive it for well
     // past the timeout, then close it cleanly and confirm the loop
     // only exited on the close, not on a heartbeat eviction.
-    let (_registry, mut attached) = attach(Arc::new(ScriptedBackend::new())).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(Arc::new(ScriptedBackend::new())).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
     let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
     let mut stream = channel_stream(browser_rx);
@@ -265,10 +265,10 @@ async fn a_frame_targeted_at_this_attach_is_forwarded_with_its_target_field() {
     let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![
         card,
     ])));
-    let (_registry, mut attached) = attach(backend.clone()).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(backend.clone()).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
 
     let (to_ws_tx, mut to_ws_rx) = mpsc::channel::<Message>(16);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
@@ -327,10 +327,10 @@ async fn a_transport_error_ends_the_loop() {
     // Requirement 8 criterion 8, second clause. The stream yields one
     // error and then pends, the heartbeat is far beyond the budget and
     // the broadcast is quiet, so only the error arm can end the loop.
-    let (_registry, mut attached) = attach(Arc::new(ScriptedBackend::new())).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(Arc::new(ScriptedBackend::new())).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
     let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
     let mut stream = erroring_stream();
 
@@ -355,10 +355,10 @@ async fn a_close_frame_ends_the_loop_while_the_stream_stays_open() {
     // Requirement 8 criterion 8, third clause. The browser sender stays
     // alive across the await, so the stream never ends on its own and a
     // `continue` on the Close arm would leave the loop pending.
-    let (_registry, mut attached) = attach(Arc::new(ScriptedBackend::new())).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(Arc::new(ScriptedBackend::new())).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
     let (to_ws_tx, _to_ws_rx) = mpsc::channel::<Message>(16);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
     let mut stream = channel_stream(browser_rx);
@@ -393,10 +393,10 @@ async fn a_peer_that_stops_reading_is_evicted_when_its_queue_fills() {
     let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::success(
         (0..8).map(|_| agent_append("x")).collect(),
     )));
-    let (_registry, mut attached) = attach(backend).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(backend).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
     let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(4);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();
     let mut stream = channel_stream(browser_rx);
@@ -449,10 +449,10 @@ async fn a_closed_writer_ends_the_attach_loop_on_its_next_broadcast() {
     // learns on its next broadcast send. The heartbeat is far out, so
     // the ping arm cannot be what ends it.
     let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::success(vec![])));
-    let (_registry, mut attached) = attach(backend).await;
-    let outbound = attached.take_outbound();
+    let (_registry, attached) = attach(backend).await;
     let commands = attached.commands.clone();
     let attach_id = attached.attach_id;
+    let (outbound, _guard) = attached.take_outbound();
     let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(16);
     drop(to_ws_rx);
     let (browser_tx, browser_rx) = mpsc::unbounded_channel::<Message>();

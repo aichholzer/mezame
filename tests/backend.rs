@@ -90,8 +90,8 @@ async fn echo_records_the_user_turn_with_no_prefix_and_no_trailing_newline() {
 
 #[tokio::test]
 async fn echo_timestamps_never_decrease_across_turns() {
-    // Requirement 4 criterion 5: every entry recorded for the life of the
-    // hub, in order, with non-decreasing timestamps and no cap.
+    // Requirement 4 criterion 5: every retained entry, in order, with
+    // non-decreasing timestamps; the ceilings have their own cases below.
     let backend = EchoBackend::new();
     for turn in 0..4 {
         run_turn(

@@ -536,9 +536,14 @@ async fn a_request_for_a_hostname_this_server_does_not_serve_is_misdirected() {
             .unwrap();
         let (status, body, _) = run_request(req).await;
         assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{method} {path}");
+        let text = String::from_utf8_lossy(&body);
         assert!(
-            String::from_utf8_lossy(&body).contains("attacker.example"),
+            text.contains("attacker.example"),
             "the refusal names the host it refused"
+        );
+        assert!(
+            text.contains("restart"),
+            "the refusal says the config is read at startup: {text}"
         );
     }
     assert!(
@@ -601,9 +606,14 @@ async fn a_write_from_another_origin_is_forbidden_and_leaves_no_trace() {
         .unwrap();
     let (status, body) = run_on(state, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    let text = String::from_utf8_lossy(&body);
     assert!(
-        String::from_utf8_lossy(&body).contains("evil.example"),
+        text.contains("evil.example"),
         "the refusal names the origin it refused"
+    );
+    assert!(
+        text.contains("hosts"),
+        "the refusal names the remedy: {text}"
     );
     assert!(
         !tmp.path().join(".mezame/state.json").exists(),

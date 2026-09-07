@@ -83,10 +83,10 @@ async fn frames_until_prompt_done(rx: &mut broadcast::Receiver<Arc<Value>>) -> V
 /// Run this attach's loop against a socket that never speaks, and return
 /// the sink it writes to. The `AttachedHub` moves into the task, so the
 /// subscriber count holds for as long as the loop runs.
-fn spawn_attach_loop(mut attached: AttachedHub) -> (u64, mpsc::Receiver<Message>) {
+fn spawn_attach_loop(attached: AttachedHub) -> (u64, mpsc::Receiver<Message>) {
     let attach_id = attached.attach_id;
-    let outbound = attached.take_outbound();
     let commands = attached.commands.clone();
+    let (outbound, guard) = attached.take_outbound();
     // The same capacity as the hub's broadcast ring, so no property's
     // sink can be the smaller buffer: a full queue ends the attach, and
     // the properties are about what the loop forwards, not about that.
@@ -105,7 +105,7 @@ fn spawn_attach_loop(mut attached: AttachedHub) -> (u64, mpsc::Receiver<Message>
             Duration::from_secs(36_000),
         )
         .await;
-        drop(attached);
+        drop(guard);
     });
     (attach_id, to_ws_rx)
 }
@@ -1141,16 +1141,17 @@ proptest! {
         rt.block_on(async move {
             let registry = HubRegistry::new();
             let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![])));
-            let mut opener = registry
+            let opener = registry
                 .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
                 .await;
-            let mut opener_rx = opener.take_outbound();
+            let opener_commands = opener.commands.clone();
+            let opener_attach_id = opener.attach_id;
+            let (mut opener_rx, _opener_guard) = opener.take_outbound();
 
-            opener
-                .commands
+            opener_commands
                 .send(HubCommand::Prompt {
                     blocks: vec![text_block("go")],
-                    attach_id: opener.attach_id,
+                    attach_id: opener_attach_id,
                 })
                 .await
                 .expect("send Prompt");
@@ -1182,12 +1183,12 @@ proptest! {
                 );
             }
 
-            let mut joiner = registry
+            let joiner = registry
                 .attach_existing_for_test(SESSION_ID)
                 .await
                 .expect("hub registered");
             let busy = joiner.snapshot_ready["busy"] == Value::Bool(true);
-            let mut joiner_rx = joiner.take_outbound();
+            let (mut joiner_rx, _joiner_guard) = joiner.take_outbound();
 
             if arm == 0 {
                 prop_assert!(busy, "an attach during an open turn reads busy");

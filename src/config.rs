@@ -135,11 +135,13 @@ pub fn temp_sibling(target: &Path) -> io::Result<PathBuf> {
 ///
 /// The target is never opened for writing, so a symlink planted there is
 /// replaced by the rename, not followed, and a reader sees either the old
-/// file or the whole new one. `durable` adds an `fsync` before the rename,
-/// for a file whose loss after a power cut would need `init` to run again;
-/// the state file skips it, since a torn or missing state reads as `{}`
-/// and on Apple targets an `fsync` is a full device flush. A failure
-/// leaves the target as it was and removes the sibling.
+/// file or the whole new one. `durable` adds an `fsync` of the sibling
+/// before the rename and, best effort, one of the directory after it, for
+/// a file whose loss after a power cut would need `init` to run again: the
+/// directory entry the rename creates is durable only once the directory
+/// itself is synced. The state file skips both, since a torn or missing
+/// state reads as `{}` and on Apple targets an `fsync` is a full device
+/// flush. A failure leaves the target as it was and removes the sibling.
 pub fn write_private_atomic(target: &Path, data: &[u8], durable: bool) -> io::Result<()> {
     let tmp = temp_sibling(target)?;
     let mut options = std::fs::OpenOptions::new();
@@ -156,7 +158,21 @@ pub fn write_private_atomic(target: &Path, data: &[u8], durable: bool) -> io::Re
             file.sync_all()?;
         }
         drop(file);
-        std::fs::rename(&tmp, target)
+        std::fs::rename(&tmp, target)?;
+        if durable {
+            // Best effort: the bytes are already on disk, and a filesystem
+            // that refuses to sync a directory handle must not fail `init`.
+            #[cfg(unix)]
+            if let Some(parent) = target.parent() {
+                let dir = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+            }
+        }
+        Ok(())
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -259,14 +275,31 @@ fn prompt_bind() -> Result<String> {
 }
 
 /// Write `~/.mezame/config.json` for `bind`, creating `~/.mezame`
-/// owner-only when it is absent, and return the config it holds. An
-/// existing file is replaced, the same as re-running the prompt.
+/// owner-only when it is absent, and return the config it holds.
+///
+/// An existing file is replaced, the same as re-running the prompt, with
+/// one exception: `hosts` is the key a user edits by hand, and a tunnel
+/// user's list dropped on a re-run left every request answered 421 with
+/// nothing said. A readable existing file's list is kept and named; a
+/// file that does not parse is what `init` exists to replace.
 pub(crate) fn write_config(bind: String) -> Result<Config> {
+    let hosts = load_config()
+        .ok()
+        .into_iter()
+        .flat_map(|old| old.transports)
+        .find_map(|transport| match transport {
+            TransportConfig::Cloudflared { hosts, .. } if !hosts.is_empty() => Some(hosts),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !hosts.is_empty() {
+        println!(
+            "Keeping hosts from the existing config: {}",
+            hosts.join(", ")
+        );
+    }
     let cfg = Config {
-        transports: vec![TransportConfig::Cloudflared {
-            bind,
-            hosts: Vec::new(),
-        }],
+        transports: vec![TransportConfig::Cloudflared { bind, hosts }],
     };
 
     let path = config_path()?;

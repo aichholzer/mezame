@@ -4,8 +4,12 @@
 //! `tests/cli_binary.rs`, which Requirement 17 criterion 7 holds to its
 //! merge-base cases.
 //!
-//! Every case runs the binary with its own temporary `HOME` and standard
-//! input closed, so an accidental prompt fails fast instead of hanging.
+//! Every case runs the binary with its own temporary `HOME` and its output
+//! captured, so standard error is a pipe. `dialoguer` checks that stream
+//! before it prompts and would otherwise take keys from `/dev/tty`, not
+//! standard input, so an accidental prompt fails with `not a terminal`
+//! instead of hanging. Standard input is closed as well, for anything that
+//! reads it directly.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -172,4 +176,37 @@ fn help_names_the_bind_flag() {
     let out = run_with_home(&["--help"], tmp.path());
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--bind"));
+}
+
+#[test]
+fn init_with_bind_keeps_the_hosts_of_an_existing_config() {
+    // `hosts` is the key a user edits by hand. A re-run used to drop it,
+    // and a tunnel user then had every request answered 421 with nothing
+    // said; the list is kept and named.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".mezame");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        br#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}]}"#,
+    )
+    .unwrap();
+
+    let out = run_with_home(&["init", "--bind", "0.0.0.0:9510"], tmp.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Keeping hosts"),
+        "the kept list is named on stdout"
+    );
+    let cfg = read_config(tmp.path());
+    assert_eq!(cfg["transports"][0]["bind"], "0.0.0.0:9510");
+    assert_eq!(
+        cfg["transports"][0]["hosts"],
+        serde_json::json!(["mezame.example.com"]),
+        "the hosts list survives the re-run"
+    );
 }

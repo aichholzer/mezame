@@ -272,15 +272,20 @@ pub async fn guard_request(
         .is_some_and(|a| !policy.host_allowed(a))
     {
         let shown = echo(authority.as_deref().unwrap_or_default());
+        // Both texts name the restart: the policy is read once, at
+        // startup, and a user who edits the file and reloads would
+        // otherwise see the same refusal with nothing new said.
         policy.note(format!(
             "Refused a request for host {shown:?}: not a name this Mezame serves. \
-             If it is yours, add it to \"hosts\" in config.json."
+             If it is yours, add it to \"hosts\" in the transport entry of \
+             ~/.mezame/config.json and restart Mezame."
         ));
         return (
             StatusCode::MISDIRECTED_REQUEST,
             format!(
-                "Host {shown:?} is not a name this Mezame serves. \
-                 If it is yours, add it to \"hosts\" in ~/.mezame/config.json.\n"
+                "Host {shown:?} is not a name this Mezame serves. If it is yours, add it \
+                 to \"hosts\" in the transport entry of ~/.mezame/config.json and \
+                 restart Mezame.\n"
             ),
         )
             .into_response();
@@ -293,15 +298,24 @@ pub async fn guard_request(
             if !policy.origin_allowed(&origin, &authority) {
                 let shown_origin = echo(&origin);
                 let shown_host = echo(&authority);
+                // A proxy that rewrites `Host` to the upstream (nginx's
+                // default) serves the page and refuses its socket and its
+                // writes here; the remedy is named, since the browser
+                // cannot show a handshake status and would only reconnect.
                 policy.note(format!(
-                    "Refused a {} from origin {shown_origin:?} sent to {shown_host:?}.",
+                    "Refused a {} from origin {shown_origin:?} sent to {shown_host:?}. If \
+                     that page is yours, add its hostname to \"hosts\" in the transport \
+                     entry of ~/.mezame/config.json and restart Mezame, or have the proxy \
+                     pass Host through unchanged.",
                     req.method()
                 ));
                 return (
                     StatusCode::FORBIDDEN,
                     format!(
                         "Origin {shown_origin:?} does not match the host {shown_host:?} \
-                         this request was sent to.\n"
+                         this request was sent to. If that page is yours, add its hostname \
+                         to \"hosts\" in the transport entry of ~/.mezame/config.json and \
+                         restart Mezame, or have the proxy pass Host through unchanged.\n"
                     ),
                 )
                     .into_response();

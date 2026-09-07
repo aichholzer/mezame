@@ -290,9 +290,23 @@ impl Counter {
     }
 }
 
-/// Subscriber-side handle on an attached hub. Drop-on-detach: the `Drop`
-/// impl decrements the counter, so the grace timer arms when the last
-/// attach goes away.
+/// One subscriber's place in the hub's count. Dropping it decrements the
+/// count, so the grace timer arms when the last attach goes away. The
+/// decrement is synchronous and lock-free, so it runs to completion
+/// inside the drop whatever the runtime is doing.
+pub struct AttachGuard {
+    counter: Arc<Counter>,
+}
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        self.counter.decrement();
+    }
+}
+
+/// Subscriber-side handle on an attached hub. Drop-on-detach: the guard
+/// inside it decrements the counter when the handle, or the guard taken
+/// out of it, goes away.
 pub struct AttachedHub {
     pub commands: mpsc::Sender<HubCommand>,
     pub outbound: broadcast::Receiver<Arc<Value>>,
@@ -303,29 +317,28 @@ pub struct AttachedHub {
     /// targeted broadcasts on it, so a peer never renders a permission
     /// card it was not asked to answer.
     pub attach_id: u64,
-    counter: Arc<Counter>,
+    guard: AttachGuard,
 }
 
 impl AttachedHub {
-    /// The receiver `subscribe` took, with everything it has buffered.
+    /// The receiver `subscribe` took, with everything it has buffered, and
+    /// the guard that keeps this attach counted.
     ///
-    /// Leaves a fresh, never-read receiver behind so `Drop` still has a
-    /// field to drop. The attach loop has to read *this* receiver:
-    /// `resubscribe` would start at the channel's tail and drop whatever
-    /// arrived between the subscribe and the hand-off, which is the
-    /// window a `prompt_done` lands in for an attach that read `busy` as
-    /// true.
-    pub fn take_outbound(&mut self) -> broadcast::Receiver<Arc<Value>> {
-        let fresh = self.outbound.resubscribe();
-        std::mem::replace(&mut self.outbound, fresh)
-    }
-}
-
-impl Drop for AttachedHub {
-    fn drop(&mut self) {
-        // Synchronous and lock-free, so it runs to completion inside the
-        // drop whatever the runtime is doing.
-        self.counter.decrement();
+    /// Consumes the handle so no receiver is left behind. A broadcast slot
+    /// is freed only once every receiver has read it, so a receiver nobody
+    /// reads pins every event in the ring until it is lapped, the whole
+    /// prompt text in each echo included; an earlier shape left a fresh
+    /// `resubscribe` in the handle for `Drop`'s sake and kept up to 1024
+    /// events resident for as long as the attach lived. The attach loop
+    /// has to read *this* receiver: `resubscribe` would start at the
+    /// channel's tail and drop whatever arrived between the subscribe and
+    /// the hand-off, which is the window a `prompt_done` lands in for an
+    /// attach that read `busy` as true.
+    pub fn take_outbound(self) -> (broadcast::Receiver<Arc<Value>>, AttachGuard) {
+        let AttachedHub {
+            outbound, guard, ..
+        } = self;
+        (outbound, guard)
     }
 }
 
@@ -549,7 +562,9 @@ impl HubRegistry {
             snapshot_session_info,
             session_id: hub.session_id.clone(),
             attach_id: NEXT_ATTACH_ID.fetch_add(1, Ordering::Relaxed),
-            counter: hub.counter.clone(),
+            guard: AttachGuard {
+                counter: hub.counter.clone(),
+            },
         }
     }
 
@@ -580,6 +595,17 @@ impl HubRegistry {
     #[doc(hidden)]
     pub async fn is_registered_for_test(&self, session_id: &str) -> bool {
         self.inner.read().await.contains_key(session_id)
+    }
+
+    /// Test-only: how many broadcast receivers the hub under `session_id`
+    /// holds. Each attach holds exactly one, and handing it to the attach
+    /// loop must add none: a receiver nobody reads pins every event in the
+    /// ring.
+    #[doc(hidden)]
+    pub async fn receiver_count_for_test(&self, session_id: &str) -> Option<usize> {
+        self.lookup(session_id)
+            .await
+            .map(|hub| hub.outbound.receiver_count())
     }
 
     /// Test-only: register a hub around a caller-supplied Backend, with
@@ -956,9 +982,10 @@ async fn drive(state: HubLoopState) {
 }
 
 /// Write one line to stderr, ignoring a failure to. `eprintln!` panics
-/// when stderr is a closed pipe, and a panic on the owner task costs the
-/// session; a log line is not worth that.
-fn warn(line: &str) {
+/// when stderr is a broken pipe, and a panic on the owner task costs the
+/// session, while one on the accept loop, the root future of `block_on`,
+/// costs the process; a log line is not worth either.
+pub(crate) fn warn(line: &str) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stderr().lock(), "{line}");
 }

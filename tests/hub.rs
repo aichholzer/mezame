@@ -1058,20 +1058,21 @@ async fn ready_busy_reflects_the_inflight_count() {
     let registry = HubRegistry::new();
     let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![])));
 
-    let mut attached = registry
+    let attached = registry
         .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
         .await;
     assert_eq!(
         attached.snapshot_ready["busy"], false,
         "no turn in flight yet"
     );
-    let mut outbound = attached.take_outbound();
+    let commands = attached.commands.clone();
+    let attach_id = attached.attach_id;
+    let (mut outbound, _guard) = attached.take_outbound();
 
-    attached
-        .commands
+    commands
         .send(HubCommand::Prompt {
             blocks: vec![text_block("hi")],
-            attach_id: attached.attach_id,
+            attach_id,
         })
         .await
         .expect("send Prompt");
@@ -1952,4 +1953,40 @@ async fn an_attach_during_a_slow_shutdown_builds_a_fresh_hub_instead_of_joining_
     );
     assert_eq!(backend.count_of(&Invocation::Shutdown), 1);
     drop(fresh);
+}
+
+#[tokio::test]
+async fn taking_the_outbound_receiver_leaves_no_second_one_behind() {
+    // A broadcast slot is freed only once every receiver has read it, so a
+    // receiver nobody reads pins every event in the ring until it is
+    // lapped, the whole prompt text in each echo included. The handle hands
+    // its one receiver to the attach loop and keeps none; an earlier shape
+    // left a fresh `resubscribe` behind for the whole attach.
+    let registry = HubRegistry::new();
+    let attached = registry
+        .register_for_test(
+            Arc::new(ScriptedBackend::new()),
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+    assert_eq!(
+        registry.receiver_count_for_test(SESSION_ID).await,
+        Some(1),
+        "one attach, one receiver"
+    );
+    let (outbound, guard) = attached.take_outbound();
+    assert_eq!(
+        registry.receiver_count_for_test(SESSION_ID).await,
+        Some(1),
+        "handing the receiver to the attach loop adds none"
+    );
+    drop(outbound);
+    assert_eq!(
+        registry.receiver_count_for_test(SESSION_ID).await,
+        Some(0),
+        "with the loop's receiver gone nothing pins the ring"
+    );
+    drop(guard);
 }

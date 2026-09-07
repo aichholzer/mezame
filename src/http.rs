@@ -43,7 +43,7 @@ use tokio::sync::{broadcast, watch, Notify};
 
 use crate::config::{ensure_private_dir, state_path, write_private_atomic, Config};
 use crate::guard::{guard_request, RequestPolicy};
-use crate::hub::HubRegistry;
+use crate::hub::{warn, HubRegistry};
 use crate::ws::ws_upgrade;
 
 /// Shared state for the axum router. Bundles the static `Config` with
@@ -179,12 +179,16 @@ pub async fn serve_with(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _peer)) => stream,
                 Err(e) => {
+                    // Through `warn`, never `eprintln!`: this loop is the
+                    // root future of `block_on`, and a panicking write to
+                    // a broken stderr here would end the process and
+                    // every live session with it.
                     if noted.insert(e.kind()) {
-                        eprintln!(
+                        warn(&format!(
                             "Could not accept a connection: {e}. If this names too many \
                              open files, raise the process's descriptor limit; see \
                              docs/service.md."
-                        );
+                        ));
                     }
                     if !is_connection_error(&e) {
                         tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
@@ -315,8 +319,8 @@ async fn shutdown_signal(shutdown: Arc<Notify>) {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => eprintln!("\nReceived SIGINT, shutting down."),
-        _ = terminate => eprintln!("Received SIGTERM, shutting down."),
+        _ = ctrl_c => warn("\nReceived SIGINT, shutting down."),
+        _ = terminate => warn("Received SIGTERM, shutting down."),
     }
     // Wake every long-poll handler. They release their futures before
     // axum's drain kicks in. `notify_waiters` only wakes tasks that are
@@ -474,12 +478,12 @@ static STATE_WRITE_FAILURE_NOTED: AtomicBool = AtomicBool::new(false);
 /// silence while the server looks healthy.
 fn note_state_write_failure(path: &Path, e: &io::Error) {
     if !STATE_WRITE_FAILURE_NOTED.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        warn(&format!(
             "Could not write {}: {e}. The tab list and settings will not be saved until \
              this process can write into that directory; check its ownership and \
              permissions.",
             path.display()
-        );
+        ));
     }
 }
 
@@ -530,8 +534,11 @@ async fn state_events(
 }
 
 /// `GET /history?session=<id>`: the transcript of the Backend behind that
-/// session id, as an `entries` array in recorded order with no cap and no
-/// pagination.
+/// session id, as an `entries` array holding every entry the Backend
+/// retains, in recorded order, with no pagination. The shipped Backend
+/// bounds what it retains at `TRANSCRIPT_BUDGET_BYTES` of entry text and
+/// `TRANSCRIPT_MAX_ENTRIES` entries (`backend.rs`), the oldest turn
+/// evicted first, so a long conversation comes back as its newest window.
 ///
 /// An absent or empty `session` answers 400 with a plain-text body. An id
 /// with no registered hub answers 200 with an empty array, which covers a
