@@ -17,13 +17,30 @@
 # so that opens the port on every network the host is on; a Cloudflare
 # Tunnel running on the host reaches the loopback mapping as it is.
 #
+# The container runs as user `mezame` (uid 1000) with its config at
+# /home/mezame/.mezame, on a read-only root filesystem, with every
+# capability dropped and no privilege escalation. Earlier images ran as
+# root at /root/.mezame. A volume created by one of those is owned by
+# root: this image reads it, so sessions work, but cannot write it, so the
+# tab list stops being saved and `mezame init` is refused with "Permission
+# denied"; Mezame logs one line about the failed write. Fix the ownership
+# once, with the stack stopped:
+#   docker run --rm -v <project>_mezame-config:/data alpine:3.23 chown -R 1000:1000 /data
+# where <project> is the compose project name, this directory's name in
+# lower case; `docker volume ls` shows it. With plain `docker run`, change
+# the mount to /home/mezame/.mezame as well. A custom bind on a port below
+# 1024 needs a capability the services below drop.
+#
 # Normal run:
 #   docker compose up
 #   # or detached:
 #   docker compose up -d
 #
 # Both services share the same image and the same volume, so the config
-# written during setup is what the running service reads.
+# written during setup is what the running service reads. The image's
+# health check fetches / on port 9510 inside the container; `docker ps`
+# shows `healthy` once Mezame answers, and `docker compose up --wait`
+# blocks on it.
 
 services:
   mezame:
@@ -34,13 +51,17 @@ services:
     ports:
       - "127.0.0.1:9510:9510"
     volumes:
-      - mezame-config:/root/.mezame
+      - mezame-config:/home/mezame/.mezame
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
 
   # One-shot service for first-run setup. Same image, same volume, but
   # interactive and without publishing the port. Invoked explicitly via
   # `docker compose run --rm setup`; never started by `docker compose up`
-  # thanks to the `setup` profile.
+  # thanks to the `setup` profile. It runs `mezame init`, never a server,
+  # so the image's health probe is switched off for it.
   setup:
     build: .
     image: mezame:local
@@ -49,7 +70,12 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - mezame-config:/root/.mezame
+      - mezame-config:/home/mezame/.mezame
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      disable: true
 
 volumes:
   mezame-config:

@@ -51,7 +51,18 @@ Browse `http://127.0.0.1:5173`. The embedded bundle is only relevant when you ru
 The suite lives in `tests/` (Rust integration tests) and `tests/ui/` plus
 `ui/src/**` (Vitest). Run the Rust side with `cargo test --all-targets` and
 the UI side with `npm test` in `ui/`. CI also enforces a coverage floor via
-`cargo llvm-cov` (see `.github/workflows/ci.yml`).
+`cargo llvm-cov` (see `.github/workflows/ci.yml`), passes `--locked` so a
+`Cargo.toml` edit without its `Cargo.lock` fails on every push, and fails the
+`docs` job if `cargo package --list` names a repository-only file.
+
+`.github/workflows/container.yml` builds the image, writes a config through
+`mezame init --bind`, serves it and reads `/` and the request checks through
+the published port. It runs when a file the image depends on changes, weekly,
+and on demand; the schedule fires only on the default branch. Locally,
+`tests/container_files.rs` pins the shape of the Dockerfile, `compose.yaml`
+and the build-context allowlist on every `cargo test`. The base images are
+pinned by digest; the Dockerfile's header has the recipe for reading a current
+digest from the registry without Docker.
 
 Most integration tests drive the hub through `ScriptedBackend` in
 `tests/support/mod.rs`: a Backend whose every answer the test supplies up

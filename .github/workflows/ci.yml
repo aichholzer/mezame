@@ -44,11 +44,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Mezame is Unix-only: src/unix.rs reaches `kill` and `setsid`
-        # through FFI, gated on `#[cfg(unix)]`. Windows compiles, and its
-        # runtime is degraded: `pid_is_alive` always returns true and
-        # there is no process group. No Windows binaries ship, and CI
-        # does not cover Windows.
+        # Mezame is built and tested on Linux and macOS. src/unix.rs reaches
+        # `kill` and `setsid` through FFI, gated on `#[cfg(unix)]`, and
+        # SIGTERM handling is Unix-only. No Windows binaries ship, CI does
+        # not cover Windows, and a Windows source build fails at the UI
+        # step: build.rs spawns `npm` by name and Node.js for Windows ships
+        # it only as `npm.cmd`.
         include:
           - os: ubuntu-latest
             rust: stable
@@ -72,7 +73,10 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Lint with clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # `--locked` fails the moment Cargo.toml moves without Cargo.lock,
+        # which the Docker build's own `--locked` used to be the first to
+        # notice, for the user running `docker compose build`.
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --all-targets --verbose
@@ -164,6 +168,21 @@ jobs:
         # the only place they run.
         run: cargo test --doc
 
+      - name: The crate ships no repository-only file
+        # `cargo package --list` resolves the file set without building.
+        # Captured first so a failing `cargo package` fails the step; piped
+        # straight into grep it would pass on empty input. The pattern is
+        # the allowlist of files that live in the repository and not in
+        # the crate; add to it and to `exclude` in Cargo.toml together.
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIST="$(cargo package --list --locked)"
+          if grep -Ex 'HARNESS\.md|reference\.html|findings\.md|\.kiro/.*' <<<"$LIST"; then
+            echo "::error::a repository-only file is in the crate; add it to exclude in Cargo.toml"
+            exit 1
+          fi
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -243,7 +262,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check MSRV
-        run: cargo check --all-targets
+        run: cargo check --all-targets --locked
 
   benchmarks:
     name: Benchmarks (CodSpeed)

@@ -185,6 +185,28 @@ docker compose up -d
 The configuration is persisted in a named volume, so you answer that prompt
 once. See the comments in `compose.yaml` for the full flow.
 
+The container runs as user `mezame` (uid 1000) with its config at
+`/home/mezame/.mezame`, on a read-only root filesystem with every capability
+dropped. Earlier images ran as root at `/root/.mezame`, and a volume one of them
+created is owned by root: the new image reads it, so sessions work, but cannot
+write it, so the tab list stops being saved and `mezame init` is refused with
+"Permission denied"; Mezame logs one line about the failed write. Fix the
+ownership once, with the stack stopped:
+
+```sh
+docker run --rm -v <project>_mezame-config:/data alpine:3.23 chown -R 1000:1000 /data
+```
+
+`<project>` is the compose project name, this directory's name in lower case;
+`docker volume ls` shows it. With plain `docker run`, change the mount to
+`/home/mezame/.mezame` as well.
+
+The image declares a health check that fetches `/` on `127.0.0.1:9510` inside
+the container; `docker ps` shows `healthy` once Mezame answers. It confirms the
+process is serving, not that you chose `0.0.0.0:9510` at the prompt: a loopback
+bind is healthy inside the container and unreachable on the published port. If
+you bound another port, override `healthcheck` in `compose.yaml`.
+
 `compose.yaml` publishes the port on the host's loopback only,
 `127.0.0.1:9510`. Mezame has no authentication of its own, so that is the
 default. To reach it from other machines on a network you trust, change the

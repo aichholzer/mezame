@@ -47,11 +47,22 @@ with an echo, on every attached browser at once.
   arriving through it is answered 421. Loopback, LAN IP addresses,
   `localhost` and `.local` names need no entry. The Cloudflare guide has
   the step.
+- The container runs as user `mezame` (uid 1000) and keeps its config at
+  `/home/mezame/.mezame`; it was root and `/root/.mezame`. A volume an
+  earlier image created is owned by root, and the new image can read it
+  but not write it: sessions work, and the tab list stops being saved,
+  with `mezame init` refused with "Permission denied". `compose.yaml` and
+  the README carry the one-off `chown`. Both compose services now run
+  with a read-only root filesystem, every capability dropped and no
+  privilege escalation, so a custom bind below port 1024 is refused.
 - `cargo install mezame` still installs 0.13.4 from crates.io. This alpha
   installs from the `feature/harness` branch.
 
 ### Added
 
+- The container image declares a `HEALTHCHECK` that fetches `/` on port
+  9510 inside the container, so `docker ps` reports its health and
+  `docker compose up --wait` can block on it.
 - `mezame init --bind ADDR` writes `~/.mezame/config.json` with no prompt,
   for a service unit or a container started before setup. A missing config
   under a service manager now logs that command as the way out. `mezame

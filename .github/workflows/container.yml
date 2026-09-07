@@ -1,0 +1,99 @@
+# Builds and runs the image the README documents as an install path. Kept
+# apart from ci.yml so the ten-minute release build does not run on every
+# push: it runs when a file the image depends on changes, weekly against a
+# moved base tag or an apk change, and on demand. The schedule fires only on
+# the default branch, so it is inert until this branch becomes it.
+name: Container
+
+on:
+  push:
+    branches: [main, feature/harness]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - compose.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - ui/package.json
+      - ui/package-lock.json
+      - .github/workflows/container.yml
+  pull_request:
+    branches: [main, feature/harness]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - compose.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - ui/package.json
+      - ui/package-lock.json
+      - .github/workflows/container.yml
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build and run the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Validate compose.yaml
+        run: docker compose config -q
+
+      - name: Build the image
+        # Requirement 20 criterion 9.
+        run: docker compose build mezame
+
+      - name: The image prints the manifest version
+        # Requirement 20 criterion 12.
+        shell: bash
+        run: |
+          want="mezame $(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          got="$(docker run --rm mezame:local mezame --version)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::--version printed '$got', Cargo.toml says '$want'"
+            exit 1
+          fi
+
+      - name: The container runs unprivileged
+        # Requirement 20 criterion 14.
+        shell: bash
+        run: test "$(docker run --rm mezame:local id -u)" = 1000
+
+      - name: Write the config the way a user without a terminal does
+        # Requirement 20 criteria 6 and 13, through `init --bind`. The fresh
+        # named volume inherits the image's ownership, which is what makes
+        # the write succeed under the unprivileged user.
+        run: docker compose run --rm -T setup mezame init --bind 0.0.0.0:9510
+
+      - name: Serve, and read the UI shell and the request checks through the published port
+        # Requirement 20 criterion 10. `--wait` returns once the health
+        # check passes; the explicit inspect is what fails the job if the
+        # HEALTHCHECK were removed, since compose waits on `running` alone
+        # for a service without one. The first probe runs one interval
+        # after start, and a transient failure adds another.
+        shell: bash
+        run: |
+          docker compose up -d --wait --wait-timeout 120 mezame
+          test "$(docker inspect -f '{{.State.Health.Status}}' mezame)" = healthy
+          curl -fsS -D headers.txt -o body.html http://127.0.0.1:9510/
+          grep -qi '^content-type: text/html; charset=utf-8' headers.txt
+          grep -qF '<div id="root">' body.html
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:9510/)" = 421
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:9510/state)" = 204
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs mezame
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

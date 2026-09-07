@@ -1,8 +1,22 @@
-# The build context is sent to the daemon in full, and a working tree
-# carries a multi-gigabyte target/ directory. build.rs reads nothing under
-# the two ui/ paths below: it copies ui/ minus both into $OUT_DIR and runs
-# `npm ci` there.
-target/
+# Everything is excluded, then the build inputs are let back in. The build
+# reads Cargo.toml, Cargo.lock, build.rs, src/, benches/ (declared as a
+# [[bench]] target, so cargo build refuses a tree without it) and ui/.
+# Nothing else: not .env files, not editor or scanner state, not the
+# gitignored spec, not target/. build.rs copies ui/ minus node_modules and
+# dist into $OUT_DIR and runs `npm ci` there. The re-excludes at the end
+# take back what `!ui/` would otherwise let in; their order after it is
+# what makes them effective, and `**/` is what makes `.env` match below
+# the context root.
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!benches/
+!ui/
 ui/node_modules/
 ui/dist/
-.git/
+ui/*.tsbuildinfo
+**/.env
+**/.env.*
+**/.DS_Store

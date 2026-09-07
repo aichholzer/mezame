@@ -1,0 +1,20 @@
+# Two ecosystems. `docker` refreshes the base-image digests in the
+# Dockerfile when a pinned tag moves and proposes tag bumps; `github-actions`
+# moves the SHA pins in the workflows, which ci.yml's comments have assumed
+# since the pins were introduced. Cargo and npm bumps stay manual. Dependabot
+# reads this file from the default branch, so it is inert until the branch
+# that carries it becomes the default.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "Container:"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday

@@ -14,7 +14,10 @@ categories = ["command-line-utilities", "web-programming::websocket"]
 # never reaches the source tree during a clean build. We also ignore it
 # via `.gitignore`. Excluded explicitly here for belt-and-braces. Assets
 # and the changelog are not needed at build time; the README links to
-# raw.githubusercontent.com for the banner image.
+# raw.githubusercontent.com for the banner image. The plan (`HARNESS.md`),
+# the review (`findings.md`) and the UI design reference (`reference.html`)
+# are repository documents, not crate contents; the `docs` CI job fails if
+# `cargo package --list` names one of them.
 exclude = [
     "ui/node_modules/**",
     "ui/dist/**",
@@ -29,7 +32,11 @@ exclude = [
     "Dockerfile",
     "compose.yaml",
     "CHANGELOG.md",
-    "benches/**"
+    "benches/**",
+    "HARNESS.md",
+    "findings.md",
+    "reference.html",
+    "ui/tsconfig.test.json"
 ]
 
 [dependencies]
@@ -37,6 +44,13 @@ anyhow = "1.0.103"
 axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 dialoguer = { version = "0.12.0", default-features = false }
 futures-util = "0.3.31"
+# Not a new crate at this lockfile: 0.2 is what axum's `ws` feature already
+# pulls in (tokio-tungstenite 0.24 -> tungstenite -> rand 0.8 -> rand_core
+# 0.6 -> getrandom 0.2), and this line unifies with it. Bump it, and the
+# tokio-tungstenite dev-dependency with it, the first time
+# `cargo tree -i getrandom@0.2` lists only mezame: that is the axum bump
+# whose tungstenite moves to rand 0.9. The 0.3 API renamed the call:
+# `getrandom::getrandom(&mut buf)` becomes `getrandom::fill(&mut buf)`.
 getrandom = "0.2"
 # Both already in the normal graph through axum, so zero new crates. They
 # are direct dependencies because `axum::serve` sets no timer on hyper,
