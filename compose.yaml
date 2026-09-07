@@ -6,6 +6,8 @@
 # That runs `mezame init`, which asks one question: the address to bind.
 # Choose 0.0.0.0:9510. The default, 127.0.0.1:9510, binds loopback inside
 # the container, and the published port below would then answer nothing.
+# Without a terminal, `docker compose run -T --rm setup mezame init --bind
+# 0.0.0.0:9510` writes the same config with no prompt.
 #
 # The port is published on the host's loopback only: the browser on the
 # host reaches it at http://127.0.0.1:9510 and nothing else does. Mezame

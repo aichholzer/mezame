@@ -12,7 +12,9 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
+use std::path::Path;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +41,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch, Notify};
 
-use crate::config::{state_path, Config};
+use crate::config::{ensure_private_dir, state_path, write_private_atomic, Config};
 use crate::guard::{guard_request, RequestPolicy};
 use crate::hub::HubRegistry;
 use crate::ws::ws_upgrade;
@@ -423,35 +425,62 @@ async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
     }
 }
 
-/// PUT /state: atomically replaces the stored state. Writes to a sibling
-/// `.tmp` then calls `rename`, and readers never see a partial file. A
-/// successful write fires a tick on the `state_changes` broadcast. Every
-/// browser subscribed to `/state/events` then refetches and merges in any
-/// new sessions another browser opened.
+/// PUT /state: atomically replaces the stored state. Writes a fresh
+/// sibling temporary file unique to this write, owner-only on Unix, and
+/// renames it over the target, so two browsers writing at once never
+/// share a file and a reader never sees a partial one; the later rename
+/// wins. A successful write fires a tick on the `state_changes`
+/// broadcast. Every browser subscribed to `/state/events` then refetches
+/// and merges in any new sessions another browser opened.
 async fn put_state(
     State(app): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    let path = state_path().map_err(internal)?;
+    let data = serde_json::to_string_pretty(&body).map_err(internal)?;
+    let target = path.clone();
+    let written = tokio::task::spawn_blocking(move || -> io::Result<()> {
+        if let Some(parent) = target.parent() {
+            ensure_private_dir(parent)?;
+        }
+        write_private_atomic(&target, data.as_bytes(), false)
+    })
+    .await
+    .map_err(internal)?;
+    if let Err(e) = written {
+        note_state_write_failure(&path, &e);
+        return Err(internal(e));
     }
-    let tmp = path.with_extension("json.tmp");
-    let data = serde_json::to_string_pretty(&body)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    tokio::fs::write(&tmp, data)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    tokio::fs::rename(&tmp, &path)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
     // A send error here only means no browser is currently subscribed.
     // The next subscriber fetches /state on connect and sees everything
     // that changed in the meantime.
     let _ = app.state_changes.send(());
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A handler failure the client sees as a 500 with the error's text.
+fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+}
+
+/// Whether the first failed state write has been reported.
+static STATE_WRITE_FAILURE_NOTED: AtomicBool = AtomicBool::new(false);
+
+/// Report the first failure to write the state file, once per process.
+///
+/// The UI does not surface a failed sync, so without this line a
+/// directory Mezame cannot write into, a Docker volume owned by another
+/// uid or a read-only home, loses every tab rename and setting in
+/// silence while the server looks healthy.
+fn note_state_write_failure(path: &Path, e: &io::Error) {
+    if !STATE_WRITE_FAILURE_NOTED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "Could not write {}: {e}. The tab list and settings will not be saved until \
+             this process can write into that directory; check its ownership and \
+             permissions.",
+            path.display()
+        );
+    }
 }
 
 /// GET /state/events: Server-Sent Events stream. Emits one

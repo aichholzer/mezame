@@ -264,10 +264,12 @@ the client owns for app-wide preferences such as the theme and the notification
 choice.
 
 A `GET` with no file present, or with a file that does not parse as JSON,
-answers 200 with `{}`. A `PUT` with a body that parses as JSON writes a sibling
-temporary file and renames it over the target, so a reader never sees a partial
-file, and answers 204. A failed write leaves any existing file alone and fires
-no event.
+answers 200 with `{}`. A `PUT` with a body that parses as JSON writes a fresh
+sibling temporary file unique to that write, owner-only on Unix, and renames it
+over the target, so a reader never sees a partial file and two browsers writing
+at once each get 204 with the later rename winning. A failed write leaves any
+existing file alone, fires no event, and is reported on stderr once per
+process.
 
 `GET /state/events` is a Server-Sent Events stream that emits one
 `state_changed` event per successful `PUT /state`. Browsers read it as a "go

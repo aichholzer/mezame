@@ -2,6 +2,19 @@
 
 Mezame is a foreground process. To start it at boot and keep it running, hand it off to the OS's init system: systemd on Linux, launchd on macOS. Both of these capture Mezame's stderr into the usual places (`journalctl` / Console.app) and send SIGTERM when asked to stop. Mezame handles SIGTERM and exits cleanly.
 
+## Before you enable it
+
+Write the config first, as the account the service runs under and with that
+account's `HOME`. Both `Restart=on-failure` and `KeepAlive` otherwise restart a
+process that exits on the missing config every few seconds, and a service has
+no terminal to answer the prompt on.
+
+```sh
+mezame init                              # the prompt, in your own shell
+mezame init --bind 127.0.0.1:9510        # the same file with no prompt
+sudo -u youruser -H /home/youruser/.cargo/bin/mezame init --bind 127.0.0.1:9510   # for a system unit
+```
+
 ## Linux (systemd)
 
 Pick one of the two patterns below. User service is the simpler choice for a single-user machine and is what most people want. System service is for multi-user hosts or setups where you want Mezame running completely independently of any login session.

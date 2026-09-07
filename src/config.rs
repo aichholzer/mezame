@@ -5,10 +5,18 @@
 //! `#[serde(default)]` and leave the existing ones where they are.
 //! Transports live in a list (`TransportConfig`) internally tagged on
 //! `kind`; see the architecture document's configuration reference.
+//!
+//! Everything under `~/.mezame` is created owner-only on Unix: the
+//! directory `0700` and its files `0600`, each file written to a fresh
+//! `O_EXCL` sibling and renamed into place, so a symlink at the target is
+//! replaced rather than followed and a reader never sees a partial file.
+//! An existing directory keeps its mode. The state endpoint writes through
+//! the same two helpers.
 
-use std::path::PathBuf;
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use serde::{Deserialize, Serialize};
 
@@ -79,12 +87,138 @@ pub fn load_config() -> Result<Config> {
     Ok(cfg)
 }
 
+/// Create `dir` and any missing parent, owner-only (`0700`) on Unix.
+///
+/// An existing directory is left as it is, mode included: a directory a
+/// 0.13.x release created stays `0755` until its owner runs `chmod`. A
+/// regular file at the path is an error, which is what keeps `PUT /state`
+/// answering 500 there. `0700` because the directory will hold credential
+/// material and transcripts, and nothing else on the machine needs to
+/// read it; the umask only ever removes bits from it.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// A temporary sibling of `target` unique to one write:
+/// `.{name}.{hex}.tmp`, with 64 bits of OS entropy in the hex.
+///
+/// Same directory, so the rename that follows stays on one filesystem;
+/// the leading dot keeps a listing of `~/.mezame` clean. Two writes that
+/// overlap never share a file, which the one fixed `.tmp` name they used
+/// to share let happen: one writer renamed a file the other had just
+/// truncated, and the loser's rename failed with a 500.
+pub fn temp_sibling(target: &Path) -> io::Result<PathBuf> {
+    let name = target.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the target has no file name")
+    })?;
+    use std::fmt::Write as _;
+
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    let hex = bytes.iter().fold(String::with_capacity(16), |mut s, b| {
+        // Writing into a String cannot fail.
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    Ok(target.with_file_name(format!(".{name}.{hex}.tmp")))
+}
+
+/// Write `data` to `target` through a fresh owner-only (`0600`) sibling
+/// opened `O_EXCL`, then rename it into place.
+///
+/// The target is never opened for writing, so a symlink planted there is
+/// replaced by the rename, not followed, and a reader sees either the old
+/// file or the whole new one. `durable` adds an `fsync` before the rename,
+/// for a file whose loss after a power cut would need `init` to run again;
+/// the state file skips it, since a torn or missing state reads as `{}`
+/// and on Apple targets an `fsync` is a full device flush. A failure
+/// leaves the target as it was and removes the sibling.
+pub fn write_private_atomic(target: &Path, data: &[u8], durable: bool) -> io::Result<()> {
+    let tmp = temp_sibling(target)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(data)?;
+        if durable {
+            file.sync_all()?;
+        }
+        drop(file);
+        std::fs::rename(&tmp, target)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// `mezame init` with no arguments: ask for the bind address, then write
+/// the config.
 pub(crate) fn init_config() -> Result<Config> {
+    write_config(prompt_bind()?)
+}
+
+/// `mezame init --bind ADDR`: write the config for `addr` with no prompt,
+/// for a service unit or a container started before setup.
+///
+/// `addr` is held to the same check as the free-form prompt entry and is
+/// otherwise not parsed: an address that does not resolve fails at
+/// `TcpListener::bind` on the next start with the operating system's own
+/// message, which says more than a guess made here would.
+pub(crate) fn init_config_with_bind(addr: &str) -> Result<Config> {
+    validate_bind_entry(addr).map_err(|message| anyhow!(message))?;
+    write_config(addr.trim().to_string())
+}
+
+/// What follows `init` on the command line: nothing, or `--bind ADDR` in
+/// either of its two spellings.
+///
+/// Anything else is an error naming the token, so a typo is refused
+/// instead of dropping into the prompt. Pure, so it has tests.
+pub fn parse_init_args(args: &[String]) -> Result<Option<String>> {
+    let mut bind: Option<String> = None;
+    let mut tokens = args.iter();
+    while let Some(token) = tokens.next() {
+        let value = if token == "--bind" {
+            match tokens.next() {
+                Some(v) if !v.starts_with('-') => v.clone(),
+                _ => bail!("`--bind` needs an address, e.g. `mezame init --bind 0.0.0.0:9510`"),
+            }
+        } else if let Some(v) = token.strip_prefix("--bind=") {
+            v.to_string()
+        } else {
+            bail!(
+                "Unknown argument `{token}`. `mezame init` takes `--bind ADDR` and nothing else."
+            );
+        };
+        if bind.is_some() {
+            bail!("`--bind` given twice");
+        }
+        bind = Some(value);
+    }
+    Ok(bind)
+}
+
+/// The one prompt: the bind address, with the two common choices and a
+/// free-form entry.
+fn prompt_bind() -> Result<String> {
     // Transport prompt commented out while Cloudflared is the only
-    // implemented option. When Telegram ships, rewrite this to build the
-    // `transports` list interactively: ask for Cloudflared, offer to add
-    // another, loop. The single-choice block below is a record of what was
-    // there.
+    // implemented option. When a Telegram transport ships, rewrite this to
+    // build the `transports` list interactively: ask for Cloudflared, offer
+    // to add another, loop. The single-choice block below is a record of
+    // what was there.
     //
     // let transport_idx = Select::with_theme(&ColorfulTheme::default())
     //     .with_prompt("Which transport?")
@@ -121,7 +255,13 @@ pub(crate) fn init_config() -> Result<Config> {
             s.trim().to_string()
         }
     };
+    Ok(bind)
+}
 
+/// Write `~/.mezame/config.json` for `bind`, creating `~/.mezame`
+/// owner-only when it is absent, and return the config it holds. An
+/// existing file is replaced, the same as re-running the prompt.
+pub(crate) fn write_config(bind: String) -> Result<Config> {
     let cfg = Config {
         transports: vec![TransportConfig::Cloudflared {
             bind,
@@ -131,9 +271,10 @@ pub(crate) fn init_config() -> Result<Config> {
 
     let path = config_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_private_dir(parent).with_context(|| format!("Creating {}", parent.display()))?;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
+    write_private_atomic(&path, serde_json::to_string_pretty(&cfg)?.as_bytes(), true)
+        .with_context(|| format!("Writing {}", path.display()))?;
     println!("Wrote {}", path.display());
     println!();
     Ok(cfg)
@@ -154,7 +295,47 @@ pub fn validate_bind_entry(input: &str) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_bind_entry;
+    use super::{parse_init_args, validate_bind_entry};
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn init_takes_no_arguments_or_a_bind_address() {
+        assert_eq!(parse_init_args(&args(&[])).unwrap(), None);
+        assert_eq!(
+            parse_init_args(&args(&["--bind", "0.0.0.0:9510"])).unwrap(),
+            Some("0.0.0.0:9510".to_string())
+        );
+        assert_eq!(
+            parse_init_args(&args(&["--bind=127.0.0.1:9511"])).unwrap(),
+            Some("127.0.0.1:9511".to_string())
+        );
+        // An empty value is accepted here and refused by the bind check.
+        assert_eq!(
+            parse_init_args(&args(&["--bind", ""])).unwrap(),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn init_refuses_what_it_does_not_understand() {
+        for (refused, names) in [
+            (vec!["--bind"], "--bind"),
+            (vec!["--bind", "--other"], "--bind"),
+            (vec!["--bind", "a", "--bind", "b"], "twice"),
+            (vec!["--bogus"], "Unknown argument"),
+            (vec!["extra"], "Unknown argument"),
+            (vec!["--bind=a", "trailing"], "Unknown argument"),
+        ] {
+            let err = parse_init_args(&args(&refused)).unwrap_err().to_string();
+            assert!(
+                err.contains(names),
+                "{refused:?} should name {names:?}: {err}"
+            );
+        }
+    }
 
     #[test]
     fn an_empty_or_whitespace_entry_is_rejected() {

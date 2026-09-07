@@ -100,6 +100,9 @@ mezame init
 mezame
 ```
 
+`mezame init --bind 127.0.0.1:9510` writes the same file with no prompt, for a
+service unit or a container started before setup.
+
 Then point a browser at `http://127.0.0.1:9510` (or whatever address and port
 you set) to run locally, or at your public hostname once your tunnel is wired.
 
@@ -169,7 +172,9 @@ docker compose run --rm setup
 
 That runs `mezame init` interactively. **Choose `0.0.0.0:9510` at the bind
 prompt.** The default, `127.0.0.1:9510`, binds loopback inside the container,
-and a published port then answers nothing.
+and a published port then answers nothing. Without a terminal,
+`docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510` writes the
+same config with no prompt.
 
 Then:
 
@@ -237,9 +242,11 @@ resulting binary is missing its UI.
 The UI build needs Node.js 24 or newer. Check `node --version` and upgrade.
 
 **No config at `~/.mezame/config.json`**
-Run `mezame init`. It writes the file after one prompt. Run with no terminal
-attached (under a service manager, or in a container without a TTY), it exits
-non-zero and writes nothing.
+Run `mezame init`. It writes the file after one prompt. With no terminal
+attached (a service manager, `docker compose up -d`) it exits non-zero, writes
+nothing, and the manager restarts it until the file exists; the log names the
+way out. Run `mezame init --bind ADDR` once, as the account the service runs
+under, and start it again.
 
 **Browser connects, the composer is read-only**
 A turn is in flight on that session, started here or on another device. It

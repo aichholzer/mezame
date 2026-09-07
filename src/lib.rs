@@ -34,9 +34,11 @@ pub mod ws;
 #[cfg(unix)]
 pub mod unix;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
-use crate::config::{config_path, init_config, load_config, TransportConfig};
+use crate::config::{
+    config_path, init_config, init_config_with_bind, load_config, parse_init_args, TransportConfig,
+};
 use crate::http::run_cloudflared;
 
 /// Top-level CLI entry point. Synchronous because `init_config` reads
@@ -56,18 +58,32 @@ pub fn run() -> Result<()> {
             return Ok(());
         }
         Some("init") => {
-            init_config()?;
+            match parse_init_args(&args[2..])? {
+                None => init_config()?,
+                Some(bind) => init_config_with_bind(&bind)?,
+            };
             return Ok(());
         }
         _ => {}
     }
 
-    let cfg = if config_path()?.exists() {
+    let path = config_path()?;
+    let cfg = if path.exists() {
         load_config()?
     } else {
-        eprintln!("No config at {}", config_path()?.display());
+        eprintln!("No config at {}", path.display());
         eprintln!("Let's set one up:");
-        init_config()?
+        // The context stays true whatever stopped the setup: no terminal
+        // to ask on under a service manager, an interrupted prompt, or a
+        // directory that could not be written. Under `Restart=on-failure`
+        // this line is what the operator reads in the log.
+        init_config().with_context(|| {
+            format!(
+                "Setup did not complete. In a terminal, run `mezame init`; without one, \
+                 `mezame init --bind ADDR` writes {} with no prompt",
+                path.display()
+            )
+        })?
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -98,8 +114,9 @@ USAGE:
     mezame [SUBCOMMAND]
 
 SUBCOMMANDS:
-    init        Run interactive setup and write ~/.mezame/config.json
-    (none)      Load the saved config and start serving
+    init                 Run interactive setup and write ~/.mezame/config.json
+    init --bind ADDR     Write ~/.mezame/config.json for ADDR with no prompt
+    (none)               Load the saved config and start serving
 
 FLAGS:
     -h, --help      Print this message

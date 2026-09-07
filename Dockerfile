@@ -9,6 +9,8 @@
 # First run, one-off setup:
 #   docker compose run --rm setup
 #   # answer the bind prompt with 0.0.0.0:9510
+#   # or, with no terminal:
+#   docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510
 #
 # Subsequent runs:
 #   docker compose up -d

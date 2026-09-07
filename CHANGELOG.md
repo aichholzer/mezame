@@ -50,6 +50,20 @@ with an echo, on every attached browser at once.
 - `cargo install mezame` still installs 0.13.4 from crates.io. This alpha
   installs from the `feature/harness` branch.
 
+### Added
+
+- `mezame init --bind ADDR` writes `~/.mezame/config.json` with no prompt,
+  for a service unit or a container started before setup. A missing config
+  under a service manager now logs that command as the way out. `mezame
+  init` refuses arguments it does not know instead of dropping into the
+  prompt.
+
+### Fixed
+
+- Two browsers syncing `state.json` at the same moment no longer race on
+  one temporary file; one of them used to get a 500, and a fresh page load
+  then restored nothing until the next sync.
+
 ### Removed
 
 - The `?cwd=` query parameter on `/ws`. A session opens against Mezame's
@@ -84,6 +98,13 @@ with an echo, on every attached browser at once.
   forever on exit. Such a peer is now disconnected and the writer is
   aborted after a 5-second drain; a live browser that trips the limit
   reconnects and reloads its transcript.
+- `~/.mezame` is created owner-only and `config.json` and `state.json`
+  are written `0600`, each through a fresh temporary sibling renamed into
+  place. A directory an earlier release created keeps its mode. Two
+  consequences: a symlink at either file is replaced rather than written
+  through, and the directory must be writable by the account Mezame runs
+  as, not only the file. The first failed state write is reported on
+  stderr, where it used to fail in silence.
 - A connection that sends no request head, or that idles between
   requests, is closed after 30 seconds. hyper's own default, which
   `axum::serve` had silently disabled by setting no timer, so an idle

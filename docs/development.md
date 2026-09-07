@@ -62,7 +62,12 @@ the test binaries that declare `mod support;` and into nothing else.
 Notable coverage already in place:
 
 - **Config paths and load.** `tests/config_paths.rs` covers `config_path`,
-  `state_path`, and `load_config` including the error branches.
+  `state_path`, and `load_config` including the error branches;
+  `tests/config_compat.rs` pins that a 0.13.x file loads unchanged and serves
+  its bind; `tests/config_fs.rs` covers the owner-only directory and file
+  writers; `tests/cli_init.rs` covers `mezame init --bind`; and
+  `tests/http_state_writes.rs` covers `/state` under concurrent and failing
+  writes.
 - **The seam.** `tests/backend.rs` covers the shipped `EchoBackend`, the echo
   text derivation, the session id form, and the upgrade decision. Session id
   uniqueness is bounded past one process run, so that case re-executes its own
