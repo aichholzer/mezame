@@ -13,16 +13,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use mezame::config::{Config, TransportConfig};
 use mezame::http::{build_router, AppState};
-use mezame::hub::HubRegistry;
-use serde_json::Value;
-use tokio::net::TcpListener;
+use mezame::hub::{HubRegistry, MAX_PROMPT_TEXT_BYTES};
+use mezame::ws::MAX_WS_MESSAGE_BYTES;
+use serde_json::{json, Value};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Notify};
 use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// A router serving on an ephemeral port, with the state it was built
 /// from so a case can inspect the registry.
@@ -55,23 +58,41 @@ async fn serve() -> Server {
     Server { addr, state }
 }
 
-/// Connect to `path` and return the first text frame as JSON.
-async fn first_frame(server: &Server, path: &str) -> Value {
+/// Connect to `path` as a browser would.
+async fn connect(server: &Server, path: &str) -> Socket {
     let url = format!("ws://{}{path}", server.addr);
-    let (mut socket, _response) = timeout(Duration::from_secs(5), connect_async(&url))
+    let (socket, _response) = timeout(Duration::from_secs(5), connect_async(&url))
         .await
         .expect("the handshake completes within 5s")
         .expect("the handshake is accepted");
+    socket
+}
+
+/// The next text frame on `socket` as JSON, within five seconds.
+async fn next_text(socket: &mut Socket) -> Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         let Ok(Some(Ok(message))) = timeout(Duration::from_secs(5), socket.next()).await else {
             break;
         };
         if let Message::Text(text) = message {
-            return serde_json::from_str(&text).expect("the first text frame is JSON");
+            return serde_json::from_str(&text).expect("a text frame is JSON");
         }
     }
-    panic!("no text frame arrived on {path}");
+    panic!("no text frame arrived");
+}
+
+/// Connect to `path` and return the first text frame as JSON.
+async fn first_frame(server: &Server, path: &str) -> Value {
+    let mut socket = connect(server, path).await;
+    next_text(&mut socket).await
+}
+
+/// A `prompt` command holding one text block of `text`.
+fn prompt_frame(text: &str) -> Message {
+    Message::Text(
+        json!({ "type": "prompt", "blocks": [{ "type": "text", "text": text }] }).to_string(),
+    )
 }
 
 #[tokio::test]
@@ -181,4 +202,94 @@ async fn two_attaches_naming_one_id_share_a_hub_over_real_sockets() {
         "one value per process"
     );
     assert_eq!(second["busy"], false);
+}
+
+#[tokio::test]
+async fn a_message_past_the_ceiling_ends_the_connection_and_spares_the_session() {
+    // The library default of 64 MiB is gone. A frame announcing more than
+    // MAX_WS_MESSAGE_BYTES is refused before its payload is read, the
+    // connection ends with nothing broadcast, and a reconnect finds the
+    // session as it was.
+    let server = serve().await;
+    let mut socket = connect(&server, "/ws").await;
+    let ready = next_text(&mut socket).await;
+    let session_id = ready["sessionId"]
+        .as_str()
+        .expect("a sessionId")
+        .to_string();
+
+    // The JSON around the text pushes the message over the ceiling.
+    let oversize = prompt_frame(&"a".repeat(MAX_WS_MESSAGE_BYTES));
+    // The send may fail part-way: the server closes as soon as it has
+    // read the frame header, which is the point.
+    let _ = timeout(Duration::from_secs(10), socket.send(oversize)).await;
+
+    let ended = timeout(Duration::from_secs(10), async {
+        loop {
+            match socket.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break true,
+                Some(Ok(Message::Text(text))) => {
+                    eprintln!("unexpected frame after an oversize message: {text}");
+                    break false;
+                }
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("the connection settles within 10s");
+    assert!(
+        ended,
+        "the server ends the connection and sends nothing else on it"
+    );
+
+    // The session is untouched: still registered, and a reconnect joins it.
+    assert!(server.state.hubs.is_registered_for_test(&session_id).await);
+    let again = first_frame(&server, &format!("/ws?session={session_id}")).await;
+    assert_eq!(again["type"], "ready");
+    assert_eq!(again["sessionId"], session_id);
+    assert_eq!(
+        again["busy"], false,
+        "no turn was started by the refused frame"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_past_the_text_ceiling_is_answered_with_an_error_over_a_real_socket() {
+    // Inside the message ceiling but past the prompt text ceiling: the
+    // hub answers the sender with one `error`, the attach loop forwards it
+    // because it is stamped for this attach, no echo follows, and the
+    // session takes the next prompt.
+    let server = serve().await;
+    let mut socket = connect(&server, "/ws").await;
+    let ready = next_text(&mut socket).await;
+    assert_eq!(ready["type"], "ready");
+
+    socket
+        .send(prompt_frame(&"t".repeat(MAX_PROMPT_TEXT_BYTES + 1)))
+        .await
+        .expect("a message inside the ceiling is accepted");
+    let error = next_text(&mut socket).await;
+    assert_eq!(error["type"], "error");
+    assert!(error["message"]
+        .as_str()
+        .is_some_and(|m| m.contains(&MAX_PROMPT_TEXT_BYTES.to_string())));
+    assert!(
+        error["_target"].is_u64(),
+        "delivered because it is stamped for this attach"
+    );
+
+    socket
+        .send(prompt_frame("hello"))
+        .await
+        .expect("the next prompt is sent");
+    let echo = next_text(&mut socket).await;
+    assert_eq!(echo["type"], "append");
+    assert_eq!(echo["role"], "user");
+    assert_eq!(echo["text"], "> hello\n");
+    let reply = next_text(&mut socket).await;
+    assert_eq!(reply["role"], "agent");
+    assert_eq!(reply["text"], "hello");
+    let done = next_text(&mut socket).await;
+    assert_eq!(done["type"], "prompt_done");
 }

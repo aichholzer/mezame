@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use mezame::backend::{extract_user_text, user_echo_event, Backend, EchoBackend};
+use mezame::backend::{extract_user_text, user_echo_event, user_text_len, Backend, EchoBackend};
 use mezame::ws::{decide_session, is_session_id, new_session_id, SessionDecision};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -378,4 +378,119 @@ fn minted_session_ids_never_collide_within_or_across_process_runs() {
         first.is_disjoint(&second),
         "no id is shared between two process runs"
     );
+}
+
+#[tokio::test]
+async fn echo_transcript_evicts_the_oldest_turns_past_its_byte_budget() {
+    // A turn of 100 bytes of text records 200 bytes. Ten turns against a
+    // 1000-byte budget keep the newest five: the oldest go first, a turn
+    // at a time, and what remains is contiguous, in order, and inside the
+    // budget, with timestamps still non-decreasing.
+    let backend = EchoBackend::with_budget(1000, usize::MAX);
+    for i in 0..10 {
+        let text = format!("{i:0>100}");
+        run_turn(&backend, vec![json!({ "type": "text", "text": text })]).await;
+    }
+    let entries = transcript_json(&backend).await;
+    assert_eq!(entries.len(), 10, "five turns of two entries");
+    assert_eq!(entries[0]["role"], "user");
+    assert_eq!(
+        entries[0]["text"],
+        format!("{:0>100}", 5),
+        "the oldest retained turn is the sixth"
+    );
+    assert_eq!(entries[9]["role"], "agent");
+    assert_eq!(entries[9]["text"], format!("{:0>100}", 9));
+    let total: usize = entries
+        .iter()
+        .map(|e| e["text"].as_str().expect("text").len())
+        .sum();
+    assert!(total <= 1000, "inside the budget, got {total}");
+    let timestamps: Vec<i64> = entries
+        .iter()
+        .map(|e| e["timestamp"].as_i64().expect("timestamp"))
+        .collect();
+    assert!(timestamps.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[tokio::test]
+async fn echo_transcript_always_keeps_the_newest_turn() {
+    // A single turn larger than the whole budget is retained on its own,
+    // and the next turn replaces it rather than joining it.
+    let backend = EchoBackend::with_budget(100, usize::MAX);
+    run_turn(
+        &backend,
+        vec![json!({ "type": "text", "text": "a".repeat(300) })],
+    )
+    .await;
+    let entries = transcript_json(&backend).await;
+    assert_eq!(entries.len(), 2, "the oversize turn is kept");
+    assert_eq!(entries[0]["text"].as_str().map(str::len), Some(300));
+
+    run_turn(
+        &backend,
+        vec![json!({ "type": "text", "text": "b".repeat(300) })],
+    )
+    .await;
+    let entries = transcript_json(&backend).await;
+    assert_eq!(entries.len(), 2, "the older oversize turn is evicted");
+    assert!(entries[0]["text"]
+        .as_str()
+        .is_some_and(|t| t.starts_with('b')));
+}
+
+#[tokio::test]
+async fn echo_transcript_evicts_past_its_entry_ceiling() {
+    // Empty prompts add two entries and no bytes; the entry ceiling is
+    // what bounds them.
+    let backend = EchoBackend::with_budget(usize::MAX, 6);
+    for _ in 0..5 {
+        run_turn(&backend, vec![json!({ "type": "text", "text": "" })]).await;
+    }
+    assert_eq!(transcript_json(&backend).await.len(), 6);
+}
+
+#[tokio::test]
+async fn echo_shipped_ceilings_are_the_documented_ones() {
+    // The constants the wire protocol document quotes.
+    assert_eq!(mezame::backend::TRANSCRIPT_BUDGET_BYTES, 16 * 1024 * 1024);
+    assert_eq!(mezame::backend::TRANSCRIPT_MAX_ENTRIES, 10_000);
+    assert_eq!(mezame::hub::MAX_PROMPT_TEXT_BYTES, 1024 * 1024);
+    assert_eq!(mezame::ws::MAX_WS_MESSAGE_BYTES, 32 * 1024 * 1024);
+    // And `new` runs under them: a small transcript is untouched.
+    let backend = EchoBackend::new();
+    run_turn(&backend, vec![json!({ "type": "text", "text": "hi" })]).await;
+    assert_eq!(transcript_json(&backend).await.len(), 2);
+}
+
+#[test]
+fn user_text_len_matches_the_derived_text() {
+    // The hub's ceiling check must measure exactly what the echo and the
+    // transcript are defined against, without building the join.
+    let cases: Vec<Vec<Value>> = vec![
+        vec![],
+        vec![json!({ "type": "image", "mimeType": "image/png", "data": "AAAA" })],
+        vec![json!({ "type": "text", "text": "" })],
+        vec![
+            json!({ "type": "text", "text": "" }),
+            json!({ "type": "text", "text": "" }),
+        ],
+        vec![
+            json!({ "type": "text", "text": "one" }),
+            json!({ "type": "text", "text": "two" }),
+        ],
+        vec![
+            json!({ "type": "text", "text": "a" }),
+            json!({ "type": "resource", "resource": { "uri": "file:///x", "text": "no" } }),
+            json!({ "type": "text", "text": "日本語" }),
+        ],
+        vec![
+            json!({ "type": "text" }),
+            json!({ "type": "text", "text": 5 }),
+        ],
+    ];
+    for blocks in cases {
+        let derived = extract_user_text(&blocks).map_or(0, |t| t.len());
+        assert_eq!(user_text_len(&blocks), derived, "{blocks:?}");
+    }
 }

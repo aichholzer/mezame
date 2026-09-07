@@ -51,6 +51,11 @@ with an echo, on every attached browser at once.
 
 ### Security
 
+- Three ceilings bound what one browser can put into memory: 32 MiB per
+  WebSocket message (the library default was 64 MiB), 1 MiB of text per
+  prompt (refused to its sender with an `error` frame), and 16 MiB or
+  10,000 entries per transcript (the oldest turn evicted first). See the
+  Limits section of the wire protocol document.
 - A permission answer reaches the Backend only for a request the Backend
   raised in the turn in flight, and only the first answer does. The hub
   no longer remembers every id a browser answers with.

@@ -65,7 +65,9 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
 use tokio::time::{Instant, Sleep};
 
-use crate::backend::{user_echo_event, Backend, EchoBackend, HistoryEntry, TurnOutcome};
+use crate::backend::{
+    user_echo_event, user_text_len, Backend, EchoBackend, HistoryEntry, TurnOutcome,
+};
 
 /// How long a session stays warm after the last browser detaches. 30s
 /// matches the WS reconnect-backoff cap on the client. A browser coming
@@ -121,6 +123,17 @@ static NEXT_ATTACH_ID: AtomicU64 = AtomicU64::new(1);
 /// longer a momentary backlog. A streamed turn bursts at a few hundred
 /// events at most.
 const BROADCAST_CAPACITY: usize = 1024;
+
+/// Ceiling on the text of one prompt, 1 MiB.
+///
+/// The text is what a turn puts into memory beyond the turn itself: the
+/// echo in the broadcast ring, where the last `BROADCAST_CAPACITY` events
+/// stay until overwritten, and the transcript. Attachments are not text;
+/// the message ceiling in `ws` bounds them, and they are held for the
+/// turn alone. A prompt past this ceiling is refused to its sender with
+/// an `error` frame and nothing else happens: no echo, no turn slot, no
+/// Backend call.
+pub const MAX_PROMPT_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Capacity of the per-hub command inbox. Each browser sends commands at
 /// user pace, and the loop drains them as fast as the Backend accepts.
@@ -995,6 +1008,22 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
     match cmd {
         HubCommand::Prompt { blocks, attach_id } => {
             if blocks.is_empty() {
+                return;
+            }
+            let text_len = user_text_len(&blocks);
+            if text_len > MAX_PROMPT_TEXT_BYTES {
+                // Refused ahead of the claim and the echo, so no composer
+                // locks and no peer sees a turn start. Stamped for the
+                // sender: that browser renders the error and unlocks its
+                // composer, and every other attach drops the frame.
+                let _ = ctx.outbound.send(Arc::new(json!({
+                    "type": "error",
+                    "message": format!(
+                        "The prompt holds {text_len} bytes of text; the limit is \
+                         {MAX_PROMPT_TEXT_BYTES} bytes."
+                    ),
+                    "_target": attach_id
+                })));
                 return;
             }
             // The claim, the echo and the spawn hold no await between

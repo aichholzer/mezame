@@ -11,6 +11,7 @@
 //! [`EchoBackend`] is the implementation this build ships. It answers every
 //! prompt with the text it was given and talks to no provider.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
@@ -93,7 +94,11 @@ pub trait Backend: Send + Sync + 'static {
     /// only key is `models`.
     fn set_model(&self, model_id: String) -> BoxFuture<'_, Result<Value>>;
 
-    /// Report the transcript, in recorded order, with no cap.
+    /// Report the transcript, in recorded order.
+    ///
+    /// An implementation bounds what it retains and reports the retained
+    /// window. A transcript lives in memory for the life of its hub, and
+    /// one with no bound is one a browser can grow at wire speed.
     fn history(&self) -> BoxFuture<'_, Vec<HistoryEntry>>;
 
     /// Release everything this Backend holds. Idempotent.
@@ -243,6 +248,24 @@ pub fn extract_user_text(blocks: &[Value]) -> Option<String> {
     }
 }
 
+/// The byte length of the text [`extract_user_text`] derives for
+/// `blocks`, with no allocation: the text blocks' lengths plus one for
+/// each newline the join inserts. Zero for a list with no text block.
+pub fn user_text_len(blocks: &[Value]) -> usize {
+    let mut total = 0;
+    let mut texts = 0usize;
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            total += text.len();
+            texts += 1;
+        }
+    }
+    total + texts.saturating_sub(1)
+}
+
 /// The hub-owned user echo, defined in terms of [`extract_user_text`].
 ///
 /// `text` is the derived join, prefixed once with `> `, followed by one
@@ -269,6 +292,23 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Ceiling on the text an [`EchoBackend`] transcript retains, 16 MiB.
+///
+/// A transcript lives in memory for the life of its hub, and every turn
+/// adds the prompt's text twice: once as the user entry, once as the
+/// echoed reply. Past the ceiling the oldest turn is evicted, a turn at a
+/// time, until the transcript fits again; the newest turn is always kept.
+/// The transcript therefore holds the most recent conversation and never
+/// more than this much text plus the newest turn. Against the hub's 1 MiB
+/// prompt text ceiling that is at least eight turns of the largest
+/// prompt, and thousands of ordinary ones.
+pub const TRANSCRIPT_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on the entries an [`EchoBackend`] transcript retains, 10,000,
+/// which is 5,000 turns. Bytes alone would let a run of empty prompts
+/// grow the entry count without bound.
+pub const TRANSCRIPT_MAX_ENTRIES: usize = 10_000;
+
 /// The Backend this build ships: it answers every prompt with the text it
 /// was given.
 ///
@@ -277,15 +317,84 @@ fn now_ms() -> i64 {
 /// device at once, with the transcript surviving a reload for as long as
 /// the hub does. No provider is contacted and no model is selectable.
 pub struct EchoBackend {
-    transcript: Mutex<Vec<HistoryEntry>>,
+    transcript: Mutex<Transcript>,
 }
 
 impl EchoBackend {
-    /// A fresh Backend with an empty transcript. One per hub.
+    /// A fresh Backend with an empty transcript under the shipped
+    /// ceilings, [`TRANSCRIPT_BUDGET_BYTES`] and
+    /// [`TRANSCRIPT_MAX_ENTRIES`]. One per hub.
     pub fn new() -> Self {
+        Self::with_budget(TRANSCRIPT_BUDGET_BYTES, TRANSCRIPT_MAX_ENTRIES)
+    }
+
+    /// A fresh Backend whose transcript is held under `budget_bytes` of
+    /// entry text and `max_entries` entries.
+    pub fn with_budget(budget_bytes: usize, max_entries: usize) -> Self {
         Self {
-            transcript: Mutex::new(Vec::new()),
+            transcript: Mutex::new(Transcript::new(budget_bytes, max_entries)),
         }
+    }
+}
+
+/// The entries an [`EchoBackend`] retains, the running byte count, and
+/// the two ceilings they are held under.
+struct Transcript {
+    entries: VecDeque<HistoryEntry>,
+    /// The sum of [`entry_text_len`] over `entries`.
+    bytes: usize,
+    budget_bytes: usize,
+    max_entries: usize,
+}
+
+impl Transcript {
+    fn new(budget_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            budget_bytes,
+            max_entries,
+        }
+    }
+
+    /// Append one turn's two entries, then evict the oldest turns until
+    /// the transcript is inside both ceilings again. The turn just
+    /// recorded is never evicted, so a single turn larger than the whole
+    /// budget is retained on its own.
+    fn record_turn(&mut self, user: HistoryEntry, agent: HistoryEntry) {
+        self.bytes += entry_text_len(&user) + entry_text_len(&agent);
+        self.entries.push_back(user);
+        self.entries.push_back(agent);
+        while self.entries.len() > 2
+            && (self.bytes > self.budget_bytes || self.entries.len() > self.max_entries)
+        {
+            // Entries are recorded in pairs, so the front two are one
+            // turn.
+            for _ in 0..2 {
+                if let Some(evicted) = self.entries.pop_front() {
+                    self.bytes -= entry_text_len(&evicted);
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
+
+/// The bytes an entry's text occupies, which is what the transcript
+/// budget counts. An echo transcript holds text entries only; the
+/// tool-call arm measures the serialised call so the count stays honest
+/// should one ever be recorded.
+fn entry_text_len(entry: &HistoryEntry) -> usize {
+    match &entry.body {
+        EntryBody::User { text }
+        | EntryBody::Agent { text }
+        | EntryBody::Sys { text }
+        | EntryBody::Thought { text } => text.len(),
+        EntryBody::ToolCall(call) => serde_json::to_vec(call).map_or(0, |v| v.len()),
     }
 }
 
@@ -315,17 +424,20 @@ impl Backend for EchoBackend {
             // steps backwards does.
             {
                 let mut transcript = self.transcript.lock().expect("transcript lock");
-                let timestamp = now_ms().max(transcript.last().map_or(i64::MIN, |e| e.timestamp));
-                transcript.push(HistoryEntry {
-                    body: EntryBody::User { text: user_text },
-                    timestamp,
-                });
-                transcript.push(HistoryEntry {
-                    body: EntryBody::Agent {
-                        text: reply.clone(),
+                let timestamp =
+                    now_ms().max(transcript.entries.back().map_or(i64::MIN, |e| e.timestamp));
+                transcript.record_turn(
+                    HistoryEntry {
+                        body: EntryBody::User { text: user_text },
+                        timestamp,
                     },
-                    timestamp,
-                });
+                    HistoryEntry {
+                        body: EntryBody::Agent {
+                            text: reply.clone(),
+                        },
+                        timestamp,
+                    },
+                );
             }
 
             // A send failure means the Hub has closed the channel, which
@@ -356,7 +468,15 @@ impl Backend for EchoBackend {
     }
 
     fn history(&self) -> BoxFuture<'_, Vec<HistoryEntry>> {
-        Box::pin(async move { self.transcript.lock().expect("transcript lock").clone() })
+        Box::pin(async move {
+            self.transcript
+                .lock()
+                .expect("transcript lock")
+                .entries
+                .iter()
+                .cloned()
+                .collect()
+        })
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {

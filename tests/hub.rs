@@ -13,7 +13,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mezame::hub::{HubCommand, HubRegistry};
+use mezame::hub::{HubCommand, HubRegistry, MAX_PROMPT_TEXT_BYTES};
 use serde_json::{json, Value};
 use support::{Invocation, Release, Resolution, ScriptedBackend, ScriptedTurn};
 use tokio::sync::broadcast;
@@ -1404,4 +1404,95 @@ async fn model_changes_run_one_at_a_time_and_the_latest_request_runs_next() {
         .await
         .expect("the reply for d");
     assert_eq!(frame["info"]["models"]["currentModelId"], "d");
+}
+
+#[tokio::test]
+async fn a_prompt_past_the_text_ceiling_is_refused_to_its_sender_alone() {
+    // One `error` stamped for the sender and nothing else: no echo, no
+    // turn slot, no Backend call. The session takes the next prompt, and
+    // a prompt exactly at the ceiling is accepted.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new());
+    let mut sender = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+    let mut peer = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("hub registered");
+
+    let too_long = "x".repeat(MAX_PROMPT_TEXT_BYTES + 1);
+    sender
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block(&too_long)],
+            attach_id: sender.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+
+    let frame = next_event(&mut sender.outbound).await.expect("the refusal");
+    assert_eq!(frame["type"], "error");
+    assert_eq!(
+        frame["_target"].as_u64(),
+        Some(sender.attach_id),
+        "stamped for the sender"
+    );
+    assert!(
+        frame["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&MAX_PROMPT_TEXT_BYTES.to_string())),
+        "the message names the ceiling: {}",
+        frame["message"]
+    );
+    // The peer receives the same stamped frame on the broadcast; the
+    // attach loop is what drops it there.
+    assert_eq!(next_event(&mut peer.outbound).await.as_ref(), Some(&frame));
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        sender.outbound.try_recv().is_err(),
+        "no echo and no prompt_done follow"
+    );
+    assert_eq!(backend.prompt_count(), 0, "no Backend call");
+    let after = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("hub registered");
+    assert_eq!(
+        after.snapshot_ready["busy"], false,
+        "no turn slot was claimed"
+    );
+
+    // Two text blocks whose join is one byte over: the join's newline
+    // counts.
+    let half = "y".repeat(MAX_PROMPT_TEXT_BYTES / 2);
+    sender
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block(&half), text_block(&half)],
+            attach_id: sender.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let frame = next_event(&mut sender.outbound)
+        .await
+        .expect("the refusal of the join");
+    assert_eq!(frame["type"], "error");
+    assert_eq!(backend.prompt_count(), 0);
+
+    // Exactly at the ceiling is accepted and runs.
+    backend.push_turn(ScriptedTurn::success(vec![agent_append("ok")]));
+    let at_limit = "z".repeat(MAX_PROMPT_TEXT_BYTES);
+    sender
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block(&at_limit)],
+            attach_id: sender.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let seen = collect_until(&mut sender.outbound, "prompt_done").await;
+    assert!(seen.iter().any(|e| e["type"] == "prompt_done"));
+    assert_eq!(backend.prompt_count(), 1, "the prompt at the ceiling ran");
 }

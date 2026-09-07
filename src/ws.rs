@@ -51,6 +51,18 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 /// is never reclaimed. See GitHub issue #4.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Ceiling on one inbound WebSocket message, 32 MiB.
+///
+/// The composer sends a prompt as one text frame holding its blocks, with
+/// attachments inline as base64. The browser allows 20 MB of attachments
+/// per prompt (`MAX_TOTAL_BYTES` in `ui/src/lib/attachments.ts`), which
+/// base64 renders as a little under 27 MiB, and the headroom above that
+/// holds the text and the JSON around it. A frame announcing more than
+/// this ends the connection with a protocol error before its payload is
+/// read; the library default of 64 MiB no longer applies. The browser
+/// reconnects to the same session, which is untouched.
+pub const MAX_WS_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Mint a session id: 16 bytes of OS entropy rendered as 32 lowercase
 /// hexadecimal characters.
 ///
@@ -130,11 +142,13 @@ pub(crate) async fn ws_upgrade(
             return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
         }
     };
-    ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws(socket, state, session_id).await {
-            eprintln!("WebSocket session ended: {e:?}");
-        }
-    })
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = handle_ws(socket, state, session_id).await {
+                eprintln!("WebSocket session ended: {e:?}");
+            }
+        })
 }
 
 /// Serialise a JSON value into a WS text frame.
@@ -387,7 +401,9 @@ fn parse_browser_command(v: &Value, attach_id: u64) -> Option<crate::hub::HubCom
         _ => None,
     };
     if parsed.is_none() {
-        eprintln!("Discarded a `{command_type}` frame");
+        // Debug-formatted: the value is the peer's, and a raw write would
+        // let it put line breaks and control characters into the log.
+        eprintln!("Discarded a {command_type:?} frame");
     }
     parsed
 }

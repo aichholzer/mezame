@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use axum::extract::ws::Message;
 use mezame::backend::{
-    extract_user_text, user_echo_event, Backend, EchoBackend, EntryBody, HistoryEntry, ToolCall,
-    ToolCallStatus, ToolContent, ToolLocation,
+    extract_user_text, user_echo_event, user_text_len, Backend, EchoBackend, EntryBody,
+    HistoryEntry, ToolCall, ToolCallStatus, ToolContent, ToolLocation,
 };
 use mezame::hub::{AttachedHub, HubCommand, HubRegistry};
 use mezame::ws::{decide_session, is_session_id, new_session_id, run_attach_loop, SessionDecision};
@@ -927,6 +927,11 @@ proptest! {
                 extract_user_text(&blocks),
                 if has_text { Some(join.clone()) } else { None },
                 "the derivation takes text blocks only"
+            );
+            prop_assert_eq!(
+                user_text_len(&blocks),
+                extract_user_text(&blocks).map_or(0, |t| t.len()),
+                "the hub's ceiling check measures the derived text without building it"
             );
 
             let echo = user_echo_event(&blocks);

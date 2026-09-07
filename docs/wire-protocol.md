@@ -170,8 +170,11 @@ byte for byte.
 A tool-call entry is the `tool_call` event with `type` renamed to `role` and a
 `timestamp` added, with the same nullability in every field.
 
-Entries come back in recorded order, with no cap and no pagination. An absent
-or empty `session` answers 400 with a plain-text body. An id with no live
+Entries come back in recorded order, with no pagination. The transcript is
+bounded: the shipped Backend retains at most 16 MiB of entry text and 10,000
+entries, evicting the oldest turn first and always keeping the newest, so a
+long conversation returns its most recent window. An absent or empty `session`
+answers 400 with a plain-text body. An id with no live
 session answers 200 with an empty array, and creates nothing; that covers a
 value holding `/`, `\` or `..`, since no such value is ever bound to a session.
 The endpoint answers 200 or 400 and nothing else. It reads no file and never
@@ -180,6 +183,23 @@ consults `HOME`.
 A transcript lives as long as its session, which outlives the last browser by
 the grace window and no longer. A reload inside that window shows the
 conversation; one after it shows an empty log.
+
+## Limits
+
+Three ceilings bound what one browser can put into Mezame's memory. None of
+them is reachable from the composer in ordinary use.
+
+- One inbound WebSocket message is at most 32 MiB. The browser allows 20 MB of
+  attachments per prompt, which base64 renders as a little under 27 MiB, and
+  the rest is headroom for the text and the JSON around it. A frame announcing
+  more ends the connection before its payload is read; the browser reconnects
+  and the session is untouched.
+- The text of one prompt, the text blocks joined, is at most 1 MiB. A prompt
+  past that is answered with an `error` frame delivered to its sender alone,
+  and nothing else happens: no echo, no turn, no Backend call. Attachments are
+  not text; the message ceiling bounds them.
+- A transcript retains at most 16 MiB of entry text and 10,000 entries, the
+  oldest turn evicted first and the newest always kept.
 
 ## Session identity
 
