@@ -318,6 +318,13 @@ const CHILD_MODE: &str = "MEZAME_SESSION_ID_MINT_CHILD";
 /// figure.
 const MINT_COUNT: usize = 10_000;
 
+/// Each id the child prints sits behind this prefix on a line of its own.
+/// libtest's single-threaded formatter leaves its `test <name> ... `
+/// progress line open when the body starts, so the child also opens with
+/// a newline. Without both, the first id is glued to that line, the
+/// filter in the parent drops it, and the run comes up one short.
+const ID_LINE: &str = "minted:";
+
 #[test]
 fn minted_session_ids_never_collide_within_or_across_process_runs() {
     // Requirement 6 criterion 6 bounds uniqueness past a single process
@@ -327,8 +334,10 @@ fn minted_session_ids_never_collide_within_or_across_process_runs() {
     // re-executes its own binary twice with an environment guard. No new
     // binary surface, no filesystem state, no fresh checkout between runs.
     if std::env::var_os(CHILD_MODE).is_some() {
-        let mut out = String::with_capacity(MINT_COUNT * 33);
+        let mut out = String::with_capacity(1 + MINT_COUNT * (ID_LINE.len() + 33));
+        out.push('\n');
         for _ in 0..MINT_COUNT {
+            out.push_str(ID_LINE);
             out.push_str(&new_session_id());
             out.push('\n');
         }
@@ -351,11 +360,12 @@ fn minted_session_ids_never_collide_within_or_across_process_runs() {
             String::from_utf8_lossy(&output.stderr)
         );
         // The child's stdout carries libtest's own progress lines too.
-        // Keep the lines that are a minted id and nothing else.
+        // Keep what sits behind the prefix, and nothing else; the checks
+        // below hold every kept line to the minted form.
         String::from_utf8(output.stdout)
             .expect("the child prints UTF-8")
             .lines()
-            .filter(|line| line.len() == 32 && line.bytes().all(|b| b.is_ascii_hexdigit()))
+            .filter_map(|line| line.strip_prefix(ID_LINE))
             .map(str::to_string)
             .collect()
     };

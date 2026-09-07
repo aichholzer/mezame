@@ -1,17 +1,17 @@
 //! Regression test for `mezame::unix::reap_session`. Linux-only.
 //!
-//! Reproduces the production leak that the process-group kill alone could
-//! not fix: an MCP server launched by the agent through `npx`/`npm` forks
-//! into its OWN process group and keeps the agent's SESSION id. A
-//! `kill(-pgid)` on the agent's process group never reaches it. On the
-//! agent's death it reparents to PID 1 and survives, piling up until the
-//! service cgroup is throttled.
+//! Reproduces the leak that a process-group kill alone cannot fix: an MCP
+//! server launched through `npx`/`npm` by a child Mezame started as its
+//! own session leader forks into its OWN process group and keeps the
+//! leader's SESSION id. A `kill(-pgid)` on the leader's process group
+//! never reaches it. On the leader's death it reparents to PID 1 and
+//! survives, piling up until the service cgroup is throttled.
 //!
 //! The model here is exact: a session leader (its own direct child) spawns
 //! a grandchild that `setpgid`s into a fresh process group and stays in
 //! the leader's session, the "escapee". The tests then show a group kill
-//! missing the escapee, and `reap_session` (called by `Agent::shutdown`
-//! after the group kill) reaping it.
+//! missing the escapee, and `reap_session`, run after the group kill on
+//! teardown, reaping it.
 //!
 //! The whole reproduction is Linux-specific (procfs plus the session
 //! walk). The file compiles to nothing on other targets, where
@@ -193,8 +193,8 @@ fn reap_session_kills_escapee_that_group_kill_misses() {
         "regression guard: the group kill alone must miss the escapee"
     );
 
-    // The fix: sweep the whole session. `Agent::shutdown` now does that
-    // right after the group kill.
+    // The fix: sweep the whole session, which a teardown runs right after
+    // the group kill.
     reap_session(sid);
 
     assert!(

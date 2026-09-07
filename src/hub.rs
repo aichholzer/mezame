@@ -321,6 +321,31 @@ impl HubRegistry {
     /// none is. Always returns an `AttachedHub` whose `Drop` decrements
     /// the counter.
     pub async fn attach_or_create(&self, session_id: &str) -> Result<AttachedHub> {
+        self.attach_or_create_parked(session_id, std::future::ready(()))
+            .await
+    }
+
+    /// Test-only: `attach_or_create` with `park` awaited after the per-id
+    /// gate is taken and before the hub is built. A case can hold the
+    /// first arrival inside the build window while a second arrival
+    /// reaches the gate, which is the interleaving Requirement 6 criterion
+    /// 4 describes and one a single-threaded scheduler never produces on
+    /// its own: the first arrival builds, registers and subscribes in one
+    /// poll, and the second always finds the hub on the fast path.
+    #[doc(hidden)]
+    pub async fn attach_or_create_parked_for_test(
+        &self,
+        session_id: &str,
+        park: impl std::future::Future<Output = ()>,
+    ) -> Result<AttachedHub> {
+        self.attach_or_create_parked(session_id, park).await
+    }
+
+    async fn attach_or_create_parked(
+        &self,
+        session_id: &str,
+        park: impl std::future::Future<Output = ()>,
+    ) -> Result<AttachedHub> {
         // Fast path: a hub is already registered under this id.
         if let Some(hub) = self.lookup(session_id).await {
             return Ok(self.subscribe(hub).await);
@@ -340,6 +365,7 @@ impl HubRegistry {
                     .clone()
             };
             let _guard = key_mutex.lock().await;
+            park.await;
 
             // Re-check now that the gate is held: the first arrival
             // registered its hub before releasing.

@@ -16,7 +16,7 @@ use std::time::Duration;
 use mezame::hub::{HubCommand, HubRegistry, MAX_PROMPT_TEXT_BYTES};
 use serde_json::{json, Value};
 use support::{Invocation, Release, Resolution, ScriptedBackend, ScriptedTurn};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tokio::time::timeout;
 
 const SESSION_ID: &str = "test-session";
@@ -779,6 +779,75 @@ async fn grace_reclaims_the_agent_once_the_inflight_hold_is_capped() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_reattach_mid_hold_starts_the_next_hold_from_zero() {
+    // Requirement 7 criterion 8. The cap is measured from the first grace
+    // fire of the current hold, not from the first detach the hub ever
+    // saw. A hub detached for 40 periods, reattached, and detached for 40
+    // more has been detached 80 periods in total and is still inside the
+    // cap; a hold that runs past 60 periods on its own is not. Under the
+    // paused clock the arithmetic is exact.
+    let grace = Duration::from_millis(50);
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![])));
+    let first = registry
+        .register_for_test_with_grace(
+            grace,
+            backend.clone(),
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+    first
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("never finishes")],
+            attach_id: first.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let mut polls = 0;
+    while backend.prompt_count() == 0 && polls < 100 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        polls += 1;
+    }
+    assert_eq!(backend.prompt_count(), 1, "the turn is in flight");
+
+    drop(first);
+    tokio::time::sleep(grace * 40).await;
+    assert!(
+        !backend.saw(&Invocation::Shutdown),
+        "40 periods detached is inside the cap"
+    );
+
+    let again = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("the hub is still registered");
+    tokio::time::sleep(grace).await;
+    drop(again);
+    tokio::time::sleep(grace * 40).await;
+    assert!(
+        !backend.saw(&Invocation::Shutdown),
+        "the second hold is 40 periods old, whatever the first one was"
+    );
+    assert!(
+        registry.is_registered_for_test(SESSION_ID).await,
+        "the hub is still registered 80 periods of detachment later"
+    );
+
+    tokio::time::sleep(grace * 22).await;
+    assert!(
+        wait_for_invocation(&backend, &Invocation::Shutdown).await,
+        "a hold that crosses 60 periods on its own releases the session"
+    );
+    assert!(
+        wait_until_unregistered(&registry, SESSION_ID).await,
+        "the capped teardown frees the registry entry"
+    );
+}
+
 #[tokio::test]
 async fn a_failing_turn_broadcasts_error_then_prompt_done_and_keeps_the_hub() {
     // Requirement 7 criterion 14. The `prompt_done` is what unlocks every
@@ -990,15 +1059,66 @@ async fn concurrent_attaches_for_one_id_build_one_hub() {
     // Requirement 6 criterion 4. Two upgrades naming one id, the second
     // reaching `attach_or_create` before the first has registered, must
     // yield one hub and one Backend with both attaches subscribed.
-    // Neither attach registers a Backend of its own here: this is the
-    // production path, so the hub builds an `EchoBackend`.
+    //
+    // On this single-threaded runtime the first arrival would build,
+    // register and subscribe in one poll, and the second would always
+    // find the hub on the fast path. So the first arrival is parked inside
+    // the build window, with the per-id gate held and nothing registered,
+    // and the second arrives while it waits there. Neither attach
+    // registers a Backend of its own: this is the production path, so the
+    // hub builds an `EchoBackend`.
     let registry = HubRegistry::new();
     let id = "raced-session";
 
-    let (first, second) =
-        tokio::join!(registry.attach_or_create(id), registry.attach_or_create(id));
-    let mut first = first.expect("the first attach");
-    let mut second = second.expect("the second attach");
+    let (parked_tx, parked_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .attach_or_create_parked_for_test(id, async move {
+                    let _ = parked_tx.send(());
+                    let _ = release_rx.await;
+                })
+                .await
+        }
+    });
+    parked_rx
+        .await
+        .expect("the first arrival reaches the build window");
+    assert!(
+        !registry.is_registered_for_test(id).await,
+        "the first arrival holds the gate with nothing registered yet"
+    );
+
+    let second = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.attach_or_create(id).await }
+    });
+    // Let the second arrival run until it blocks on the gate.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !registry.is_registered_for_test(id).await,
+        "the second arrival built nothing of its own: it waits at the gate"
+    );
+    assert!(
+        !second.is_finished(),
+        "the second arrival is parked at the gate, not served"
+    );
+
+    release_tx
+        .send(())
+        .expect("the first arrival is waiting to be released");
+    let mut first = first
+        .await
+        .expect("the first task")
+        .expect("the first attach");
+    let mut second = second
+        .await
+        .expect("the second task")
+        .expect("the second attach");
 
     assert_eq!(first.session_id, id);
     assert_eq!(second.session_id, id);

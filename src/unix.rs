@@ -1,12 +1,18 @@
-//! Tiny Unix FFI helpers shared across modules.
+//! Tiny Unix FFI helpers for child-process teardown.
 //!
 //! Three libc symbols are all this crate needs: `kill`, `setsid` and
-//! `getsid`. The `libc` crate is not a dependency. This module hosts the
-//! single source of truth for the bindings; previously they were
-//! duplicated across `agent.rs` and `session.rs`.
+//! `getsid`. The `libc` crate is not a dependency, and this module is the
+//! one place the bindings live.
 //!
-//! All entry points are gated on `#[cfg(unix)]` at the call sites; the
-//! module itself is only compiled on Unix targets.
+//! The 0.14 harness spawns no process of its own yet, so nothing in this
+//! release calls these from production code. They stay for what comes
+//! next on this line: the exec tool and MCP servers, both children Mezame
+//! starts as their own session leaders and must reap whole on teardown.
+//! `send_signal` and `reap_session` keep their integration tests under
+//! `tests/`, so the teardown they will do is pinned before it has a
+//! caller.
+//!
+//! The module is only compiled on Unix targets.
 
 #![cfg(unix)]
 
@@ -32,9 +38,11 @@ pub fn send_signal(pid: i32, sig: i32) -> i32 {
 /// Create a new session and process group. Returns the new session id on
 /// success, -1 on error.
 ///
-/// Used inside `Command::pre_exec` to make the spawned child its own
-/// process-group leader. POSIX lists `setsid` as async-signal-safe, which
-/// is the requirement a `pre_exec` hook imposes.
+/// Meant for a `Command::pre_exec` hook, to make a child Mezame spawns its
+/// own session and process-group leader, so that one `kill(-pid)` on
+/// teardown reaches the child and everything it started. POSIX lists
+/// `setsid` as async-signal-safe, which is the requirement a `pre_exec`
+/// hook imposes.
 ///
 /// # Safety
 ///
@@ -72,14 +80,15 @@ fn session_of(pid: i32) -> Option<i32> {
 
 /// SIGKILL every process belonging to session `sid`.
 ///
-/// The agent is spawned as its own session leader (via `setsid` in
-/// `spawn_agent`). Its session id equals its pid. A `kill(-pgid)` on the
-/// agent's process group reaps the agent and `kiro-cli`. MCP servers
-/// launched through `npx`/`npm` place themselves in their OWN process
-/// groups and the group kill never reaches them; they only inherit the
-/// agent's SESSION. Walking `/proc` for processes whose
-/// session id matches and SIGKILLing them reaps those escapees before they
-/// orphan to PID 1 and accumulate inside the service cgroup.
+/// A child spawned as its own session leader, via [`new_session`] in a
+/// `pre_exec` hook, has a session id equal to its pid, and a `kill(-pid)`
+/// on its process group reaps it and the processes that stayed in that
+/// group. Processes that put themselves in a process group of their own,
+/// as an MCP server launched through `npx`/`npm` does, escape the group
+/// kill and inherit only the leader's SESSION. Walking `/proc` for
+/// processes whose session id matches and SIGKILLing them reaps those
+/// escapees before they orphan to PID 1 and accumulate inside the service
+/// cgroup.
 ///
 /// Best-effort and defensive:
 ///   - A `sid` of 0 or 1, or one equal to our own session, is a no-op. A
@@ -89,8 +98,8 @@ fn session_of(pid: i32) -> Option<i32> {
 ///   - Unreadable or vanished `/proc` entries are silently ignored.
 ///
 /// The walk is Linux-specific (procfs). On other Unix targets it degrades
-/// to a no-op via `sweep_session`, and the process-group kill in
-/// `kill_process_group` remains the primary teardown.
+/// to a no-op via `sweep_session`, and the process-group kill through
+/// [`send_signal`] with a negative pid remains the primary teardown.
 pub fn reap_session(sid: i32) {
     // Never sweep the kernel/init sessions or our own: the first two do
     // nothing useful and the third takes Mezame down with it.
@@ -129,8 +138,8 @@ fn sweep_session(sid: i32) {
 }
 
 /// Non-Linux Unix targets have no `/proc` to walk and the sweep is a
-/// no-op. The process-group kill in `kill_process_group` remains the
-/// teardown there.
+/// no-op. The process-group kill through [`send_signal`] with a negative
+/// pid remains the teardown there.
 #[cfg(not(target_os = "linux"))]
 fn sweep_session(_sid: i32) {}
 

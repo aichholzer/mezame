@@ -779,18 +779,25 @@ proptest! {
     // attach and detach events against a hub holding an unresolved turn,
     // the Backend's recorded invocation log holds no shutdown until either
     // the turn resolves or the detached hold passes 60 grace periods
-    // measured from the first grace fire of that hold.
+    // measured from the first grace fire of that hold. A reattach ends
+    // the hold, and the next detach starts a new one from zero.
     //
     // Validates: Requirements 3.11, 7.5, 7.6, 7.7, 7.8
     #[test]
     fn property_5_shutdown_never_runs_while_a_turn_is_in_flight(
-        schedule in prop::collection::vec((any::<bool>(), 1u64..40), 1..20),
+        schedule in prop::collection::vec((any::<bool>(), 1u64..=1_250), 1..20),
     ) {
         let rt = paused_runtime();
         rt.block_on(async move {
-            // 50ms grace puts the cap at 3s. The schedule spans at most
-            // 19 gaps of 40ms, so it cannot reach the cap on its own.
+            // A 50ms grace puts the cap at 3s: teardown runs on the 61st
+            // grace fire of a hold, 3,050ms after the detach that began
+            // it. Gaps run to 1,250ms, so a schedule can sit detached
+            // past the cap, or reattach 2,400ms into a hold and detach
+            // again for another 2,400ms, which only a hold measured from
+            // its own start survives. Under the paused clock every gap
+            // and every fire is exact.
             let grace = Duration::from_millis(50);
+            let cap_crossed_at = grace * 61;
             let registry = HubRegistry::new();
             let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![])));
             let first = registry
@@ -813,19 +820,49 @@ proptest! {
                 .expect("send Prompt");
             let commands = first.commands.clone();
             let mut held: Vec<AttachedHub> = vec![first];
+            // When the current detached hold began; `None` while attached.
+            let mut detached_since: Option<tokio::time::Instant> = None;
 
             for (attach, gap_ms) in schedule {
                 if attach {
                     if let Some(more) = registry.attach_existing_for_test(SESSION_ID).await {
                         held.push(more);
+                        detached_since = None;
                     }
                 } else {
                     held.pop();
                 }
+                if held.is_empty() && detached_since.is_none() {
+                    detached_since = Some(tokio::time::Instant::now());
+                }
                 tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+
+                let detached_for = detached_since.map(|since| since.elapsed());
+                if detached_for.is_some_and(|d| d >= cap_crossed_at) {
+                    // This hold outlived the cap on its own: teardown is
+                    // due, and the rest of the schedule has no hub to run
+                    // against.
+                    let mut polls = 0;
+                    while !backend.saw(&Invocation::Shutdown) && polls < 100 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        polls += 1;
+                    }
+                    prop_assert!(
+                        backend.saw(&Invocation::Shutdown),
+                        "a hold past 60 grace periods releases the session (detached {:?})",
+                        detached_for
+                    );
+                    prop_assert!(
+                        !registry.is_registered_for_test(SESSION_ID).await,
+                        "the capped teardown frees the registry entry"
+                    );
+                    return Ok::<(), TestCaseError>(());
+                }
                 prop_assert!(
                     !backend.saw(&Invocation::Shutdown),
-                    "no shutdown while the turn is in flight and inside the cap"
+                    "no shutdown while the turn is in flight and the hold is inside the \
+                     cap (detached for {:?})",
+                    detached_for
                 );
             }
             prop_assert!(
