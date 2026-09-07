@@ -212,6 +212,10 @@ reachable from the composer in ordinary use.
   reading: its connection is closed, the session is untouched, and its
   reconnect seeds from `/history`. A live browser on a slow link receiving a
   large echo can trip the minute; it reconnects the same way.
+- A connection that sends no complete request head within 30 seconds, or that
+  stays idle between requests for 30 seconds, is closed. An upgraded WebSocket
+  and a streaming `/state/events` response are not subject to this; the timer
+  runs only while a request head is awaited.
 
 ## Request checks
 

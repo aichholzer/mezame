@@ -21,6 +21,7 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
    ExecStart=%h/.cargo/bin/mezame
    Restart=on-failure
    RestartSec=5
+   LimitNOFILE=65536
 
    [Install]
    WantedBy=default.target
@@ -66,6 +67,7 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
    ExecStart=/home/youruser/.cargo/bin/mezame
    Restart=on-failure
    RestartSec=5
+   LimitNOFILE=65536
 
    [Install]
    WantedBy=multi-user.target
@@ -123,11 +125,16 @@ Install as a LaunchAgent under your user account. This runs Mezame whenever you 
        <key>PATH</key>
        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
      </dict>
+     <key>SoftResourceLimits</key>
+     <dict>
+       <key>NumberOfFiles</key>
+       <integer>8192</integer>
+     </dict>
    </dict>
    </plist>
    ```
 
-   `KeepAlive` with `SuccessfulExit=false` restarts on crash but not when Mezame exits cleanly (matches systemd's `Restart=on-failure`). `PATH` is set because launchd's default does not include Homebrew, and Mezame's own build and run paths expect a normal login `PATH`.
+   `KeepAlive` with `SuccessfulExit=false` restarts on crash but not when Mezame exits cleanly (matches systemd's `Restart=on-failure`). `PATH` is set because launchd's default does not include Homebrew, and Mezame's own build and run paths expect a normal login `PATH`. `NumberOfFiles` raises launchd's default soft limit of 256 descriptors; see "Resource limits" below.
 
 2. Load it (the modern verb is `bootstrap`; `load` is legacy but still works):
 
@@ -158,6 +165,18 @@ Install as a LaunchAgent under your user account. This runs Mezame whenever you 
 ## Shutdown behaviour
 
 Both systemd `stop` and launchd `bootout` send SIGTERM. Mezame catches it, stops accepting new WebSocket connections, and exits. Live browser sessions drop, and the next connect recreates them. Nothing is left behind on disk to clean up: a session and its transcript live in memory only, so a restart starts every conversation fresh. Durable storage is planned; until it lands, treat a restart as losing the transcripts.
+
+## Resource limits
+
+Every attached browser holds one descriptor for its WebSocket and one for its
+`/state/events` stream, and every connection a proxy or a scanner opens holds
+one until Mezame closes it: 30 seconds after a request head stops arriving or
+after the last request on a kept-alive connection. When the process runs out,
+the log carries one line, `Could not accept a connection: Too many open files`,
+and the accept loop retries every second until connections close. The unit
+files above set `LimitNOFILE=65536` and `NumberOfFiles` 8192 for that reason;
+launchd's default is 256 and systemd's is usually 1024. Docker's default is
+already high.
 
 ## A note on `--background`
 

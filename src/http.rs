@@ -9,7 +9,10 @@
 //! fallback. Every route sits behind the `Host` and `Origin` checks in
 //! `guard.rs`, the two request checks that need no user identity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::io;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,10 +30,14 @@ use axum::{
     Json, Router,
 };
 use futures_util::stream::Stream;
+use futures_util::FutureExt;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 
 use crate::config::{state_path, Config};
 use crate::guard::{guard_request, RequestPolicy};
@@ -93,10 +100,135 @@ pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     enable_tcp_keepalive(&listener);
     eprintln!("Mezame is listening on: http://{bind}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown))
-        .await?;
+    serve(listener, app, shutdown_signal(shutdown)).await?;
     Ok(())
+}
+
+/// How long a connection may take to send a complete request head, and
+/// how long a keep-alive connection may sit idle between requests: 30
+/// seconds, hyper's own default.
+///
+/// `axum::serve` builds hyper with no timer, and hyper drops a timeout it
+/// has no timer for, so that default was silently disabled: a connection
+/// that opened and sent nothing, or finished a request and went quiet,
+/// was held for as long as the peer liked, one descriptor each. hyper
+/// re-arms this timer for every request head on a kept-alive connection,
+/// which is what makes it the idle limit too. It runs only while a head
+/// is awaited, so an upgraded WebSocket and a streaming SSE response are
+/// untouched.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the accept loop waits after an accept error that is not a
+/// peer's own reset before trying again. Running out of descriptors is
+/// the error that matters, and it clears only as connections close.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Serve `app` on `listener` until `shutdown` resolves, then stop
+/// accepting, ask every open connection to finish, and return once they
+/// have.
+///
+/// Owns the accept loop rather than handing it to `axum::serve`, for one
+/// reason: to set a timer on hyper so [`HEADER_READ_TIMEOUT`] applies.
+/// The shape is axum's own (a watch channel closed by the shutdown, a
+/// second one whose receivers count the open connections), on hyper's
+/// HTTP/1 builder, which is the only protocol this build speaks.
+/// `with_upgrades` is what lets `/ws` take the connection over.
+///
+/// An accept error is reported on stderr once per error kind, so a
+/// descriptor limit shows up in the log instead of stalling the loop in
+/// silence. Errors on a single connection (a request head that never
+/// completed, a scanner sending garbage) are not logged.
+pub async fn serve(
+    listener: TcpListener,
+    app: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    serve_with(listener, app, HEADER_READ_TIMEOUT, shutdown).await
+}
+
+/// [`serve`] with an explicit header-read timeout, so a test can drive
+/// the timeout in milliseconds.
+#[doc(hidden)]
+pub async fn serve_with(
+    listener: TcpListener,
+    app: Router,
+    header_read_timeout: Duration,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    let mut http = http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+
+    // The shutdown drops `signal_rx`; every `signal_tx.closed()` then
+    // resolves, in the accept loop and in each connection task.
+    let (signal_tx, signal_rx) = watch::channel(());
+    let signal_tx = Arc::new(signal_tx);
+    tokio::spawn(async move {
+        shutdown.await;
+        drop(signal_rx);
+    });
+    // Each connection task holds a `close_rx`; `close_tx.closed()` resolves
+    // once the last of them has dropped it.
+    let (close_tx, close_rx) = watch::channel(());
+    let mut noted: HashSet<io::ErrorKind> = HashSet::new();
+
+    loop {
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _peer)) => stream,
+                Err(e) => {
+                    if noted.insert(e.kind()) {
+                        eprintln!(
+                            "Could not accept a connection: {e}. If this names too many \
+                             open files, raise the process's descriptor limit; see \
+                             docs/service.md."
+                        );
+                    }
+                    if !is_connection_error(&e) {
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    }
+                    continue;
+                }
+            },
+            _ = signal_tx.closed() => break,
+        };
+
+        let service = TowerToHyperService::new(app.clone());
+        let http = http.clone();
+        let signal_tx = Arc::clone(&signal_tx);
+        let close_rx = close_rx.clone();
+        tokio::spawn(async move {
+            let conn = http
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades();
+            let mut conn = pin!(conn);
+            let mut closed = pin!(signal_tx.closed().fuse());
+            loop {
+                tokio::select! {
+                    // A finished connection, whichever way it ended.
+                    _ = conn.as_mut() => break,
+                    _ = &mut closed => conn.as_mut().graceful_shutdown(),
+                }
+            }
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+    close_tx.closed().await;
+    Ok(())
+}
+
+/// An accept error the peer caused, which needs no pause before the next
+/// accept.
+fn is_connection_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    )
 }
 
 /// Enable TCP keepalive on the listening socket as a kernel-level
@@ -147,8 +279,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 /// Resolve when the process receives SIGINT (Ctrl+C) or SIGTERM (systemd
-/// / launchd `stop`). `with_graceful_shutdown` stops accepting new
-/// connections on the returned future. Mezame exits promptly when its
+/// / launchd `stop`). `serve` stops accepting new connections when the
+/// returned future resolves. Mezame exits promptly when its
 /// service manager asks it to.
 ///
 /// Before returning we fire `shutdown`. Long-poll handlers in flight (the

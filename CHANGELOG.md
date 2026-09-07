@@ -84,6 +84,13 @@ with an echo, on every attached browser at once.
   forever on exit. Such a peer is now disconnected and the writer is
   aborted after a 5-second drain; a live browser that trips the limit
   reconnects and reloads its transcript.
+- A connection that sends no request head, or that idles between
+  requests, is closed after 30 seconds. hyper's own default, which
+  `axum::serve` had silently disabled by setting no timer, so an idle
+  connection held its descriptor for as long as the peer liked. Mezame
+  now owns its accept loop, sets the timer, and reports an accept failure
+  such as running out of descriptors on stderr once per error kind. The
+  service-unit examples raise the descriptor limit.
 - A permission answer reaches the Backend only for a request the Backend
   raised in the turn in flight, and only the first answer does. The hub
   no longer remembers every id a browser answers with.

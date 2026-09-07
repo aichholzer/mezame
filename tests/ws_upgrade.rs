@@ -9,18 +9,23 @@
 //!
 //! This is also the one test that reaches `handle_ws`, and through it
 //! `take_outbound`, `build_hub` and the shipped `EchoBackend`, end to end.
+//! Every case here runs on the production serve path, `http::serve_with`,
+//! so the accept loop, the connection task and the upgrade hand-off are
+//! covered by the same handshakes; three cases at the end drive its
+//! header-read timeout and its shutdown directly.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use mezame::config::{Config, TransportConfig};
-use mezame::http::{build_router, AppState};
+use mezame::http::{build_router, serve_with, AppState, HEADER_READ_TIMEOUT};
 use mezame::hub::{HubRegistry, GRACE_PERIOD, MAX_PROMPT_TEXT_BYTES};
 use mezame::ws::MAX_WS_MESSAGE_BYTES;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, oneshot, Notify};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HOST, ORIGIN};
@@ -47,8 +52,19 @@ async fn serve() -> Server {
 /// `serve` around a caller-supplied registry, so a case can start from a
 /// small capacity.
 async fn serve_with_registry(hubs: HubRegistry) -> Server {
+    serve_configured(hubs, HEADER_READ_TIMEOUT).await
+}
+
+/// `serve` with a caller-supplied header-read timeout, so a case can wait
+/// it out in milliseconds.
+async fn serve_with_header_timeout(header_read_timeout: Duration) -> Server {
+    serve_configured(HubRegistry::new(), header_read_timeout).await
+}
+
+/// The state every server here is built from.
+fn state_with_registry(hubs: HubRegistry) -> Arc<AppState> {
     let (state_changes, _) = broadcast::channel(8);
-    let state = Arc::new(AppState {
+    Arc::new(AppState {
         config: Arc::new(Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
@@ -58,15 +74,18 @@ async fn serve_with_registry(hubs: HubRegistry) -> Server {
         hubs,
         state_changes,
         shutdown: Arc::new(Notify::new()),
-    });
+    })
+}
 
+async fn serve_configured(hubs: HubRegistry, header_read_timeout: Duration) -> Server {
+    let state = state_with_registry(hubs);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind an ephemeral port");
     let addr = listener.local_addr().expect("the bound address");
     let app = build_router(state.clone());
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = serve_with(listener, app, header_read_timeout, std::future::pending()).await;
     });
     Server { addr, state }
 }
@@ -429,4 +448,118 @@ async fn an_upgrade_for_a_new_session_is_answered_503_before_the_handshake_when_
     );
     assert!(server.state.hubs.is_registered_for_test(&first_id).await);
     drop(first);
+}
+
+/// Read from a raw connection until the server closes it, or until
+/// `patience` passes. `Some(bytes)` is what arrived before the close;
+/// `None` means the server was still holding the connection open.
+async fn read_until_closed(stream: &mut TcpStream, patience: Duration) -> Option<Vec<u8>> {
+    let mut all = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match timeout(remaining, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => return Some(all),
+            Ok(Ok(n)) => all.extend_from_slice(&buf[..n]),
+            Ok(Err(_)) => return Some(all),
+            Err(_) => return None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_connection_that_sends_no_request_is_closed_after_the_header_read_timeout() {
+    // A peer that opens a connection and never sends a request head used
+    // to hold it, and its descriptor, forever: axum's serve set no timer
+    // on hyper, which drops the timeout it has no timer for. With the
+    // timer set, the connection is closed once the timeout passes.
+    let server = serve_with_header_timeout(Duration::from_millis(200)).await;
+    let mut stream = TcpStream::connect(server.addr)
+        .await
+        .expect("connect to the server");
+    let started = tokio::time::Instant::now();
+    let closed = read_until_closed(&mut stream, Duration::from_secs(3)).await;
+    assert!(
+        closed.is_some(),
+        "the server must close a connection that sends no request head"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the close waits for the timeout, not less"
+    );
+    assert!(
+        closed.is_some_and(|bytes| bytes.is_empty()),
+        "nothing is written to a peer that sent nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_keep_alive_connection_is_closed_after_the_header_read_timeout() {
+    // hyper re-arms the header timer for every request head on a kept-alive
+    // connection, so the same timeout is the idle limit between requests.
+    // `/history` with an unknown id answers from memory and touches no
+    // file, so the case reads nothing under `HOME`.
+    let server = serve_with_header_timeout(Duration::from_millis(200)).await;
+    let mut stream = TcpStream::connect(server.addr)
+        .await
+        .expect("connect to the server");
+    stream
+        .write_all(b"GET /history?session=x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .expect("send one request");
+
+    let started = tokio::time::Instant::now();
+    let bytes = read_until_closed(&mut stream, Duration::from_secs(3))
+        .await
+        .expect("the server must close an idle keep-alive connection");
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "the request was answered before the idle close, got {text:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the idle close waits for the timeout"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_closes_the_listener_and_serve_returns() {
+    // The shutdown future resolves: the accept loop stops, the listener is
+    // dropped so a new connection is refused, open connections are asked
+    // to finish, and `serve` returns. The signal is a oneshot, which
+    // stores its value: a `Notify::notify_waiters` sent before the serve
+    // task first polls its shutdown future would be lost.
+    let state = state_with_registry(HubRegistry::new());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("the bound address");
+    let app = build_router(state.clone());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        serve_with(listener, app, HEADER_READ_TIMEOUT, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    // One live connection first, so the shutdown has something to drain.
+    let server = Server { addr, state };
+    let mut socket = connect(&server, "/ws").await;
+    let ready = next_text(&mut socket).await;
+    assert_eq!(ready["type"], "ready");
+
+    shutdown_tx.send(()).expect("the serve task is waiting");
+    let outcome = timeout(Duration::from_secs(2), serving)
+        .await
+        .expect("serve returns within 2s of the shutdown")
+        .expect("the serve task did not panic");
+    assert!(outcome.is_ok(), "serve returns Ok on a clean shutdown");
+    assert!(
+        TcpStream::connect(addr).await.is_err(),
+        "the listener is closed: a new connection is refused"
+    );
+    drop(socket);
 }
