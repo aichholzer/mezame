@@ -7,6 +7,14 @@
 # Choose 0.0.0.0:9510. The default, 127.0.0.1:9510, binds loopback inside
 # the container, and the published port below would then answer nothing.
 #
+# The port is published on the host's loopback only: the browser on the
+# host reaches it at http://127.0.0.1:9510 and nothing else does. Mezame
+# has no authentication of its own, so this is the safe default. To reach
+# it from other machines on a network you trust, change the mapping to
+# "0.0.0.0:9510:9510". On Linux, Docker's own firewall rules bypass ufw,
+# so that opens the port on every network the host is on; a Cloudflare
+# Tunnel running on the host reaches the loopback mapping as it is.
+#
 # Normal run:
 #   docker compose up
 #   # or detached:
@@ -22,7 +30,7 @@ services:
     container_name: mezame
     command: ["mezame"]
     ports:
-      - "9510:9510"
+      - "127.0.0.1:9510:9510"
     volumes:
       - mezame-config:/root/.mezame
     restart: unless-stopped

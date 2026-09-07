@@ -70,17 +70,23 @@ your self-hosted tools.
 
 ## Features
 
-- Multiple concurrent sessions per browser, each with its own conversation.
-- Share a session across devices: open the same conversation on your phone,
-  laptop, and desktop. Everything stays in sync, including what you type.
-- Model switches propagate to every connected browser.
-- Reasoning shows up in a collapsible block. Survives reloads.
-- Tool calls render as expandable cards with arguments and output.
-- Sessions survive a reload, a reconnect, and a laptop going to sleep
-  mid-turn.
+What this build does today:
+
+- Several sessions per browser, each its own conversation, in tabs.
+- One session on several devices: open the same conversation on a phone and a
+  laptop, and every turn lands on both as it happens.
+- A session survives a reload or a reconnect within a 30-second grace window,
+  and the transcript is served back on attach. A turn still running when the
+  last browser leaves keeps running, for up to 30 minutes.
 - Recently-closed history with one-click restore.
 - Auto-reconnect with exponential back-off on WebSocket drops.
-- Idle sessions release their resources and come back on your next click.
+- Idle sessions release their resources 30 seconds after the last browser
+  leaves.
+
+What the browser already renders, waiting on a provider to feed it: model
+selection shared across every attached browser, reasoning in a collapsible
+block, tool calls as expandable cards with arguments and output, and
+permission prompts. See [Roadmap](#roadmap).
 
 ## Install
 
@@ -170,6 +176,13 @@ docker compose up -d
 The configuration is persisted in a named volume, so you answer that prompt
 once. See the comments in `compose.yaml` for the full flow.
 
+`compose.yaml` publishes the port on the host's loopback only,
+`127.0.0.1:9510`. Mezame has no authentication of its own, so that is the
+default. To reach it from other machines on a network you trust, change the
+mapping to `"0.0.0.0:9510:9510"`, knowing that on Linux Docker's own firewall
+rules bypass `ufw` and the port opens on every network the host is on. A
+Cloudflare Tunnel running on the host reaches the loopback mapping as it is.
+
 Stderr carries Mezame's own logs. One environment variable is worth knowing:
 
 - `MEZAME_SKIP_UI_BUILD=1` tells `build.rs` not to run the UI build. The binary
@@ -218,8 +231,9 @@ resulting binary is missing its UI.
 The UI build needs Node.js 24 or newer. Check `node --version` and upgrade.
 
 **No config at `~/.mezame/config.json`**
-Run `mezame init`. It writes the file after one prompt. Running it with
-standard input closed exits non-zero and writes nothing.
+Run `mezame init`. It writes the file after one prompt. Run with no terminal
+attached (under a service manager, or in a container without a TTY), it exits
+non-zero and writes nothing.
 
 **Browser connects, the composer is read-only**
 A turn is in flight on that session, started here or on another device. It
@@ -240,8 +254,7 @@ browser first to satisfy Access, then retry.
 
 ## Support
 
-RTFM, then RTFC... If you are still stuck or just need an additional feature,
-file an [issue](https://github.com/aichholzer/mezame/issues).
+RTFM, then RTFC... If you are still stuck or just need an additional feature, file an [issue](https://github.com/aichholzer/mezame/issues).
 
 ## Trademarks
 

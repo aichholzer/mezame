@@ -20,6 +20,54 @@ local agent process and becomes the agent harness itself. This alpha
 ships the transport with no provider behind it: every prompt is answered
 with an echo, on every attached browser at once.
 
+### Breaking
+
+- Mezame no longer starts or drives a separate agent process. The
+  `agent_cmd` and `agent_args` keys in `~/.mezame/config.json` are read
+  and ignored; the file is left on disk as it is.
+- Every prompt is answered with an echo of its text. No provider is
+  contacted and no model is selectable: the picker is still there, and a
+  change is refused with a notice in the log.
+- A transcript lives as long as its session. Nothing is written to disk,
+  a session is released 30 seconds after the last browser leaves, and a
+  restart loses every conversation. The 0.13 history reader over the
+  agent's on-disk JSONL went with the agent.
+- The tab list a 0.13 `state.json` holds is discarded on first load. The
+  UI starts with one fresh tab and the next sync rewrites the file under
+  the new key.
+- Building from source needs Node.js 24 or newer. `build.rs` refuses an
+  older version.
+- `cargo install mezame` still installs 0.13.4 from crates.io. This alpha
+  installs from the `feature/harness` branch.
+
+### Removed
+
+- The `?cwd=` query parameter on `/ws`. A session opens against Mezame's
+  own working directory, whatever a client sends.
+- The `/tool-result` endpoint, the `set_mode` command and the mode
+  picker, and the `MEZAME_DEBUG_ACP` variable.
+- The `resumeFailedFor` field on `ready`. Under the hub model every
+  attach is a join to a session that exists.
+
+### Security
+
+- A permission answer reaches the Backend only for a request the Backend
+  raised in the turn in flight, and only the first answer does. The hub
+  no longer remembers every id a browser answers with.
+- A Backend whose model change stalls no longer stalls its session. The
+  hub loop awaits nothing a Backend implements, and a browser reconnecting
+  against a stalled change no longer wedges the session id until restart.
+- A panic on a hub's owner task now shuts the Backend down and frees the
+  session id instead of leaving a dead hub for every later attach to join.
+
+### Changed
+
+- `/ws` takes a `session` query parameter naming the session to join and
+  mints a 32-character hexadecimal id when none is given. Every browser
+  naming one id attaches to one hub and sees one conversation.
+- Everything that produces a turn sits behind one trait, `Backend`, with
+  six operations. The provider loop drops into that seam next.
+
 ## [0.13.4] - 2026-09-04
 
 ### Changed
