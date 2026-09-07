@@ -13,10 +13,11 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use mezame::backend::Backend;
 use mezame::hub::{HubCommand, HubRegistry, MAX_PROMPT_TEXT_BYTES};
 use serde_json::{json, Value};
 use support::{Invocation, Release, Resolution, ScriptedBackend, ScriptedTurn};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 
 const SESSION_ID: &str = "test-session";
@@ -594,28 +595,51 @@ async fn attach_or_create_fast_path_reuses_registered_hub() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn detach_to_zero_then_reattach_exercises_grace_counter() {
-    // Requirement 7 criterion 4: the last detach arms the grace timer and
-    // a fresh attach inside the window cancels the pending teardown.
+    // Requirement 7 criterion 4, its three clauses: the last detach arms
+    // the grace timer, a fresh attach inside the window cancels the
+    // pending teardown, and the hub keeps its registry entry and keeps
+    // delivering. Under the paused clock with a 50ms window a regression
+    // of both cancel paths fires inside the test, not 29 seconds after
+    // it ends as it did against the production period.
+    let grace = Duration::from_millis(50);
     let registry = HubRegistry::new();
     let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::success(vec![
         agent_append("still alive"),
     ])));
 
     let first = registry
-        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .register_for_test_with_grace(
+            grace,
+            backend.clone(),
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
         .await;
 
-    // The `Drop` impl spawns the decrement, so give the runtime a moment
-    // to run it and let the loop install its cancel handle.
+    // The detach is synchronous; the sleep lets the loop wake and arm,
+    // and stays well inside the window.
     drop(first);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(grace / 2).await;
 
     let mut second = registry
         .attach_existing_for_test(SESSION_ID)
         .await
         .expect("hub still registered inside the grace window");
+
+    // Three periods later the original deadline has long passed. The
+    // reattach must have cancelled it.
+    tokio::time::sleep(grace * 3).await;
+    assert!(
+        registry.is_registered_for_test(SESSION_ID).await,
+        "the armed teardown was cancelled by the reattach"
+    );
+    assert!(
+        !backend.saw(&Invocation::Shutdown),
+        "a cancelled teardown runs no shutdown"
+    );
 
     second
         .commands
@@ -636,7 +660,19 @@ async fn detach_to_zero_then_reattach_exercises_grace_counter() {
     );
     assert!(
         !backend.saw(&Invocation::Shutdown),
-        "a cancelled teardown runs no shutdown"
+        "no shutdown ran while a browser was attached"
+    );
+
+    // A cancelled window does not disarm the timer for good: the next
+    // detach to zero arms a fresh one that fires.
+    drop(second);
+    assert!(
+        wait_until_unregistered(&registry, SESSION_ID).await,
+        "the next detach to zero arms a fresh window that fires"
+    );
+    assert!(
+        wait_for_invocation(&backend, &Invocation::Shutdown).await,
+        "the fresh window's teardown runs the shutdown"
     );
 }
 
@@ -668,9 +704,18 @@ async fn grace_does_not_cancel_an_in_flight_turn() {
         .await
         .expect("send Prompt");
 
-    // Sync point: the turn is open and has streamed its event.
-    let streamed = collect_until(&mut attached.outbound, "append").await;
-    assert!(!streamed.is_empty());
+    // Sync point: the turn is open and has streamed its event. The user
+    // echo goes out before the turn task is spawned and proves nothing
+    // about the Backend; the agent frame is sent by the turn itself,
+    // after its `prompt` invocation is recorded, so waiting for it holds
+    // on any scheduler.
+    let echo = next_event(&mut attached.outbound).await.expect("the echo");
+    assert_eq!(echo["role"], "user");
+    let streamed = next_event(&mut attached.outbound)
+        .await
+        .expect("the turn's event");
+    assert_eq!(streamed["role"], "agent");
+    assert_eq!(streamed["text"], "working");
     assert_eq!(backend.prompt_count(), 1);
 
     // Detach the only browser: the count falls to zero and the 50ms grace
@@ -728,8 +773,10 @@ async fn grace_still_tears_down_once_the_turn_completes() {
         wait_until_unregistered(&registry, SESSION_ID).await,
         "an idle hub must be torn down once the turn completes"
     );
+    // Polled, not read once: the registry entry and the shutdown call
+    // are two steps of the teardown, and nothing here fixes their order.
     assert!(
-        backend.saw(&Invocation::Shutdown),
+        wait_for_invocation(&backend, &Invocation::Shutdown).await,
         "teardown invokes the Backend's shutdown"
     );
 }
@@ -1615,4 +1662,164 @@ async fn a_prompt_past_the_text_ceiling_is_refused_to_its_sender_alone() {
     let seen = collect_until(&mut sender.outbound, "prompt_done").await;
     assert!(seen.iter().any(|e| e["type"] == "prompt_done"));
     assert_eq!(backend.prompt_count(), 1, "the prompt at the ceiling ran");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_attach_and_detach_inside_one_wake_leave_the_grace_window_whole() {
+    // Requirement 7 criteria 4 and 6. The loop reads the subscriber count
+    // on every wake rather than trusting the wake, and cancels an armed
+    // window by dropping it, never by treating the cancel as a fire. An
+    // earlier shape resolved the deadline future on either the timer or
+    // the cancel handle and could tear an idle hub down at once when an
+    // attach and a detach landed in one wake. Both phases below coalesce
+    // three counter changes into one wake: on this current-thread runtime
+    // the only awaits between them are uncontended locks, which do not
+    // yield to the loop.
+    let grace = Duration::from_millis(50);
+
+    // Phase 1: nothing armed yet when the coalesced wake lands.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new());
+    let first = registry
+        .register_for_test_with_grace(
+            grace,
+            backend.clone(),
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+    drop(first);
+    let second = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("the hub is registered");
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        registry.is_registered_for_test(SESSION_ID).await,
+        "the window is whole: no teardown before one grace period"
+    );
+    assert!(!backend.saw(&Invocation::Shutdown));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !registry.is_registered_for_test(SESSION_ID).await,
+        "the window fires once, one period after the last detach"
+    );
+    assert!(wait_for_invocation(&backend, &Invocation::Shutdown).await);
+
+    // Phase 2: the window is already armed when the coalesced wake lands.
+    // The deadline must be neither pulled in nor pushed out.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new());
+    let first = registry
+        .register_for_test_with_grace(
+            grace,
+            backend.clone(),
+            SESSION_ID.into(),
+            ready_event(),
+            None,
+        )
+        .await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let second = registry
+        .attach_existing_for_test(SESSION_ID)
+        .await
+        .expect("the hub is registered inside the window");
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    assert!(
+        registry.is_registered_for_test(SESSION_ID).await,
+        "at 45ms the window armed at 0ms has not fired"
+    );
+    assert!(!backend.saw(&Invocation::Shutdown));
+    // The loop's deadline at 50ms runs before this wake at 55ms. A loop
+    // that re-armed on the coalesced wake would still be registered.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !registry.is_registered_for_test(SESSION_ID).await,
+        "the window fires at 50ms, unmoved by the coalesced wake"
+    );
+    assert!(wait_for_invocation(&backend, &Invocation::Shutdown).await);
+}
+
+#[tokio::test]
+async fn a_cancel_with_no_turn_open_leaves_the_next_turn_untouched() {
+    // The trait's obligation (src/backend.rs): a cancel with no turn open
+    // is a no-op. The scripted Backend used to store a release anyway,
+    // which the next `Pending` turn consumed at once, so a test could
+    // pass for the wrong reason. Requirement 5 criterion 5.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![
+        agent_append("working"),
+    ])));
+    let mut attached = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+
+    attached
+        .commands
+        .send(HubCommand::Cancel)
+        .await
+        .expect("send Cancel");
+    assert!(wait_for_invocation(&backend, &Invocation::Cancel).await);
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("after the cancel")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let echo = next_event(&mut attached.outbound).await.expect("the echo");
+    assert_eq!(echo["role"], "user");
+    let streamed = next_event(&mut attached.outbound)
+        .await
+        .expect("the turn's event");
+    assert_eq!(streamed["text"], "working");
+
+    // The turn stays open: no error and no prompt_done arrive on their
+    // own.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        attached.outbound.try_recv().is_err(),
+        "a stale release ended the turn that the earlier cancel never aimed at"
+    );
+    assert_eq!(backend.prompt_count(), 1);
+
+    backend.release_turn(Release::Ok);
+    let rest = collect_until(&mut attached.outbound, "prompt_done").await;
+    let types: Vec<&str> = rest.iter().filter_map(|e| e["type"].as_str()).collect();
+    assert_eq!(
+        types,
+        vec!["prompt_done"],
+        "the turn ends as released, with no error"
+    );
+}
+
+#[tokio::test]
+async fn a_shutdown_with_no_turn_open_leaves_the_next_turn_untouched() {
+    // The trait's obligation: shutdown is idempotent and a shutdown with
+    // no turn open leaves nothing behind for a later turn.
+    let backend = ScriptedBackend::new();
+    backend.shutdown().await;
+    backend.shutdown().await;
+
+    backend.push_turn(ScriptedTurn::pending(vec![]));
+    let (events, _rx) = mpsc::unbounded_channel();
+    let turn = backend.prompt(vec![text_block("later")], events);
+    assert!(
+        timeout(Duration::from_millis(150), turn).await.is_err(),
+        "the earlier shutdowns left no release for this turn"
+    );
+    assert_eq!(
+        backend.invocations(),
+        vec![
+            Invocation::Shutdown,
+            Invocation::Shutdown,
+            Invocation::Prompt(vec![text_block("later")]),
+        ]
+    );
 }

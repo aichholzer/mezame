@@ -7,6 +7,13 @@
 //! streams and how that turn resolves, then reads back every method the
 //! Hub invoked, in order, with the arguments each invocation received.
 //!
+//! `cancel` and `shutdown` release only a turn that is open. With no turn
+//! open they record their invocation and leave nothing behind, which is
+//! the trait's no-op; an earlier shape stored a release the next `Pending`
+//! turn consumed at once. A test that cancels a turn must first sync on
+//! something the turn produced (its echo, its first event, or
+//! `prompt_count()`), so the turn is open when the cancel lands.
+//!
 //! Interior mutability is `std::sync::Mutex` throughout and no lock is
 //! held across an await. Reading the invocation log while a turn is
 //! unresolved is therefore a plain function call from any task. A
@@ -148,6 +155,80 @@ impl<T> Slot<T> {
     }
 }
 
+/// The release hand-off for a `Pending` turn, gated on a turn being open.
+///
+/// `release_turn` stores unconditionally: a release that lands before the
+/// turn parks must not be lost. `cancel` and `shutdown` store only while a
+/// turn is open, which is the trait's "a cancel with no turn open is a
+/// no-op". The open flag lives under the same mutex as the value, so the
+/// check and the store are one step against the turn closing on any
+/// runtime flavour. Closing the turn discards a release nobody took.
+#[derive(Default)]
+struct TurnSlot {
+    state: Mutex<TurnState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct TurnState {
+    open: bool,
+    release: Option<Release>,
+}
+
+impl TurnSlot {
+    /// Mark a turn open for as long as the returned guard lives.
+    fn open(&self) -> OpenTurn<'_> {
+        self.state.lock().expect("turn slot").open = true;
+        OpenTurn(self)
+    }
+
+    /// Store a release for the open turn. With no turn open, store
+    /// nothing and report it.
+    fn put_if_open(&self, release: Release) -> bool {
+        let mut state = self.state.lock().expect("turn slot");
+        if !state.open {
+            return false;
+        }
+        state.release = Some(release);
+        drop(state);
+        self.notify.notify_one();
+        true
+    }
+
+    /// Store a release whether or not a turn is open.
+    fn put(&self, release: Release) {
+        self.state.lock().expect("turn slot").release = Some(release);
+        self.notify.notify_one();
+    }
+
+    async fn take(&self) -> Release {
+        loop {
+            let taken = self.state.lock().expect("turn slot").release.take();
+            if let Some(release) = taken {
+                return release;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// Closes the turn on drop: on resolve, on a panic unwind, and on a turn
+/// future dropped mid-flight. A release aimed at this turn and never
+/// consumed goes with it.
+struct OpenTurn<'a>(&'a TurnSlot);
+
+impl Drop for OpenTurn<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.open = false;
+        state.release = None;
+    }
+}
+
 /// A Backend whose every answer a test supplies up front.
 #[derive(Default)]
 pub struct ScriptedBackend {
@@ -159,7 +240,7 @@ pub struct ScriptedBackend {
     /// whose model change does I/O.
     set_model_blocks: bool,
     transcript: Mutex<Vec<HistoryEntry>>,
-    release: Slot<Release>,
+    turn: TurnSlot,
     model_release: Slot<Result<Value, String>>,
 }
 
@@ -214,9 +295,10 @@ impl ScriptedBackend {
         self.turns.lock().expect("turns").push_back(turn);
     }
 
-    /// End the open `Pending` turn.
+    /// End the open `Pending` turn. A release that lands before the turn
+    /// parks is kept for it.
     pub fn release_turn(&self, release: Release) {
-        self.release.put(release);
+        self.turn.put(release);
     }
 
     /// Every recorded invocation, in invocation order. Readable while a
@@ -258,6 +340,9 @@ impl Backend for ScriptedBackend {
                     .push(Invocation::Prompt(blocks));
                 self.turns.lock().expect("turns").pop_front()
             };
+            // Open for the whole poll, the unscripted turn included, so a
+            // cancel that lands while this future is alive is delivered.
+            let _open = self.turn.open();
             let Some(turn) = turn else {
                 return Err(anyhow!(
                     "ScriptedBackend: no turn was scripted for this prompt"
@@ -272,7 +357,7 @@ impl Backend for ScriptedBackend {
                 Resolution::Success => Ok(TurnOutcome::default()),
                 Resolution::Error(message) => Err(anyhow!(message)),
                 Resolution::Panic(message) => panic!("{message}"),
-                Resolution::Pending => match self.release.take().await {
+                Resolution::Pending => match self.turn.take().await {
                     Release::Ok => Ok(TurnOutcome::default()),
                     Release::Err(message) => Err(anyhow!(message)),
                     Release::Panic(message) => panic!("{message}"),
@@ -288,10 +373,9 @@ impl Backend for ScriptedBackend {
                 .expect("invocations")
                 .push(Invocation::Cancel);
             // The trait obligation: a cancel while a turn is open makes
-            // that turn resolve promptly. A cancel with no turn open
-            // leaves a release the next `Pending` turn consumes, which is
-            // why no test sends one.
-            self.release.put(Release::Err("cancelled".to_string()));
+            // that turn resolve promptly, and a cancel with no turn open
+            // is a no-op. The invocation is recorded either way.
+            self.turn.put_if_open(Release::Err("cancelled".to_string()));
         })
     }
 
@@ -338,7 +422,9 @@ impl Backend for ScriptedBackend {
                 .expect("invocations")
                 .push(Invocation::Shutdown);
             self.turns.lock().expect("turns").clear();
-            self.release.put(Release::Err("cancelled".to_string()));
+            // Idempotent: a second call finds no turn open and stores
+            // nothing.
+            self.turn.put_if_open(Release::Err("cancelled".to_string()));
         })
     }
 }
