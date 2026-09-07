@@ -240,15 +240,27 @@ impl Counter {
     /// Call when a subscriber detaches. Saturates at zero: a count that
     /// dipped below would read as "attached" forever and make the hub
     /// immortal. Returns the post-detach count.
+    ///
+    /// A compare-exchange loop rather than `fetch_update`, which Rust
+    /// 1.99 deprecates in favour of a `try_update` the 1.86 floor does
+    /// not have.
     fn decrement(&self) -> usize {
-        let previous = self
-            .count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                Some(c.saturating_sub(1))
-            })
-            .unwrap_or(0);
-        self.changed.notify_one();
-        previous.saturating_sub(1)
+        let mut current = self.count.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.count.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.changed.notify_one();
+                    return next;
+                }
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// The current subscriber count.

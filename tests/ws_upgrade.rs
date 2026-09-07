@@ -309,22 +309,27 @@ async fn a_prompt_past_the_text_ceiling_is_answered_with_an_error_over_a_real_so
 }
 
 /// A handshake attempt with `header` set to `value`, as a browser's own
-/// page or a hostile one would send it.
+/// page or a hostile one would send it: the socket, or the HTTP status
+/// the server refused the handshake with.
 async fn connect_with_header(
     server: &Server,
     path: &str,
     header: tokio_tungstenite::tungstenite::http::HeaderName,
     value: &str,
-) -> Result<Socket, WsError> {
+) -> Result<Socket, u16> {
     let url = format!("ws://{}{path}", server.addr);
     let mut request = url.into_client_request().expect("a client request");
     request
         .headers_mut()
         .insert(header, value.parse().expect("a header value"));
-    timeout(Duration::from_secs(5), connect_async(request))
+    match timeout(Duration::from_secs(5), connect_async(request))
         .await
         .expect("the attempt settles within 5s")
-        .map(|(socket, _response)| socket)
+    {
+        Ok((socket, _response)) => Ok(socket),
+        Err(WsError::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("expected a socket or an HTTP refusal, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -336,21 +341,15 @@ async fn an_upgrade_from_another_origin_is_forbidden_before_the_handshake() {
     // handshake, and no hub is created for the id it asked for.
     let server = serve().await;
     let id = "00112233445566778899aabbccddeeff";
-    let outcome = connect_with_header(
+    let status = connect_with_header(
         &server,
         &format!("/ws?session={id}"),
         ORIGIN,
         "http://evil.example",
     )
-    .await;
-
-    match outcome {
-        Ok(_) => panic!("the handshake should have been refused"),
-        Err(WsError::Http(response)) => {
-            assert_eq!(response.status(), 403, "another page's origin is forbidden");
-        }
-        Err(other) => panic!("expected an HTTP 403, got {other:?}"),
-    }
+    .await
+    .expect_err("the handshake should have been refused");
+    assert_eq!(status, 403, "another page's origin is forbidden");
     assert!(
         !server.state.hubs.is_registered_for_test(id).await,
         "no hub is created for a refused upgrade"
@@ -376,13 +375,8 @@ async fn an_upgrade_for_a_hostname_this_server_does_not_serve_is_misdirected() {
     // sends its own name in `Host`, and its `Origin` matches it. The
     // `Host` check answers 421 before `Origin` is even consulted.
     let server = serve().await;
-    let outcome = connect_with_header(&server, "/ws", HOST, "attacker.example:9510").await;
-
-    match outcome {
-        Ok(_) => panic!("the handshake should have been refused"),
-        Err(WsError::Http(response)) => {
-            assert_eq!(response.status(), 421, "a name this server does not serve");
-        }
-        Err(other) => panic!("expected an HTTP 421, got {other:?}"),
-    }
+    let status = connect_with_header(&server, "/ws", HOST, "attacker.example:9510")
+        .await
+        .expect_err("the handshake should have been refused");
+    assert_eq!(status, 421, "a name this server does not serve");
 }
