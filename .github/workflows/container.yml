@@ -1,8 +1,10 @@
 # Builds and runs the image the README documents as an install path. Kept
-# apart from ci.yml so the ten-minute release build does not run on every
-# push: it runs when a file the image depends on changes, weekly against a
-# moved base tag or an apk change, and on demand. The schedule fires only on
-# the default branch, so it is inert until this branch becomes it.
+# apart from ci.yml so the image build (about two minutes on the runners)
+# runs only when a file the image is built from changes: the build-context
+# allowlist in .dockerignore plus the compose file and this workflow. It
+# also runs weekly, against a moved base tag or an apk change, and on
+# demand. The schedule fires only on the default branch, so it is inert
+# until this branch becomes it.
 name: Container
 
 on:
@@ -15,8 +17,9 @@ on:
       - Cargo.toml
       - Cargo.lock
       - build.rs
-      - ui/package.json
-      - ui/package-lock.json
+      - "src/**"
+      - "benches/**"
+      - "ui/**"
       - .github/workflows/container.yml
   pull_request:
     branches: [main, feature/harness]
@@ -27,8 +30,9 @@ on:
       - Cargo.toml
       - Cargo.lock
       - build.rs
-      - ui/package.json
-      - ui/package-lock.json
+      - "src/**"
+      - "benches/**"
+      - "ui/**"
       - .github/workflows/container.yml
   schedule:
     - cron: "23 5 * * 1"

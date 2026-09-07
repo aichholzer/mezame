@@ -109,7 +109,8 @@ Mezame/
   of those sets is answered 421, so list the public hostname here. A browser
   page at one of these names is also accepted as the origin of an upgrade or a
   write, whatever the proxy rewrote `Host` to. Absent means no extra names;
-  `mezame init` writes none.
+  `mezame init` writes none on a fresh file and keeps the list a readable
+  existing file holds when it rewrites one.
 
 Keys this version does not know are ignored and left on disk untouched, so a
 file written by an earlier release loads with no edit and no re-run of

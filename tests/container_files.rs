@@ -32,7 +32,7 @@ fn every_from_line_is_pinned_to_an_image_index_digest() {
     assert_eq!(froms.len(), 2, "two stages");
     for from in froms {
         let image = from.split_whitespace().nth(1).expect("an image reference");
-        let (_, digest) = image
+        let (name, digest) = image
             .split_once("@sha256:")
             .unwrap_or_else(|| panic!("{from:?} carries no digest"));
         assert_eq!(digest.len(), 64, "{from:?}: a sha256 is 64 hex characters");
@@ -42,8 +42,13 @@ fn every_from_line_is_pinned_to_an_image_index_digest() {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "{from:?}: lowercase hex only"
         );
+        // On the name half, not the whole reference, which always holds
+        // the ':' of "@sha256:". The tag is what Dependabot refreshes the
+        // digest against; a digest-only reference would be retargeted to
+        // `latest`.
+        let repo_and_tag = name.rsplit('/').next().unwrap_or(name);
         assert!(
-            image.contains(':'),
+            repo_and_tag.contains(':'),
             "{from:?} keeps its tag in front of the digest"
         );
     }
@@ -240,4 +245,36 @@ fn the_build_context_is_an_allowlist_of_build_inputs() {
             "{reexcluded} comes after !ui/, or it has no effect"
         );
     }
+}
+
+#[test]
+fn the_port_is_published_on_the_host_s_loopback_only() {
+    // Requirement 20 criterion 13 as amended. "9510:9510" would publish the
+    // unauthenticated port on every host interface, past ufw on Linux; the
+    // compose header, the README and the change log all promise loopback
+    // only, and nothing else pinned it.
+    let compose = repo_file("compose.yaml");
+    let lines = code_lines(&compose);
+    let ports: Vec<usize> = (0..lines.len())
+        .filter(|i| lines[*i].trim() == "ports:")
+        .collect();
+    assert_eq!(ports.len(), 1, "exactly one service publishes a port");
+    let mappings: Vec<&str> = lines[ports[0] + 1..]
+        .iter()
+        .take_while(|l| l.trim_start().starts_with("- "))
+        .map(|l| l.trim())
+        .collect();
+    assert_eq!(
+        mappings,
+        vec![r#"- "127.0.0.1:9510:9510""#],
+        "the one mapping binds the host's loopback"
+    );
+    let setup = lines
+        .iter()
+        .position(|l| *l == "  setup:")
+        .expect("the setup service");
+    assert!(
+        !lines[setup..].iter().any(|l| l.trim() == "ports:"),
+        "the setup service publishes nothing"
+    );
 }

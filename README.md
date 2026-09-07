@@ -190,11 +190,13 @@ same config with no prompt.
 Then:
 
 ```sh
-docker compose up -d
+docker compose up -d --build
 ```
 
-The configuration is persisted in a named volume, so you answer that prompt
-once. See the comments in `compose.yaml` for the full flow.
+Keep `--build` after pulling a new version: `up -d` alone reuses the image
+already built on this machine. The configuration is persisted in a named
+volume, so you answer that prompt once. See the comments in `compose.yaml` for
+the full flow.
 
 The container runs as user `mezame` (uid 1000) with its config at
 `/home/mezame/.mezame`, on a read-only root filesystem with every capability
@@ -300,9 +302,12 @@ Mezame holds at most 128 live sessions, each kept for 30 seconds after its
 last browser leaves. Something is opening sessions faster than they expire;
 existing tabs keep working, and the new one connects once a slot frees.
 
-**Every request through the tunnel answers 421**
-Mezame serves only hostnames it has been told about. Add the public hostname to
-`hosts` in the transport entry of `~/.mezame/config.json` and restart; step 5 of
+**Every request answers 421**
+Mezame serves only hostnames it has been told about: IP addresses,
+`localhost`, `.localhost` and `.local` names, and the host part of `bind`. Any
+other name you reach it by, a tunnel or proxy hostname, a router-assigned name,
+a `.lan` or `.home.arpa` name, a Tailscale MagicDNS name, goes under `hosts` in
+the transport entry of `~/.mezame/config.json`; then restart Mezame. Step 5 of
 the Cloudflare guide shows the shape.
 
 **The browser gets 403 on the WebSocket or when saving state**

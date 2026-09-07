@@ -141,12 +141,14 @@ async fn a_failed_write_leaves_the_existing_file_alone_and_no_temp_behind() {
     // sibling's creation fail; the existing file is untouched and the
     // response is a 500. Root ignores modes, so the case returns early
     // when run as root.
-    use std::os::unix::fs::PermissionsExt;
-    if std::env::var_os("USER").is_some_and(|u| u == "root") {
-        return;
-    }
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let _g = home_lock().lock().await;
     let tmp = TempDir::new().unwrap();
+    // Root ignores modes; it is detected by who owns the directory this
+    // test just created, since `docker run` leaves `USER` unset.
+    if std::fs::metadata(tmp.path()).is_ok_and(|m| m.uid() == 0) {
+        return;
+    }
     set_home(tmp.path());
     let dir = tmp.path().join(".mezame");
     std::fs::create_dir(&dir).unwrap();

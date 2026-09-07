@@ -11,8 +11,8 @@
 #   # or, with no terminal:
 #   docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510
 #
-# Subsequent runs:
-#   docker compose up -d
+# Subsequent runs, and after pulling a new version:
+#   docker compose up -d --build
 #
 # See compose.yaml for the volume and port wiring, and for the one-off
 # ownership fix a volume created by an earlier, root-running image needs.

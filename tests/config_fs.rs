@@ -5,7 +5,9 @@
 //!
 //! Two cases chmod a directory to `0500` to force a write failure. Root
 //! ignores modes, so those return early when the test runs as root, which
-//! the CI runners do not.
+//! the CI runners do not. Root is detected by who owns a directory the
+//! test just created, not by the `USER` variable, which `docker run` and
+//! `su` leave unset.
 
 #![cfg(unix)]
 
@@ -24,8 +26,11 @@ fn mode(path: &Path) -> u32 {
         & 0o777
 }
 
-fn running_as_root() -> bool {
-    std::env::var_os("USER").is_some_and(|u| u == "root")
+/// Whether this process is root, read from the owner of a directory the
+/// test itself just created.
+fn running_as_root(owned_by_us: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(owned_by_us).is_ok_and(|m| m.uid() == 0)
 }
 
 fn set_mode(path: &Path, mode: u32) {
@@ -128,10 +133,10 @@ fn write_private_atomic_leaves_the_target_alone_and_no_temp_on_failure() {
     // Requirement 14 criterion 10: a failed write leaves the existing file
     // as it was. The parent is made unwritable so the sibling cannot be
     // created.
-    if running_as_root() {
+    let tmp = TempDir::new().unwrap();
+    if running_as_root(tmp.path()) {
         return;
     }
-    let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join(".mezame");
     std::fs::create_dir(&dir).unwrap();
     let target = dir.join("state.json");

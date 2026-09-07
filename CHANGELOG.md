@@ -41,20 +41,35 @@ with an echo, on every attached browser at once.
   characters. `/ws?session=` with any other value is refused with a 400,
   as a path segment already was. The UI only ever sends ids the server
   minted, so nothing it has persisted is affected.
-- Behind a Cloudflare Tunnel, or any proxy that passes the public
-  hostname through in `Host`, that hostname must be listed under `hosts`
-  in the transport entry of `~/.mezame/config.json`, or every request
-  arriving through it is answered 421. Loopback, LAN IP addresses,
-  `localhost` and `.local` names need no entry. The Cloudflare guide has
-  the step.
+- Mezame answers only hostnames it has been told about. IP addresses,
+  `localhost`, `.localhost` and `.local` names, and the host part of `bind`
+  need no entry. Any other DNS name you reach it by, a Cloudflare Tunnel or
+  proxy hostname, a router-assigned name, a `.lan` or `.home.arpa` name, a
+  Tailscale MagicDNS name, must be listed under `hosts` in the transport
+  entry of `~/.mezame/config.json`, and Mezame restarted; until then every
+  request naming it is answered 421 with the name to add. A proxy that
+  instead rewrites `Host` to the upstream (nginx's default) serves the page
+  but answers 403 to the WebSocket and to every write until the page's
+  hostname is listed. `mezame init` keeps an existing `hosts` list when it
+  rewrites the file. The Cloudflare guide has the step.
 - The container runs as user `mezame` (uid 1000) and keeps its config at
   `/home/mezame/.mezame`; it was root and `/root/.mezame`. A volume an
   earlier image created is owned by root, and the new image can read it
   but not write it: sessions work, and the tab list stops being saved,
   with `mezame init` refused with "Permission denied". `compose.yaml` and
-  the README carry the one-off `chown`. Both compose services now run
-  with a read-only root filesystem, every capability dropped and no
-  privilege escalation, so a custom bind below port 1024 is refused.
+  the README carry the one-off `chown`. Rebuild the image with
+  `docker compose up -d --build`: `up -d` alone reuses the previous root
+  image, which looks for its config at `/root/.mezame` and restarts on
+  `not a terminal`. Both compose services now run with a read-only root
+  filesystem, every capability dropped and no privilege escalation.
+- `compose.yaml` publishes the container's port on the host's loopback
+  only, `127.0.0.1:9510:9510`; it was `9510:9510`, every interface the
+  host has. A browser on another machine, or a `cloudflared` on another
+  host pointed at `http://<docker-host>:9510`, is refused until the
+  mapping is changed to `"0.0.0.0:9510:9510"`, as the README's Docker
+  section describes; nothing reaches Mezame, so its log shows nothing and
+  `docker ps` still reports `healthy`. A `cloudflared` on the Docker host
+  itself reaches the loopback mapping as it is.
 - `cargo install mezame` still installs 0.13.4 from crates.io. This alpha
   installs from the `feature/harness` branch.
 
