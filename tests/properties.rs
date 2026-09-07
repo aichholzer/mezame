@@ -22,7 +22,11 @@ use mezame::backend::{
     extract_user_text, user_echo_event, user_text_len, Backend, EchoBackend, EntryBody,
     HistoryEntry, ToolCall, ToolCallStatus, ToolContent, ToolLocation,
 };
+use mezame::conversation::{Block, Message as CanonicalMessage, Role};
 use mezame::hub::{AttachedHub, HubCommand, HubRegistry};
+use mezame::prompt::{assemble, Date, Part};
+use mezame::provider::bedrock::{thinking_rule, to_bedrock_messages, Normaliser};
+use mezame::provider::{ThinkingMode, TurnEvent};
 use mezame::ws::{decide_session, is_session_id, new_session_id, run_attach_loop, SessionDecision};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -1214,5 +1218,208 @@ proptest! {
             }
             Ok::<(), TestCaseError>(())
         })?;
+    }
+}
+
+// ---------- phase 1: the provider, the request and the prompt ----------
+
+mod bedrock_events {
+    use aws_sdk_bedrockruntime::types::{
+        ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStopEvent, ConversationRole,
+        ConverseStreamOutput as StreamEvent, MessageStartEvent, MessageStopEvent,
+        StopReason as BedrockStop,
+    };
+
+    pub fn start() -> StreamEvent {
+        StreamEvent::MessageStart(
+            MessageStartEvent::builder()
+                .role(ConversationRole::Assistant)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    pub fn text(index: i32, text: &str) -> StreamEvent {
+        StreamEvent::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .content_block_index(index)
+                .delta(ContentBlockDelta::Text(text.to_string()))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    pub fn stop(index: i32) -> StreamEvent {
+        StreamEvent::ContentBlockStop(
+            ContentBlockStopEvent::builder()
+                .content_block_index(index)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    pub fn end_turn() -> StreamEvent {
+        StreamEvent::MessageStop(
+            MessageStopEvent::builder()
+                .stop_reason(BedrockStop::EndTurn)
+                .build()
+                .unwrap(),
+        )
+    }
+}
+
+fn non_empty_block() -> impl Strategy<Value = Block> {
+    prop_oneof![
+        "[a-zA-Z0-9 ,.!?]{1,40}".prop_map(|text| Block::Text { text }),
+        prop::collection::vec(any::<u8>(), 1..8).prop_map(|data| Block::Image {
+            media_type: "image/png".to_string(),
+            data,
+        }),
+        "[a-z]{1,20}".prop_map(|text| Block::Thinking {
+            text,
+            signature: Some("sig".to_string()),
+            provider: "bedrock".to_string(),
+            model: "anthropic.claude-sonnet-5".to_string(),
+        }),
+    ]
+}
+
+fn exchanges() -> impl Strategy<Value = Vec<(Vec<Block>, Option<Vec<Block>>)>> {
+    prop::collection::vec(
+        (
+            prop::collection::vec(non_empty_block(), 1..4),
+            prop::option::of(prop::collection::vec(non_empty_block(), 1..4)),
+        ),
+        1..30,
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: bedrock-end-to-end, Property 1: Normalised text is the text
+    // that was fed
+    #[test]
+    fn property_p1_normalised_text_is_the_text_that_was_fed(
+        chunks in prop::collection::vec("[\\p{L}\\p{N}\\p{M}\\p{P} ]{1,200}", 1..50)
+    ) {
+        let mut normaliser = Normaliser::new("anthropic.claude-sonnet-5");
+        let mut events = normaliser.feed(bedrock_events::start());
+        for chunk in &chunks {
+            events.extend(normaliser.feed(bedrock_events::text(0, chunk)));
+        }
+        events.extend(normaliser.feed(bedrock_events::stop(0)));
+        events.extend(normaliser.feed(bedrock_events::end_turn()));
+
+        let starts_with_message_start = matches!(events.first(), Some(TurnEvent::MessageStart { .. }));
+        prop_assert!(starts_with_message_start);
+        let ends_with_end_turn = matches!(
+            events.last(),
+            Some(TurnEvent::Stop(mezame::provider::StopReason::EndTurn))
+        );
+        prop_assert!(ends_with_end_turn);
+        let middle = &events[1..events.len() - 1];
+        prop_assert_eq!(middle.len(), chunks.len());
+        let mut joined = String::new();
+        for event in middle {
+            match event {
+                TurnEvent::TextDelta(text) => joined.push_str(text),
+                other => prop_assert!(false, "unexpected event {:?}", other),
+            }
+        }
+        prop_assert_eq!(joined, chunks.concat());
+    }
+
+    // Feature: bedrock-end-to-end, Property 2: Built requests alternate
+    // roles from `user`
+    #[test]
+    fn property_p2_built_requests_alternate_roles_from_user(exchanges in exchanges()) {
+        use aws_sdk_bedrockruntime::types::{ContentBlock, ConversationRole};
+
+        let last = exchanges.len() - 1;
+        let mut messages = Vec::new();
+        let mut input_blocks = 0usize;
+        for (i, (user_blocks, assistant_blocks)) in exchanges.into_iter().enumerate() {
+            input_blocks += user_blocks.len();
+            messages.push(CanonicalMessage { role: Role::User, blocks: user_blocks });
+            if i != last {
+                if let Some(blocks) = assistant_blocks {
+                    input_blocks += blocks.len();
+                    messages.push(CanonicalMessage { role: Role::Assistant, blocks });
+                }
+            }
+        }
+
+        let built = to_bedrock_messages(&messages, "anthropic.claude-sonnet-5");
+        prop_assert!(!built.is_empty());
+        for (i, message) in built.iter().enumerate() {
+            let expected = if i % 2 == 0 { ConversationRole::User } else { ConversationRole::Assistant };
+            prop_assert_eq!(message.role(), &expected, "message {} has the wrong role", i);
+        }
+        prop_assert_eq!(built.last().unwrap().role(), &ConversationRole::User);
+
+        let mut cache_points = Vec::new();
+        let mut plain = 0usize;
+        for (m, message) in built.iter().enumerate() {
+            for (b, block) in message.content().iter().enumerate() {
+                if matches!(block, ContentBlock::CachePoint(_)) {
+                    cache_points.push((m, b));
+                } else {
+                    plain += 1;
+                }
+            }
+        }
+        prop_assert_eq!(plain, input_blocks);
+        let last_message = built.len() - 1;
+        let last_block = built[last_message].content().len() - 1;
+        prop_assert_eq!(cache_points, vec![(last_message, last_block)]);
+    }
+
+    // Feature: bedrock-end-to-end, Property 3: The thinking rule is total
+    // and agrees with the table
+    #[test]
+    fn property_p3_the_thinking_rule_is_total_and_agrees_with_the_table(id in ".{0,300}") {
+        let _ = thinking_rule(&id);
+
+        use ThinkingMode::{Adaptive, Enabled, Off};
+        let table = [
+            ("anthropic.claude-sonnet-5", Adaptive),
+            ("anthropic.claude-opus-5", Adaptive),
+            ("anthropic.claude-fable-5-1", Adaptive),
+            ("anthropic.claude-opus-4-8", Adaptive),
+            ("anthropic.claude-sonnet-4-6", Adaptive),
+            ("anthropic.claude-opus-4-6-v1", Adaptive),
+            ("anthropic.claude-sonnet-4-5-20250929-v1:0", Enabled),
+            ("anthropic.claude-haiku-4-5-20251001-v1:0", Enabled),
+            ("anthropic.claude-opus-4-5-20251101-v1:0", Enabled),
+            ("anthropic.claude-opus-4-1-20250805-v1:0", Enabled),
+            ("anthropic.claude-3-7-sonnet-20250219-v1:0", Enabled),
+            ("anthropic.claude-3-5-haiku-20241022-v1:0", Off),
+        ];
+        for prefix in ["", "us.", "global.", "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us."] {
+            for (base, expected) in table {
+                let id = format!("{prefix}{base}");
+                prop_assert_eq!(thinking_rule(&id), expected, "{}", id);
+            }
+        }
+        prop_assert_eq!(thinking_rule("amazon.nova-pro-v1:0"), Off);
+        prop_assert_eq!(thinking_rule(""), Off);
+    }
+
+    // Feature: bedrock-end-to-end, Property 5: Assembly is a function
+    #[test]
+    fn property_p5_assembly_is_a_function(
+        texts in prop::collection::vec(".{0,80}", 0..6),
+        year in 1i64..=9999,
+        month in 1u32..=12,
+        day in 1u32..=28,
+    ) {
+        let parts: Vec<Part> = texts.iter().map(|text| Part { name: "part", text: text.clone() }).collect();
+        let date = Date { year, month, day };
+        let first = assemble(&parts, date);
+        let second = assemble(&parts, date);
+        prop_assert_eq!(&first, &second);
+        prop_assert_eq!(&first.date_line, &format!("Today's date is {date}."));
+        prop_assert!(!first.static_text.contains("Today's date is"));
     }
 }

@@ -337,9 +337,14 @@ impl EchoBackend {
     }
 }
 
-/// The entries an [`EchoBackend`] retains, the running byte count, and
-/// the two ceilings they are held under.
-struct Transcript {
+/// The entries a Backend retains, the running byte count, and the two
+/// ceilings they are held under. [`EchoBackend`] records a turn at a time
+/// through [`Transcript::record_turn`]; the conversation store in
+/// `crate::conversation` records and evicts whole exchanges through
+/// [`Transcript::record`] and [`Transcript::evict_front`] and holds the
+/// budget itself, with attachment bytes added to the text.
+#[derive(Debug)]
+pub(crate) struct Transcript {
     entries: VecDeque<HistoryEntry>,
     /// The sum of [`entry_text_len`] over `entries`.
     bytes: usize,
@@ -348,7 +353,7 @@ struct Transcript {
 }
 
 impl Transcript {
-    fn new(budget_bytes: usize, max_entries: usize) -> Self {
+    pub(crate) fn new(budget_bytes: usize, max_entries: usize) -> Self {
         Self {
             entries: VecDeque::new(),
             bytes: 0,
@@ -357,28 +362,57 @@ impl Transcript {
         }
     }
 
+    /// Append entries in order, counting their text.
+    pub(crate) fn record(&mut self, entries: impl IntoIterator<Item = HistoryEntry>) {
+        for entry in entries {
+            self.bytes += entry_text_len(&entry);
+            self.entries.push_back(entry);
+        }
+    }
+
+    /// Drop the oldest `count` entries, uncounting their text.
+    pub(crate) fn evict_front(&mut self, count: usize) {
+        for _ in 0..count {
+            if let Some(evicted) = self.entries.pop_front() {
+                self.bytes -= entry_text_len(&evicted);
+            }
+        }
+    }
+
+    /// Whether the text plus `extra` bytes, or the entry count, exceeds a
+    /// ceiling.
+    pub(crate) fn over_budget(&self, extra: usize) -> bool {
+        self.bytes + extra > self.budget_bytes || self.entries.len() > self.max_entries
+    }
+
+    /// The text bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The entries, oldest first.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &HistoryEntry> {
+        self.entries.iter()
+    }
+
+    /// The newest entry's timestamp.
+    pub(crate) fn last_timestamp(&self) -> Option<i64> {
+        self.entries.back().map(|entry| entry.timestamp)
+    }
+
     /// Append one turn's two entries, then evict the oldest turns until
     /// the transcript is inside both ceilings again. The turn just
     /// recorded is never evicted, so a single turn larger than the whole
     /// budget is retained on its own.
     fn record_turn(&mut self, user: HistoryEntry, agent: HistoryEntry) {
-        self.bytes += entry_text_len(&user) + entry_text_len(&agent);
-        self.entries.push_back(user);
-        self.entries.push_back(agent);
-        while self.entries.len() > 2
-            && (self.bytes > self.budget_bytes || self.entries.len() > self.max_entries)
-        {
-            // Entries are recorded in pairs, so the front two are one
-            // turn.
-            for _ in 0..2 {
-                if let Some(evicted) = self.entries.pop_front() {
-                    self.bytes -= entry_text_len(&evicted);
-                }
-            }
+        self.record([user, agent]);
+        // Entries are recorded in pairs, so the front two are one turn.
+        while self.entries.len() > 2 && self.over_budget(0) {
+            self.evict_front(2);
         }
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
     }
@@ -388,7 +422,7 @@ impl Transcript {
 /// budget counts. An echo transcript holds text entries only; the
 /// tool-call arm measures the serialised call so the count stays honest
 /// should one ever be recorded.
-fn entry_text_len(entry: &HistoryEntry) -> usize {
+pub(crate) fn entry_text_len(entry: &HistoryEntry) -> usize {
     match &entry.body {
         EntryBody::User { text }
         | EntryBody::Agent { text }

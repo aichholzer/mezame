@@ -14,11 +14,16 @@
 //!   - `backend`: the Backend seam, the transcript types, the shipped
 //!     `EchoBackend`
 //!   - `config`:  on-disk settings and interactive setup
+//!   - `conversation`: the canonical content blocks, the wire-to-block
+//!     mapping, and the conversation store coupled to the transcript
 //!   - `guard`:   the `Host` allowlist and the `Origin` check, the one
 //!     layer in front of every route
 //!   - `http`:    cloudflared transport (HTTP/WS server, UI assets,
 //!     `/state`, `/history`)
 //!   - `hub`:     the per-session hub, its registry and its owner loop
+//!   - `prompt`:  the system prompt assembly, date last
+//!   - `provider`: the `TurnEvent` vocabulary, the `Provider` trait and
+//!     the Bedrock implementation
 //!   - `ws`:      the upgrade, the per-attach loop and the client command
 //!     set
 //!   - `unix`:    the three libc calls this crate needs, on Unix only
@@ -28,9 +33,12 @@
 
 pub mod backend;
 pub mod config;
+pub mod conversation;
 pub mod guard;
 pub mod http;
 pub mod hub;
+pub mod prompt;
+pub mod provider;
 pub mod ws;
 
 #[cfg(unix)]
