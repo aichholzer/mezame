@@ -31,6 +31,7 @@ fn test_state(capacity: usize) -> Arc<AppState> {
         config: Arc::new(Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
+                hosts: vec![],
             }],
         }),
         hubs: HubRegistry::new(),

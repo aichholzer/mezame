@@ -42,7 +42,17 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TransportConfig {
-    Cloudflared { bind: String },
+    Cloudflared {
+        bind: String,
+        /// Hostnames this server answers to besides IP literals, `localhost`
+        /// and `.local` names: the public hostname a tunnel or proxy in
+        /// front of Mezame carries in `Host`, and the origin its pages
+        /// present. A request naming any other hostname is answered 421;
+        /// see `guard.rs`. A file written before this key existed reads as
+        /// an empty list, and `mezame init` writes none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hosts: Vec<String>,
+    },
     // Telegram { token: String }: commented out until `run_telegram`
     // ships. An enabled variant would have to round-trip through the
     // config, advertising a transport that does nothing.
@@ -113,7 +123,10 @@ pub(crate) fn init_config() -> Result<Config> {
     };
 
     let cfg = Config {
-        transports: vec![TransportConfig::Cloudflared { bind }],
+        transports: vec![TransportConfig::Cloudflared {
+            bind,
+            hosts: Vec::new(),
+        }],
     };
 
     let path = config_path()?;

@@ -37,6 +37,12 @@ with an echo, on every attached browser at once.
   the new key.
 - Building from source needs Node.js 24 or newer. `build.rs` refuses an
   older version.
+- Behind a Cloudflare Tunnel, or any proxy that passes the public
+  hostname through in `Host`, that hostname must be listed under `hosts`
+  in the transport entry of `~/.mezame/config.json`, or every request
+  arriving through it is answered 421. Loopback, LAN IP addresses,
+  `localhost` and `.local` names need no entry. The Cloudflare guide has
+  the step.
 - `cargo install mezame` still installs 0.13.4 from crates.io. This alpha
   installs from the `feature/harness` branch.
 
@@ -51,6 +57,12 @@ with an echo, on every attached browser at once.
 
 ### Security
 
+- Two request checks that need no user identity close the path a page in
+  the user's own browser had to a loopback Mezame. Every request must name
+  a host Mezame serves in `Host`, which stops DNS rebinding; a WebSocket
+  upgrade or a write whose `Origin` is another page is refused with a 403,
+  which stops cross-site WebSocket hijacking and cross-site writes.
+  Clients that are not browsers send no `Origin` and are unaffected.
 - Three ceilings bound what one browser can put into memory: 32 MiB per
   WebSocket message (the library default was 64 MiB), 1 MiB of text per
   prompt (refused to its sender with an `error` frame), and 16 MiB or

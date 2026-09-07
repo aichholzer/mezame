@@ -25,7 +25,10 @@ flowchart LR
   answers with the text it was given.
 - Mezame binds loopback by default; `mezame init` also offers `0.0.0.0` for
   trusted-LAN setups. Public reachability can be delegated to an existing
-  Cloudflare Tunnel on your network.
+  Cloudflare Tunnel on your network. Two checks in `src/guard.rs` keep pages
+  from other sites out of a loopback Mezame: every request must name a host
+  Mezame serves in `Host`, and an upgrade or a write must come from a page
+  Mezame served, read from `Origin`. Neither needs to know who the user is.
 - The web UI is a React + Tailwind v4 app under `ui/`. The `build.rs` step runs
   the Vite build; the compiled bundle is baked into the binary via `rust-embed`
   so the release binary stays self-contained.
@@ -74,7 +77,9 @@ Mezame/
 
 ```json
 {
-  "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }]
+  "transports": [
+    { "kind": "cloudflared", "bind": "127.0.0.1:9510", "hosts": ["mezame.example.com"] }
+  ]
 }
 ```
 
@@ -88,6 +93,14 @@ Mezame/
   loopback; `mezame init` offers `0.0.0.0:9510` if you want LAN reach. Mezame
   has no auth of its own today. Anything non-loopback relies on Cloudflare
   Access, or on your LAN being trusted.
+- `transports[].hosts` (cloudflared only, optional): the hostnames Mezame
+  answers to besides IP addresses, `localhost`, `.localhost` and `.local`
+  names, and the host part of `bind`. A tunnel or proxy passes the public
+  hostname through in `Host`, and a request naming a hostname that is in none
+  of those sets is answered 421, so list the public hostname here. A browser
+  page at one of these names is also accepted as the origin of an upgrade or a
+  write, whatever the proxy rewrote `Host` to. Absent means no extra names;
+  `mezame init` writes none.
 
 Keys this version does not know are ignored and left on disk untouched, so a
 file written by an earlier release loads with no edit and no re-run of

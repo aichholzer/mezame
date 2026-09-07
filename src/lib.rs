@@ -26,6 +26,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod guard;
 pub mod http;
 pub mod hub;
 pub mod ws;
@@ -79,7 +80,7 @@ pub fn run() -> Result<()> {
         match cfg.transports.as_slice() {
             [] => bail!("No transports configured. Re-run `mezame init`."),
             [one] => match one.clone() {
-                TransportConfig::Cloudflared { bind } => run_cloudflared(cfg, bind).await,
+                TransportConfig::Cloudflared { bind, .. } => run_cloudflared(cfg, bind).await,
             },
             _ => bail!(
                 "Running more than one transport at once is not yet supported. \

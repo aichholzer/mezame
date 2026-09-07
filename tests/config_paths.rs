@@ -80,8 +80,12 @@ async fn load_config_reads_a_well_formed_json_file() {
 
     let cfg: Config = load_config().expect("load_config");
     assert_eq!(cfg.transports.len(), 1);
-    let TransportConfig::Cloudflared { bind } = &cfg.transports[0];
+    let TransportConfig::Cloudflared { bind, hosts } = &cfg.transports[0];
     assert_eq!(bind, "127.0.0.1:9510");
+    assert!(
+        hosts.is_empty(),
+        "a file without the key reads as no extra hosts"
+    );
 }
 
 #[tokio::test]

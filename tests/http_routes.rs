@@ -35,11 +35,18 @@ fn home_lock() -> &'static Mutex<()> {
 }
 
 fn dummy_state() -> Arc<AppState> {
+    state_with_hosts(&[])
+}
+
+/// A state whose transport lists `hosts`, the public names a tunnel or
+/// proxy in front of Mezame carries.
+fn state_with_hosts(hosts: &[&str]) -> Arc<AppState> {
     let (state_changes, _) = broadcast::channel(8);
     Arc::new(AppState {
         config: Arc::new(Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
+                hosts: hosts.iter().map(|h| h.to_string()).collect(),
             }],
         }),
         hubs: HubRegistry::new(),
@@ -258,6 +265,7 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
         config: Arc::new(Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
+                hosts: vec![],
             }],
         }),
         hubs,
@@ -484,4 +492,202 @@ async fn get_state_serves_an_empty_object_for_malformed_json() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&bytes), json!({}));
+}
+
+// ---------- the Host and Origin checks ----------
+
+/// Send one request through a router built on `state`.
+async fn run_on(state: Arc<AppState>, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let res = build_router(state)
+        .oneshot(req)
+        .await
+        .expect("router did not respond");
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .expect("body read")
+        .to_vec();
+    (status, bytes)
+}
+
+#[tokio::test]
+async fn a_request_for_a_hostname_this_server_does_not_serve_is_misdirected() {
+    // DNS rebinding: a page at attacker.example, re-pointed at 127.0.0.1,
+    // sends its own name in `Host`. Every route answers 421, the SPA
+    // fallback included, and no handler runs: the PUT leaves no file.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    for (method, path) in [
+        ("GET", "/state"),
+        ("GET", "/history?session=x"),
+        ("GET", "/"),
+        ("GET", "/assets/app.js"),
+        ("PUT", "/state"),
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "attacker.example:9510")
+            .header("origin", "http://attacker.example:9510")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"sessions":[]}"#))
+            .unwrap();
+        let (status, body, _) = run_request(req).await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{method} {path}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("attacker.example"),
+            "the refusal names the host it refused"
+        );
+    }
+    assert!(
+        !tmp.path().join(".mezame/state.json").exists(),
+        "the PUT never reached its handler"
+    );
+}
+
+#[tokio::test]
+async fn requests_for_loopback_local_and_configured_names_are_served() {
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    for host in [
+        "127.0.0.1:9510",
+        "localhost:9510",
+        "[::1]:9510",
+        "192.168.1.20:9510",
+        "stefans-mac.local:9510",
+    ] {
+        let req = Request::get("/state")
+            .header("host", host)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = run_request(req).await;
+        assert_eq!(status, StatusCode::OK, "{host} names this server");
+    }
+
+    // The public hostname a tunnel passes through in `Host`: refused until
+    // it is listed, served once it is.
+    let req = || {
+        Request::get("/state")
+            .header("host", "mezame.example.com")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, _) = run_on(dummy_state(), req()).await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "unlisted");
+    let (status, _) = run_on(state_with_hosts(&["mezame.example.com"]), req()).await;
+    assert_eq!(status, StatusCode::OK, "listed under hosts");
+}
+
+#[tokio::test]
+async fn a_write_from_another_origin_is_forbidden_and_leaves_no_trace() {
+    // Cross-site: a page at evil.example fetches PUT /state at loopback.
+    // The browser sends that page's `Origin`; the write is refused before
+    // the handler, so no file is written and no `state_changes` tick fires.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let state = dummy_state();
+    let mut rx = state.state_changes.subscribe();
+    let req = Request::put("/state")
+        .header("host", "127.0.0.1:9510")
+        .header("origin", "http://evil.example")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"sessions":[]}"#))
+        .unwrap();
+    let (status, body) = run_on(state, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        String::from_utf8_lossy(&body).contains("evil.example"),
+        "the refusal names the origin it refused"
+    );
+    assert!(
+        !tmp.path().join(".mezame/state.json").exists(),
+        "the write never reached its handler"
+    );
+    assert!(rx.try_recv().is_err(), "no tick for a refused write");
+}
+
+#[tokio::test]
+async fn a_write_from_the_page_this_server_served_goes_through() {
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let put = |origin: &str, host: &str| {
+        Request::put("/state")
+            .header("host", host)
+            .header("origin", origin)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"sessions":[]}"#))
+            .unwrap()
+    };
+    let hosts = || state_with_hosts(&["mezame.example.com"]);
+
+    for (origin, host) in [
+        // The UI at loopback.
+        ("http://127.0.0.1:9510", "127.0.0.1:9510"),
+        // Behind a tunnel: the public name in both headers.
+        ("https://mezame.example.com", "mezame.example.com"),
+        // Behind a proxy that rewrote `Host` to the bind address: the
+        // configured name in `Origin` is enough on its own.
+        ("https://mezame.example.com", "127.0.0.1:9510"),
+    ] {
+        let (status, _) = run_on(hosts(), put(origin, host)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{origin} sent to {host}");
+    }
+
+    for (origin, host) in [
+        // Another port on the same host is another page.
+        ("http://127.0.0.1:8080", "127.0.0.1:9510"),
+        // A sandboxed frame or a `file://` page.
+        ("null", "127.0.0.1:9510"),
+        // A name that is not listed, whatever `Host` says.
+        ("https://evil.example", "mezame.example.com"),
+    ] {
+        let (status, _) = run_on(hosts(), put(origin, host)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin} sent to {host}");
+    }
+}
+
+#[tokio::test]
+async fn a_read_over_get_carries_no_origin_check() {
+    // The browser withholds a cross-origin response on its own, and the
+    // `Host` check covers the rebound page that would read it. A client
+    // sending a stray `Origin` on a GET is served.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let req = Request::get("/state")
+        .header("host", "127.0.0.1:9510")
+        .header("origin", "http://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let (status, bytes, _) = run_request(req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&bytes), json!({}));
+}
+
+#[tokio::test]
+async fn a_client_sending_neither_header_is_served() {
+    // Every other case in this file sends neither `Host` nor `Origin`,
+    // which no browser does: hyper refuses an HTTP/1.1 request without a
+    // `Host` before this layer runs, and a browser attaches `Origin` to
+    // every request the check covers. The two absences mean a client that
+    // is not a browser, and the checks are aimed at browsers.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    set_home(tmp.path());
+
+    let req = Request::put("/state")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"sessions":[]}"#))
+        .unwrap();
+    let (status, _, _) = run_request(req).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }

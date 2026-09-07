@@ -34,7 +34,11 @@ reconnect.
 - **Mezame has no authentication of its own.** Every request that reaches the
   socket is trusted. Access control is pushed to the edge: bind an address in
   your own network and put something in front of it that already knows who you
-  are.
+  are. Binding loopback keeps the network out, not your own browser: any page
+  you have open can reach `127.0.0.1`. Mezame checks that a WebSocket upgrade
+  or a write comes from a page it served itself and that every request names a
+  host it serves, so a hostile page cannot ride your browser into it. That is
+  the extent of it; there is still no notion of who you are.
 - **Mezame is not multi-user.** One installation serves one person's sessions.
   The session list and the settings are shared across every browser that can
   reach it, deliberately, so your phone and your desktop stay in sync.
@@ -194,11 +198,13 @@ Stderr carries Mezame's own logs. One environment variable is worth knowing:
    of what you typed and talks to no provider. It exists to prove the
    transport: connect two browsers to one session, send a prompt, and watch it
    land on both. The provider loop is the next release on this line.
-2. **Auth enforcement.** Mezame trusts everything that reaches the WebSocket
-   upgrade. When fronted by Cloudflare Access, validate the
+2. **Auth enforcement.** Mezame has no notion of who is connected. What it
+   does check, in `src/guard.rs`, is that a WebSocket upgrade or a write comes
+   from a page it served (`Origin`) and that every request names a host it
+   serves (`Host`). When fronted by Cloudflare Access, validating the
    `Cf-Access-Jwt-Assertion` header (JWKS at
-   `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`). See
-   `ws_upgrade` in `src/ws.rs`.
+   `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`) is the next
+   step; the TODO sits in `src/http.rs`.
 3. **A transcript lives as long as its session.** Nothing is written to disk,
    so a reload after the grace period shows an empty log and a restart loses
    every conversation. Durable storage is planned.

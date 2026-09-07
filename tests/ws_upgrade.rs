@@ -22,7 +22,9 @@ use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Notify};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HOST, ORIGIN};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -40,6 +42,7 @@ async fn serve() -> Server {
         config: Arc::new(Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
+                hosts: vec![],
             }],
         }),
         hubs: HubRegistry::new(),
@@ -292,4 +295,83 @@ async fn a_prompt_past_the_text_ceiling_is_answered_with_an_error_over_a_real_so
     assert_eq!(reply["text"], "hello");
     let done = next_text(&mut socket).await;
     assert_eq!(done["type"], "prompt_done");
+}
+
+/// A handshake attempt with `header` set to `value`, as a browser's own
+/// page or a hostile one would send it.
+async fn connect_with_header(
+    server: &Server,
+    path: &str,
+    header: tokio_tungstenite::tungstenite::http::HeaderName,
+    value: &str,
+) -> Result<Socket, WsError> {
+    let url = format!("ws://{}{path}", server.addr);
+    let mut request = url.into_client_request().expect("a client request");
+    request
+        .headers_mut()
+        .insert(header, value.parse().expect("a header value"));
+    timeout(Duration::from_secs(5), connect_async(request))
+        .await
+        .expect("the attempt settles within 5s")
+        .map(|(socket, _response)| socket)
+}
+
+#[tokio::test]
+async fn an_upgrade_from_another_origin_is_forbidden_before_the_handshake() {
+    // Browsers apply no same-origin policy to a WebSocket handshake: a page
+    // at evil.example can open `ws://127.0.0.1:9510/ws` and, before this
+    // check, read and drive the session it named. The handshake carries
+    // that page's `Origin`; the upgrade is refused with a 403 ahead of the
+    // handshake, and no hub is created for the id it asked for.
+    let server = serve().await;
+    let id = "00112233445566778899aabbccddeeff";
+    let outcome = connect_with_header(
+        &server,
+        &format!("/ws?session={id}"),
+        ORIGIN,
+        "http://evil.example",
+    )
+    .await;
+
+    match outcome {
+        Ok(_) => panic!("the handshake should have been refused"),
+        Err(WsError::Http(response)) => {
+            assert_eq!(response.status(), 403, "another page's origin is forbidden");
+        }
+        Err(other) => panic!("expected an HTTP 403, got {other:?}"),
+    }
+    assert!(
+        !server.state.hubs.is_registered_for_test(id).await,
+        "no hub is created for a refused upgrade"
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_from_the_page_this_server_served_is_accepted() {
+    // The shipped UI builds its socket URL from `location.host`, so its
+    // `Origin` names the same host and port the handshake is sent to.
+    let server = serve().await;
+    let origin = format!("http://{}", server.addr);
+    let mut socket = connect_with_header(&server, "/ws", ORIGIN, &origin)
+        .await
+        .expect("the page this server served is accepted");
+    let ready = next_text(&mut socket).await;
+    assert_eq!(ready["type"], "ready");
+}
+
+#[tokio::test]
+async fn an_upgrade_for_a_hostname_this_server_does_not_serve_is_misdirected() {
+    // DNS rebinding: a page at attacker.example, re-pointed at 127.0.0.1,
+    // sends its own name in `Host`, and its `Origin` matches it. The
+    // `Host` check answers 421 before `Origin` is even consulted.
+    let server = serve().await;
+    let outcome = connect_with_header(&server, "/ws", HOST, "attacker.example:9510").await;
+
+    match outcome {
+        Ok(_) => panic!("the handshake should have been refused"),
+        Err(WsError::Http(response)) => {
+            assert_eq!(response.status(), 421, "a name this server does not serve");
+        }
+        Err(other) => panic!("expected an HTTP 421, got {other:?}"),
+    }
 }

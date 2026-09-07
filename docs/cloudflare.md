@@ -40,7 +40,17 @@ A named Cloudflare Tunnel can route a public hostname at your local Mezame. The 
    cloudflared tunnel route dns mezame mezame.example.com
    ```
 
-5. Run it:
+5. Tell Mezame the hostname. `cloudflared` passes it through as the `Host` of every request, and Mezame answers 421 to a hostname it has not been told about (that check is what stops DNS rebinding). Add it to the transport entry in `~/.mezame/config.json` and restart Mezame:
+
+   ```json
+   {
+     "transports": [
+       { "kind": "cloudflared", "bind": "127.0.0.1:9510", "hosts": ["mezame.example.com"] }
+     ]
+   }
+   ```
+
+6. Run it:
 
    ```sh
    cloudflared tunnel run mezame
@@ -68,6 +78,8 @@ cloudflared tunnel route dns <your-tunnel-name> mezame.example.com
 ```
 
 Reload `cloudflared`. WebSocket upgrades are forwarded by default and `/ws` needs no special flags.
+
+Then list the hostname under `hosts` in the transport entry of Mezame's `~/.mezame/config.json` (step 5 above shows the shape) and restart Mezame. Without it, every request arriving through the tunnel is answered 421, because Mezame serves only hostnames it has been told about. If your ingress rule sets `originRequest.httpHostHeader` instead, the entry is still needed: the browser's `Origin` carries the public hostname, and Mezame accepts an upgrade or a write from a listed hostname whatever `Host` was rewritten to.
 
 ## Put Cloudflare Access in front (strongly recommended)
 

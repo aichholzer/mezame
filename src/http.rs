@@ -6,7 +6,8 @@
 //!
 //! Also home to the plain HTTP endpoints: `/state` (cross-device browser
 //! state), `/history` (a session's transcript), and the embedded-asset
-//! fallback.
+//! fallback. Every route sits behind the `Host` and `Origin` checks in
+//! `guard.rs`, the two request checks that need no user identity.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, HeaderValue, StatusCode, Uri},
+    middleware,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -31,6 +33,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Notify};
 
 use crate::config::{state_path, Config};
+use crate::guard::{guard_request, RequestPolicy};
 use crate::hub::HubRegistry;
 use crate::ws::ws_upgrade;
 
@@ -72,6 +75,9 @@ struct UiAssets;
 // allowing the upgrade. The header is injected by Cloudflare Access; its
 // signing keys are at
 //   https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+// What is enforced today lives in `guard.rs`: the `Host` allowlist and the
+// `Origin` check, which stop a page in the user's own browser from reaching
+// a loopback Mezame, and need no identity to do it.
 
 pub(crate) async fn run_cloudflared(cfg: Config, bind: String) -> Result<()> {
     let (state_changes, _) = broadcast::channel(64);
@@ -122,6 +128,10 @@ pub fn enable_tcp_keepalive(listener: &TcpListener) {
 /// out from `run_cloudflared` so integration tests can drive it via
 /// `tower::ServiceExt::oneshot` without binding a TCP port.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // The one layer, outermost: every route and the fallback sit behind
+    // the `Host` allowlist and the `Origin` check. The policy is read
+    // from the config once, here.
+    let policy = Arc::new(RequestPolicy::from_config(&state.config));
     Router::new()
         .route("/ws", get(ws_upgrade))
         .route("/state", get(get_state).put(put_state))
@@ -131,6 +141,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // the embedded UI bundle, with index.html as the fallback for
         // client-side routes.
         .fallback(get(serve_ui_asset))
+        .layer(middleware::from_fn_with_state(policy, guard_request))
         .with_state(state)
 }
 

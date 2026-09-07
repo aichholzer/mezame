@@ -201,6 +201,26 @@ them is reachable from the composer in ordinary use.
 - A transcript retains at most 16 MiB of entry text and 10,000 entries, the
   oldest turn evicted first and the newest always kept.
 
+## Request checks
+
+Two checks run ahead of every route. A request that fails one is answered with
+a plain-text body naming the value refused, and reaches no handler.
+
+- `Host` must name this server: an IP literal, `localhost`, a `.localhost` or
+  `.local` name, the host part of the bind address, or a hostname listed under
+  `hosts` in the transport config. Anything else is answered 421. An IP
+  literal cannot be rebound through DNS; a name can, so names are allowlisted.
+- On a WebSocket upgrade and on any request whose method is not `GET` or
+  `HEAD`, an `Origin` header, when present, must name the host and port the
+  request was sent to (the port ignored when `Host` names none), or a hostname
+  listed under `hosts`. Anything else, `null` included, is answered 403. A
+  request without `Origin` passes: a browser sends one on every request this
+  check covers, so its absence means a client that is not a browser.
+
+A plain `GET` carries no `Origin` check. The browser withholds a cross-origin
+response on its own, and the `Host` check covers the rebound page that would
+otherwise read it as same-origin.
+
 ## Session identity
 
 A session id is 1 to 128 characters drawn from the ASCII letters, the digits,
