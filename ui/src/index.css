@@ -99,9 +99,12 @@
    * reskin briefly ran EB Garamond and Manrope to match the supplied
    * reference. The project's identity is the mono-throughout look that
    * pre-dates it, and the fonts were reverted while the warm palette
-   * stayed. */
+   * stayed. Both families are bundled from Fontsource (imported in
+   * main.tsx); nothing is fetched from Google. The variable build
+   * registers as 'JetBrains Mono Variable', and the plain name stays
+   * second for a locally installed copy. */
   --font-display: 'Gugi', ui-serif, Georgia, serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
   --font-body: var(--font-mono);
 }
 

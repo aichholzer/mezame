@@ -36,6 +36,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     suspended: false,
     lastActivityAt: Date.now(),
     inFlight: false,
+    thoughtOpen: false,
     ...overrides
   };
 }
@@ -101,7 +102,8 @@ describe('applyServerMessage / ready', () => {
     applyServerMessage(s, {
       type: 'ready',
       sessionId: 'abc',
-      resumed: true
+      resumed: true,
+      busy: false
     });
     expect(s.log).toEqual(liveLog);
     expect(s.hydrated).toBe(true);

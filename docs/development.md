@@ -27,12 +27,18 @@ Two terminals:
 # terminal 1: Rust on :9510
 cargo run --release
 
-# terminal 2: Vite with HMR on :5173, proxies /ws and /state
+# terminal 2: Vite with HMR on :5173, proxies /ws, /state and /history
 cd ui
 npm run dev
 ```
 
 Browse `http://127.0.0.1:5173`. The embedded bundle is only relevant when you run the release binary directly.
+
+Do not add `changeOrigin` to the proxy entries in `ui/vite.config.ts`: the
+server refuses an upgrade or a write whose `Origin` names a different host or
+port from `Host`, and Vite rewrites `Host` when that flag is on. Browse the dev
+server by `127.0.0.1` or `localhost`, which the `Host` allowlist serves without
+configuration.
 
 ## Where to add things
 
@@ -50,7 +56,9 @@ Browse `http://127.0.0.1:5173`. The embedded bundle is only relevant when you ru
 
 The suite lives in `tests/` (Rust integration tests) and `tests/ui/` plus
 `ui/src/**` (Vitest). Run the Rust side with `cargo test --all-targets` and
-the UI side with `npm test` in `ui/`. CI also enforces a coverage floor via
+the UI side with `npm test` in `ui/`, which type-checks the suites against
+`ui/src/types.ts` (`tsconfig.test.json`) and then runs vitest. CI also enforces
+a coverage floor via
 `cargo llvm-cov` (see `.github/workflows/ci.yml`), passes `--locked` so a
 `Cargo.toml` edit without its `Cargo.lock` fails on every push, and fails the
 `docs` job if `cargo package --list` names a repository-only file.

@@ -74,6 +74,16 @@ with an echo, on every attached browser at once.
 - Two browsers syncing `state.json` at the same moment no longer race on
   one temporary file; one of them used to get a 500, and a fresh page load
   then restored nothing until the next sync.
+- A `state.json` whose label is not a string no longer blanks the page on
+  every load; the tab shows as `?`. A render error anywhere shows a
+  recovery screen with a Reload action instead of a blank page.
+- A persisted session id the server would refuse, anything but 32
+  lowercase hexadecimal characters, is discarded at load like a missing
+  one, instead of leaving the tab reconnecting forever with no cause
+  shown.
+- The Vite dev loop proxies `/history` (it proxied a `/legacy` route that
+  no longer exists) and no longer rewrites `Host`, which the Origin check
+  refused.
 
 ### Removed
 
@@ -86,6 +96,11 @@ with an echo, on every attached browser at once.
 
 ### Security
 
+- Markdown images are never fetched. An image in a reply renders as its
+  alt text and the host it points at, so a reply cannot make every
+  attached browser request an arbitrary remote or LAN address.
+- The UI loads no fonts from Google. JetBrains Mono and Gugi ship inside
+  the bundle, so a page load contacts only Mezame.
 - Two request checks that need no user identity close the path a page in
   the user's own browser had to a loopback Mezame. Every request must name
   a host Mezame serves in `Host`, which stops DNS rebinding; a WebSocket
@@ -134,6 +149,10 @@ with an echo, on every attached browser at once.
 
 ### Changed
 
+- `npm test` in `ui/` type-checks the vitest suites against the UI's types
+  before running them.
+- Settings and attachment copy no longer refer to the removed agent
+  process.
 - `/ws` takes a `session` query parameter naming the session to join and
   mints a 32-character hexadecimal id when none is given. Every browser
   naming one id attaches to one hub and sees one conversation.

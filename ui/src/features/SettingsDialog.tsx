@@ -119,8 +119,8 @@ export const SettingsDialog = () => {
             <div className="flex flex-col gap-0.5">
               <span className="text-sm text-foreground">Suspend idle sessions after</span>
               <span className="text-xs text-muted-foreground">
-                Disconnect a background session once it has been idle this long, freeing its
-                agent and MCP servers. It reconnects automatically when you return to it.
+                Disconnect a background session once it has been idle this long, releasing it
+                on the server. It reconnects automatically when you return to it.
               </span>
             </div>
             <div className="flex items-center gap-3">

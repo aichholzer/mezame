@@ -1,0 +1,24 @@
+{
+  // Type-checks the vitest suites under tests/ui/ against ui/src/types.ts.
+  // `tsc -b` (npm run build) covers src/ only and vitest compiles with
+  // esbuild, so without this a fixture drifting from a type was never
+  // reported. Not referenced from tsconfig.json on purpose: build.rs runs
+  // `tsc -b` from the crate tarball, where tests/ is excluded and this
+  // project would find no inputs. `src/__test_setup.ts` brings the
+  // jest-dom matcher augmentation; `src/vite-env.d.ts` the vite/client
+  // types and the `*.css` module declaration. `__MEZAME_VERSION__` and
+  // `__MEZAME_BUILD_ID__` are declared where they are read, in
+  // src/hooks/useMezame.ts. Bare imports from tests/ui resolve through
+  // the tests/ui/node_modules symlink, as they do for vitest.
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "types": ["vitest/globals"],
+    "noEmit": true
+  },
+  "include": [
+    "src/vite-env.d.ts",
+    "src/__test_setup.ts",
+    "../tests/ui/*.ts",
+    "../tests/ui/*.tsx"
+  ]
+}

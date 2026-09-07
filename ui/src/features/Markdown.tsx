@@ -1,3 +1,4 @@
+import { ImageIcon } from 'lucide-react';
 import type { ComponentPropsWithoutRef, ReactNode } from 'react';
 import { isValidElement, memo } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
@@ -16,6 +17,12 @@ import { cn } from '@/lib/utils';
 //   imported once at the app level.
 // - Custom overrides to keep the terminal aesthetic and add a copy button
 //   to every fenced code block.
+// - Images are never fetched. An image renders as its alt text and the
+//   host it points at, nothing more: a reply that carried one would
+//   otherwise make every attached browser request an arbitrary remote or
+//   LAN address, a per-view beacon today and the canonical exfiltration
+//   channel once a provider writes here. Nothing interactive inside the
+//   placeholder either, since markdown lets an image sit inside a link.
 //
 // Memoised by input text so React does not re-run the parser when
 // unrelated state changes. During streaming each chunk lengthens the
@@ -156,6 +163,27 @@ const components: Components = {
       >
         {children}
       </a>
+    );
+  },
+  img({ src, alt, title }) {
+    // A <span>, not a <div>: an image is phrasing content inside a <p>.
+    const href = typeof src === 'string' ? src : '';
+    const label = alt && alt.trim() ? alt : 'image';
+    let host = '';
+    try {
+      host = href ? new URL(href).host : '';
+    } catch {
+      host = '';
+    }
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-sm bg-muted px-1 py-0.5 text-[0.9em] text-muted-foreground"
+        title={title ?? href}
+      >
+        <ImageIcon className="size-3 shrink-0" aria-hidden />
+        <span>{label}</span>
+        {host && <span className="opacity-70">({host})</span>}
+      </span>
     );
   }
 };

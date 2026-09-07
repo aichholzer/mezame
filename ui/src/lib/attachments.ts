@@ -6,14 +6,11 @@ import type { PromptBlock, PromptCapabilities } from '@/types';
 //
 // ## History replay caveat
 //
-// Attachments sent in a prompt are not rehydrated when the browser
-// reconnects and issues `session/load`. Reasoning: Mezame's `/history`
-// endpoint parses Kiro's on-disk JSONL, which today we only read for
-// text turns (see `parse_kiro_history` in `src/http.rs`). Kiro's JSONL
-// almost certainly records the full ACP prompt payload, but we have
-// not inspected what shape it uses for image / resource blocks, and
-// the parser would need corresponding work. Until then, expect to see
-// only the text portion of a prior turn after a resume.
+// Attachments are not replayed on reconnect. `/history` carries the text
+// of each turn (`EntryBody` in `src/backend.rs`, rendered by
+// `renderHistoryText` in `useMezame.ts`); image and resource blocks go to
+// the Backend and are not recorded, so after a reload a prior turn shows
+// only its text.
 
 export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5 MB per file.
 export const MAX_TOTAL_BYTES = 20 * 1024 * 1024; // 20 MB across all attachments.
@@ -25,11 +22,11 @@ export type Attachment = {
   id: string;
   /** Display name shown on the chip. */
   name: string;
-  /** Source mime type (agent sees this). */
+  /** Source mime type (the Backend sees this). */
   mimeType: string;
   /** Byte size before base64 encoding, for quota accounting. */
   size: number;
-  /** Routing decision: which ACP block we will build on submit. */
+  /** Routing decision: which `PromptBlock` we will build on submit. */
   kind: 'image' | 'text-resource' | 'binary-resource';
   /** Object URL for thumbnail/preview. Revoked when the attachment is
    * removed or the composer submits. Only populated for images. */
@@ -67,10 +64,10 @@ const isTextish = (mime: string): boolean => {
   ].includes(mime);
 };
 
-/** Classify a file into an ACP content-block kind, gated by the
- * agent's advertised capabilities. Returns either a staged attachment
- * or the reason we rejected it. No I/O happens here; the raw bytes are
- * only read when the user submits. */
+/** Classify a file into a `PromptBlock` kind, gated by the capabilities
+ * `ready` advertised. Returns either a staged attachment or the reason
+ * we rejected it. No I/O happens here; the raw bytes are only read when
+ * the user submits. */
 export const fileToAttachment = (file: File, caps: PromptCapabilities): StageResult => {
   if (file.size > MAX_ATTACHMENT_BYTES) {
     return { ok: false, reason: { kind: 'too-large', bytes: file.size, limit: MAX_ATTACHMENT_BYTES } };
@@ -117,11 +114,10 @@ export const fileToAttachment = (file: File, caps: PromptCapabilities): StageRes
 
   if (!caps.embeddedContext) {
     // Non-image, non-textish (e.g. application/pdf) only ever reaches
-    // the agent as a binary embedded resource. If embeddedContext is
-    // off, the rejection is the same as for textish files: the agent
-    // does not accept embedded content. The previous "unknown-type"
-    // path was misleading; the mime type was fine, the agent just
-    // wouldn't take it.
+    // Mezame as a binary embedded resource. If embeddedContext is off,
+    // the rejection is the same as for textish files: Mezame does not
+    // accept embedded content. The previous "unknown-type" path was
+    // misleading; the mime type was fine, Mezame just wouldn't take it.
     return { ok: false, reason: { kind: 'embed-not-supported' } };
   }
 
@@ -157,8 +153,8 @@ const readAsBase64 = (file: File): Promise<string> =>
 
 const readAsText = (file: File): Promise<string> => file.text();
 
-/** Turn a staged attachment into an ACP `PromptBlock`. Reads the file
- * bytes at submit time. Staging stays cheap for large files. */
+/** Turn a staged attachment into a `PromptBlock`. Reads the file bytes
+ * at submit time. Staging stays cheap for large files. */
 export const attachmentToBlock = async (att: Attachment): Promise<PromptBlock> => {
   switch (att.kind) {
     case 'image': {
@@ -197,9 +193,9 @@ export const describeRejection = (reason: RejectReason): string => {
     case 'too-large':
       return `File is ${(reason.bytes / 1024 / 1024).toFixed(1)} MB, limit is ${reason.limit / 1024 / 1024} MB.`;
     case 'image-not-supported':
-      return 'This agent did not advertise image support.';
+      return 'This session does not accept images.';
     case 'embed-not-supported':
-      return 'This agent does not accept embedded files.';
+      return 'This session does not accept embedded files.';
   }
 };
 

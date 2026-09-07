@@ -5,7 +5,6 @@
 //   - the `NotificationsPrompt` banner (only shown when pending)
 
 import { act, render, screen, userEvent } from '@/__test_utils';
-import { useEffect } from 'react';
 import { NotificationsPrompt } from '@/features/NotificationsPrompt';
 import { useNotifications } from '@/hooks/useNotifications';
 import {
@@ -83,6 +82,10 @@ const baseSession = (overrides: Partial<Session> = {}): Session => ({
   reconnectTimer: null,
   closing: false,
   inFlight: false,
+  hydrated: true,
+  suspended: false,
+  lastActivityAt: 1,
+  thoughtOpen: false,
   ...overrides
 });
 
@@ -92,11 +95,6 @@ const HookHost = () => {
   return null;
 };
 
-const Reset = () => {
-  // Used to force the host to re-run with a new mockSessions value.
-  useEffect(() => {}, []);
-  return null;
-};
 
 // ---------- settings ----------
 

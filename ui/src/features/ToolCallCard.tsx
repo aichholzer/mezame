@@ -5,12 +5,12 @@ import { Markdown } from '@/features/Markdown';
 import { cn } from '@/lib/utils';
 import type { LogEntry, ToolCallLocation } from '@/types';
 
-// Renders an ACP tool_call as a collapsible summary row. The row shows
+// Renders a tool_call event as a collapsible summary row. The row shows
 // the title and a status pill. Expanded, it reveals the arguments (as
 // JSON), the content (as markdown when present), and the file locations
-// the tool touched. Multiple tool_call_update notifications with the
-// same toolCallId mutate the underlying store entry in place. This
-// component just re-renders.
+// the tool touched. Repeated tool_call events with the same toolCallId
+// mutate the underlying store entry in place. This component just
+// re-renders.
 
 type Entry = Extract<LogEntry, { kind: 'tool_call' }>;
 
@@ -48,9 +48,9 @@ const stringifyContent = (content: unknown): string | null => {
   if (typeof content === 'string') {
     return content;
   }
-  // ACP tool-call content is typically an array of ContentBlocks. We
-  // render text blocks verbatim; anything else falls through to a
-  // JSON dump so nothing is silently lost.
+  // Tool-call content is an array of content blocks when a Backend
+  // structures it. We render text blocks verbatim; anything else falls
+  // through to a JSON dump so nothing is silently lost.
   if (Array.isArray(content)) {
     const textBlocks: string[] = [];
     let nonText = false;

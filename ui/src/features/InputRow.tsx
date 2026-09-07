@@ -9,7 +9,7 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { CwdChip } from '@/features/CwdChip';
-import { ModeModelSelectors } from '@/features/ModeModelSelectors';
+import { ModelSelector } from '@/features/ModelSelector';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { mezameActions } from '@/hooks/useMezame';
 import {
@@ -33,7 +33,7 @@ import type { PromptBlock, Session } from '@/types';
 // Desktop layout:
 //   [ attachment chips (when any)                                 ]
 //   [  textarea                                         [  send ] ]
-//   [ [cwd chip] [attach]              [ Agent ] [ Model picker ] ]
+//   [ [cwd chip] [attach]                        [ Model picker ] ]
 //
 // Mobile layout (below `md`):
 //   [ attachment chips (when any)                                 ]
@@ -41,13 +41,13 @@ import type { PromptBlock, Session } from '@/types';
 //   [ [cwd] [attach] [settings]                          [ send ] ]
 //
 // On mobile the top-right send button moves to the bottom row so it
-// is within thumb reach, and the Agent/Model pickers move behind a
-// settings icon that opens a DropdownMenu with both pickers stacked.
+// is within thumb reach, and the model picker moves behind a settings
+// icon that opens a DropdownMenu.
 //
 // Attachments come in three ways: paste an image from the clipboard,
 // drop a file on the card, or click the paperclip to open a file
 // picker. All three funnel through `stageFile` and render as chips
-// above the textarea. The agent's advertised prompt capabilities
+// above the textarea. The prompt capabilities `ready` advertises
 // (image, embeddedContext) gate which file types are accepted.
 
 type Props = {
@@ -83,9 +83,9 @@ export const InputRow = ({ session, onSubmit }: Props) => {
   const caps = session?.promptCapabilities ?? {};
   const canAttachAnything = !!(caps.image || caps.embeddedContext);
 
-  // The picker's `accept` attribute reflects the agent's advertised
-  // capabilities so the OS file dialogue only offers files the agent
-  // can actually take. `image/*` covers every image mime; the textish
+  // The picker's `accept` attribute reflects the capabilities `ready`
+  // advertised so the OS file dialogue only offers files Mezame
+  // accepts. `image/*` covers every image mime; the textish
   // branch in `fileToAttachment` recognises a small allowlist so we
   // hint at those mime types explicitly. When `embeddedContext` is on
   // we accept everything (binary embedded resources cover anything
@@ -415,11 +415,11 @@ export const InputRow = ({ session, onSubmit }: Props) => {
         </div>
 
         {/* Bottom row.
-         *   Desktop: [cwd] [attach]            [Agent] [Model]
+         *   Desktop: [cwd] [attach]                    [Model]
          *   Mobile:  [cwd] [attach] [settings]          [send]
-         * The settings trigger only shows when the agent advertises at
-         * least one mode or model (`ModeModelSelectors` would otherwise
-         * render nothing). */}
+         * The settings trigger only shows when `session_info` lists at
+         * least one model (`ModelSelector` would otherwise render
+         * nothing). */}
         <div className="absolute inset-x-2 bottom-2 flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5">
             <CwdChip session={session} />
@@ -454,9 +454,9 @@ export const InputRow = ({ session, onSubmit }: Props) => {
             <MobileSettingsTrigger session={session} />
           </div>
           <div className="flex items-center gap-1.5">
-            {/* Inline Agent/Model pickers on desktop only. */}
+            {/* Inline model picker on desktop only. */}
             <div className="hidden md:block">
-              <ModeModelSelectors session={session} layout="row" />
+              <ModelSelector session={session} layout="row" />
             </div>
             {/* Mobile send/stop button. */}
             {busy ? (
@@ -559,7 +559,7 @@ const formatBytes = (bytes: number): string => {
 // Mobile-only trigger that opens a DropdownMenu holding the model
 // picker. Reuses the existing `@radix-ui/react-dropdown-menu` primitive.
 // Renders nothing when no model is on offer; matches
-// `ModeModelSelectors`'s own empty-state rule.
+// `ModelSelector`'s own empty-state rule.
 const MobileSettingsTrigger = ({ session }: { session: Session | null }) => {
   if (!session) {
     return null;
@@ -584,11 +584,11 @@ const MobileSettingsTrigger = ({ session }: { session: Session | null }) => {
         side="top"
         align="start"
         // Radix applies its own min-width inside DropdownMenuContent;
-        // constrain so the Agent/Model stack (each ~10rem) fits the
-        // popover comfortably on a 320 px viewport.
+        // constrain so the model picker (~10rem) fits the popover
+        // comfortably on a 320 px viewport.
         className="p-2"
       >
-        <ModeModelSelectors session={session} layout="stack" />
+        <ModelSelector session={session} layout="stack" />
       </DropdownMenuContent>
     </DropdownMenu>
   );

@@ -14,17 +14,15 @@ import { mezameActions } from '@/hooks/useMezame';
 import { cn } from '@/lib/utils';
 import type { Session } from '@/types';
 
-// Tab-level selectors for the agent "mode" (really Kiro agent variants
-// like kiro_default / kiro_planner / kiro_guide) and the underlying
-// model. Both are session-scoped and disabled while the session is
-// busy: Kiro doesn't guarantee mid-turn mode/model switches behave
-// sensibly.
+// Tab-level model picker. Session-scoped and disabled while the session
+// is busy: the hub refuses a mid-turn switch anyway. The mode picker this
+// file also held went with the agent process; the file kept the plural
+// name until the review caught it.
 
 type Props = {
   session: Session | null;
-  /** `row` packs both pickers side-by-side (legacy). `stack` places
-   * them vertically so they fit next to a tall textarea without
-   * stealing width. */
+  /** `row` places the picker inline. `stack` places it vertically so it
+   * fits next to a tall textarea without stealing width. */
   layout?: 'row' | 'stack';
 };
 
@@ -95,7 +93,7 @@ const Picker = <T extends { id: string; label: string; description?: string }>({
   </DropdownMenu>
 );
 
-export const ModeModelSelectors = ({ session, layout = 'row' }: Props) => {
+export const ModelSelector = ({ session, layout = 'row' }: Props) => {
   if (!session) {
     return null;
   }

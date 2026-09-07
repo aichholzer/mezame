@@ -4,9 +4,11 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
-// Dev: Vite runs on :5173 with HMR and proxies /ws and /state to the Rust
-// binary on :9510. Release builds emit to ui/dist and get baked into the
-// binary via rust-embed.
+// Dev: Vite runs on :5173 with HMR and proxies /ws, /state (with
+// /state/events) and /history to the Rust binary on :9510 without rewriting
+// Host: the server compares Origin against Host, port included, and a
+// rewritten Host fails that check. Release builds emit to ui/dist and get
+// baked into the binary via rust-embed.
 
 // Surface the version string in `ui/package.json` to the UI at build
 // time. Keep the one canonical source; `Cargo.toml` mirrors it by hand
@@ -37,14 +39,22 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    // Every entry is in object form with no `changeOrigin`: Vite turns a
+    // string entry into `{ target, changeOrigin: true }`, and a rewritten
+    // `Host` fails the server's Origin check (`src/guard.rs`). `/state`
+    // also covers `/state/events`. `/history` is what the log seeds from
+    // on reload; it used to name a `/legacy` route that no longer exists.
     proxy: {
       '/ws': {
         target: 'ws://127.0.0.1:9510',
-        ws: true,
-        changeOrigin: true
+        ws: true
       },
-      '/state': 'http://127.0.0.1:9510',
-      '/legacy': 'http://127.0.0.1:9510'
+      '/state': {
+        target: 'http://127.0.0.1:9510'
+      },
+      '/history': {
+        target: 'http://127.0.0.1:9510'
+      }
     }
   },
   build: {

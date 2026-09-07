@@ -99,7 +99,7 @@ describe('fileToAttachment / binary resources', () => {
   });
 
   // #31 fix: a non-image, non-textish file (PDF, .docx, etc.) gets
-  // rejected with `embed-not-supported` when the agent does not
+  // rejected with `embed-not-supported` when the session does not
   // advertise embedded content. The previous `unknown-type` rejection
   // misled users into thinking the mime was wrong; the real reason
   // was always the missing capability.

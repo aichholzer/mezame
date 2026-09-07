@@ -250,6 +250,9 @@ name a user typed or the minted form in upper case included, the upgrade is
 refused with a 400 before the handshake: no WebSocket is established and no
 session is created.
 
+The UI applies the same form to every session id it reads back from `/state`;
+an entry with an id of any other form is dropped as if it had none.
+
 A `cwd` query parameter is not read. A session always runs in Mezame's own
 working directory.
 
@@ -261,7 +264,9 @@ the active tab, and the numeric label counter. The backing file is
 which is what keeps your phone and your laptop in step. Mezame does not
 interpret the contents; it stores labels, session ids, and a `settings` object
 the client owns for app-wide preferences such as the theme and the notification
-choice.
+choice. The UI coerces what it reads back: a label that is not a string shows as
+`?`, a `closedAt` that is not a number reads as the epoch, and an entry with no
+accepted session id is dropped.
 
 A `GET` with no file present, or with a file that does not parse as JSON,
 answers 200 with `{}`. A `PUT` with a body that parses as JSON writes a fresh

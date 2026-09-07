@@ -1,7 +1,15 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@/App';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { bootTheme } from '@/hooks/useTheme';
+// Both families ship inside the bundle, from Fontsource. Nothing is
+// fetched from Google: a page load used to send every viewer's address to
+// fonts.googleapis.com and fonts.gstatic.com, and the two origins stood in
+// the way of a same-origin content security policy.
+import '@fontsource-variable/jetbrains-mono/index.css';
+import '@fontsource-variable/jetbrains-mono/wght-italic.css';
+import '@fontsource/gugi/latin-400.css';
 import 'highlight.js/styles/github-dark.css';
 import 'katex/dist/katex.min.css';
 import '@/index.css';
@@ -17,7 +25,9 @@ bootTheme();
 
 createRoot(container).render(
   <StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </StrictMode>
 );
 

@@ -178,10 +178,26 @@ const scheduleSync = () => {
  *
  * @internal
  */
-/** True when a persisted session or closed entry carries a session id
- * this build can attach to.
+/** The session id form the server accepts: exactly 32 lowercase
+ * hexadecimal characters, what `/ws` mints. Mirrors `is_session_id` in
+ * `src/ws.rs`; the two move together. Stricter than the server in one
+ * way: the server trims surrounding whitespace before it checks, and no
+ * code path here ever persists a padded id, so none is accepted.
  *
- * Applied at every point a persisted entry is read. It also handles a
+ * @internal
+ */
+export const SESSION_ID_FORM = /^[0-9a-f]{32}$/;
+
+const acceptedSessionId = (value: unknown): string | null =>
+  typeof value === 'string' && SESSION_ID_FORM.test(value) ? value : null;
+
+/** True when a persisted session or closed entry carries a session id
+ * this build can attach to: one of the form the server accepts.
+ *
+ * Applied at every point a persisted entry is read. An entry with an id
+ * of any other form is discarded like one with none: the server refuses
+ * it with a 400 before the handshake, and the tab would otherwise pulse
+ * "reconnecting" forever with no cause shown. It also handles a
  * `state.json` written by 0.13.x, whose ids sit under a key this version
  * does not read: those entries are discarded, the UI starts with one fresh
  * tab, and the next sync rewrites both lists under the new key.
@@ -190,8 +206,63 @@ const scheduleSync = () => {
  */
 export const hasSessionId = (entry: {
   sessionId?: string | null;
-}): entry is { sessionId: string } =>
-  typeof entry.sessionId === 'string' && entry.sessionId.length > 0;
+}): entry is { sessionId: string } => acceptedSessionId(entry.sessionId) !== null;
+
+/** A persisted session entry as the UI restores it, or null when the
+ * entry has no string `id` or no accepted session id. The label is
+ * coerced to a string: `state.json` is shared and unauthenticated, and an
+ * object-valued label made React throw on render and blanked the page on
+ * every load.
+ *
+ * @internal
+ */
+/** A persisted session entry with an accepted id, as `restoreSession`
+ * takes it. */
+export type RestorableSession = { id: string; label: string; sessionId: string };
+
+export const coercePersistedSession = (entry: unknown): RestorableSession | null => {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const e = entry as { id?: unknown; label?: unknown; sessionId?: unknown };
+  const sessionId = acceptedSessionId(e.sessionId);
+  if (typeof e.id !== 'string' || sessionId === null) {
+    return null;
+  }
+  return { id: e.id, label: typeof e.label === 'string' ? e.label : '?', sessionId };
+};
+
+/** A persisted closed entry as the UI keeps it, or null when it names no
+ * accepted session id. Gated on the session id alone, as the reads always
+ * were: the closed list is keyed, restored and forgotten by `sessionId`.
+ * A missing `id` is filled from it, a non-string label reads as `?`, and
+ * a `closedAt` that is not a finite number reads as 0. Every coercion is
+ * deterministic on purpose: reconcile compares the coerced list to the
+ * one it holds, and a value that differed per call would mark every SSE
+ * tick dirty and ping-pong PUTs between browsers.
+ *
+ * @internal
+ */
+export const coerceClosedEntry = (entry: unknown): ClosedEntry | null => {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const e = entry as { id?: unknown; label?: unknown; sessionId?: unknown; closedAt?: unknown };
+  const sessionId = acceptedSessionId(e.sessionId);
+  if (sessionId === null) {
+    return null;
+  }
+  return {
+    id: typeof e.id === 'string' ? e.id : sessionId,
+    label: typeof e.label === 'string' ? e.label : '?',
+    sessionId,
+    closedAt: typeof e.closedAt === 'number' && Number.isFinite(e.closedAt) ? e.closedAt : 0
+  };
+};
+
+const isClosedEntry = (entry: ClosedEntry | null): entry is ClosedEntry => entry !== null;
+const isPersistedSession = (entry: RestorableSession | null): entry is RestorableSession =>
+  entry !== null;
 
 export const mergeSessionsForSync = (
   localSessions: PersistedState['sessions'],
@@ -222,23 +293,17 @@ export const mergeSessionsForSync = (
   }
   const carried: PersistedState['sessions'] = [];
   for (const entry of serverSessions) {
-    if (!entry || typeof entry.id !== 'string' || localIds.has(entry.id)) {
-      continue;
-    }
     // Only carry entries that name a session, matching the restore guard
     // in `reconcileFromServer`. A tab elsewhere that has not applied its
     // first `ready` yet has no id, and there is nothing here to attach to.
-    if (!hasSessionId(entry)) {
+    const carriedEntry = coercePersistedSession(entry);
+    if (!carriedEntry || localIds.has(carriedEntry.id)) {
       continue;
     }
-    if (closedIds.has(entry.sessionId)) {
+    if (closedIds.has(carriedEntry.sessionId)) {
       continue;
     }
-    carried.push({
-      id: entry.id,
-      label: typeof entry.label === 'string' ? entry.label : '?',
-      sessionId: entry.sessionId
-    });
+    carried.push(carriedEntry);
   }
   return carried.length > 0 ? [...localSessions, ...carried] : localSessions;
 };
@@ -355,23 +420,14 @@ const reconcileFromServer = async () => {
 
   // Restore sessions present on the server but not locally.
   for (const entry of saved.sessions) {
-    if (!entry || typeof entry.id !== 'string') {
-      continue;
-    }
-    if (sessions.some((s) => s.id === entry.id)) {
-      continue;
-    }
     // Only restore entries that name a session. A tab elsewhere that has
     // not applied its first `ready` yet has no id; once it does, the id
     // lands on the server and the next tick brings it across.
-    if (!hasSessionId(entry)) {
+    const restorable = coercePersistedSession(entry);
+    if (!restorable || sessions.some((s) => s.id === restorable.id)) {
       continue;
     }
-    restoreSession({
-      id: entry.id,
-      label: typeof entry.label === 'string' ? entry.label : '?',
-      sessionId: entry.sessionId
-    });
+    restoreSession(restorable);
     dirty = true;
   }
 
@@ -446,7 +502,7 @@ const reconcileFromServer = async () => {
   // server snapshot the most-recently-closed entries stay consistent
   // across browsers with no ping-pong.
   if (Array.isArray(saved.closed)) {
-    const next = saved.closed.filter((entry) => entry && hasSessionId(entry)).slice(0, HISTORY_MAX);
+    const next = saved.closed.map(coerceClosedEntry).filter(isClosedEntry).slice(0, HISTORY_MAX);
     if (JSON.stringify(next) !== JSON.stringify(closed)) {
       closed = next;
       dirty = true;
@@ -1497,19 +1553,23 @@ const init = async () => {
   initStarted = true;
   const saved = await fetchState();
   if (saved?.closed && Array.isArray(saved.closed)) {
-    closed = saved.closed.filter((entry) => entry && hasSessionId(entry)).slice(0, HISTORY_MAX);
+    closed = saved.closed.map(coerceClosedEntry).filter(isClosedEntry).slice(0, HISTORY_MAX);
   }
   // Every persisted entry has to name a session; one that does not is
   // discarded with no error and no tab is restored for it. Checking the
-  // filtered list rather than the raw one closes the hole a `sessions[0]`
-  // read leaves when the filter removed every entry.
+  // coerced list rather than the raw one closes the hole a `sessions[0]`
+  // read leaves when the filter removed every entry. The shapes are
+  // coerced here as reconcile coerces them: the file is shared and
+  // unauthenticated, and a label that is not a string used to blank the
+  // page on every load.
   const restorable = Array.isArray(saved?.sessions)
-    ? saved.sessions.filter(
-      (entry) => entry && typeof entry.id === 'string' && hasSessionId(entry)
-    )
+    ? saved.sessions.map(coercePersistedSession).filter(isPersistedSession)
     : [];
   if (restorable.length > 0) {
-    nextLabel = saved?.nextLabel ?? restorable.length + 1;
+    nextLabel =
+      typeof saved?.nextLabel === 'number' && Number.isFinite(saved.nextLabel)
+        ? saved.nextLabel
+        : restorable.length + 1;
     for (const entry of restorable) {
       restoreSession(entry);
     }

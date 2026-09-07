@@ -54,6 +54,9 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     closing: false,
     inFlight: false,
     thoughtOpen: false,
+    suspended: false,
+    // A constant, not `Date.now()`, so whole-object equalities stay stable.
+    lastActivityAt: 1,
     ...overrides
   };
 }

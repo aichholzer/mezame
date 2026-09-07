@@ -122,4 +122,31 @@ describe('Markdown', () => {
     expect(a).toHaveAttribute('target', '_blank');
     expect(a.getAttribute('rel') ?? '').toMatch(/noreferrer/);
   });
+
+  it('never emits an img element for a markdown image', () => {
+    // An image in a reply would make every attached browser fetch an
+    // arbitrary URL. It renders as its alt text and the host, with no
+    // <img> and nothing interactive.
+    const { container } = render(<Markdown text="![diagram](https://example.com/x.png)" />);
+    expect(container.querySelector('img')).toBeNull();
+    expect(screen.getByText('diagram')).toBeInTheDocument();
+    expect(screen.getByText('(example.com)')).toBeInTheDocument();
+    expect(container.querySelector('a')).toBeNull();
+  });
+
+  it('labels an image with no alt text as image', () => {
+    const { container } = render(<Markdown text="![](https://example.com/x.png)" />);
+    expect(container.querySelector('img')).toBeNull();
+    expect(screen.getByText('image')).toBeInTheDocument();
+  });
+
+  it('keeps the outer link and adds no inner one for an image nested in a link', () => {
+    const { container } = render(
+      <Markdown text="[![a](https://e.test/x.png)](https://e.test/)" />
+    );
+    expect(container.querySelector('img')).toBeNull();
+    const anchors = container.querySelectorAll('a');
+    expect(anchors).toHaveLength(1);
+    expect(anchors[0].getAttribute('href')).toBe('https://e.test/');
+  });
 });
