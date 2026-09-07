@@ -20,6 +20,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use serde::{Deserialize, Serialize};
 
+use crate::provider::bedrock::{thinking_rule, vendor};
+use crate::provider::{LoopSettings, ThinkingMode};
+
 const MEZAME_ART: &str = r#"
  ███╗   ███╗███████╗███████╗ █████╗ ███╗   ███╗███████╗
  ████╗ ████║██╔════╝╚══███╔╝██╔══██╗████╗ ████║██╔════╝
@@ -32,15 +35,198 @@ const MEZAME_ART: &str = r#"
 
 pub const DEFAULT_PORT: u16 = 9510;
 
+/// The bind `init` writes when neither a flag nor an existing file gives
+/// one: loopback on the default port.
+pub fn default_bind() -> String {
+    format!("127.0.0.1:{DEFAULT_PORT}")
+}
+
+/// The budget an `enabled` thinking request sends when the file sets none.
+pub const DEFAULT_THINKING_BUDGET: u32 = 4096;
+/// The smallest budget the provider accepts.
+pub const MIN_THINKING_BUDGET: u32 = 1024;
+/// The output ceiling of a request when the file sets none.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
 /// Server settings, as they sit at `~/.mezame/config.json`.
 ///
-/// One field. No `deny_unknown_fields`: a file written by 0.13.x carries
+/// No `deny_unknown_fields`: a file written by an earlier release carries
 /// keys this version knows nothing about, and they are ignored, the file
-/// is left on disk untouched, and the parsed bind address is served. No
-/// re-run of `mezame init` is needed to move onto this line.
+/// is left on disk untouched, and the parsed settings are served. A file
+/// without a `bedrock` section loads exactly as before the section existed
+/// and selects the echo backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub transports: Vec<TransportConfig>,
+    /// The Bedrock model and, when the AWS setup needs them, the region and
+    /// profile. Absent means the echo backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock: Option<BedrockConfig>,
+}
+
+impl Config {
+    /// The bind of the first transport, when there is one.
+    pub fn bind(&self) -> Option<&str> {
+        self.transports.first().map(|t| match t {
+            TransportConfig::Cloudflared { bind, .. } => bind.as_str(),
+        })
+    }
+
+    /// Every `hosts` entry of every transport, in order: the same walk
+    /// the request guard makes, so a re-run of `init` carries forward
+    /// exactly what the guard was serving.
+    pub fn hosts(&self) -> Vec<String> {
+        self.transports
+            .iter()
+            .flat_map(|t| match t {
+                TransportConfig::Cloudflared { hosts, .. } => hosts.iter().cloned(),
+            })
+            .collect()
+    }
+}
+
+/// The `bedrock` object of `config.json`. `model` is required; every other
+/// key is optional and left out of a written file when unset.
+///
+/// `model` is passed to the API unchanged: a base id, an inference profile
+/// id under `global.`, `us.`, `eu.` or another geo prefix, or an ARN. The
+/// forms differ by model generation and newer models refuse the base id,
+/// so nothing here second-guesses it; the API's own error, relayed to the
+/// browser, is the validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BedrockConfig {
+    #[serde(default)]
+    pub model: String,
+    /// The ids the picker offers. `model` is always among them, first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// `adaptive`, `enabled` or `off`; unset derives the mode from the
+    /// model id. Held as the string the file holds so a wrong value is
+    /// refused by [`validate`](Self::validate) with the key, the accepted
+    /// values and the file named; `ThinkingMode::from_str` is the one place
+    /// the accepted set lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
+impl BedrockConfig {
+    /// A section naming `model` and nothing else.
+    pub fn for_model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            models: Vec::new(),
+            region: None,
+            profile: None,
+            thinking: None,
+            thinking_budget: None,
+            max_output_tokens: None,
+        }
+    }
+
+    /// Refuse a section the loop could not run, naming the key, the
+    /// accepted values or range, and the file.
+    pub fn validate(&self, path: &Path) -> Result<()> {
+        let at = path.display();
+        if self.model.trim().is_empty() {
+            bail!("`bedrock.model` must name a model id, in {at}");
+        }
+        if self.models.iter().any(|m| m.trim().is_empty()) {
+            bail!("`bedrock.models` holds an empty entry, in {at}");
+        }
+        let configured = match &self.thinking {
+            Some(text) => Some(
+                text.parse::<ThinkingMode>()
+                    .map_err(|why| anyhow!("`bedrock.thinking` {why}, in {at}"))?,
+            ),
+            None => None,
+        };
+        // A thinking request is an Anthropic request field. Asking for one
+        // on another vendor's model would fail every request instead of
+        // failing here.
+        if matches!(
+            configured,
+            Some(ThinkingMode::Adaptive | ThinkingMode::Enabled)
+        ) {
+            if let Some(other) = self
+                .model_list()
+                .into_iter()
+                .find(|id| vendor(id).is_some_and(|v| v != "anthropic"))
+            {
+                bail!(
+                    "`bedrock.thinking` `{}` needs an Anthropic model, and `{other}` names \
+                     another vendor, in {at}",
+                    configured.map_or("", ThinkingMode::as_str)
+                );
+            }
+        }
+        let max_output_tokens = self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        if max_output_tokens < 1 {
+            bail!("`bedrock.max_output_tokens` must be at least 1, in {at}");
+        }
+        // The budget is checked when a request would carry it: when it is
+        // set, or when the mode that sends it is in force for any model the
+        // picker offers. A user who sets a small `max_output_tokens` under
+        // `adaptive` thinking is not told off about a budget nothing sends.
+        let budget_in_force = self.thinking_budget.is_some()
+            || match configured {
+                Some(mode) => mode == ThinkingMode::Enabled,
+                None => self
+                    .model_list()
+                    .iter()
+                    .any(|id| thinking_rule(id) == ThinkingMode::Enabled),
+            };
+        let budget = self.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET);
+        if budget_in_force && (budget < MIN_THINKING_BUDGET || budget >= max_output_tokens) {
+            bail!(
+                "`bedrock.thinking_budget` must be at least {MIN_THINKING_BUDGET} and below \
+                 `bedrock.max_output_tokens` ({max_output_tokens}), not {budget}, in {at}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The configured mode, or `None` to derive it per model. Only valid
+    /// after [`validate`](Self::validate): a string the enum does not
+    /// spell reads as unset.
+    pub fn thinking_mode(&self) -> Option<ThinkingMode> {
+        self.thinking.as_deref().and_then(|t| t.parse().ok())
+    }
+
+    /// The mode a request for `model` would carry.
+    pub fn thinking_mode_or_rule(&self) -> ThinkingMode {
+        self.thinking_mode()
+            .unwrap_or_else(|| thinking_rule(&self.model))
+    }
+
+    /// `model` first, then the configured list in order, no duplicates.
+    pub fn model_list(&self) -> Vec<String> {
+        let mut list = vec![self.model.clone()];
+        for id in &self.models {
+            if !list.contains(id) {
+                list.push(id.clone());
+            }
+        }
+        list
+    }
+
+    /// What the loop is configured with, defaults applied.
+    pub fn settings(&self) -> LoopSettings {
+        LoopSettings {
+            model: self.model.clone(),
+            models: self.model_list(),
+            thinking: self.thinking_mode(),
+            thinking_budget: self.thinking_budget.unwrap_or(DEFAULT_THINKING_BUDGET),
+            max_output_tokens: self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+        }
+    }
 }
 
 /// Transport entries are internally tagged by `kind`. Each variant holds
@@ -80,11 +266,32 @@ pub fn state_path() -> Result<PathBuf> {
 }
 
 pub fn load_config() -> Result<Config> {
-    let path = config_path()?;
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;
-    let cfg: Config = serde_json::from_str(&raw).context("Parsing config.json")?;
+    load_config_from(&config_path()?)
+}
+
+/// Read and validate the configuration at `path`. A `bedrock` section the
+/// loop could not run is refused here, so the process never starts on a
+/// file it would fail on later.
+pub fn load_config_from(path: &Path) -> Result<Config> {
+    let cfg = read_config_from(path)?;
+    if let Some(bedrock) = &cfg.bedrock {
+        bedrock.validate(path)?;
+    }
     Ok(cfg)
+}
+
+/// Read the configuration at `~/.mezame/config.json` without validating
+/// it: what `init` starts from, so a file with one bad value is carried
+/// forward and reported rather than treated as absent and dropped.
+pub fn read_config() -> Result<Config> {
+    read_config_from(&config_path()?)
+}
+
+/// Read the configuration at `path` without validating it.
+pub fn read_config_from(path: &Path) -> Result<Config> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("Reading {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("Parsing config.json at {}", path.display()))
 }
 
 /// Create `dir` and any missing parent, owner-only (`0700`) on Unix.
@@ -180,55 +387,167 @@ pub fn write_private_atomic(target: &Path, data: &[u8], durable: bool) -> io::Re
     written
 }
 
-/// `mezame init` with no arguments: ask for the bind address, then write
-/// the config.
+/// `mezame init` with no arguments: ask for the bind address and the
+/// Bedrock settings, then write the config.
 pub(crate) fn init_config() -> Result<Config> {
-    write_config(prompt_bind()?)
+    let existing = read_config().ok();
+    let bind = prompt_bind()?;
+    let bedrock = prompt_bedrock(existing.as_ref().and_then(|c| c.bedrock.clone()))?;
+    write_config(&assemble(existing.as_ref(), bind, bedrock), false)
 }
 
-/// `mezame init --bind ADDR`: write the config for `addr` with no prompt,
-/// for a service unit or a container started before setup.
-///
-/// `addr` is held to the same check as the free-form prompt entry and is
-/// otherwise not parsed: an address that does not resolve fails at
-/// `TcpListener::bind` on the next start with the operating system's own
-/// message, which says more than a guess made here would.
-pub(crate) fn init_config_with_bind(addr: &str) -> Result<Config> {
-    validate_bind_entry(addr).map_err(|message| anyhow!(message))?;
-    write_config(addr.trim().to_string())
+/// One transport with `bind`, the hosts an existing file carried, and the
+/// Bedrock section: the shape both `init` paths write.
+fn assemble(existing: Option<&Config>, bind: String, bedrock: Option<BedrockConfig>) -> Config {
+    Config {
+        transports: vec![TransportConfig::Cloudflared {
+            bind,
+            hosts: existing.map(Config::hosts).unwrap_or_default(),
+        }],
+        bedrock,
+    }
 }
 
-/// What follows `init` on the command line: nothing, or `--bind ADDR` in
-/// either of its two spellings.
+/// What follows `init` on the command line, parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitArgs {
+    pub bind: Option<String>,
+    pub model: Option<String>,
+    pub region: Option<String>,
+    pub profile: Option<String>,
+}
+
+impl InitArgs {
+    /// No flag at all: the interactive setup runs.
+    pub fn is_empty(&self) -> bool {
+        self.bind.is_none()
+            && self.model.is_none()
+            && self.region.is_none()
+            && self.profile.is_none()
+    }
+}
+
+/// The flags `init` takes, each with the example its error shows. One
+/// table: the parser, the error text and the slot all read it.
+const INIT_FLAGS: [(&str, &str); 4] = [
+    ("--bind", "0.0.0.0:9510"),
+    ("--model", "global.anthropic.claude-sonnet-5"),
+    ("--region", "us-east-1"),
+    ("--profile", "work"),
+];
+
+/// Parse what follows `init`: nothing, or any of `--bind ADDR`, `--model
+/// ID`, `--region NAME` and `--profile NAME`, each in either of its two
+/// spellings and each at most once.
 ///
 /// Anything else is an error naming the token, so a typo is refused
 /// instead of dropping into the prompt. Pure, so it has tests.
-pub fn parse_init_args(args: &[String]) -> Result<Option<String>> {
-    let mut bind: Option<String> = None;
+pub fn parse_init_args(args: &[String]) -> Result<InitArgs> {
+    let mut parsed = InitArgs::default();
     let mut tokens = args.iter();
     while let Some(token) = tokens.next() {
-        let value = if token == "--bind" {
-            match tokens.next() {
-                Some(v) if !v.starts_with('-') => v.clone(),
-                _ => bail!("`--bind` needs an address, e.g. `mezame init --bind 0.0.0.0:9510`"),
-            }
-        } else if let Some(v) = token.strip_prefix("--bind=") {
-            v.to_string()
-        } else {
+        let Some((index, (flag, example))) = INIT_FLAGS
+            .iter()
+            .enumerate()
+            .find(|(_, (flag, _))| token == *flag || token.starts_with(&format!("{flag}=")))
+        else {
             bail!(
-                "Unknown argument `{token}`. `mezame init` takes `--bind ADDR` and nothing else."
+                "Unknown argument `{token}`. `mezame init` takes `--bind ADDR`, `--model ID`, \
+                 `--region NAME` and `--profile NAME`, and nothing else."
             );
         };
-        if bind.is_some() {
-            bail!("`--bind` given twice");
+        let value = if token == flag {
+            match tokens.next() {
+                Some(v) if !v.starts_with('-') => v.clone(),
+                _ => bail!("`{flag}` needs a value, e.g. `mezame init {flag} {example}`"),
+            }
+        } else {
+            token[flag.len() + 1..].to_string()
+        };
+        let slots = [
+            &mut parsed.bind,
+            &mut parsed.model,
+            &mut parsed.region,
+            &mut parsed.profile,
+        ];
+        let slot = slots
+            .into_iter()
+            .nth(index)
+            .expect("one slot per flag in the table");
+        if slot.is_some() {
+            bail!("`{flag}` given twice");
         }
-        bind = Some(value);
+        *slot = Some(value);
     }
-    Ok(bind)
+    Ok(parsed)
 }
 
-/// The one prompt: the bind address, with the two common choices and a
-/// free-form entry.
+/// A flag's value with the whitespace trimmed, refused when nothing is
+/// left. One rule for every flag: no flag clears a key. Removing a key is
+/// a hand edit of the file, as it is for `hosts`.
+fn non_empty(flag: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        let example = INIT_FLAGS
+            .iter()
+            .find(|(f, _)| *f == flag)
+            .map_or("", |(_, example)| example);
+        bail!("`{flag}` needs a value, e.g. `mezame init {flag} {example}`");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// `mezame init` with flags: write the config with no prompt, for a
+/// service unit or a container started before setup.
+///
+/// The bind comes from `--bind`, else from an existing file, else
+/// [`default_bind`]; it is held to the same check as the free-form prompt
+/// entry and otherwise not parsed. The Bedrock keys the flags set replace
+/// those of an existing section and the rest is carried forward; a run
+/// that sets none keeps the section whole and says so. `--region` or
+/// `--profile` with no model anywhere is refused: there is nothing to
+/// attach them to.
+pub(crate) fn init_config_with_args(args: &InitArgs) -> Result<Config> {
+    let existing = read_config().ok();
+    let bind = match &args.bind {
+        Some(addr) => {
+            validate_bind_entry(addr).map_err(|message| anyhow!(message))?;
+            addr.trim().to_string()
+        }
+        None => existing
+            .as_ref()
+            .and_then(|c| c.bind().map(str::to_string))
+            .unwrap_or_else(default_bind),
+    };
+    let mut bedrock = existing.as_ref().and_then(|c| c.bedrock.clone());
+    let touches_bedrock = args.model.is_some() || args.region.is_some() || args.profile.is_some();
+    let kept = bedrock.is_some() && !touches_bedrock;
+    if let Some(model) = &args.model {
+        let model = non_empty("--model", model)?;
+        match &mut bedrock {
+            Some(section) => section.model = model,
+            None => bedrock = Some(BedrockConfig::for_model(model)),
+        }
+    }
+    if args.region.is_some() || args.profile.is_some() {
+        let Some(section) = &mut bedrock else {
+            bail!(
+                "`--region` and `--profile` need a model: pass `--model ID` with them, or \
+                 configure one first"
+            );
+        };
+        if let Some(region) = &args.region {
+            section.region = Some(non_empty("--region", region)?);
+        }
+        if let Some(profile) = &args.profile {
+            section.profile = Some(non_empty("--profile", profile)?);
+        }
+    }
+    write_config(&assemble(existing.as_ref(), bind, bedrock), kept)
+}
+
+/// The one prompt for the transport: the bind address, with the two common
+/// choices and a free-form entry.
 fn prompt_bind() -> Result<String> {
     // Transport prompt commented out while Cloudflared is the only
     // implemented option. When a Telegram transport ships, rewrite this to
@@ -245,7 +564,7 @@ fn prompt_bind() -> Result<String> {
 
     let theme = ColorfulTheme::default();
 
-    let loopback = format!("127.0.0.1:{DEFAULT_PORT}");
+    let loopback = default_bind();
     let all = format!("0.0.0.0:{DEFAULT_PORT}");
 
     let bind_options = [
@@ -274,43 +593,142 @@ fn prompt_bind() -> Result<String> {
     Ok(bind)
 }
 
-/// Write `~/.mezame/config.json` for `bind`, creating `~/.mezame`
-/// owner-only when it is absent, and return the config it holds.
+/// The Bedrock prompts, in one of two shapes each. With no existing
+/// value, an empty answer is accepted and means "none": the echo backend
+/// for the model, the AWS default for the region and the profile. With an
+/// existing value, that value is the default and the Enter key keeps it;
+/// `dialoguer` returns the default on an empty answer, so the two shapes
+/// cannot be one prompt. Nothing here removes a section or clears a key,
+/// a blank answer included: that is a hand edit of the file, as it is for
+/// `hosts`.
+fn prompt_bedrock(existing: Option<BedrockConfig>) -> Result<Option<BedrockConfig>> {
+    let theme = ColorfulTheme::default();
+    let model = match &existing {
+        None => {
+            let entered: String = Input::with_theme(&theme)
+                .with_prompt("Bedrock model id (leave empty to keep the echo backend)")
+                .allow_empty(true)
+                .interact_text()?;
+            let entered = entered.trim().to_string();
+            if entered.is_empty() {
+                return Ok(None);
+            }
+            entered
+        }
+        Some(section) => Input::with_theme(&theme)
+            .with_prompt("Bedrock model id (Enter keeps the current one)")
+            .default(section.model.clone())
+            // The default applies to an empty line only; a line of spaces
+            // reaches the validator, which sends it back.
+            .validate_with(|input: &String| {
+                if input.trim().is_empty() {
+                    Err("A model id is required; Enter keeps the current one")
+                } else {
+                    Ok(())
+                }
+            })
+            .interact_text()?
+            .trim()
+            .to_string(),
+    };
+    let optional =
+        |label: &str, current: Option<&String>, default_text: &str| -> Result<Option<String>> {
+            let entered: String = match current {
+                None => Input::with_theme(&theme)
+                    .with_prompt(format!("{label} (leave empty to use {default_text})"))
+                    .allow_empty(true)
+                    .interact_text()?,
+                Some(value) => Input::with_theme(&theme)
+                    .with_prompt(format!("{label} (Enter keeps the current one)"))
+                    .default(value.clone())
+                    .interact_text()?,
+            };
+            // A blank answer keeps what there was: nothing here clears a key.
+            Ok(Some(entered.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| current.cloned()))
+        };
+    let region = optional(
+        "AWS region",
+        existing.as_ref().and_then(|s| s.region.as_ref()),
+        "the AWS default",
+    )?;
+    let profile = optional(
+        "AWS profile",
+        existing.as_ref().and_then(|s| s.profile.as_ref()),
+        "the default credential chain",
+    )?;
+    let mut section = existing.unwrap_or_else(|| BedrockConfig::for_model(&model));
+    section.model = model;
+    section.region = region;
+    section.profile = profile;
+    Ok(Some(section))
+}
+
+/// Write `cfg` to `~/.mezame/config.json`, creating `~/.mezame` owner-only
+/// when it is absent, and say what was written and which backend it
+/// selects.
 ///
-/// An existing file is replaced, the same as re-running the prompt, with
-/// one exception: `hosts` is the key a user edits by hand, and a tunnel
-/// user's list dropped on a re-run left every request answered 421 with
-/// nothing said. A readable existing file's list is kept and named; a
-/// file that does not parse is what `init` exists to replace.
-pub(crate) fn write_config(bind: String) -> Result<Config> {
-    let hosts = load_config()
-        .ok()
-        .into_iter()
-        .flat_map(|old| old.transports)
-        .find_map(|transport| match transport {
-            TransportConfig::Cloudflared { hosts, .. } if !hosts.is_empty() => Some(hosts),
-            _ => None,
-        })
-        .unwrap_or_default();
+/// An existing file is replaced. Two things the callers carry forward are
+/// named on the way, because dropping them on a re-run was silent and
+/// costly: `hosts`, the key a tunnel user edits by hand, and the `bedrock`
+/// section a bind-only run leaves untouched (`kept`).
+pub(crate) fn write_config(cfg: &Config, kept: bool) -> Result<Config> {
+    let hosts = cfg.hosts();
     if !hosts.is_empty() {
         println!(
             "Keeping hosts from the existing config: {}",
             hosts.join(", ")
         );
     }
-    let cfg = Config {
-        transports: vec![TransportConfig::Cloudflared { bind, hosts }],
-    };
+    if kept {
+        println!("Keeping the Bedrock settings from the existing config");
+    }
 
     let path = config_path()?;
+    // What is written is what the next start loads, so it is held to the
+    // same check here. A section carried forward from a file with a bad
+    // value, or a flag that made one, is refused with the key named and
+    // the file left as it was.
+    if let Some(section) = &cfg.bedrock {
+        section.validate(&path)?;
+    }
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent).with_context(|| format!("Creating {}", parent.display()))?;
     }
-    write_private_atomic(&path, serde_json::to_string_pretty(&cfg)?.as_bytes(), true)
+    write_private_atomic(&path, serde_json::to_string_pretty(cfg)?.as_bytes(), true)
         .with_context(|| format!("Writing {}", path.display()))?;
     println!("Wrote {}", path.display());
+    match &cfg.bedrock {
+        Some(section) => {
+            println!("Backend: Bedrock {}", section.model);
+            println!(
+                "Credentials come from the AWS chain: aws configure, aws sso login, AWS_PROFILE or \
+                 the AWS_ACCESS_KEY_ID variables."
+            );
+            println!(
+                "Enable access to {} in the Bedrock console for the region you use.",
+                section.model
+            );
+            // The example is built only from a bare base id; a profile id
+            // or an ARN already carries its routing.
+            if section.model.starts_with("anthropic.") {
+                println!(
+                    "If a base id is refused with an on-demand-throughput error, use an \
+                     inference profile id such as global.{}.",
+                    section.model
+                );
+            } else {
+                println!(
+                    "If the id is refused with an on-demand-throughput error, use an inference \
+                     profile id: the base id under a `global.` or geo prefix."
+                );
+            }
+        }
+        None => println!("Backend: echo"),
+    }
     println!();
-    Ok(cfg)
+    Ok(cfg.clone())
 }
 
 /// The check the free-form bind entry is held to.
@@ -328,26 +746,48 @@ pub fn validate_bind_entry(input: &str) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_init_args, validate_bind_entry};
+    use super::{parse_init_args, validate_bind_entry, InitArgs};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn init_takes_no_arguments_or_a_bind_address() {
-        assert_eq!(parse_init_args(&args(&[])).unwrap(), None);
+    fn init_takes_no_arguments_or_any_of_the_four_flags() {
+        assert!(parse_init_args(&args(&[])).unwrap().is_empty());
         assert_eq!(
             parse_init_args(&args(&["--bind", "0.0.0.0:9510"])).unwrap(),
-            Some("0.0.0.0:9510".to_string())
+            InitArgs {
+                bind: Some("0.0.0.0:9510".to_string()),
+                ..InitArgs::default()
+            }
         );
         assert_eq!(
             parse_init_args(&args(&["--bind=127.0.0.1:9511"])).unwrap(),
-            Some("127.0.0.1:9511".to_string())
+            InitArgs {
+                bind: Some("127.0.0.1:9511".to_string()),
+                ..InitArgs::default()
+            }
         );
-        // An empty value is accepted here and refused by the bind check.
         assert_eq!(
-            parse_init_args(&args(&["--bind", ""])).unwrap(),
+            parse_init_args(&args(&[
+                "--model",
+                "global.anthropic.claude-sonnet-5",
+                "--region=eu-west-1",
+                "--profile",
+                "work",
+            ]))
+            .unwrap(),
+            InitArgs {
+                bind: None,
+                model: Some("global.anthropic.claude-sonnet-5".to_string()),
+                region: Some("eu-west-1".to_string()),
+                profile: Some("work".to_string()),
+            }
+        );
+        // An empty value is accepted here and refused by the later check.
+        assert_eq!(
+            parse_init_args(&args(&["--bind", ""])).unwrap().bind,
             Some(String::new())
         );
     }
@@ -358,7 +798,11 @@ mod tests {
             (vec!["--bind"], "--bind"),
             (vec!["--bind", "--other"], "--bind"),
             (vec!["--bind", "a", "--bind", "b"], "twice"),
+            (vec!["--model"], "--model"),
+            (vec!["--model", "a", "--model=b"], "twice"),
+            (vec!["--region", "--profile", "x"], "--region"),
             (vec!["--bogus"], "Unknown argument"),
+            (vec!["--bogus"], "--profile NAME"),
             (vec!["extra"], "Unknown argument"),
             (vec!["--bind=a", "trailing"], "Unknown argument"),
         ] {

@@ -47,7 +47,7 @@ pub mod unix;
 use anyhow::{bail, Context, Result};
 
 use crate::config::{
-    config_path, init_config, init_config_with_bind, load_config, parse_init_args, TransportConfig,
+    config_path, init_config, init_config_with_args, load_config, parse_init_args, TransportConfig,
 };
 use crate::http::run_cloudflared;
 
@@ -68,10 +68,12 @@ pub fn run() -> Result<()> {
             return Ok(());
         }
         Some("init") => {
-            match parse_init_args(&args[2..])? {
-                None => init_config()?,
-                Some(bind) => init_config_with_bind(&bind)?,
-            };
+            let init_args = parse_init_args(&args[2..])?;
+            if init_args.is_empty() {
+                init_config()?;
+            } else {
+                init_config_with_args(&init_args)?;
+            }
             return Ok(());
         }
         _ => {}
@@ -90,7 +92,7 @@ pub fn run() -> Result<()> {
         init_config().with_context(|| {
             format!(
                 "Setup did not complete. In a terminal, run `mezame init`; without one, \
-                 `mezame init --bind ADDR` writes {} with no prompt",
+                 `mezame init --bind ADDR [--model ID]` writes {} with no prompt",
                 path.display()
             )
         })?
@@ -125,8 +127,14 @@ USAGE:
 
 SUBCOMMANDS:
     init                 Run interactive setup and write ~/.mezame/config.json
-    init --bind ADDR     Write ~/.mezame/config.json for ADDR with no prompt
+    init [FLAGS]         Write ~/.mezame/config.json from the flags with no prompt
     (none)               Load the saved config and start serving
+
+INIT FLAGS (any combination; a key not given keeps the existing value):
+    --bind ADDR          The address to serve on (default 127.0.0.1:9510)
+    --model ID           The Bedrock model id; without one, prompts are echoed
+    --region NAME        The AWS region, else the AWS default chain decides
+    --profile NAME       The AWS profile, else the default credential chain
 
 FLAGS:
     -h, --help      Print this message

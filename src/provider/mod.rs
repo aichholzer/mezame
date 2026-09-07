@@ -13,6 +13,7 @@ pub mod bedrock;
 
 use std::fmt;
 use std::pin::Pin;
+use std::str::FromStr;
 
 use futures_util::future::BoxFuture;
 use futures_util::Stream;
@@ -93,6 +94,37 @@ pub enum ThinkingMode {
     /// No thinking is asked for. On models that think by default the
     /// reasoning still runs, hidden.
     Off,
+}
+
+impl ThinkingMode {
+    /// The spellings `bedrock.thinking` takes, in the order the error names
+    /// them.
+    pub const NAMES: [&'static str; 3] = ["adaptive", "enabled", "off"];
+
+    /// The configuration spelling of this mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingMode::Adaptive => "adaptive",
+            ThinkingMode::Enabled => "enabled",
+            ThinkingMode::Off => "off",
+        }
+    }
+}
+
+impl FromStr for ThinkingMode {
+    type Err = String;
+
+    /// Exact, lowercase spellings only; the error names the accepted set.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "adaptive" => Ok(ThinkingMode::Adaptive),
+            "enabled" => Ok(ThinkingMode::Enabled),
+            "off" => Ok(ThinkingMode::Off),
+            other => Err(format!(
+                "must be one of `adaptive`, `enabled` or `off`, not `{other}`"
+            )),
+        }
+    }
 }
 
 /// What a turn loop is configured with. `BedrockConfig::settings` builds

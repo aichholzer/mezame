@@ -35,6 +35,7 @@ fn state() -> Arc<AppState> {
                 bind: "127.0.0.1:0".to_string(),
                 hosts: vec![],
             }],
+            bedrock: None,
         }),
         hubs: HubRegistry::new(),
         state_changes,
