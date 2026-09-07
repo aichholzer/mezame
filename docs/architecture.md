@@ -52,6 +52,7 @@ Mezame/
 │   ├── lib.rs                  # CLI entry (run/help/version), module wiring, transport dispatch
 │   ├── backend.rs              # the Backend seam, transcript types, the shipped EchoBackend
 │   ├── config.rs               # on-disk settings and interactive setup
+│   ├── guard.rs                # the Host allowlist and the Origin check, ahead of every route
 │   ├── hub.rs                  # multi-attach session hub: one session, many browsers
 │   ├── http.rs                 # cloudflared transport, UI assets, /state, /history
 │   ├── ws.rs                   # the upgrade, the per-attach loop, the client command set
@@ -94,8 +95,13 @@ Mezame/
 - `transports[].bind` (cloudflared only): local bind address. Default is
   loopback; `mezame init` offers `0.0.0.0:9510` if you want LAN reach, and
   `mezame init --bind ADDR` writes the file with no prompt. Mezame has no auth
-  of its own today. Anything non-loopback relies on Cloudflare Access, or on
-  your LAN being trusted.
+  of its own today: on a non-loopback bind, every host that can reach the port
+  can read the session list from `GET /state`, read any transcript from
+  `/history`, attach to any session over `/ws` and overwrite `state.json`
+  through `PUT /state`. The `Host` and `Origin` checks stop pages in a browser,
+  not a peer with `curl`. Anything non-loopback relies on Cloudflare Access
+  gating the public hostname and on every host on the network segment being
+  trusted, because Access never sees the LAN port.
 - `transports[].hosts` (cloudflared only, optional): the hostnames Mezame
   answers to besides IP addresses, `localhost`, `.localhost` and `.local`
   names, and the host part of `bind`. A tunnel or proxy passes the public

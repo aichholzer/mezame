@@ -283,4 +283,5 @@ no manual reload. A keep-alive comment every 15 seconds stops an intermediary
 idle-timing out the stream.
 
 Neither endpoint applies per-user scoping and neither requires
-authentication, which is the same posture the 0.13 release ships.
+authentication. Both sit behind the `Host` and `Origin` checks above; beyond
+those, the posture is the one the 0.13 release ships.

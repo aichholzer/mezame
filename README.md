@@ -31,14 +31,20 @@ reconnect.
 - **Mezame is not a hosted service.** You install it on a machine you control.
   There is no account to create and nothing of yours leaves that machine except
   to whichever provider you configure.
-- **Mezame has no authentication of its own.** Every request that reaches the
-  socket is trusted. Access control is pushed to the edge: bind an address in
-  your own network and put something in front of it that already knows who you
-  are. Binding loopback keeps the network out, not your own browser: any page
-  you have open can reach `127.0.0.1`. Mezame checks that a WebSocket upgrade
-  or a write comes from a page it served itself and that every request names a
-  host it serves, so a hostile page cannot ride your browser into it. That is
-  the extent of it; there is still no notion of who you are.
+- **Mezame has no authentication of its own.** Mezame checks that every
+  request names a host it serves and that a WebSocket upgrade or a write comes
+  from a page it served itself, so a hostile page cannot ride your browser into
+  a loopback Mezame; binding loopback keeps the network out, not your own
+  browser. Every request that passes those two checks is trusted: there is no
+  notion of who you are. On any bind other than loopback, anyone who can reach
+  the port can list your sessions (`GET /state` returns every session id), read
+  every transcript (`/history`), join any session and send prompts into it
+  (`/ws`), learn the directory Mezame runs in (the `ready` frame), and rewrite
+  the shared tab list (`PUT /state`). A session id is not a secret on that
+  path. Loopback also does not separate you from other accounts on the same
+  machine: on a shared host, any local user can reach the port. Access control
+  is pushed to the edge: bind an address in your own network and put something
+  in front of it that already knows who you are.
 - **Mezame is not multi-user.** One installation serves one person's sessions.
   The session list and the settings are shared across every browser that can
   reach it, deliberately, so your phone and your desktop stay in sync.
@@ -120,6 +126,11 @@ for the harness.
   `npm` is missing or too old.
 
 [rustup]: https://rustup.rs
+
+Mezame is built and tested on Linux and macOS. Windows is not supported: there
+is no Windows CI and no Windows binary, and `cargo install` fails at the UI
+build because `build.rs` spawns `npm` by name while Node.js for Windows ships it
+only as `npm.cmd`.
 
 `cargo install` puts the binary at `~/.cargo/bin/mezame`. The UI bundle is
 baked into it. No need for Node.js at run time.
@@ -248,10 +259,11 @@ None of these ship today, and none block the core loop.
    than one person.
 3. **Tools and workspaces.** File reads and writes, shell commands, and an
    approval flow in the browser, scoped to a directory you nominate.
-4. **Telegram transport.** `run_telegram` is a stub and the option is hidden
-   from `mezame init`. Planned shape: long-poll `getUpdates`, one session per
-   chat, stream chunks as `editMessageText` throttled to about one per second,
-   inline keyboard for approvals.
+4. **Telegram transport.** Not implemented: `TransportConfig` carries a
+   commented-out `Telegram` variant and `mezame init` offers no such option.
+   Planned shape: long-poll `getUpdates`, one session per chat, stream chunks
+   as `editMessageText` throttled to about one per second, inline keyboard for
+   approvals.
 
 ## Troubleshooting
 
@@ -287,6 +299,16 @@ browser first to satisfy Access, then retry.
 Mezame holds at most 128 live sessions, each kept for 30 seconds after its
 last browser leaves. Something is opening sessions faster than they expire;
 existing tabs keep working, and the new one connects once a slot frees.
+
+**Every request through the tunnel answers 421**
+Mezame serves only hostnames it has been told about. Add the public hostname to
+`hosts` in the transport entry of `~/.mezame/config.json` and restart; step 5 of
+the Cloudflare guide shows the shape.
+
+**The browser gets 403 on the WebSocket or when saving state**
+The page was served from a host and port other than the one it is talking to: a
+proxy that rewrites `Host`, or a dev server on another port. List the page's
+hostname under `hosts`, or serve the page from the host it talks to.
 
 ## Licence
 

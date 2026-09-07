@@ -1,7 +1,8 @@
 # Development
 
-Same prerequisites as a normal build: a stable Rust toolchain and Node.js 24
-or newer with `npm` on `PATH`. See the README for install details.
+Same prerequisites as a normal build, on Linux or macOS: a stable Rust
+toolchain and Node.js 24 or newer with `npm` on `PATH`. See the README for
+install details.
 
 ## Build, check, lint
 
@@ -48,7 +49,7 @@ configuration.
 | New browser to Mezame message type     | `parse_browser_command` in `src/ws.rs` (parse it) and `handle_command` in `src/hub.rs` (act on it)          |
 | New Mezame to browser message type     | Stream it from a Backend, or emit it from the hub loop in `src/hub.rs`; type in `ui/src/types.ts`; handle in `handleMessage` in `ui/src/hooks/useMezame.ts` |
 | New transcript entry shape            | `EntryBody` in `src/backend.rs`; the history branch of `loadHistory` in `ui/src/hooks/useMezame.ts`           |
-| Auth middleware                       | wrap `Router` in `build_router`/`run_cloudflared` (`src/http.rs`) or apply to the `/ws` route                |
+| Auth middleware                       | `guard_request` in `src/guard.rs` is the one layer in front of every route (`.layer(...)` in `build_router`, `src/http.rs`); an identity check goes beside it, after the `Host` and `Origin` checks |
 | New transport (telegram, matrix, ...) | add a variant to `TransportConfig` in `src/config.rs` and an arm in `run` (`src/lib.rs`); implement a sibling module |
 | UI tweak                              | edit under `ui/src/`; `npm run dev` for HMR or full `cargo build` for the embedded path                      |
 
@@ -102,6 +103,11 @@ Notable coverage already in place:
   the three upgrade arms, the message and text ceilings, the session cap and
   the `Host` and `Origin` refusals over a real socket, which is the only way to
   reach the extractor axum's upgrade needs.
+- **The request checks.** `tests/guard.rs` drives `RequestPolicy` directly; the
+  guard cases in `tests/http_routes.rs` and `tests/ws_upgrade.rs` cover the 421
+  and 403 answers over the router and over a real socket.
+- **The container.** `tests/container_files.rs` pins the Dockerfile, the
+  compose file and the build-context allowlist as text.
 - **Invariants.** `tests/properties.rs` holds nine `proptest` properties at 100
   cases each: broadcast fidelity, targeted delivery, turn ordering, the
   in-flight trajectory, grace and shutdown, session ids, the echo agreement,
@@ -115,6 +121,10 @@ Notable coverage already in place:
 - A discarded browser frame writes one line to stderr naming its `type`, or
   naming the frame as unparseable. A prompt dropped because a turn was already
   in flight writes one naming the session.
+- A refused `Host` or `Origin` writes one line to stderr, once per distinct
+  value and at most 64 values per run (`src/guard.rs`); the response body names
+  the value refused. The first failed write of `state.json` writes one line
+  naming the path.
 - Browser devtools, Network, WS view shows every frame in both directions.
 - `curl 'http://127.0.0.1:9510/history?session=<id>'` shows what a reload would
   seed the log from.

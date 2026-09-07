@@ -45,8 +45,8 @@ pub struct Config {
 
 /// Transport entries are internally tagged by `kind`. Each variant holds
 /// its own config with no separate top-level section. A new transport
-/// takes three steps: add a variant here, add an arm in `main`, implement
-/// its `run_*` entry point.
+/// takes three steps: add a variant here, add an arm in `run`
+/// (`src/lib.rs`), implement its `run_*` entry point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TransportConfig {
@@ -61,8 +61,8 @@ pub enum TransportConfig {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hosts: Vec<String>,
     },
-    // Telegram { token: String }: commented out until `run_telegram`
-    // ships. An enabled variant would have to round-trip through the
+    // Telegram { token: String }: commented out until a Telegram
+    // transport ships. An enabled variant would have to round-trip through the
     // config, advertising a transport that does nothing.
 }
 

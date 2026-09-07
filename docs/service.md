@@ -64,6 +64,8 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
 
 ### System service (multi-user or headless)
 
+Mezame has no auth of its own; on a host with other accounts, every one of them can reach a loopback Mezame at `127.0.0.1:9510`, list its sessions and read its transcripts. Use a system service on a shared host only behind something that knows who the user is.
+
 1. Put the unit at `/etc/systemd/system/mezame.service`:
 
    ```ini

@@ -79,6 +79,8 @@ cloudflared tunnel route dns <your-tunnel-name> mezame.example.com
 
 Reload `cloudflared`. WebSocket upgrades are forwarded by default and `/ws` needs no special flags.
 
+This recipe puts `cloudflared` on one machine and Mezame on another, so Mezame has to bind an address that machine can reach (`0.0.0.0:9510` or a LAN address), and Cloudflare Access gates only the public hostname. Every host on that network segment reaches port 9510 directly with no Access in the way, and Mezame has no auth of its own: such a peer can list your sessions from `GET /state`, read any transcript, attach to any session and rewrite the shared state. When the network is not one you trust end to end, run `cloudflared` on the Mezame host with `service: http://localhost:9510` and a loopback bind, or firewall port 9510 to the `cloudflared` host.
+
 Then list the hostname under `hosts` in the transport entry of Mezame's `~/.mezame/config.json` (step 5 above shows the shape) and restart Mezame. Without it, every request arriving through the tunnel is answered 421, because Mezame serves only hostnames it has been told about. If your ingress rule sets `originRequest.httpHostHeader` instead, the entry is still needed: the browser's `Origin` carries the public hostname, and Mezame accepts an upgrade or a write from a listed hostname whatever `Host` was rewritten to.
 
 ## Put Cloudflare Access in front (strongly recommended)

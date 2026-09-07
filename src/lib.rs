@@ -14,6 +14,8 @@
 //!   - `backend`: the Backend seam, the transcript types, the shipped
 //!     `EchoBackend`
 //!   - `config`:  on-disk settings and interactive setup
+//!   - `guard`:   the `Host` allowlist and the `Origin` check, the one
+//!     layer in front of every route
 //!   - `http`:    cloudflared transport (HTTP/WS server, UI assets,
 //!     `/state`, `/history`)
 //!   - `hub`:     the per-session hub, its registry and its owner loop
