@@ -31,6 +31,34 @@ fn run_with_home(args: &[&str], home: &std::path::Path) -> std::process::Output 
         .expect("spawn mezame")
 }
 
+#[test]
+fn the_legacy_state_file_is_removed_when_present_and_its_absence_is_not_an_error() {
+    // Phase 2 Requirement 7 criterion 7: the helper `init` calls once the
+    // rest of the module lands. The path removed is reported so `init`
+    // can say so; a second call finds nothing and says nothing.
+    use mezame::init::remove_legacy_state_file;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".mezame");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("state.json"), b"{}").unwrap();
+    std::fs::write(dir.join("config.json"), b"{}").unwrap();
+
+    let removed = remove_legacy_state_file(&dir).expect("removal succeeds");
+    assert_eq!(removed, Some(dir.join("state.json")));
+    assert!(!dir.join("state.json").exists());
+    assert!(dir.join("config.json").exists(), "only the one file goes");
+
+    assert_eq!(
+        remove_legacy_state_file(&dir).expect("absence is fine"),
+        None
+    );
+    // A directory that does not exist is the same absence.
+    assert_eq!(
+        remove_legacy_state_file(&tmp.path().join("nowhere")).expect("absence"),
+        None
+    );
+}
+
 fn config_at(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".mezame/config.json")
 }

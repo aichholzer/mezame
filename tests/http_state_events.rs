@@ -8,7 +8,8 @@
 //! off `into_data_stream()` under a timeout.
 //!
 //! No `HOME` mutation anywhere in this file: the handler only touches the
-//! broadcast channel and the shutdown notify.
+//! broadcast channel and the shutdown notify. A tick carries the id of the
+//! user whose state changed and reaches that user's streams alone.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,8 +53,14 @@ fn test_state(capacity: usize) -> Arc<AppState> {
 /// `Arc<AppState>` once this returns. That is load-bearing for
 /// `stream_ends_when_the_last_sender_is_dropped` below.
 async fn open_stream(state: Arc<AppState>) -> BodyDataStream {
-    let cookie = state.login_for_test("alice", "correct horse battery").await;
+    open_stream_as(state, "alice").await
+}
+
+/// [`open_stream`] for the user `name`, created on first use.
+async fn open_stream_as(state: Arc<AppState>, name: &str) -> BodyDataStream {
+    let cookie = state.login_for_test(name, "correct horse battery").await;
     let app = build_router(state);
+
     let req = Request::get("/state/events")
         .header(axum::http::header::COOKIE, cookie)
         .body(Body::empty())
@@ -74,6 +81,17 @@ async fn open_stream(state: Arc<AppState>) -> BodyDataStream {
     res.into_body().into_data_stream()
 }
 
+/// The id of the user `name`, once they exist.
+async fn user_id(state: &AppState, name: &str) -> String {
+    state
+        .store
+        .user_by_name(name)
+        .await
+        .expect("store")
+        .expect("the user exists")
+        .id
+}
+
 /// Read one frame, failing the test on timeout or on a closed stream.
 async fn next_frame(stream: &mut BodyDataStream) -> String {
     let chunk = timeout(Duration::from_secs(5), stream.next())
@@ -91,9 +109,10 @@ async fn emits_state_changed_when_a_tick_fires() {
 
     // `send` reporting a receiver count above zero is itself the proof
     // that the handler subscribed before returning its response.
+    let alice = user_id(&state, "alice").await;
     let receivers = state
         .state_changes
-        .send(())
+        .send(alice)
         .expect("a receiver is attached");
     assert_eq!(receivers, 1);
 
@@ -108,14 +127,45 @@ async fn emits_state_changed_when_a_tick_fires() {
 async fn emits_one_event_per_tick() {
     let state = test_state(8);
     let mut stream = open_stream(state.clone()).await;
+    let alice = user_id(&state, "alice").await;
 
-    state.state_changes.send(()).expect("receiver attached");
+    state
+        .state_changes
+        .send(alice.clone())
+        .expect("receiver attached");
     let first = next_frame(&mut stream).await;
     assert!(first.contains("state_changed"), "first was `{first}`");
 
-    state.state_changes.send(()).expect("receiver attached");
+    state.state_changes.send(alice).expect("receiver attached");
     let second = next_frame(&mut stream).await;
     assert!(second.contains("state_changed"), "second was `{second}`");
+}
+
+#[tokio::test]
+async fn a_tick_reaches_the_streams_of_its_user_and_no_other() {
+    // Phase 2 Requirement 7 criterion 6. Bob's tick is not forwarded to
+    // Alice's stream; her own, sent after it, is the first frame she sees.
+    let state = test_state(8);
+    let mut alice_stream = open_stream(state.clone()).await;
+    let mut bob_stream = open_stream_as(state.clone(), "bob").await;
+    let alice = user_id(&state, "alice").await;
+    let bob = user_id(&state, "bob").await;
+
+    state.state_changes.send(bob).expect("receivers attached");
+    let frame = next_frame(&mut bob_stream).await;
+    assert!(frame.contains("state_changed"), "bob sees his: `{frame}`");
+    let nothing = timeout(Duration::from_millis(300), alice_stream.next()).await;
+    assert!(
+        nothing.is_err(),
+        "alice's stream stays quiet on bob's tick, got {nothing:?}"
+    );
+
+    state.state_changes.send(alice).expect("receivers attached");
+    let frame = next_frame(&mut alice_stream).await;
+    assert!(
+        frame.contains("state_changed"),
+        "alice sees hers: `{frame}`"
+    );
 }
 
 #[tokio::test]
@@ -126,9 +176,13 @@ async fn a_lagged_receiver_skips_ahead_and_keeps_streaming() {
     // still refetches, which is all the event means.
     let state = test_state(2);
     let mut stream = open_stream(state.clone()).await;
+    let alice = user_id(&state, "alice").await;
 
     for _ in 0..8 {
-        state.state_changes.send(()).expect("receiver attached");
+        state
+            .state_changes
+            .send(alice.clone())
+            .expect("receiver attached");
     }
 
     let frame = next_frame(&mut stream).await;

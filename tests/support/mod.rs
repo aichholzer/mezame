@@ -777,6 +777,8 @@ macro_rules! forward_store {
             }
             fn set_title_if_null(&self, id: &str, title: &str, now: i64) -> StoreFuture<'_, bool> {
                 let gate = ($before)(self);
+                self.on_title_write();
+
                 let (id, title) = (id.to_string(), title.to_string());
                 Box::pin(async move {
                     gate?;
@@ -978,15 +980,18 @@ impl FailingStore {
     }
 
     fn on_load(&self) {}
+    fn on_title_write(&self) {}
 }
 
 forward_store!(FailingStore, |s: &FailingStore| s.gate());
 
 /// A Store that counts `load_window` calls, for the two-phase factory's
-/// once-per-build assertion.
+/// once-per-build assertion, and `set_title_if_null` calls, for the
+/// once-per-session title write.
 pub struct CountingStore {
     inner: Arc<dyn Store>,
     loads: AtomicUsize,
+    title_writes: AtomicUsize,
 }
 
 impl CountingStore {
@@ -994,6 +999,7 @@ impl CountingStore {
         Self {
             inner,
             loads: AtomicUsize::new(0),
+            title_writes: AtomicUsize::new(0),
         }
     }
 
@@ -1001,8 +1007,16 @@ impl CountingStore {
         self.loads.load(Ordering::SeqCst)
     }
 
+    pub fn title_writes(&self) -> usize {
+        self.title_writes.load(Ordering::SeqCst)
+    }
+
     fn on_load(&self) {
         self.loads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_title_write(&self) {
+        self.title_writes.fetch_add(1, Ordering::SeqCst);
     }
 }
 

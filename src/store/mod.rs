@@ -62,6 +62,15 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// Milliseconds since the Unix epoch now, the unit every timestamp column
+/// takes.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Mint an id: 16 bytes of OS entropy rendered as 32 lowercase hexadecimal
 /// characters. The panic on entropy failure is deliberate: on Unix it means
 /// `getrandom(2)` failed, and continuing with a predictable id would be

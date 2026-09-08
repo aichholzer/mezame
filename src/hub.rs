@@ -58,12 +58,15 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+
 use futures_util::FutureExt;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify, RwLock};
@@ -72,6 +75,7 @@ use tokio::time::{Instant, Sleep};
 use crate::backend::{
     user_echo_event, user_text_len, Backend, EchoBackend, HistoryEntry, TurnOutcome,
 };
+use crate::store::Store;
 
 /// How long a session stays warm after the last browser detaches. 30s
 /// matches the WS reconnect-backoff cap on the client. A browser coming
@@ -161,6 +165,10 @@ pub const MAX_PROMPT_TEXT_BYTES: usize = 1024 * 1024;
 /// 256 leaves headroom for rapid clicks with no visible backpressure.
 const COMMAND_CAPACITY: usize = 256;
 
+/// The tick channel a registry makes for itself before `with_store` hands
+/// it the server's. Nothing subscribes to it; the size only has to exist.
+const TICK_CAPACITY: usize = 8;
+
 /// Browser to hub commands. The owner loop drains these and calls into
 /// the Backend. The loop processes them one at a time, so two browsers
 /// cannot interleave halfway through one command.
@@ -182,6 +190,10 @@ pub enum HubCommand {
     /// later request replaces it, so the last selection a browser made is
     /// the one that runs next.
     SetModel { model_id: String },
+    /// End the session: cancel a turn in flight, tell every attached
+    /// socket with the close frame, and tear the hub down. Sent by the
+    /// registry when the session's row is archived or deleted.
+    Close,
 }
 
 /// What every attach is sent on arrival. Replayed so a browser joining
@@ -386,6 +398,13 @@ pub struct HubRegistry {
     /// Builds one Backend per hub, with the `session_info` that hub
     /// replays on attach.
     factory: BackendFactory,
+    /// Where a new session's row goes and where a hub writes its title.
+    /// `None` in a registry built without one, which creates no rows.
+    store: Option<Arc<dyn Store>>,
+    /// The `state_changed` ticks, carrying the user id whose state moved.
+    /// The server's channel once `with_store` has run; a private one
+    /// nobody listens on before that.
+    ticks: broadcast::Sender<String>,
 }
 
 /// What the factory hands a new hub: its Backend and the `session_info`
@@ -396,17 +415,78 @@ pub struct NewBackend {
     pub session_info: Option<Value>,
 }
 
+/// Whose session an attach is for. The row a hub is built for is theirs,
+/// the title the hub writes goes to their row, and the tick a write fires
+/// reaches their streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerContext {
+    pub user_id: String,
+    pub user_name: String,
+}
+
+/// What an upgrade with no `session` parameter carries: the row is created
+/// for the owner once the hub is built, with their default workspace at
+/// `workspace_root` when they have none and the server's directory is
+/// eligible. `now` is in milliseconds.
+#[derive(Debug, Clone)]
+pub struct MintContext {
+    pub workspace_root: Option<PathBuf>,
+    pub now: i64,
+}
+
 /// Builds the Backend for a session id. The registry holds one and calls
-/// it under its write lock, so it awaits nothing and returns at once.
-pub type BackendFactory = Arc<dyn Fn(&str) -> NewBackend + Send + Sync>;
+/// it under its write lock, so it awaits nothing and returns at once. An
+/// `Err` fails the attach and leaves no hub and no row.
+pub type BackendFactory = Arc<dyn Fn(&str) -> Result<NewBackend> + Send + Sync>;
 
 /// The factory a registry has when none is given: an [`EchoBackend`] per
 /// hub and no `session_info`.
 pub fn echo_factory() -> BackendFactory {
-    Arc::new(|_session_id| NewBackend {
-        backend: Arc::new(EchoBackend::new()),
-        session_info: None,
+    Arc::new(|_session_id| {
+        Ok(NewBackend {
+            backend: Arc::new(EchoBackend::new()),
+            session_info: None,
+        })
     })
+}
+
+/// The close code an attached socket ends with when its session is closed
+/// under it; the client reads it as "this session is gone", not as a drop
+/// to retry.
+pub const SESSION_CLOSED_CLOSE: u16 = 4404;
+
+/// The internal frame the hub broadcasts on `Close`. The attach loop turns
+/// it into the close frame and forwards nothing.
+pub fn session_closed_frame() -> Value {
+    json!({ "type": "_close", "code": SESSION_CLOSED_CLOSE, "reason": "session closed" })
+}
+
+/// How many characters a title derived from a prompt keeps.
+pub const TITLE_MAX_CHARS: usize = 40;
+
+/// The title a first prompt gives its session: the text blocks joined with
+/// a space, whitespace collapsed and trimmed, cut to [`TITLE_MAX_CHARS`]
+/// characters with `…` appended when cut. `None` when nothing is left or
+/// the text begins with `/`, a command; the session then stays untitled
+/// for the next prompt.
+pub fn title_from_prompt(blocks: &[Value]) -> Option<String> {
+    let words: Vec<&str> = blocks
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .flat_map(str::split_whitespace)
+        .collect();
+    let joined = words.join(" ");
+    if joined.is_empty() || joined.starts_with('/') {
+        return None;
+    }
+    let mut chars = joined.chars();
+    let title: String = chars.by_ref().take(TITLE_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        Some(format!("{title}…"))
+    } else {
+        Some(title)
+    }
 }
 
 impl Default for HubRegistry {
@@ -429,12 +509,24 @@ impl HubRegistry {
     }
 
     fn with_capacity(capacity: usize, factory: BackendFactory) -> Self {
+        let (ticks, _) = broadcast::channel(TICK_CAPACITY);
         Self {
             inner: Arc::default(),
             building: Arc::default(),
             capacity,
             factory,
+            store: None,
+            ticks,
         }
+    }
+
+    /// This registry with the store its session rows and titles go to and
+    /// the channel its ticks go out on: the server's `state_changes`, so a
+    /// row the registry writes reaches the owner's other devices.
+    pub fn with_store(mut self, store: Arc<dyn Store>, ticks: broadcast::Sender<String>) -> Self {
+        self.store = Some(store);
+        self.ticks = ticks;
+        self
     }
 
     /// Test-only: a registry with a small capacity, so a test reaches the
@@ -453,11 +545,17 @@ impl HubRegistry {
         map.contains_key(session_id) || map.len() < self.capacity
     }
 
-    /// Attach to the hub registered under `session_id`, building one if
-    /// none is. Always returns an `AttachedHub` whose `Drop` decrements
-    /// the counter.
-    pub async fn attach_or_create(&self, session_id: &str) -> Result<AttachedHub> {
-        self.attach_or_create_parked(session_id, std::future::ready(()))
+    /// Attach to the hub registered under `session_id`, building one for
+    /// `owner` if none is. `mint` is `Some` for an id this upgrade made
+    /// up: the row is then created once the hub is built. Always returns
+    /// an `AttachedHub` whose `Drop` decrements the counter.
+    pub async fn attach_or_create(
+        &self,
+        session_id: &str,
+        owner: &OwnerContext,
+        mint: Option<MintContext>,
+    ) -> Result<AttachedHub> {
+        self.attach_or_create_parked(session_id, owner, mint, std::future::ready(()))
             .await
     }
 
@@ -472,14 +570,18 @@ impl HubRegistry {
     pub async fn attach_or_create_parked_for_test(
         &self,
         session_id: &str,
+        owner: &OwnerContext,
         park: impl std::future::Future<Output = ()>,
     ) -> Result<AttachedHub> {
-        self.attach_or_create_parked(session_id, park).await
+        self.attach_or_create_parked(session_id, owner, None, park)
+            .await
     }
 
     async fn attach_or_create_parked(
         &self,
         session_id: &str,
+        owner: &OwnerContext,
+        mint: Option<MintContext>,
         park: impl std::future::Future<Output = ()>,
     ) -> Result<AttachedHub> {
         // Fast path: a hub is already registered under this id.
@@ -507,9 +609,26 @@ impl HubRegistry {
             // registered its hub before releasing.
             match self.lookup(session_id).await {
                 Some(hub) => Ok(self.subscribe(hub).await),
-                None => self.build_and_register(session_id).await,
+                None => {
+                    // Whether the first prompt titles the session: a new
+                    // row has no title; an existing row is read here,
+                    // with no registry lock held.
+                    let title_pending = match (&mint, &self.store) {
+                        (Some(_), _) => true,
+                        (None, Some(store)) => store
+                            .session(session_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|row| row.title.is_none()),
+                        (None, None) => false,
+                    };
+                    self.build_and_register(session_id, owner, mint, title_pending)
+                        .await
+                }
             }
         };
+
         self.cleanup_build_slot(session_id).await;
         result
     }
@@ -541,7 +660,13 @@ impl HubRegistry {
     /// two builds can both see a free slot. `build_hub` awaits nothing,
     /// so the lock is held for microseconds. Building before the check
     /// would spawn a loop whose teardown removes the id from the map.
-    async fn build_and_register(&self, session_id: &str) -> Result<AttachedHub> {
+    async fn build_and_register(
+        &self,
+        session_id: &str,
+        owner: &OwnerContext,
+        mint: Option<MintContext>,
+        title_pending: bool,
+    ) -> Result<AttachedHub> {
         let mut map = self.inner.write().await;
         if map.len() >= self.capacity {
             return Err(RegistryFull {
@@ -549,7 +674,7 @@ impl HubRegistry {
             }
             .into());
         }
-        let hub = build_hub(session_id, self.clone())?;
+        let hub = build_hub(session_id, self.clone(), owner.clone(), title_pending)?;
         // The gate above is what makes the occupied case unreachable
         // here; `or_insert_with` keeps the insert atomic against
         // `register_for_test` all the same.
@@ -559,6 +684,30 @@ impl HubRegistry {
         let hub = entry.clone();
         // Released before `subscribe`, which awaits the snapshot lock.
         drop(map);
+        // A new session's row, once the hub exists and the lock is gone:
+        // a cap refusal or a build failure above has left nothing to
+        // undo, and a client retrying an upgrade accumulates no rows.
+        if let (Some(mint), Some(store)) = (mint, &self.store) {
+            if let Err(e) = store
+                .create_session(
+                    &owner.user_id,
+                    session_id,
+                    mint.workspace_root.as_deref(),
+                    mint.now,
+                )
+                .await
+            {
+                // Tear the hub down: with the map's handle and this one
+                // gone, the command inbox closes and the loop ends as on
+                // grace, freeing the slot and the Backend.
+                self.remove(session_id).await;
+                drop(hub);
+                return Err(anyhow!("could not create the session: {e}"));
+            }
+            // The owner's other devices learn of the session before its
+            // first prompt.
+            let _ = self.ticks.send(owner.user_id.clone());
+        }
         Ok(self.subscribe(hub).await)
     }
 
@@ -612,6 +761,17 @@ impl HubRegistry {
             map.get(session_id).map(|hub| Arc::clone(&hub.backend))
         }?;
         Some(backend.history().await)
+    }
+
+    /// Close the hub registered under `session_id`, if one is: its turn is
+    /// cancelled, every attached socket is closed with
+    /// [`SESSION_CLOSED_CLOSE`], and the hub is torn down. Whether a hub
+    /// was there to tell.
+    pub async fn close_session(&self, session_id: &str) -> bool {
+        match self.lookup(session_id).await {
+            Some(hub) => hub.commands.send(HubCommand::Close).await.is_ok(),
+            None => false,
+        }
     }
 
     /// Remove a hub by session id. Called by the owner loop on exit.
@@ -697,6 +857,11 @@ impl HubRegistry {
             snapshot,
             grace_period,
             inflight,
+            owner: OwnerContext {
+                user_id: "test-user".to_string(),
+                user_name: "test".to_string(),
+            },
+            title_pending: false,
         }));
 
         let mut map = self.inner.write().await;
@@ -722,7 +887,12 @@ impl HubRegistry {
 /// reports. The OS answers with an absolute path, and a browser cannot
 /// choose another one. Synchronous, so the caller may hold the registry
 /// lock across it.
-fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
+fn build_hub(
+    session_id: &str,
+    registry: HubRegistry,
+    owner: OwnerContext,
+    title_pending: bool,
+) -> Result<SessionHub> {
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
     let ready = json!({
         "type": "ready",
@@ -741,7 +911,7 @@ fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
     let NewBackend {
         backend,
         session_info,
-    } = (registry.factory)(session_id);
+    } = (registry.factory)(session_id)?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(COMMAND_CAPACITY);
     let (out_tx, _) = broadcast::channel::<Arc<Value>>(BROADCAST_CAPACITY);
@@ -772,6 +942,8 @@ fn build_hub(session_id: &str, registry: HubRegistry) -> Result<SessionHub> {
         snapshot,
         grace_period: GRACE_PERIOD,
         inflight,
+        owner,
+        title_pending,
     }));
 
     Ok(hub)
@@ -806,6 +978,13 @@ struct HubLoopState {
     /// Shared with `SessionHub::inflight`, so `subscribe` reads the same
     /// count the loop claims.
     inflight: Arc<AtomicUsize>,
+    /// Whose session this is: the row the title goes to, the user the
+    /// tick names.
+    owner: OwnerContext,
+    /// Whether the next accepted prompt derives the session's title. Set
+    /// for a new row and for an existing row with no title; cleared once
+    /// a title has been derived.
+    title_pending: bool,
 }
 
 /// Owner loop: serialises browser commands, sends the frames that end a
@@ -885,10 +1064,12 @@ async fn drive(state: HubLoopState) {
         outbound,
         mut commands,
         counter,
-        registry: _,
+        registry,
         snapshot,
         grace_period,
         inflight,
+        owner,
+        mut title_pending,
     } = state;
 
     let outstanding: Outstanding = Arc::default();
@@ -917,23 +1098,33 @@ async fn drive(state: HubLoopState) {
         tokio::select! {
             // Browser to Backend.
             cmd = commands.recv() => {
-                match cmd {
-                    Some(c) => handle_command(
-                        CommandContext {
-                            backend: &backend,
-                            session_id: &session_id,
-                            outbound: &outbound,
-                            inflight: &inflight,
-                            turn_done_tx: &turn_done_tx,
-                            outstanding: &outstanding,
-                            model_change: &mut model_change,
-                            model_done_tx: &model_done_tx,
-                            turn_started: &mut turn_started,
-                        },
-                        c,
-                    ),
+                                match cmd {
+                    Some(c) => {
+                        let flow = handle_command(
+                            CommandContext {
+                                backend: &backend,
+                                session_id: &session_id,
+                                outbound: &outbound,
+                                inflight: &inflight,
+                                turn_done_tx: &turn_done_tx,
+                                outstanding: &outstanding,
+                                model_change: &mut model_change,
+                                model_done_tx: &model_done_tx,
+                                turn_started: &mut turn_started,
+                                owner: &owner,
+                                store: registry.store.as_ref(),
+                                ticks: &registry.ticks,
+                                title_pending: &mut title_pending,
+                            },
+                            c,
+                        );
+                        if flow == Flow::Close {
+                            break;
+                        }
+                    }
                     None => break, // every sender dropped: nobody can reach us
                 }
+
             }
             // A turn finished. This arm is synchronous from its first
             // line to its last: the slot is released and `prompt_done`
@@ -1247,17 +1438,49 @@ struct CommandContext<'a> {
     /// turns. A cancel waits on it so it reaches the turn it was aimed at
     /// rather than a slot the turn task has not filled yet.
     turn_started: &'a mut Option<watch::Receiver<bool>>,
+    owner: &'a OwnerContext,
+    /// Where the derived title goes; `None` writes nothing.
+    store: Option<&'a Arc<dyn Store>>,
+    ticks: &'a broadcast::Sender<String>,
+    /// See `HubLoopState::title_pending`.
+    title_pending: &'a mut bool,
+}
+
+/// What the loop does after a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    /// `Close` was handled: the loop ends and teardown follows.
+    Close,
+}
+
+/// Cancel the turn in flight once it has a handle to cancel. Spawned, so a
+/// slow Backend cannot stall the command inbox and the grace arm behind
+/// one call; the turn task and this one are spawned with no order between
+/// them, so the cancel waits for the turn to have called `prompt`.
+fn spawn_cancel(backend: &Arc<dyn Backend>, turn_started: &Option<watch::Receiver<bool>>) {
+    let backend = Arc::clone(backend);
+    let started = turn_started.clone();
+    tokio::spawn(async move {
+        if let Some(mut started) = started {
+            // `Err` means the turn task is gone before it called
+            // `prompt`; cancelling then finds nothing, harmlessly.
+            let _ = started.wait_for(|ready| *ready).await;
+        }
+        backend.cancel().await;
+    });
 }
 
 /// Act on one browser command. Synchronous: nothing here waits on the
 /// Backend, so no Backend can hold the inbox.
-fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
+fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) -> Flow {
     match cmd {
         HubCommand::Prompt { blocks, attach_id } => {
             if blocks.is_empty() {
-                return;
+                return Flow::Continue;
             }
             let text_len = user_text_len(&blocks);
+
             if text_len > MAX_PROMPT_TEXT_BYTES {
                 // Refused ahead of the claim and the echo, so no composer
                 // locks and no peer sees a turn start. Stamped for the
@@ -1269,10 +1492,11 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
                         "The prompt holds {text_len} bytes of text; the limit is \
                          {MAX_PROMPT_TEXT_BYTES} bytes."
                     ),
-                    "_target": attach_id
+                                        "_target": attach_id
                 })));
-                return;
+                return Flow::Continue;
             }
+
             // The claim, the echo and the spawn hold no await between
             // them, so no other command interleaves and the count is
             // above zero from before the echo until the loop releases
@@ -1282,9 +1506,40 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
                     "Session {}: prompt discarded, a turn is already in flight",
                     ctx.session_id
                 ));
-                return;
+                return Flow::Continue;
             };
             let _ = ctx.outbound.send(Arc::new(user_echo_event(&blocks)));
+            // The first accepted prompt titles an untitled session. A
+            // prompt that yields no title leaves the flag set for the
+            // next one; a title is written only while the row's is still
+            // null, so a rename made before this prompt stands, and the
+            // tick goes out only when a row was written.
+            if *ctx.title_pending {
+                if let Some(title) = title_from_prompt(&blocks) {
+                    *ctx.title_pending = false;
+                    if let Some(store) = ctx.store {
+                        let store = Arc::clone(store);
+                        let ticks = ctx.ticks.clone();
+                        let session_id = ctx.session_id.to_string();
+                        let user_id = ctx.owner.user_id.clone();
+                        tokio::spawn(async move {
+                            match store
+                                .set_title_if_null(&session_id, &title, crate::store::now_ms())
+                                .await
+                            {
+                                Ok(true) => {
+                                    let _ = ticks.send(user_id);
+                                }
+                                Ok(false) => {}
+                                Err(e) => warn(&format!(
+                                    "Session {session_id}: could not save the title: {e}"
+                                )),
+                            }
+                        });
+                    }
+                }
+            }
+
             let (events_tx, events_rx) = mpsc::unbounded_channel::<Value>();
             let (started_tx, started_rx) = watch::channel(false);
             *ctx.turn_started = Some(started_rx);
@@ -1313,8 +1568,9 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
                     "Session {}: dropped an answer for a permission that is not outstanding",
                     ctx.session_id
                 ));
-                return;
+                return Flow::Continue;
             }
+
             let backend = Arc::clone(ctx.backend);
             tokio::spawn(async move {
                 backend.permission_response(id, option_id).await;
@@ -1322,29 +1578,28 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
         }
         HubCommand::Cancel => {
             // A cancel with no turn in flight is dropped here: delivered,
-            // it would reach whatever turn a peer starts next. One that
-            // has a turn to reach waits until that turn has installed its
-            // handle, since the turn task and this one are spawned with no
-            // order between them. Spawned, so a slow Backend cannot stall
-            // the command inbox and the grace arm behind one call.
+            // it would reach whatever turn a peer starts next.
             if ctx.inflight.load(Ordering::SeqCst) == 0 {
                 warn(&format!(
                     "Session {}: cancel dropped, no turn is in flight",
                     ctx.session_id
                 ));
-                return;
+                return Flow::Continue;
             }
-            let backend = Arc::clone(ctx.backend);
-            let started = ctx.turn_started.clone();
-            tokio::spawn(async move {
-                if let Some(mut started) = started {
-                    // `Err` means the turn task is gone before it called
-                    // `prompt`; cancelling then finds nothing, harmlessly.
-                    let _ = started.wait_for(|ready| *ready).await;
-                }
-                backend.cancel().await;
-            });
+            spawn_cancel(ctx.backend, ctx.turn_started);
         }
+        HubCommand::Close => {
+            // The session's row was archived or deleted under this hub. A
+            // turn in flight is cancelled, every attached socket is told
+            // with the frame the attach loop turns into its close, and
+            // the loop ends; teardown frees the slot and the Backend.
+            if ctx.inflight.load(Ordering::SeqCst) > 0 {
+                spawn_cancel(ctx.backend, ctx.turn_started);
+            }
+            let _ = ctx.outbound.send(Arc::new(session_closed_frame()));
+            return Flow::Close;
+        }
+
         HubCommand::SetModel { model_id } => {
             // Never awaited here. The reply is applied by the loop when it
             // arrives, one change at a time; a change that stalls on I/O
@@ -1357,4 +1612,5 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
             }
         }
     }
+    Flow::Continue
 }

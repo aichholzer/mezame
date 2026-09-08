@@ -5,7 +5,11 @@
 
 use std::sync::OnceLock;
 
-use mezame::config::{config_path, load_config, state_path, Config, TransportConfig};
+use std::path::Path;
+
+use mezame::config::{
+    config_path, eligible_workspace_root, load_config, Config, TransportConfig, WorkspaceIneligible,
+};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -34,16 +38,6 @@ async fn config_path_appends_dotmezame_config_json() {
 }
 
 #[tokio::test]
-async fn state_path_appends_dotmezame_state_json() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let p = state_path().expect("state_path");
-    assert_eq!(p, tmp.path().join(".mezame/state.json"));
-}
-
-#[tokio::test]
 async fn config_path_errors_when_home_unset() {
     let _g = home_lock().lock().await;
     unset_home();
@@ -52,13 +46,48 @@ async fn config_path_errors_when_home_unset() {
     assert!(err.to_string().contains("HOME"));
 }
 
-#[tokio::test]
-async fn state_path_errors_when_home_unset() {
-    let _g = home_lock().lock().await;
-    unset_home();
-
-    let err = state_path().expect_err("HOME unset should error");
-    assert!(err.to_string().contains("HOME"));
+#[test]
+fn the_working_directory_is_a_workspace_root_unless_it_is_the_root_the_home_or_holds_mezame() {
+    // Requirement 3 criterion 5: a pure rule over two paths, no `HOME`
+    // read, so it needs no lock.
+    let mezame = Path::new("/home/alice/.mezame");
+    assert_eq!(
+        eligible_workspace_root(Path::new("/home/alice/project"), mezame),
+        Ok(std::path::PathBuf::from("/home/alice/project"))
+    );
+    assert_eq!(
+        eligible_workspace_root(Path::new("/srv/mezame"), mezame),
+        Ok(std::path::PathBuf::from("/srv/mezame"))
+    );
+    assert_eq!(
+        eligible_workspace_root(Path::new("/"), mezame),
+        Err(WorkspaceIneligible::Root)
+    );
+    assert_eq!(
+        eligible_workspace_root(Path::new("/home/alice"), mezame),
+        Err(WorkspaceIneligible::Home)
+    );
+    for holds_or_is in ["/home", "/home/alice/.mezame", "/home/alice/.mezame/inner"] {
+        assert_eq!(
+            eligible_workspace_root(Path::new(holds_or_is), mezame),
+            Err(WorkspaceIneligible::MezameDir),
+            "{holds_or_is}"
+        );
+    }
+    // A sibling that merely shares a prefix is a directory of its own.
+    assert!(eligible_workspace_root(Path::new("/home/alice/.mezame-work"), mezame).is_ok());
+    assert!(eligible_workspace_root(Path::new("/home/alice2"), mezame).is_ok());
+    // Each reason reads as a sentence for the startup line.
+    for why in [
+        WorkspaceIneligible::Root,
+        WorkspaceIneligible::Home,
+        WorkspaceIneligible::MezameDir,
+    ] {
+        assert!(
+            why.to_string().starts_with("the working directory"),
+            "{why}"
+        );
+    }
 }
 
 #[tokio::test]

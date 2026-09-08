@@ -12,26 +12,27 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::PathBuf;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
 use std::time::Duration;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use axum::{
-    body::Body,
-    extract::{rejection::JsonRejection, Query, Request, State},
+    body::{Body, Bytes},
+    extract::{rejection::JsonRejection, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
-    Json, Router,
+    routing::{get, patch, post},
+    Extension, Json, Router,
 };
+
 use futures_util::stream::Stream;
 use futures_util::FutureExt;
 use hyper::server::conn::http1;
@@ -47,11 +48,13 @@ use crate::auth::{
     self, clear_cookie_header, cookie_value, dummy_hash, set_cookie_header, sign, verify,
     verify_password, AuthUser, Cookie, RateLimiter,
 };
-use crate::config::{ensure_private_dir, state_path, write_private_atomic, Config};
+use crate::config::Config;
+
 use crate::guard::{guard_request, RequestPolicy};
 use crate::hub::{warn, HubRegistry};
 use crate::store::crypto::Keys;
-use crate::store::{Store, UserRow};
+use crate::store::{SessionList, SessionRow, Store, StoreError, UserRow};
+
 use crate::ws::ws_upgrade;
 
 /// Unix seconds, as the server sees them. A test installs its own.
@@ -60,9 +63,9 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 /// Shared state for the axum router. Bundles the configuration with the
 /// live `HubRegistry` so the WS handler can attach to existing hubs or
 /// create new ones for fresh sessions, the store and the keys every
-/// identity check reads, plus a broadcast channel that fires whenever
-/// `state.json` is rewritten so connected browsers can re-sync their
-/// session list without a manual reload.
+/// identity check reads, plus a broadcast channel that fires whenever a
+/// user's sessions or settings change so that user's connected browsers
+/// refetch `/state` without a manual reload.
 pub struct AppState {
     /// Read per request; swappable so a later phase can reload it.
     pub config: ArcSwap<Config>,
@@ -71,13 +74,16 @@ pub struct AppState {
     pub keys: Keys,
     pub limiter: RateLimiter,
     pub clock: Clock,
-    /// Tick channel: `put_state` fires `()` on every successful
-    /// rename. Browsers subscribed to `/state/events` receive an
-    /// SSE event and refetch `/state`. Receivers that lag behind
-    /// are dropped silently; the next tick brings them back in
-    /// sync. Capacity 64 is plenty given state writes happen at
-    /// human-edit pace.
-    pub state_changes: broadcast::Sender<()>,
+    /// Tick channel, carrying the id of the user whose state changed: a
+    /// session created, renamed, titled, archived, restored or deleted,
+    /// or settings written. `/state/events` forwards a tick to that
+    /// user's streams alone, and each refetches `/state`. Receivers that
+    /// lag are skipped ahead; the next tick brings them back in sync.
+    pub state_changes: broadcast::Sender<String>,
+    /// The root a user's default workspace is created at on their first
+    /// session: the server's working directory when it is eligible.
+    pub workspace_root: Option<PathBuf>,
+
     /// Process-wide shutdown signal. Fired by the SIGINT/SIGTERM
     /// handler before letting axum's graceful shutdown drain.
     /// Long-poll handlers (currently just the SSE stream) listen
@@ -121,9 +127,13 @@ pub(crate) async fn run_cloudflared(
     hubs: HubRegistry,
     store: Arc<dyn Store>,
     keys: Keys,
+    workspace_root: Option<PathBuf>,
 ) -> Result<()> {
     let (state_changes, _) = broadcast::channel(64);
     let shutdown = Arc::new(Notify::new());
+    // The registry writes session rows and titles into the same store and
+    // ticks on the same channel the routes do.
+    let hubs = hubs.with_store(Arc::clone(&store), state_changes.clone());
     let state = Arc::new(AppState {
         config: ArcSwap::from_pointee(cfg),
         hubs,
@@ -132,8 +142,10 @@ pub(crate) async fn run_cloudflared(
         limiter: RateLimiter::default(),
         clock: Arc::new(auth::now_unix),
         state_changes,
+        workspace_root,
         shutdown: shutdown.clone(),
     });
+
     let app = build_router(state);
 
     let listener = TcpListener::bind(&bind).await?;
@@ -325,7 +337,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/state", get(get_state).put(put_state))
         .route("/state/events", get(state_events))
         .route("/history", get(get_history))
+        .route("/sessions/:id", patch(patch_session).delete(delete_session))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_user));
+
     public
         .merge(protected)
         .layer(middleware::from_fn_with_state(policy, guard_request))
@@ -337,23 +351,70 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 pub const LOGIN_REQUIRED: &str = "login required\n";
 
 impl AppState {
-    /// A state over an in-memory store and a fixed key, for the suite.
+    /// A state over an in-memory store and a fixed key, for the suite,
+    /// with no workspace root.
     #[doc(hidden)]
     pub fn for_test(config: Config, hubs: HubRegistry, capacity: usize) -> Arc<Self> {
+        Self::for_test_with(config, hubs, capacity, None, None)
+    }
+
+    /// [`AppState::for_test`] over `store` when given (else a fresh
+    /// in-memory one) and with `workspace_root`. `capacity` is the tick
+    /// channel's. The registry is wired to the store and the channel the
+    /// way the server wires it.
+    #[doc(hidden)]
+    pub fn for_test_with(
+        config: Config,
+        hubs: HubRegistry,
+        capacity: usize,
+        store: Option<Arc<dyn Store>>,
+        workspace_root: Option<PathBuf>,
+    ) -> Arc<Self> {
         let keys = crate::store::crypto::MasterKey::from_bytes_for_test([42u8; 32]).keys();
-        let store = crate::store::sqlite::SqliteStore::open_in_memory(keys.clone())
-            .expect("an in-memory store opens");
+        let store: Arc<dyn Store> = store.unwrap_or_else(|| {
+            Arc::new(
+                crate::store::sqlite::SqliteStore::open_in_memory(keys.clone())
+                    .expect("an in-memory store opens"),
+            )
+        });
         let (state_changes, _) = broadcast::channel(capacity);
+        let hubs = hubs.with_store(Arc::clone(&store), state_changes.clone());
         Arc::new(AppState {
             config: ArcSwap::from_pointee(config),
             hubs,
-            store: Arc::new(store),
+            store,
             keys,
             limiter: RateLimiter::default(),
             clock: Arc::new(auth::now_unix),
             state_changes,
+            workspace_root,
             shutdown: Arc::new(Notify::new()),
         })
+    }
+
+    /// The clock in milliseconds, the unit the store's timestamps take.
+    pub fn now_ms(&self) -> i64 {
+        (self.clock)() * 1000
+    }
+
+    /// The session `id` when `user` owns it. `Ok(None)` for no row and for
+    /// another user's row alike, so a caller answers both the same way.
+    async fn owned_session(
+        &self,
+        user: &UserRow,
+        id: &str,
+    ) -> std::result::Result<Option<SessionRow>, StoreError> {
+        Ok(self
+            .store
+            .session(id)
+            .await?
+            .filter(|row| row.user_id == user.id))
+    }
+
+    /// Fire a `state_changed` tick for `user_id`. A send error only means
+    /// no browser is subscribed; the next one fetches `/state` on connect.
+    fn tick(&self, user_id: &str) {
+        let _ = self.state_changes.send(user_id.to_string());
     }
 
     /// Whether a cookie set on this request is marked `Secure`: the request
@@ -652,118 +713,238 @@ pub fn mime_for(path: &str) -> &'static str {
         .unwrap_or("application/octet-stream")
 }
 
-/// GET /state: returns the persisted browser state as JSON, or `{}` if the
-/// file does not exist yet. Mezame does not interpret the contents; it is
-/// purely a cross-device store for the UI.
-async fn get_state() -> Result<Json<Value>, (StatusCode, String)> {
-    let path = state_path().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    match tokio::fs::read_to_string(&path).await {
-        Ok(raw) => {
-            let v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
-            Ok(Json(v))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Json(json!({}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))),
+/// The most bytes a user's settings object may take, serialised.
+pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
+/// The longest title a rename may set, in characters, after trimming.
+pub const SESSION_TITLE_MAX_CHARS: usize = 200;
+
+/// The body every session route answers for a row the user does not own
+/// or that does not exist: one answer, so neither says which.
+const NO_SUCH_SESSION: &str = "no such session\n";
+
+/// `GET /state`: the user's open sessions by creation, their newest twenty
+/// archived ones by archival, and their settings object. `title` is null
+/// for an untitled session. Mezame does not interpret the settings.
+async fn get_state(
+    State(app): State<Arc<AppState>>,
+    Extension(AuthUser(user)): Extension<AuthUser>,
+) -> Response {
+    match app.store.list_sessions(&user.id).await {
+        Ok(list) => Json(state_json(&list, &user.settings)).into_response(),
+        Err(e) => internal(e).into_response(),
     }
 }
 
-/// PUT /state: atomically replaces the stored state. Writes a fresh
-/// sibling temporary file unique to this write, owner-only on Unix, and
-/// renames it over the target, so two browsers writing at once never
-/// share a file and a reader never sees a partial one; the later rename
-/// wins. A successful write fires a tick on the `state_changes`
-/// broadcast. Every browser subscribed to `/state/events` then refetches
-/// and merges in any new sessions another browser opened.
+/// The `/state` document for `list` and `settings`.
+pub fn state_json(list: &SessionList, settings: &Value) -> Value {
+    let sessions: Vec<Value> = list
+        .active
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "title": row.title,
+                "created": row.created,
+                "updated": row.updated,
+            })
+        })
+        .collect();
+    let closed: Vec<Value> = list
+        .archived
+        .iter()
+        .map(|row| json!({ "id": row.id, "title": row.title, "closedAt": row.archived_at }))
+        .collect();
+    json!({ "sessions": sessions, "closed": closed, "settings": settings })
+}
+
+/// `PUT /state`: replace the user's settings with the object under
+/// `settings` in a body of exactly that one key, at most
+/// [`SETTINGS_MAX_BYTES`] serialised. 204 and one tick for the user; any
+/// other body is 400 and changes nothing.
 async fn put_state(
     State(app): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let path = state_path().map_err(internal)?;
-    let data = serde_json::to_string_pretty(&body).map_err(internal)?;
-    let target = path.clone();
-    let written = tokio::task::spawn_blocking(move || -> io::Result<()> {
-        if let Some(parent) = target.parent() {
-            ensure_private_dir(parent)?;
-        }
-        write_private_atomic(&target, data.as_bytes(), false)
-    })
-    .await
-    .map_err(internal)?;
-    if let Err(e) = written {
-        note_state_write_failure(&path, &e);
-        return Err(internal(e));
+    Extension(AuthUser(user)): Extension<AuthUser>,
+    body: Bytes,
+) -> Response {
+    let Some(settings) = settings_of_body(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the body is {{\"settings\": {{...}}}}, an object of at most {SETTINGS_MAX_BYTES} \
+                 bytes\n"
+            ),
+        )
+            .into_response();
+    };
+    if let Err(e) = app.store.set_settings(&user.id, &settings).await {
+        return internal(e).into_response();
     }
-    // A send error here only means no browser is currently subscribed.
-    // The next subscriber fetches /state on connect and sees everything
-    // that changed in the meantime.
-    let _ = app.state_changes.send(());
-    Ok(StatusCode::NO_CONTENT)
+    app.tick(&user.id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// The settings object a `PUT /state` body carries, when it is the one
+/// shape and size the route takes.
+pub fn settings_of_body(body: &[u8]) -> Option<Value> {
+    let document: Value = serde_json::from_slice(body).ok()?;
+    let object = document.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let settings = object.get("settings")?;
+    settings.as_object()?;
+    let size = serde_json::to_vec(settings).ok()?.len();
+    (size <= SETTINGS_MAX_BYTES).then(|| settings.clone())
+}
+
+/// What a `PATCH /sessions/{id}` body asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPatch {
+    /// A rename, trimmed, 1 to [`SESSION_TITLE_MAX_CHARS`] characters.
+    Title(String),
+    /// Close (`true`) or restore (`false`).
+    Archived(bool),
+}
+
+/// The change a `PATCH /sessions/{id}` body asks for, when it is one of
+/// the two shapes the route takes and nothing else.
+pub fn session_patch_of(body: &[u8]) -> Option<SessionPatch> {
+    let document: Value = serde_json::from_slice(body).ok()?;
+    let object = document.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    if let Some(title) = object.get("title") {
+        let title = title.as_str()?.trim();
+        let length = title.chars().count();
+        return (1..=SESSION_TITLE_MAX_CHARS)
+            .contains(&length)
+            .then(|| SessionPatch::Title(title.to_string()));
+    }
+    object
+        .get("archived")?
+        .as_bool()
+        .map(SessionPatch::Archived)
+}
+
+/// `PATCH /sessions/{id}`: rename, close or restore one of the user's
+/// sessions. A close also ends the hub registered under the id, so every
+/// attached socket is closed with 4404 and a later upgrade naming the id
+/// is refused until the row is restored. 204 and one tick for the owner;
+/// 404 for a row the user does not own or that does not exist; 400 for a
+/// body of another shape.
+async fn patch_session(
+    State(app): State<Arc<AppState>>,
+    Extension(AuthUser(user)): Extension<AuthUser>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    match app.owned_session(&user, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, NO_SUCH_SESSION).into_response(),
+        Err(e) => return internal(e).into_response(),
+    }
+    let Some(patch) = session_patch_of(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the body is {{\"title\": \"...\"}} (1 to {SESSION_TITLE_MAX_CHARS} characters) or \
+                 {{\"archived\": true|false}}\n"
+            ),
+        )
+            .into_response();
+    };
+    let now = app.now_ms();
+    let outcome = match patch {
+        SessionPatch::Title(title) => app.store.set_title(&id, &title, now).await,
+        SessionPatch::Archived(archived) => {
+            let outcome = app.store.set_archived(&id, archived, now).await;
+            if outcome.is_ok() && archived {
+                app.hubs.close_session(&id).await;
+            }
+            outcome
+        }
+    };
+    if let Err(e) = outcome {
+        return internal(e).into_response();
+    }
+    app.tick(&user.id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `DELETE /sessions/{id}`: forget one of the user's sessions and, through
+/// the cascade, its messages. A hub registered under the id is closed the
+/// way an archive closes it, since it has no row to serve. 204 and one
+/// tick for the owner; 404 for a row the user does not own or that does
+/// not exist.
+async fn delete_session(
+    State(app): State<Arc<AppState>>,
+    Extension(AuthUser(user)): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Response {
+    match app.owned_session(&user, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, NO_SUCH_SESSION).into_response(),
+        Err(e) => return internal(e).into_response(),
+    }
+    if let Err(e) = app.store.delete_session(&id).await {
+        return internal(e).into_response();
+    }
+    app.hubs.close_session(&id).await;
+    app.tick(&user.id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// A handler failure the client sees as a 500 with the error's text.
 fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
-}
-
-/// Whether the first failed state write has been reported.
-static STATE_WRITE_FAILURE_NOTED: AtomicBool = AtomicBool::new(false);
-
-/// Report the first failure to write the state file, once per process.
-///
-/// The UI does not surface a failed sync, so without this line a
-/// directory Mezame cannot write into, a Docker volume owned by another
-/// uid or a read-only home, loses every tab rename and setting in
-/// silence while the server looks healthy.
-fn note_state_write_failure(path: &Path, e: &io::Error) {
-    if !STATE_WRITE_FAILURE_NOTED.swap(true, Ordering::Relaxed) {
-        warn(&format!(
-            "Could not write {}: {e}. The tab list and settings will not be saved until \
-             this process can write into that directory; check its ownership and \
-             permissions.",
-            path.display()
-        ));
-    }
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n"))
 }
 
 /// GET /state/events: Server-Sent Events stream. Emits one
-/// `state_changed` event each time `put_state` writes a new state
-/// file. The browser reads it as a "go refetch /state" signal, and
-/// sessions opened in another browser show up without a manual
-/// reload.
+/// `state_changed` event each time this user's sessions or settings
+/// change, on any device; ticks for other users are not forwarded. The
+/// browser reads it as a "go refetch /state" signal, and a session opened
+/// in another browser shows up without a manual reload.
 ///
 /// A periodic keep-alive comment goes out alongside. A Cloudflare Tunnel
 /// or other intermediary would otherwise idle-timeout the stream during a
 /// quiet period.
 async fn state_events(
     State(app): State<Arc<AppState>>,
+    Extension(AuthUser(user)): Extension<AuthUser>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = app.state_changes.subscribe();
     let shutdown = app.shutdown.clone();
-    let stream = futures_util::stream::unfold((rx, shutdown), |(mut rx, shutdown)| async move {
-        loop {
-            tokio::select! {
-                // Shutdown wins: end the stream and let axum's
-                // graceful drain finish. Without this the SSE handler
-                // holds a request future that never resolves, and
-                // Ctrl+C hangs.
-                _ = shutdown.notified() => return None,
-                msg = rx.recv() => match msg {
-                    Ok(()) => {
-                        return Some((
-                            Ok(Event::default().event("state_changed").data("")),
-                            (rx, shutdown),
-                        ));
-                    }
-                    // Lagged: skip and wait for the next message. The
-                    // browser refetches on the next event delivered.
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    // All senders dropped: end the stream. In practice
-                    // this only happens when the server is shutting down.
-                    Err(broadcast::error::RecvError::Closed) => return None,
-                },
+    let me = user.id;
+    let stream =
+        futures_util::stream::unfold((rx, shutdown, me), |(mut rx, shutdown, me)| async move {
+            loop {
+                tokio::select! {
+                    // Shutdown wins: end the stream and let axum's
+                    // graceful drain finish. Without this the SSE handler
+                    // holds a request future that never resolves, and
+                    // Ctrl+C hangs.
+                    _ = shutdown.notified() => return None,
+                    msg = rx.recv() => match msg {
+                        Ok(user_id) if user_id == me => {
+                            return Some((
+                                Ok(Event::default().event("state_changed").data("")),
+                                (rx, shutdown, me),
+                            ));
+                        }
+                        // Another user's state moved: nothing for this stream.
+                        Ok(_) => continue,
+
+                        // Lagged: skip and wait for the next message. The
+                        // browser refetches on the next event delivered.
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                            // All senders dropped: end the stream. In practice
+                        // this only happens when the server is shutting down.
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    },
+                }
             }
-        }
-    });
+        });
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -778,22 +959,30 @@ async fn state_events(
 /// `TRANSCRIPT_MAX_ENTRIES` entries (`backend.rs`), the oldest turn
 /// evicted first, so a long conversation comes back as its newest window.
 ///
-/// An absent or empty `session` answers 400 with a plain-text body. An id
-/// with no registered hub answers 200 with an empty array, which covers a
-/// value holding `/`, `\` or `..` with no separate validation step: no
-/// such value can be a registry key. Nothing here reads a file or
-/// consults `HOME`, and the endpoint answers 200 or 400 and nothing else.
+/// An absent or empty `session` answers 400 with a plain-text body. A
+/// session the user does not own, or that does not exist, answers 404
+/// with an empty `entries` array, the same answer in both cases, so the
+/// route says nothing about rows that are not theirs. An owned session
+/// with no registered hub answers 200 with an empty array.
 ///
 /// A transcript lives as long as its hub. A reload inside the grace window
 /// shows the conversation so far; one after it shows an empty log.
 async fn get_history(
     Query(params): Query<HashMap<String, String>>,
     State(app): State<Arc<AppState>>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+    Extension(AuthUser(user)): Extension<AuthUser>,
+) -> Response {
     let sid = params.get("session").map(String::as_str).unwrap_or("");
     if sid.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "missing ?session=<id>".into()));
+        return (StatusCode::BAD_REQUEST, "missing ?session=<id>").into_response();
+    }
+    match app.owned_session(&user, sid).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({ "entries": [] }))).into_response();
+        }
+        Err(e) => return internal(e).into_response(),
     }
     let entries = app.hubs.history(sid).await.unwrap_or_default();
-    Ok(Json(json!({ "entries": entries })))
+    Json(json!({ "entries": entries })).into_response()
 }

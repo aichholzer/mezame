@@ -361,12 +361,48 @@ pub fn master_key_path() -> Result<PathBuf> {
     Ok(mezame_dir()?.join("master.key"))
 }
 
-/// Path to the persistent browser state (currently-open tabs, history list,
-/// active id, next numeric label). Server-side so any device hitting Mezame
-/// sees the same list.
-pub fn state_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".mezame/state.json"))
+/// Why the server's working directory cannot be a user's default
+/// workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceIneligible {
+    /// The filesystem root.
+    Root,
+    /// The home directory.
+    Home,
+    /// `~/.mezame` itself, a directory holding it, or one inside it.
+    MezameDir,
+}
+
+impl std::fmt::Display for WorkspaceIneligible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            WorkspaceIneligible::Root => "the working directory is the filesystem root",
+            WorkspaceIneligible::Home => "the working directory is the home directory",
+            WorkspaceIneligible::MezameDir => {
+                "the working directory is, holds or is inside ~/.mezame"
+            }
+        })
+    }
+}
+
+/// `cwd` as a default workspace root, or why it cannot be one: the root,
+/// the home directory (`mezame_dir`'s parent), and any directory that is,
+/// holds or sits inside `mezame_dir` are refused, since a workspace there
+/// would put the key and the datastore under a tool's reach.
+pub fn eligible_workspace_root(
+    cwd: &Path,
+    mezame_dir: &Path,
+) -> std::result::Result<PathBuf, WorkspaceIneligible> {
+    if cwd.parent().is_none() {
+        return Err(WorkspaceIneligible::Root);
+    }
+    if mezame_dir.parent() == Some(cwd) {
+        return Err(WorkspaceIneligible::Home);
+    }
+    if mezame_dir.starts_with(cwd) || cwd.starts_with(mezame_dir) {
+        return Err(WorkspaceIneligible::MezameDir);
+    }
+    Ok(cwd.to_path_buf())
 }
 
 pub fn load_config() -> Result<Config> {

@@ -4,15 +4,11 @@
 //! so we hit the real axum routing, the real handlers, and the embedded
 //! UI bundle without binding a TCP port.
 //!
-//! Several tests mutate `HOME` so `state_path()` and the history reader
-//! resolve into a tempdir. Cargo runs tests in parallel by default; a
-//! single process-wide `Mutex` serialises every test in this file so
-//! the env var is never observed mid-swap.
+//! Nothing here reads a file or the environment: the state lives in the
+//! in-memory store `AppState::for_test` opens, so every case runs on its
+//! own state with no lock.
 
 mod support;
-
-use std::path::Path;
-use std::sync::OnceLock;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -25,14 +21,7 @@ use mezame::hub::HubRegistry;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use support::ScriptedBackend;
-use tempfile::TempDir;
-use tokio::sync::Mutex;
 use tower::ServiceExt;
-
-fn home_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 fn dummy_state() -> Arc<AppState> {
     state_with_hosts(&[])
@@ -93,92 +82,10 @@ fn json_body(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("response was not JSON")
 }
 
-// SAFETY: every test in this file takes `home_lock()` before touching the
-// env, and the unsafe set/remove calls below never race. Rust 2024 will
-// require `unsafe { std::env::set_var(...) }`. This crate is on 2021, and
-// the helpers document the contract in the meantime.
-fn set_home(p: &Path) {
-    std::env::set_var("HOME", p);
-}
-
-fn unset_home() {
-    std::env::remove_var("HOME");
-}
-
-// ---------- /state ----------
-
-#[tokio::test]
-async fn get_state_with_no_file_returns_empty_object() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let req = Request::get("/state").body(Body::empty()).unwrap();
-    let (status, bytes, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&bytes), json!({}));
-}
-
-#[tokio::test]
-async fn put_state_then_get_state_round_trip() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let payload = json!({ "sessions": [{ "id": "s1", "label": "1" }] });
-    let req = Request::put("/state")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    // Confirm the file actually landed where state_path() expects.
-    let state_file = tmp.path().join(".mezame/state.json");
-    assert!(state_file.exists(), "state.json should exist after PUT");
-
-    let req = Request::get("/state").body(Body::empty()).unwrap();
-    let (status, bytes, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&bytes), payload);
-}
-
-#[tokio::test]
-async fn put_state_fires_state_changed_broadcast() {
-    // Two browsers cooperating: the second one is subscribed to the
-    // broadcast and should receive a tick the moment the first writes
-    // a new state. Without this, peer browsers only see another
-    // browser's new session after a manual reload.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let state = dummy_state();
-    let mut rx = state.state_changes.subscribe();
-
-    let payload = json!({ "sessions": [{ "id": "s1", "label": "1" }] });
-    let req = Request::put("/state")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
-        .unwrap();
-    let req = as_browser(&state, req).await;
-    let app = build_router(state);
-    let res = app.oneshot(req).await.expect("router responded");
-    assert_eq!(res.status(), StatusCode::NO_CONTENT);
-
-    // The tick must have been queued by the time put_state returned.
-    rx.try_recv().expect("state_changes should have ticked");
-}
-
 // ---------- /history ----------
 
 #[tokio::test]
 async fn get_history_without_session_param_is_400() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     let req = Request::get("/history").body(Body::empty()).unwrap();
     let (status, _, _) = run_request(req).await;
 
@@ -190,10 +97,6 @@ async fn get_history_with_an_empty_session_param_is_400() {
     // The other branch of Requirement 13 criterion 2, which had no case.
     // Both branches answer 400 with a plain-text body naming what is
     // missing.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     let req = Request::get("/history?session=")
         .body(Body::empty())
         .unwrap();
@@ -224,9 +127,6 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
     // Self-contained on purpose: its own state, its own registry, and the
     // attach held across the request so the hub cannot be torn down under
     // it. `run_request` is untouched.
-    let _g = home_lock().lock().await;
-    unset_home();
-
     let transcript = vec![
         HistoryEntry {
             body: EntryBody::User {
@@ -298,6 +198,13 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
         8,
     );
     let cookie = state.login_for_test("alice", "correct horse battery").await;
+    // The route answers for a row the user owns; the hub alone is not one.
+    let alice = state.store.user_by_name("alice").await.unwrap().unwrap();
+    state
+        .store
+        .create_session(&alice.id, "hist-session", None, 1_000)
+        .await
+        .unwrap();
 
     let app = build_router(state);
     let res = app
@@ -344,33 +251,58 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
 }
 
 #[tokio::test]
-async fn get_history_for_an_unknown_session_returns_empty_entries() {
-    // Requirement 13 criterion 4. This is what a value holding `/`, `\`
-    // or `..` gets too: no such value can be a registry key, so no
-    // separate validation step is needed. Nothing is created.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
+async fn get_history_for_an_unknown_session_is_404_with_empty_entries() {
+    // Phase 2 Requirement 6 criterion 4: an id with no row is answered the
+    // way another user's row is, 404 with an empty array. A value holding
+    // `/`, `\` or `..` is such an id; nothing is created.
     for id in ["nobody-here", "../etc/passwd", "a/b", "a%5Cb"] {
         let req = Request::get(format!("/history?session={id}"))
             .body(Body::empty())
             .unwrap();
         let (status, bytes, _) = run_request(req).await;
-        assert_eq!(status, StatusCode::OK, "id {id:?} answers 200");
+        assert_eq!(status, StatusCode::NOT_FOUND, "id {id:?} answers 404");
         assert_eq!(json_body(&bytes), json!({ "entries": [] }), "id {id:?}");
     }
+}
+
+#[tokio::test]
+async fn get_history_for_a_session_owned_by_someone_else_is_the_same_404() {
+    let state = dummy_state();
+    let bob = state.login_for_test("bob", "correct horse battery").await;
+    let bob_row = state.store.user_by_name("bob").await.unwrap().unwrap();
+    state
+        .store
+        .create_session(&bob_row.id, "bobs-session", None, 1_000)
+        .await
+        .unwrap();
+    // Bob sees his (empty) history; Alice sees the 404 an unknown id gets.
+    let res = build_router(state.clone())
+        .oneshot(
+            Request::get("/history?session=bobs-session")
+                .header(axum::http::header::COOKIE, bob)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let req = as_browser(
+        &state,
+        Request::get("/history?session=bobs-session")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let res = build_router(state).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let bytes = to_bytes(res.into_body(), 4096).await.unwrap();
+    assert_eq!(json_body(&bytes), json!({ "entries": [] }));
 }
 
 // ---------- SPA fallback / asset routing ----------
 
 #[tokio::test]
 async fn get_root_serves_index_html_with_no_cache() {
-    let _g = home_lock().lock().await;
-    // No HOME mutation needed; the asset path does not touch the
-    // filesystem. We still take the lock so we observe a stable env.
-    unset_home();
-
     let req = Request::get("/").body(Body::empty()).unwrap();
     let (status, bytes, headers) = run_request(req).await;
 
@@ -387,8 +319,6 @@ async fn get_root_serves_index_html_with_no_cache() {
 
 #[tokio::test]
 async fn get_hashed_asset_uses_long_max_age_and_js_content_type() {
-    let _g = home_lock().lock().await;
-
     // The build script writes this stub when MEZAME_SKIP_UI_BUILD=1.
     let req = Request::get("/assets/main.abc123.js")
         .body(Body::empty())
@@ -410,8 +340,6 @@ async fn get_hashed_asset_uses_long_max_age_and_js_content_type() {
 
 #[tokio::test]
 async fn unknown_path_falls_back_to_index_html() {
-    let _g = home_lock().lock().await;
-
     let req = Request::get("/some/spa/route").body(Body::empty()).unwrap();
     let (status, _, headers) = run_request(req).await;
 
@@ -425,8 +353,6 @@ async fn unknown_path_falls_back_to_index_html() {
 
 #[tokio::test]
 async fn get_sw_js_uses_no_cache_headers() {
-    let _g = home_lock().lock().await;
-
     let req = Request::get("/sw.js").body(Body::empty()).unwrap();
     let (status, _, headers) = run_request(req).await;
 
@@ -444,8 +370,6 @@ async fn get_sw_js_uses_no_cache_headers() {
 
 #[tokio::test]
 async fn top_level_static_file_uses_short_cache() {
-    let _g = home_lock().lock().await;
-
     // `favicon.png` lives at dist root, not under `assets/`. It should
     // get the default short cache, not the year-long immutable one.
     let req = Request::get("/favicon.png").body(Body::empty()).unwrap();
@@ -459,66 +383,6 @@ async fn top_level_static_file_uses_short_cache() {
         cc.contains("max-age=3600") && !cc.contains("immutable"),
         "top-level static cache-control was `{cc}`"
     );
-}
-
-// ---------- error paths ----------
-
-#[tokio::test]
-async fn get_state_returns_500_when_the_state_file_cannot_be_read() {
-    // A `state.json` that exists as a directory fails the read with
-    // something other than `NotFound`, which is the one error the handler
-    // absorbs into an empty object. Anything else is reported.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    std::fs::create_dir_all(tmp.path().join(".mezame/state.json")).unwrap();
-
-    let req = Request::get("/state").body(Body::empty()).unwrap();
-    let (status, _, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn put_state_returns_500_when_the_parent_cannot_be_created() {
-    // `.mezame` occupied by a regular file makes `create_dir_all` fail.
-    // The write is refused and the caller is told, and no partial state
-    // file is left behind.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    std::fs::write(tmp.path().join(".mezame"), b"not a directory").unwrap();
-
-    let payload = json!({ "sessions": [] });
-    let req = Request::put("/state")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
-        .unwrap();
-    let (status, _, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-}
-
-#[tokio::test]
-async fn get_state_serves_an_empty_object_for_malformed_json() {
-    // A hand-edited or truncated `state.json` resolves to `{}`. The
-    // browser then rebuilds its session list from scratch, and a corrupt
-    // file never wedges the UI behind a 500.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
-    let dir = tmp.path().join(".mezame");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("state.json"), "{ truncated").unwrap();
-
-    let req = Request::get("/state").body(Body::empty()).unwrap();
-    let (status, bytes, _) = run_request(req).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&bytes), json!({}));
 }
 
 // ---------- the Host and Origin checks ----------
@@ -543,10 +407,6 @@ async fn a_request_for_a_hostname_this_server_does_not_serve_is_misdirected() {
     // DNS rebinding: a page at attacker.example, re-pointed at 127.0.0.1,
     // sends its own name in `Host`. Every route answers 421, the SPA
     // fallback included, and no handler runs: the PUT leaves no file.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     for (method, path) in [
         ("GET", "/state"),
         ("GET", "/history?session=x"),
@@ -560,7 +420,7 @@ async fn a_request_for_a_hostname_this_server_does_not_serve_is_misdirected() {
             .header("host", "attacker.example:9510")
             .header("origin", "http://attacker.example:9510")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"sessions":[]}"#))
+            .body(Body::from(r#"{"settings":{}}"#))
             .unwrap();
         let (status, body, _) = run_request(req).await;
         assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{method} {path}");
@@ -574,18 +434,10 @@ async fn a_request_for_a_hostname_this_server_does_not_serve_is_misdirected() {
             "the refusal says the config is read at startup: {text}"
         );
     }
-    assert!(
-        !tmp.path().join(".mezame/state.json").exists(),
-        "the PUT never reached its handler"
-    );
 }
 
 #[tokio::test]
 async fn requests_for_loopback_local_and_configured_names_are_served() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     for host in [
         "127.0.0.1:9510",
         "localhost:9510",
@@ -620,17 +472,13 @@ async fn a_write_from_another_origin_is_forbidden_and_leaves_no_trace() {
     // Cross-site: a page at evil.example fetches PUT /state at loopback.
     // The browser sends that page's `Origin`; the write is refused before
     // the handler, so no file is written and no `state_changes` tick fires.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     let state = dummy_state();
     let mut rx = state.state_changes.subscribe();
     let req = Request::put("/state")
         .header("host", "127.0.0.1:9510")
         .header("origin", "http://evil.example")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"sessions":[]}"#))
+        .body(Body::from(r#"{"settings":{}}"#))
         .unwrap();
     let (status, body) = run_on(state, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -643,25 +491,17 @@ async fn a_write_from_another_origin_is_forbidden_and_leaves_no_trace() {
         text.contains("hosts"),
         "the refusal names the remedy: {text}"
     );
-    assert!(
-        !tmp.path().join(".mezame/state.json").exists(),
-        "the write never reached its handler"
-    );
     assert!(rx.try_recv().is_err(), "no tick for a refused write");
 }
 
 #[tokio::test]
 async fn a_write_from_the_page_this_server_served_goes_through() {
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     let put = |origin: &str, host: &str| {
         Request::put("/state")
             .header("host", host)
             .header("origin", origin)
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"sessions":[]}"#))
+            .body(Body::from(r#"{"settings":{}}"#))
             .unwrap()
     };
     let hosts = || state_with_hosts(&["mezame.example.com"]);
@@ -697,10 +537,6 @@ async fn a_read_over_get_carries_no_origin_check() {
     // The browser withholds a cross-origin response on its own, and the
     // `Host` check covers the rebound page that would read it. A client
     // sending a stray `Origin` on a GET is served.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     let req = Request::get("/state")
         .header("host", "127.0.0.1:9510")
         .header("origin", "http://evil.example")
@@ -708,7 +544,10 @@ async fn a_read_over_get_carries_no_origin_check() {
         .unwrap();
     let (status, bytes, _) = run_request(req).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&bytes), json!({}));
+    assert_eq!(
+        json_body(&bytes),
+        json!({ "sessions": [], "closed": [], "settings": {} })
+    );
 }
 
 #[tokio::test]
@@ -719,16 +558,12 @@ async fn a_write_carrying_neither_origin_nor_sec_fetch_site_is_refused() {
     // neither means a client that is not a browser, refused 403 ahead of
     // the login layer (phase 2 Requirement 6 criterion 3). A script adds
     // `Sec-Fetch-Site: none`.
-    let _g = home_lock().lock().await;
-    let tmp = TempDir::new().unwrap();
-    set_home(tmp.path());
-
     let state = dummy_state();
     let cookie = state.login_for_test("alice", "correct horse battery").await;
     let bare = Request::put("/state")
         .header(axum::http::header::COOKIE, cookie.clone())
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"sessions":[]}"#))
+        .body(Body::from(r#"{"settings":{}}"#))
         .unwrap();
     let res = build_router(state.clone()).oneshot(bare).await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -742,7 +577,7 @@ async fn a_write_carrying_neither_origin_nor_sec_fetch_site_is_refused() {
         .header(axum::http::header::COOKIE, cookie)
         .header("sec-fetch-site", "none")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"sessions":[]}"#))
+        .body(Body::from(r#"{"settings":{}}"#))
         .unwrap();
     let res = build_router(state).oneshot(marked).await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);

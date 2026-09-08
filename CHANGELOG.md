@@ -37,12 +37,40 @@ the old state.
   username in a minute answer 429 with `Retry-After`. A password change
   ends every earlier cookie of that user. No command creates a user yet and
   the browser has no login form yet; both arrive later in this alpha.
+- Sessions belong to the user who opened them and live in the datastore.
+  `GET /state` answers the user's open sessions (`id`, `title`, `created`,
+  `updated`), their newest twenty closed ones (`id`, `title`, `closedAt`)
+  and their settings object; `PUT /state` with `{"settings": {...}}` of at
+  most 16 KiB replaces the settings; `PATCH /sessions/{id}` renames
+  (`{"title": "..."}`, 1 to 200 characters), closes or restores
+  (`{"archived": true|false}`), and `DELETE /sessions/{id}` forgets a
+  session and its messages. Each change fires one `state_changed` event on
+  `/state/events`, and only to the streams of the user it concerns. A
+  session named in a socket upgrade or in `/history` that is not the
+  user's, does not exist or is closed answers 404, the same way in each
+  case. Closing a session with a socket attached ends that socket with
+  code 4404, `session closed`.
+- A session's first prompt names it: the prompt's text, whitespace
+  collapsed, cut to 40 characters with `…` when longer. A prompt that is
+  empty or a `/` command leaves the session unnamed for the next one; a
+  name given before the first prompt stands. Every device shows the one
+  name the server chose.
+- On a user's first session the server creates their default workspace at
+  its own working directory, unless that directory is `/`, the home
+  directory, or is, holds or sits inside `~/.mezame`; startup prints a
+  `Workspace:` line naming the root or the reason there is none. Nothing
+  reads a workspace root yet.
 
 ### Changed
 
 - `config.json` carries `"version": 2`. A file without a version, or with
   another one, is refused at startup with one line pointing at
   `mezame init`, which rewrites it at version 2 and keeps the hosts.
+- `~/.mezame/state.json` is gone. The tab list and the settings it held
+  now live in the datastore, per user; `PUT /state` takes the settings
+  document alone and answers 400 to the old body. The active tab moves to
+  the browser's own storage later in this alpha, when the browser learns
+  the new shape.
 - A write or a socket upgrade that carries no `Origin` is judged by
   `Sec-Fetch-Site`: `same-origin` and `none` pass, `same-site` and
   `cross-site` are refused, and a request carrying neither header is

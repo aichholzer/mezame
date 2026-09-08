@@ -15,7 +15,10 @@ use std::time::Duration;
 
 use mezame::backend::Backend;
 use mezame::conversation::Role;
-use mezame::hub::{HubCommand, HubRegistry, NewBackend, RegistryFull, MAX_PROMPT_TEXT_BYTES};
+use mezame::hub::{
+    title_from_prompt, HubCommand, HubRegistry, NewBackend, OwnerContext, RegistryFull,
+    MAX_PROMPT_TEXT_BYTES, SESSION_CLOSED_CLOSE, TITLE_MAX_CHARS,
+};
 use mezame::provider::{LoopSettings, Provider, StopReason, TurnEvent, Usage};
 use mezame::turn::LoopBackend;
 use serde_json::{json, Value};
@@ -27,6 +30,15 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 
 const SESSION_ID: &str = "test-session";
+
+/// The owner every attach here is for. No registry in this file has a
+/// store, so no row is written for them.
+fn owner() -> OwnerContext {
+    OwnerContext {
+        user_id: "user-alice".to_string(),
+        user_name: "alice".to_string(),
+    }
+}
 
 fn ready_event() -> Value {
     json!({
@@ -618,7 +630,7 @@ async fn attach_or_create_fast_path_reuses_registered_hub() {
         .await;
 
     let mut fast = registry
-        .attach_or_create(SESSION_ID)
+        .attach_or_create(SESSION_ID, &owner(), None)
         .await
         .expect("fast path attach");
 
@@ -1177,7 +1189,7 @@ async fn concurrent_attaches_for_one_id_build_one_hub() {
         let registry = registry.clone();
         async move {
             registry
-                .attach_or_create_parked_for_test(id, async move {
+                .attach_or_create_parked_for_test(id, &owner(), async move {
                     let _ = parked_tx.send(());
                     let _ = release_rx.await;
                 })
@@ -1194,7 +1206,7 @@ async fn concurrent_attaches_for_one_id_build_one_hub() {
 
     let second = tokio::spawn({
         let registry = registry.clone();
-        async move { registry.attach_or_create(id).await }
+        async move { registry.attach_or_create(id, &owner(), None).await }
     });
     // Let the second arrival run until it blocks on the gate.
     for _ in 0..8 {
@@ -1903,15 +1915,15 @@ async fn a_new_session_is_refused_once_the_registry_holds_its_capacity() {
         "00000000000000000000000000000003",
     ];
     let first = registry
-        .attach_or_create(ids[0])
+        .attach_or_create(ids[0], &owner(), None)
         .await
         .expect("the first session");
     let second = registry
-        .attach_or_create(ids[1])
+        .attach_or_create(ids[1], &owner(), None)
         .await
         .expect("the second session");
 
-    let refused = match registry.attach_or_create(ids[2]).await {
+    let refused = match registry.attach_or_create(ids[2], &owner(), None).await {
         Ok(_) => panic!("a third session should have been refused"),
         Err(e) => e,
     };
@@ -1925,7 +1937,7 @@ async fn a_new_session_is_refused_once_the_registry_holds_its_capacity() {
     );
 
     let rejoin = registry
-        .attach_or_create(ids[0])
+        .attach_or_create(ids[0], &owner(), None)
         .await
         .expect("a live session is always joinable");
     assert_ne!(rejoin.attach_id, first.attach_id);
@@ -1949,14 +1961,17 @@ async fn a_slot_freed_by_teardown_admits_the_next_session() {
         .await;
     let new_id = "00000000000000000000000000000009";
     assert!(
-        registry.attach_or_create(new_id).await.is_err(),
+        registry
+            .attach_or_create(new_id, &owner(), None)
+            .await
+            .is_err(),
         "the one slot is held"
     );
 
     drop(held);
     assert!(wait_until_unregistered(&registry, SESSION_ID).await);
     let admitted = registry
-        .attach_or_create(new_id)
+        .attach_or_create(new_id, &owner(), None)
         .await
         .expect("the freed slot admits the next session");
     assert_eq!(admitted.session_id, new_id);
@@ -1992,7 +2007,7 @@ async fn an_attach_during_a_slow_shutdown_builds_a_fresh_hub_instead_of_joining_
     );
 
     let mut fresh = registry
-        .attach_or_create(SESSION_ID)
+        .attach_or_create(SESSION_ID, &owner(), None)
         .await
         .expect("a fresh hub is built while the old shutdown is parked");
     fresh
@@ -2160,12 +2175,15 @@ async fn a_factory_registry_replays_the_session_info_frame_on_attach_and_the_def
             settings.clone(),
             session_id,
         );
-        NewBackend {
+        Ok(NewBackend {
             session_info: Some(backend.session_info()),
             backend: Arc::new(backend),
-        }
+        })
     }));
-    let attached = registry.attach_or_create("factory-session").await.unwrap();
+    let attached = registry
+        .attach_or_create("factory-session", &owner(), None)
+        .await
+        .unwrap();
     let frame = attached
         .snapshot_session_info
         .clone()
@@ -2179,7 +2197,10 @@ async fn a_factory_registry_replays_the_session_info_frame_on_attach_and_the_def
     assert_eq!(attached.snapshot_ready["type"], "ready");
 
     let plain = HubRegistry::new();
-    let attached = plain.attach_or_create("echo-session").await.unwrap();
+    let attached = plain
+        .attach_or_create("echo-session", &owner(), None)
+        .await
+        .unwrap();
     assert!(attached.snapshot_session_info.is_none());
 }
 
@@ -2328,4 +2349,118 @@ async fn after_a_provider_panic_the_next_prompt_streams_and_carries_both_questio
     assert_eq!(requests[1].messages[1].text(), "second");
     let history = registry.history(SESSION_ID).await.unwrap();
     assert_eq!(history.len(), 3, "user, user, agent");
+}
+
+#[tokio::test]
+async fn close_cancels_the_turn_in_flight_broadcasts_the_close_frame_and_tears_down() {
+    // Phase 2 Requirement 7 criterion 4, the hub's half: `Close` reaches
+    // the Backend's cancel while a turn is open, every subscriber gets
+    // the `_close` frame the attach loop turns into a 4404, and the hub
+    // leaves the registry with its Backend shut down.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![
+        agent_append("partial"),
+    ])));
+    let mut attached = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("go")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    assert!(
+        wait_for_invocation(&backend, &Invocation::Prompt(vec![text_block("go")])).await,
+        "the turn is open"
+    );
+
+    assert!(
+        registry.close_session(SESSION_ID).await,
+        "a hub was there to tell"
+    );
+
+    let events = collect_until(&mut attached.outbound, "_close").await;
+    let close = events.last().expect("the close frame arrives");
+    assert_eq!(close["type"], "_close");
+    assert_eq!(close["code"], SESSION_CLOSED_CLOSE);
+    assert_eq!(close["reason"], "session closed");
+    assert!(
+        wait_for_invocation(&backend, &Invocation::Cancel).await,
+        "the open turn is cancelled"
+    );
+    assert!(wait_until_unregistered(&registry, SESSION_ID).await);
+    assert!(
+        wait_for_invocation(&backend, &Invocation::Shutdown).await,
+        "teardown shuts the Backend down"
+    );
+    // Nothing registered under an id: nobody to tell.
+    assert!(!registry.close_session("nobody").await);
+}
+
+#[tokio::test]
+async fn close_with_no_turn_open_sends_no_cancel() {
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::new());
+    let mut attached = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+    assert!(registry.close_session(SESSION_ID).await);
+    let events = collect_until(&mut attached.outbound, "_close").await;
+    assert_eq!(events.last().map(|e| e["code"].clone()), Some(json!(4404)));
+    assert!(wait_until_unregistered(&registry, SESSION_ID).await);
+    assert!(
+        !backend.saw(&Invocation::Cancel),
+        "no turn was open, so nothing to cancel"
+    );
+}
+
+#[test]
+fn a_title_is_the_collapsed_text_cut_to_forty_characters_or_nothing_for_a_command() {
+    // Phase 2 Requirement 7 criterion 5, the pure rule.
+    assert_eq!(title_from_prompt(&[]), None);
+    assert_eq!(title_from_prompt(&[text_block("")]), None);
+    assert_eq!(title_from_prompt(&[text_block("  \n\t ")]), None);
+    assert_eq!(title_from_prompt(&[text_block("/model claude")]), None);
+    assert_eq!(
+        title_from_prompt(&[text_block("  /help ")]),
+        None,
+        "a command after leading whitespace is still a command"
+    );
+    assert_eq!(
+        title_from_prompt(&[text_block("How do I\nsort a   list?")]),
+        Some("How do I sort a list?".to_string()),
+        "lines and runs of whitespace collapse to one space"
+    );
+    assert_eq!(
+        title_from_prompt(&[text_block("first block"), text_block("second block")]),
+        Some("first block second block".to_string()),
+        "text blocks are joined with a space"
+    );
+    assert_eq!(
+        title_from_prompt(&[
+            json!({ "type": "image", "data": "..." }),
+            text_block("with an image")
+        ]),
+        Some("with an image".to_string()),
+        "blocks that are not text are skipped"
+    );
+    let exact = "x".repeat(TITLE_MAX_CHARS);
+    assert_eq!(
+        title_from_prompt(&[text_block(&exact)]),
+        Some(exact.clone())
+    );
+    let over = "x".repeat(TITLE_MAX_CHARS + 1);
+    assert_eq!(
+        title_from_prompt(&[text_block(&over)]),
+        Some(format!("{exact}…")),
+        "forty characters and the ellipsis"
+    );
+    // A multi-byte character at the cut is kept whole.
+    let mixed = format!("{}é more words", "y".repeat(TITLE_MAX_CHARS - 1));
+    let title = title_from_prompt(&[text_block(&mixed)]).expect("a title");
+    assert_eq!(title.chars().count(), TITLE_MAX_CHARS + 1);
+    assert!(title.ends_with("é…"), "{title}");
 }

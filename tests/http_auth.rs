@@ -52,6 +52,7 @@ fn state_at(now: i64, public_url: Option<&str>) -> Arc<AppState> {
         limiter: RateLimiter::default(),
         clock,
         state_changes,
+        workspace_root: None,
         shutdown: Arc::new(Notify::new()),
     })
 }
@@ -172,8 +173,21 @@ async fn login_sets_the_cookie_and_answers_who_you_are() {
         serde_json::from_slice::<Value>(&body).unwrap()["name"],
         "alice"
     );
-    let (status, _, _) = send(&state, get("/history?session=x", Some(&value))).await;
+    state
+        .store
+        .create_session(&id, "0123456789abcdef0123456789abcdef", None, NOW * 1000)
+        .await
+        .unwrap();
+    let (status, _, _) = send(
+        &state,
+        get(
+            "/history?session=0123456789abcdef0123456789abcdef",
+            Some(&value),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
+
     // A trimmed name logs in too.
     let (status, _, _) = send(&state, login_request("  alice ", "correct horse battery")).await;
     assert_eq!(status, StatusCode::OK);

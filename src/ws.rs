@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
-use crate::hub::GRACE_PERIOD;
+use crate::hub::{MintContext, OwnerContext, GRACE_PERIOD, SESSION_CLOSED_CLOSE};
 
 /// How often the server sends a WebSocket `Ping` to each attached
 /// browser. A live peer answers with a `Pong` (or sends any other
@@ -158,9 +158,12 @@ pub fn decide_session(param: Option<&str>) -> SessionDecision {
 
 /// The `/ws` handler. Decides the session id before the handshake, so a
 /// value Mezame would never bind a hub to is refused with no WebSocket
-/// established and no hub created. A new session while the registry is
-/// full is refused the same way, with a 503 and a `Retry-After` of one
-/// grace period; a live session is always joinable.
+/// established and no hub created. A named session is looked up first:
+/// no row, an archived row and a row of another user are one 404, the
+/// answer `/history` and `/sessions/{id}` give, so no route says whether
+/// a row exists. A new session while the registry is full is refused the
+/// same way, with a 503 and a `Retry-After` of one grace period and no
+/// row written; a live session is always joinable.
 ///
 /// The `cwd` query parameter is not read at all. A session opens against
 /// Mezame's own working directory, whatever a client sends.
@@ -173,7 +176,7 @@ pub(crate) async fn ws_upgrade(
     // The login first. A browser cannot read the status of a refused
     // upgrade, so the handshake completes and the socket closes with a
     // code the client can tell from a network drop.
-    if state.current_user(&headers).await.is_none() {
+    let Some((user, _cookie)) = state.current_user(&headers).await else {
         return ws.on_upgrade(|mut socket| async move {
             let _ = socket
                 .send(Message::Close(Some(CloseFrame {
@@ -182,14 +185,34 @@ pub(crate) async fn ws_upgrade(
                 })))
                 .await;
         });
-    }
-    let session_id = match decide_session(params.get("session").map(String::as_str)) {
-        SessionDecision::Mint => new_session_id(),
-        SessionDecision::Accept(id) => id,
+    };
+    let owner = OwnerContext {
+        user_id: user.id,
+        user_name: user.name,
+    };
+    let (session_id, mint) = match decide_session(params.get("session").map(String::as_str)) {
+        SessionDecision::Mint => (
+            new_session_id(),
+            Some(MintContext {
+                workspace_root: state.workspace_root.clone(),
+                now: state.now_ms(),
+            }),
+        ),
+        SessionDecision::Accept(id) => {
+            match state.store.session(&id).await {
+                Ok(Some(row)) if row.archived_at.is_none() && row.user_id == owner.user_id => {}
+                Ok(_) => return (StatusCode::NOT_FOUND, "no such session\n").into_response(),
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response();
+                }
+            }
+            (id, None)
+        }
         SessionDecision::Refuse => {
             return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
         }
     };
+
     // Advisory: the registry decides again under its lock when the hub
     // is built, and a loser of that race gets an `error` frame from
     // `handle_ws`. Deciding here spares the handshake.
@@ -207,7 +230,7 @@ pub(crate) async fn ws_upgrade(
     ws.max_message_size(MAX_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
-            if let Err(e) = handle_ws(socket, state, session_id).await {
+            if let Err(e) = handle_ws(socket, state, session_id, owner, mint).await {
                 eprintln!("WebSocket session ended: {e:?}");
             }
         })
@@ -226,15 +249,18 @@ async fn handle_ws(
     ws: WebSocket,
     state: Arc<crate::http::AppState>,
     session_id: String,
+    owner: OwnerContext,
+    mint: Option<MintContext>,
 ) -> Result<()> {
     let (sink, mut stream) = ws.split();
     let (to_ws_tx, to_ws_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
     let mut writer = tokio::spawn(run_writer(sink, to_ws_rx, OUTBOUND_WRITE_TIMEOUT));
 
     // Attach to the hub for this session id, building one if none is
-    // registered. The only failure is the working-directory lookup the
-    // `ready` template needs; log it, tell the browser, and close.
-    let attached = match state.hubs.attach_or_create(&session_id).await {
+    // registered. A failure (the registry cap under the lock, a Backend
+    // that could not be built, a session row that could not be written)
+    // is logged, told to the browser, and closes the socket.
+    let attached = match state.hubs.attach_or_create(&session_id, &owner, mint).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("Session {session_id}: could not attach: {e:?}");
@@ -413,10 +439,29 @@ pub async fn run_attach_loop<S, E>(
                     break;
                 }
             }
-            evt = outbound.recv() => {
+                        evt = outbound.recv() => {
                 match evt {
                     Ok(value) => {
+                        // The hub closed the session under this attach:
+                        // send the close frame it names and stop, so the
+                        // browser reads the code rather than a drop.
+                        if value["type"] == "_close" {
+                            let code = value["code"]
+                                .as_u64()
+                                .and_then(|c| u16::try_from(c).ok())
+                                .unwrap_or(SESSION_CLOSED_CLOSE);
+                            let reason = value["reason"]
+                                .as_str()
+                                .unwrap_or("session closed")
+                                .to_string();
+                            let _ = to_ws_tx.try_send(Message::Close(Some(CloseFrame {
+                                code,
+                                reason: reason.into(),
+                            })));
+                            break;
+                        }
                         // Drop targeted broadcasts that are not for
+
                         // this attach. The hub stamps `_target` on a
                         // permission request with the attach id of the
                         // browser that started the turn; every other

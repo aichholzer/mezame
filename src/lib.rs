@@ -34,6 +34,8 @@
 //! import internals. The thin binary in `src/main.rs` calls `run()`.
 
 pub mod auth;
+pub mod init;
+
 pub mod backend;
 pub mod config;
 pub mod conversation;
@@ -135,7 +137,8 @@ pub fn run() -> Result<()> {
                         crate::config::datastore_path()?.display(),
                         if users == 1 { "" } else { "s" }
                     );
-                    run_cloudflared(cfg, bind, hubs, store, keys).await
+                    let workspace_root = workspace_root();
+                    run_cloudflared(cfg, bind, hubs, store, keys, workspace_root).await
                 }
             },
             _ => bail!(
@@ -144,6 +147,30 @@ pub fn run() -> Result<()> {
             ),
         }
     })
+}
+
+/// The working directory as the root of a user's default workspace, when
+/// it can be one. Decided once per start and said once: the line names the
+/// root, or the reason there is none.
+fn workspace_root() -> Option<std::path::PathBuf> {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Workspace: none (the working directory could not be read: {e})");
+            return None;
+        }
+    };
+    let dir = crate::config::mezame_dir().ok()?;
+    match crate::config::eligible_workspace_root(&cwd, &dir) {
+        Ok(root) => {
+            eprintln!("Workspace: {}", root.display());
+            Some(root)
+        }
+        Err(why) => {
+            eprintln!("Workspace: none ({why})");
+            None
+        }
+    }
 }
 
 /// The master key and the datastore, in the order that keeps a restored
@@ -200,10 +227,10 @@ async fn build_registry(bedrock: Option<&BedrockConfig>, path: &std::path::Path)
     let settings = section.settings();
     HubRegistry::with_factory(Arc::new(move |session_id| {
         let backend = LoopBackend::new(Arc::clone(&provider), settings.clone(), session_id);
-        NewBackend {
+        Ok(NewBackend {
             session_info: Some(backend.session_info()),
             backend: Arc::new(backend),
-        }
+        })
     }))
 }
 
@@ -230,7 +257,8 @@ FLAGS:
     -V, --version   Print the version and exit
 
 ENVIRONMENT:
-    HOME                   Resolves ~/.mezame/config.json and state.json
+        HOME                   Resolves ~/.mezame: config.json, mezame.db, master.key
+
     MEZAME_SKIP_UI_BUILD=1 Skip the Vite build (developer use only)
 ",
         version = env!("CARGO_PKG_VERSION")

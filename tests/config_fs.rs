@@ -111,7 +111,7 @@ fn write_private_atomic_replaces_a_symlink_instead_of_following_it() {
     let tmp = TempDir::new().unwrap();
     let outside = tmp.path().join("outside.json");
     std::fs::write(&outside, b"B").unwrap();
-    let target = tmp.path().join("state.json");
+    let target = tmp.path().join("config.json");
     std::os::unix::fs::symlink(&outside, &target).unwrap();
 
     write_private_atomic(&target, b"A", false).expect("write");
@@ -139,7 +139,7 @@ fn write_private_atomic_leaves_the_target_alone_and_no_temp_on_failure() {
     }
     let dir = tmp.path().join(".mezame");
     std::fs::create_dir(&dir).unwrap();
-    let target = dir.join("state.json");
+    let target = dir.join("config.json");
     std::fs::write(&target, b"B").unwrap();
     set_mode(&dir, 0o500);
 
@@ -159,13 +159,13 @@ fn write_private_atomic_leaves_the_target_alone_and_no_temp_on_failure() {
 
 #[test]
 fn temp_sibling_paths_are_unique_and_sit_beside_the_target() {
-    let target = Path::new("/some/dir/state.json");
+    let target = Path::new("/some/dir/config.json");
     let mut seen = std::collections::HashSet::new();
     for _ in 0..1000 {
         let sibling = temp_sibling(target).expect("a sibling");
         assert_eq!(sibling.parent(), target.parent(), "same directory");
         let name = sibling.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.starts_with(".state.json."), "{name}");
+        assert!(name.starts_with(".config.json."), "{name}");
         assert!(name.ends_with(".tmp"), "{name}");
         assert!(seen.insert(name.clone()), "a sibling name repeated: {name}");
     }
@@ -180,7 +180,7 @@ fn concurrent_writers_never_share_a_sibling() {
     // contention, and without `O_EXCL` a torn file could be renamed into
     // place, which is the race the review reproduced against `PUT /state`.
     let tmp = TempDir::new().unwrap();
-    let target = Arc::new(tmp.path().join("state.json"));
+    let target = Arc::new(tmp.path().join("config.json"));
     let barrier = Arc::new(Barrier::new(8));
     let writers: Vec<_> = (0..8u8)
         .map(|writer| {

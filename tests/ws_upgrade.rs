@@ -17,10 +17,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{header::COOKIE as AXUM_COOKIE, Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use mezame::config::{Config, TransportConfig};
 use mezame::http::{build_router, serve_with, AppState, HEADER_READ_TIMEOUT};
-use mezame::hub::{HubRegistry, GRACE_PERIOD, MAX_PROMPT_TEXT_BYTES};
+use mezame::hub::{HubRegistry, GRACE_PERIOD, MAX_PROMPT_TEXT_BYTES, SESSION_CLOSED_CLOSE};
+
 use mezame::ws::MAX_WS_MESSAGE_BYTES;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +34,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HOST, ORIGIN};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tower::ServiceExt;
+
+mod support;
+use support::CountingStore;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -61,9 +68,16 @@ async fn serve_with_header_timeout(header_read_timeout: Duration) -> Server {
     serve_configured(HubRegistry::new(), header_read_timeout).await
 }
 
-/// The state every server here is built from.
+/// The state every server here is built from: no workspace root, so a
+/// new session's `workspace_id` is null.
 fn state_with_registry(hubs: HubRegistry) -> Arc<AppState> {
-    AppState::for_test(
+    state_with(hubs, None)
+}
+
+/// [`state_with_registry`] with a workspace root, as a server started in
+/// an eligible directory has.
+fn state_with(hubs: HubRegistry, workspace_root: Option<std::path::PathBuf>) -> Arc<AppState> {
+    AppState::for_test_with(
         Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
@@ -77,6 +91,8 @@ fn state_with_registry(hubs: HubRegistry) -> Arc<AppState> {
         },
         hubs,
         8,
+        None,
+        workspace_root,
     )
 }
 
@@ -88,8 +104,40 @@ async fn cookie_for(server: &Server) -> String {
         .await
 }
 
+/// The id of the user `name` on `server`, created on first use.
+async fn user_id(server: &Server, name: &str) -> String {
+    server
+        .state
+        .login_for_test(name, "correct horse battery")
+        .await;
+    server
+        .state
+        .store
+        .user_by_name(name)
+        .await
+        .expect("store")
+        .expect("the user exists")
+        .id
+}
+
+/// A session row `id` owned by the test user, so an upgrade naming it is
+/// theirs to join.
+async fn own_session(server: &Server, id: &str) {
+    let alice = user_id(server, "alice").await;
+    server
+        .state
+        .store
+        .create_session(&alice, id, None, 1_000)
+        .await
+        .expect("the row is created");
+}
+
 async fn serve_configured(hubs: HubRegistry, header_read_timeout: Duration) -> Server {
-    let state = state_with_registry(hubs);
+    serve_state(state_with_registry(hubs), header_read_timeout).await
+}
+
+/// A server over a caller-built state.
+async fn serve_state(state: Arc<AppState>, header_read_timeout: Duration) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind an ephemeral port");
@@ -228,6 +276,7 @@ async fn an_upgrade_with_an_accepted_session_parameter_uses_it_verbatim() {
     // Requirement 6 criterion 2: the trimmed value is the session id, and
     // nothing is minted.
     let server = serve().await;
+    own_session(&server, ACCEPTED_ID).await;
     let ready = first_frame(&server, &format!("/ws?session=%20{ACCEPTED_ID}%20")).await;
 
     assert_eq!(ready["type"], "ready");
@@ -282,7 +331,9 @@ async fn two_attaches_naming_one_id_share_a_hub_over_real_sockets() {
     // Requirement 7 criterion 2 over the transport: the second browser
     // sees the same `ready` the first did, bar the per-attach fields.
     let server = serve().await;
+    own_session(&server, SHARED_ID).await;
     let first = first_frame(&server, &format!("/ws?session={SHARED_ID}")).await;
+
     let second = first_frame(&server, &format!("/ws?session={SHARED_ID}")).await;
 
     assert_eq!(first["sessionId"], SHARED_ID);
@@ -709,4 +760,405 @@ async fn shutdown_closes_the_listener_and_serve_returns() {
         "the idle keep-alive connection was closed by the drain"
     );
     drop(socket);
+}
+
+/// The next tick on `ticks` within a second, or `None`.
+async fn next_tick(ticks: &mut tokio::sync::broadcast::Receiver<String>) -> Option<String> {
+    timeout(Duration::from_secs(1), ticks.recv())
+        .await
+        .ok()
+        .and_then(Result::ok)
+}
+
+/// The session row `id`, once the store has it.
+async fn row_of(server: &Server, id: &str) -> mezame::store::SessionRow {
+    server
+        .state
+        .store
+        .session(id)
+        .await
+        .expect("store")
+        .expect("a row for the session")
+}
+
+/// The row's title once one is written, within two seconds; the hub writes
+/// it off the loop, so a case polls.
+async fn title_of(server: &Server, id: &str) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let row = row_of(server, id).await;
+        if row.title.is_some() || tokio::time::Instant::now() >= deadline {
+            return row.title;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Poll until no hub is registered under `session_id`, within five seconds.
+async fn wait_until_unregistered(server: &Server, session_id: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if !server.state.hubs.is_registered_for_test(session_id).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// `PATCH /sessions/{id}` with `body` as the test user, through a router
+/// over the server's own state, so the hub the route closes is the one
+/// the socket is attached to.
+async fn patch_session(server: &Server, id: &str, body: Value) -> StatusCode {
+    let cookie = cookie_for(server).await;
+    let req = Request::patch(format!("/sessions/{id}"))
+        .header(AXUM_COOKIE, cookie)
+        .header("sec-fetch-site", "same-origin")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    build_router(server.state.clone())
+        .oneshot(req)
+        .await
+        .expect("the router answers")
+        .status()
+}
+
+/// Read frames until `prompt_done`, within five seconds.
+async fn drain_turn(socket: &mut Socket) {
+    for _ in 0..8 {
+        if next_text(socket).await["type"] == "prompt_done" {
+            return;
+        }
+    }
+    panic!("no prompt_done within eight frames");
+}
+
+#[tokio::test]
+async fn a_mint_creates_a_row_with_the_default_workspace_and_ticks_its_owner_alone() {
+    // Phase 2 Requirement 6 criterion 5 and Requirement 3 criteria 5 and
+    // 6: the row is the user's, its workspace is created at the eligible
+    // root, one tick names the owner, and a second session reuses the
+    // workspace.
+    let root = tempfile::TempDir::new().unwrap();
+    let server = serve_state(
+        state_with(HubRegistry::new(), Some(root.path().to_path_buf())),
+        HEADER_READ_TIMEOUT,
+    )
+    .await;
+    let alice = user_id(&server, "alice").await;
+    let bob = user_id(&server, "bob").await;
+    let mut ticks = server.state.state_changes.subscribe();
+
+    let ready = first_frame(&server, "/ws").await;
+    let id = ready["sessionId"].as_str().expect("a sessionId");
+    let row = row_of(&server, id).await;
+    assert_eq!(row.user_id, alice);
+    assert_eq!(row.title, None);
+    assert_eq!(row.archived_at, None);
+    let workspace_id = row.workspace_id.expect("a workspace from an eligible root");
+    let workspace = server
+        .state
+        .store
+        .default_workspace(&alice)
+        .await
+        .unwrap()
+        .expect("alice's default workspace");
+    assert_eq!(workspace.id, workspace_id);
+    assert_eq!(workspace.root, root.path().to_string_lossy());
+
+    assert_eq!(next_tick(&mut ticks).await.as_deref(), Some(alice.as_str()));
+    assert!(
+        ticks.try_recv().is_err(),
+        "one tick for the owner and none for anyone else"
+    );
+    assert!(
+        server
+            .state
+            .store
+            .list_sessions(&bob)
+            .await
+            .unwrap()
+            .active
+            .is_empty(),
+        "bob has no session"
+    );
+
+    let second = first_frame(&server, "/ws").await;
+    let second_row = row_of(&server, second["sessionId"].as_str().unwrap()).await;
+    assert_eq!(
+        second_row.workspace_id,
+        Some(workspace_id),
+        "the second session reuses the workspace"
+    );
+    assert_eq!(
+        server
+            .state
+            .store
+            .list_sessions(&alice)
+            .await
+            .unwrap()
+            .active
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_server_with_no_eligible_workspace_root_leaves_workspace_id_null() {
+    let server = serve().await;
+    let alice = user_id(&server, "alice").await;
+    let ready = first_frame(&server, "/ws").await;
+    let row = row_of(&server, ready["sessionId"].as_str().unwrap()).await;
+    assert_eq!(row.workspace_id, None);
+    assert!(server
+        .state
+        .store
+        .default_workspace(&alice)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn an_upgrade_naming_another_users_an_unknown_or_an_archived_session_is_404() {
+    // Phase 2 Requirement 6 criterion 5: one answer for the three cases,
+    // ahead of the handshake, and no hub built for any of them.
+    let server = serve().await;
+    let bob = user_id(&server, "bob").await;
+    let bobs = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    server
+        .state
+        .store
+        .create_session(&bob, bobs, None, 1_000)
+        .await
+        .unwrap();
+    let archived = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    own_session(&server, archived).await;
+    server
+        .state
+        .store
+        .set_archived(archived, true, 2_000)
+        .await
+        .unwrap();
+    let unknown = "cccccccccccccccccccccccccccccccc";
+
+    let cookie = cookie_for(&server).await;
+    for id in [bobs, unknown, archived] {
+        let status = connect_as(&server, &format!("/ws?session={id}"), Some(&cookie), None)
+            .await
+            .expect_err("refused before the handshake");
+        assert_eq!(status, 404, "{id}");
+        assert!(
+            !server.state.hubs.is_registered_for_test(id).await,
+            "no hub for {id}"
+        );
+    }
+    // Bob's own row is his to join.
+    let bob_cookie = server
+        .state
+        .login_for_test("bob", "correct horse battery")
+        .await;
+    let mut socket = connect_as(
+        &server,
+        &format!("/ws?session={bobs}"),
+        Some(&bob_cookie),
+        None,
+    )
+    .await
+    .expect("bob joins his own session");
+    assert_eq!(next_text(&mut socket).await["sessionId"], bobs);
+}
+
+#[tokio::test]
+async fn a_mint_against_a_full_registry_answers_503_and_writes_no_row() {
+    let server = serve_with_registry(HubRegistry::with_capacity_for_test(1)).await;
+    let alice = user_id(&server, "alice").await;
+    let mut held = connect(&server, "/ws").await;
+    assert_eq!(next_text(&mut held).await["type"], "ready");
+    let before = server.state.store.list_sessions(&alice).await.unwrap();
+    assert_eq!(before.active.len(), 1);
+
+    let cookie = cookie_for(&server).await;
+    let status = connect_as(&server, "/ws", Some(&cookie), None)
+        .await
+        .expect_err("the registry is full");
+    assert_eq!(status, 503);
+    let after = server.state.store.list_sessions(&alice).await.unwrap();
+    assert_eq!(after, before, "the refused mint wrote no row");
+}
+
+#[tokio::test]
+async fn a_mint_whose_backend_cannot_be_built_leaves_no_row() {
+    let failing = HubRegistry::with_factory(Arc::new(|_| Err(anyhow::anyhow!("no backend today"))));
+    let server = serve_with_registry(failing).await;
+    let alice = user_id(&server, "alice").await;
+    let mut socket = connect(&server, "/ws").await;
+    let frame = next_text(&mut socket).await;
+    assert_eq!(frame["type"], "error");
+    assert!(
+        frame["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no backend today")),
+        "{frame}"
+    );
+    assert!(server
+        .state
+        .store
+        .list_sessions(&alice)
+        .await
+        .unwrap()
+        .active
+        .is_empty());
+}
+
+#[tokio::test]
+async fn archiving_a_session_closes_its_socket_with_4404_and_restoring_reopens_it() {
+    // Phase 2 Requirement 7 criterion 4 over a real socket.
+    let server = serve().await;
+    let mut socket = connect(&server, "/ws").await;
+    let id = next_text(&mut socket).await["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        patch_session(&server, &id, json!({ "archived": true })).await,
+        StatusCode::NO_CONTENT
+    );
+    let (code, reason) = next_close(&mut socket).await;
+    assert_eq!(code, SESSION_CLOSED_CLOSE);
+    assert_eq!(reason, "session closed");
+    assert!(
+        wait_until_unregistered(&server, &id).await,
+        "the hub is gone"
+    );
+
+    let cookie = cookie_for(&server).await;
+    let status = connect_as(&server, &format!("/ws?session={id}"), Some(&cookie), None)
+        .await
+        .expect_err("an archived session is not joinable");
+    assert_eq!(status, 404);
+
+    assert_eq!(
+        patch_session(&server, &id, json!({ "archived": false })).await,
+        StatusCode::NO_CONTENT
+    );
+    let again = first_frame(&server, &format!("/ws?session={id}")).await;
+    assert_eq!(again["type"], "ready");
+    assert_eq!(again["sessionId"], id);
+}
+
+#[tokio::test]
+async fn the_first_prompt_titles_the_session_and_the_second_leaves_the_title_alone() {
+    // Phase 2 Requirement 7 criterion 5 end to end: the title is the
+    // collapsed prompt text, one tick names the owner when it is written,
+    // and the next prompt writes nothing: the store sees one title write.
+    let keys = mezame::store::crypto::MasterKey::from_bytes_for_test([42u8; 32]).keys();
+    let counting = Arc::new(CountingStore::new(Arc::new(
+        mezame::store::sqlite::SqliteStore::open_in_memory(keys).unwrap(),
+    )));
+    let state = AppState::for_test_with(
+        Config {
+            transports: vec![TransportConfig::Cloudflared {
+                bind: "127.0.0.1:0".to_string(),
+                hosts: vec![],
+            }],
+            version: 2,
+            datastore: Default::default(),
+            public_url: None,
+            models: vec![],
+            bedrock: None,
+        },
+        HubRegistry::new(),
+        8,
+        Some(counting.clone()),
+        None,
+    );
+    let server = serve_state(state, HEADER_READ_TIMEOUT).await;
+    let alice = user_id(&server, "alice").await;
+
+    let mut socket = connect(&server, "/ws").await;
+    let id = next_text(&mut socket).await["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut ticks = server.state.state_changes.subscribe();
+
+    socket
+        .send(prompt_frame("  How do I   sort a list\nin Rust?  "))
+        .await
+        .unwrap();
+    drain_turn(&mut socket).await;
+    assert_eq!(
+        title_of(&server, &id).await.as_deref(),
+        Some("How do I sort a list in Rust?")
+    );
+    assert_eq!(next_tick(&mut ticks).await.as_deref(), Some(alice.as_str()));
+
+    socket.send(prompt_frame("and a map?")).await.unwrap();
+    drain_turn(&mut socket).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        row_of(&server, &id).await.title.as_deref(),
+        Some("How do I sort a list in Rust?"),
+        "the second prompt does not retitle"
+    );
+    assert!(ticks.try_recv().is_err(), "no tick without a write");
+    assert_eq!(counting.title_writes(), 1, "one title write per session");
+}
+
+#[tokio::test]
+async fn a_prompt_that_yields_no_title_leaves_the_session_untitled_for_the_next_one() {
+    let server = serve().await;
+    let mut socket = connect(&server, "/ws").await;
+    let id = next_text(&mut socket).await["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut ticks = server.state.state_changes.subscribe();
+
+    for no_title in ["   ", "/model claude-sonnet"] {
+        socket.send(prompt_frame(no_title)).await.unwrap();
+        drain_turn(&mut socket).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(row_of(&server, &id).await.title, None, "{no_title:?}");
+        assert!(ticks.try_recv().is_err(), "no tick for {no_title:?}");
+    }
+    socket.send(prompt_frame("a real question")).await.unwrap();
+    drain_turn(&mut socket).await;
+    assert_eq!(
+        title_of(&server, &id).await.as_deref(),
+        Some("a real question"),
+        "the next prompt titles the session"
+    );
+    assert!(next_tick(&mut ticks).await.is_some());
+}
+
+#[tokio::test]
+async fn a_title_given_before_the_first_prompt_survives_it() {
+    let server = serve().await;
+    let mut socket = connect(&server, "/ws").await;
+    let id = next_text(&mut socket).await["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        patch_session(&server, &id, json!({ "title": "Planning" })).await,
+        StatusCode::NO_CONTENT
+    );
+    let mut ticks = server.state.state_changes.subscribe();
+
+    socket
+        .send(prompt_frame("first prompt text"))
+        .await
+        .unwrap();
+    drain_turn(&mut socket).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        row_of(&server, &id).await.title.as_deref(),
+        Some("Planning"),
+        "the rename stands"
+    );
+    assert!(ticks.try_recv().is_err(), "nothing was written, so no tick");
 }
