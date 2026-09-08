@@ -610,3 +610,400 @@ impl Provider for ScriptedProvider {
         })
     }
 }
+
+// ---------- store wrappers ----------
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use mezame::conversation::Block;
+use mezame::provider::Usage;
+use mezame::store::{
+    CredentialRow, MessageStats, MessageWindow, NewProfile, ProfileRow, SessionList, SessionRow,
+    Store, StoreError, StoreFuture, UserRow, WorkspaceRow,
+};
+
+/// Forward every `Store` method of `$wrapper` to `self.inner`, after running
+/// `$before` (a closure over `&self` returning `Result<(), StoreError>`).
+macro_rules! forward_store {
+    ($wrapper:ty, $before:expr) => {
+        #[allow(unused_variables)]
+        impl Store for $wrapper {
+            fn backend_name(&self) -> &'static str {
+                self.inner.backend_name()
+            }
+            fn health(&self) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                Box::pin(async move {
+                    gate?;
+                    self.inner.health().await
+                })
+            }
+            fn create_user(
+                &self,
+                name: &str,
+                password_hash: &str,
+                role: mezame::store::Role,
+                now: i64,
+            ) -> StoreFuture<'_, UserRow> {
+                let gate = ($before)(self);
+                let (name, hash) = (name.to_string(), password_hash.to_string());
+                Box::pin(async move {
+                    gate?;
+                    self.inner.create_user(&name, &hash, role, now).await
+                })
+            }
+            fn user_by_name(&self, name: &str) -> StoreFuture<'_, Option<UserRow>> {
+                let gate = ($before)(self);
+                let name = name.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.user_by_name(&name).await
+                })
+            }
+            fn user_by_id(&self, id: &str) -> StoreFuture<'_, Option<UserRow>> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.user_by_id(&id).await
+                })
+            }
+            fn list_users(&self) -> StoreFuture<'_, Vec<UserRow>> {
+                let gate = ($before)(self);
+                Box::pin(async move {
+                    gate?;
+                    self.inner.list_users().await
+                })
+            }
+            fn count_users(&self) -> StoreFuture<'_, u64> {
+                let gate = ($before)(self);
+                Box::pin(async move {
+                    gate?;
+                    self.inner.count_users().await
+                })
+            }
+            fn password_hash_of(&self, name: &str) -> StoreFuture<'_, Option<String>> {
+                let gate = ($before)(self);
+                let name = name.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.password_hash_of(&name).await
+                })
+            }
+            fn set_password_hash(&self, id: &str, hash: &str) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                let (id, hash) = (id.to_string(), hash.to_string());
+                Box::pin(async move {
+                    gate?;
+                    self.inner.set_password_hash(&id, &hash).await
+                })
+            }
+            fn bump_session_epoch(&self, id: &str) -> StoreFuture<'_, u64> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.bump_session_epoch(&id).await
+                })
+            }
+            fn settings(&self, id: &str) -> StoreFuture<'_, Value> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.settings(&id).await
+                })
+            }
+            fn set_settings(&self, id: &str, settings: &Value) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                let (id, settings) = (id.to_string(), settings.clone());
+                Box::pin(async move {
+                    gate?;
+                    self.inner.set_settings(&id, &settings).await
+                })
+            }
+            fn default_workspace(&self, user_id: &str) -> StoreFuture<'_, Option<WorkspaceRow>> {
+                let gate = ($before)(self);
+                let user_id = user_id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.default_workspace(&user_id).await
+                })
+            }
+            fn create_session(
+                &self,
+                user_id: &str,
+                id: &str,
+                workspace_root: Option<&Path>,
+                now: i64,
+            ) -> StoreFuture<'_, SessionRow> {
+                let gate = ($before)(self);
+                let (user_id, id, root) = (
+                    user_id.to_string(),
+                    id.to_string(),
+                    workspace_root.map(Path::to_path_buf),
+                );
+                Box::pin(async move {
+                    gate?;
+                    self.inner
+                        .create_session(&user_id, &id, root.as_deref(), now)
+                        .await
+                })
+            }
+            fn session(&self, id: &str) -> StoreFuture<'_, Option<SessionRow>> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.session(&id).await
+                })
+            }
+            fn list_sessions(&self, user_id: &str) -> StoreFuture<'_, SessionList> {
+                let gate = ($before)(self);
+                let user_id = user_id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.list_sessions(&user_id).await
+                })
+            }
+            fn set_title(&self, id: &str, title: &str, now: i64) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                let (id, title) = (id.to_string(), title.to_string());
+                Box::pin(async move {
+                    gate?;
+                    self.inner.set_title(&id, &title, now).await
+                })
+            }
+            fn set_title_if_null(&self, id: &str, title: &str, now: i64) -> StoreFuture<'_, bool> {
+                let gate = ($before)(self);
+                let (id, title) = (id.to_string(), title.to_string());
+                Box::pin(async move {
+                    gate?;
+                    self.inner.set_title_if_null(&id, &title, now).await
+                })
+            }
+            fn set_archived(&self, id: &str, archived: bool, now: i64) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.set_archived(&id, archived, now).await
+                })
+            }
+            fn delete_session(&self, id: &str) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.delete_session(&id).await
+                })
+            }
+            fn append_user(
+                &self,
+                session_id: &str,
+                blocks: &[Block],
+                text: &str,
+                created: i64,
+            ) -> StoreFuture<'_, i64> {
+                let gate = ($before)(self);
+                let (session_id, blocks, text) =
+                    (session_id.to_string(), blocks.to_vec(), text.to_string());
+                Box::pin(async move {
+                    gate?;
+                    self.inner
+                        .append_user(&session_id, &blocks, &text, created)
+                        .await
+                })
+            }
+            fn append_assistant(
+                &self,
+                session_id: &str,
+                blocks: &[Block],
+                usage: Option<Usage>,
+                rejected: bool,
+                created: i64,
+            ) -> StoreFuture<'_, i64> {
+                let gate = ($before)(self);
+                let (session_id, blocks) = (session_id.to_string(), blocks.to_vec());
+                Box::pin(async move {
+                    gate?;
+                    self.inner
+                        .append_assistant(&session_id, &blocks, usage, rejected, created)
+                        .await
+                })
+            }
+            fn mark_rejected(&self, message_ids: &[i64]) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                let ids = message_ids.to_vec();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.mark_rejected(&ids).await
+                })
+            }
+            fn load_window(
+                &self,
+                session_id: &str,
+                max_rows: usize,
+                max_bytes: usize,
+            ) -> StoreFuture<'_, MessageWindow> {
+                let gate = ($before)(self);
+                self.on_load();
+                let session_id = session_id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner
+                        .load_window(&session_id, max_rows, max_bytes)
+                        .await
+                })
+            }
+            fn message_stats(&self, session_id: &str) -> StoreFuture<'_, MessageStats> {
+                let gate = ($before)(self);
+                let session_id = session_id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.message_stats(&session_id).await
+                })
+            }
+            fn create_credential(
+                &self,
+                owner: Option<&str>,
+                creator: &str,
+                provider: &str,
+                label: &str,
+                payload: &Value,
+                now: i64,
+            ) -> StoreFuture<'_, CredentialRow> {
+                let gate = ($before)(self);
+                let (owner, creator, provider, label, payload) = (
+                    owner.map(str::to_string),
+                    creator.to_string(),
+                    provider.to_string(),
+                    label.to_string(),
+                    payload.clone(),
+                );
+                Box::pin(async move {
+                    gate?;
+                    self.inner
+                        .create_credential(
+                            owner.as_deref(),
+                            &creator,
+                            &provider,
+                            &label,
+                            &payload,
+                            now,
+                        )
+                        .await
+                })
+            }
+            fn credentials(
+                &self,
+                owner: Option<&str>,
+                provider: &str,
+            ) -> StoreFuture<'_, Vec<CredentialRow>> {
+                let gate = ($before)(self);
+                let (owner, provider) = (owner.map(str::to_string), provider.to_string());
+                Box::pin(async move {
+                    gate?;
+                    self.inner.credentials(owner.as_deref(), &provider).await
+                })
+            }
+            fn credential_payload(&self, id: &str) -> StoreFuture<'_, Value> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.credential_payload(&id).await
+                })
+            }
+            fn delete_credential(&self, id: &str) -> StoreFuture<'_, ()> {
+                let gate = ($before)(self);
+                let id = id.to_string();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.delete_credential(&id).await
+                })
+            }
+            fn global_profile(&self) -> StoreFuture<'_, Option<ProfileRow>> {
+                let gate = ($before)(self);
+                Box::pin(async move {
+                    gate?;
+                    self.inner.global_profile().await
+                })
+            }
+            fn upsert_global_profile(&self, profile: &NewProfile) -> StoreFuture<'_, ProfileRow> {
+                let gate = ($before)(self);
+                let profile = profile.clone();
+                Box::pin(async move {
+                    gate?;
+                    self.inner.upsert_global_profile(&profile).await
+                })
+            }
+        }
+    };
+}
+
+/// A Store whose every operation fails on demand, for the loop's failed
+/// write path (Requirement 8.2). Forwards to `inner` until `fail()` is
+/// called; `recover()` forwards again.
+pub struct FailingStore {
+    inner: Arc<dyn Store>,
+    failing: AtomicBool,
+}
+
+impl FailingStore {
+    pub fn new(inner: Arc<dyn Store>) -> Self {
+        Self {
+            inner,
+            failing: AtomicBool::new(false),
+        }
+    }
+
+    pub fn fail(&self) {
+        self.failing.store(true, Ordering::SeqCst);
+    }
+
+    pub fn recover(&self) {
+        self.failing.store(false, Ordering::SeqCst);
+    }
+
+    fn gate(&self) -> Result<(), StoreError> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(StoreError::Internal(
+                "the failing store refused".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn on_load(&self) {}
+}
+
+forward_store!(FailingStore, |s: &FailingStore| s.gate());
+
+/// A Store that counts `load_window` calls, for the two-phase factory's
+/// once-per-build assertion.
+pub struct CountingStore {
+    inner: Arc<dyn Store>,
+    loads: AtomicUsize,
+}
+
+impl CountingStore {
+    pub fn new(inner: Arc<dyn Store>) -> Self {
+        Self {
+            inner,
+            loads: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn loads(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+
+    fn on_load(&self) {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+forward_store!(CountingStore, |_: &CountingStore| Ok::<(), StoreError>(()));

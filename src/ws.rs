@@ -115,15 +115,7 @@ pub const MAX_WS_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 /// `getrandom(2)` failed, and continuing with a predictable id would be
 /// worse than stopping.
 pub fn new_session_id() -> String {
-    use std::fmt::Write as _;
-
-    let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("OS entropy source");
-    bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-        // Writing into a String cannot fail.
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    crate::store::new_id()
 }
 
 /// The accepted session id form: exactly 32 lowercase hexadecimal
