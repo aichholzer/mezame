@@ -41,6 +41,7 @@ pub mod http;
 pub mod hub;
 pub mod prompt;
 pub mod provider;
+pub mod store;
 pub mod turn;
 pub mod ws;
 

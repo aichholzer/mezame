@@ -57,7 +57,12 @@ fn init_with_bind_writes_the_config_without_a_prompt() {
 
     let cfg = read_config(tmp.path());
     let keys: Vec<&String> = cfg.as_object().expect("an object").keys().collect();
-    assert_eq!(keys, vec!["transports"], "transports is the only key");
+    // `serde_json::Value` holds an object's keys in sorted order.
+    assert_eq!(
+        keys,
+        vec!["datastore", "transports", "version"],
+        "the version-2 key set and nothing else"
+    );
     assert_eq!(
         cfg["transports"],
         serde_json::json!([{ "kind": "cloudflared", "bind": "0.0.0.0:9510" }]),
@@ -136,8 +141,37 @@ fn init_with_bind_overwrites_an_existing_config() {
         String::from_utf8_lossy(&out.stderr)
     );
     let cfg = read_config(tmp.path());
+    assert_eq!(cfg["version"], 2, "rewritten at the current version");
     assert_eq!(cfg["transports"][0]["bind"], "0.0.0.0:9510");
     assert!(cfg.get("agent_cmd").is_none(), "the old keys are gone");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("written by an earlier release (version none)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("dropping the rest"), "{stdout}");
+}
+
+#[test]
+fn init_over_a_versionless_file_keeps_its_hosts() {
+    // The server refuses such a file with a pointer at `init`; `init` has
+    // to be a working step, so the transports' hosts survive it.
+    let tmp = home_with(
+        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}],"bedrock":{"model":"m"}}"#,
+    );
+    let out = run_with_home(&["init", "--bind", "0.0.0.0:9510"], tmp.path());
+    assert!(out.status.success(), "{}", stderr(&out));
+    let cfg = read_config(tmp.path());
+    assert_eq!(cfg["version"], 2);
+    assert_eq!(
+        cfg["transports"][0]["hosts"],
+        serde_json::json!(["mezame.example.com"])
+    );
+    assert!(
+        cfg.get("bedrock").is_none(),
+        "only the transports are carried from another version"
+    );
+    assert!(stdout(&out).contains("version none"), "{}", stdout(&out));
 }
 
 #[cfg(unix)]
@@ -189,7 +223,7 @@ fn init_with_bind_keeps_the_hosts_of_an_existing_config() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.json"),
-        br#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}]}"#,
+        br#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}]}"#,
     )
     .unwrap();
 
@@ -313,7 +347,7 @@ fn init_with_model_alone_and_no_file_writes_the_default_bind() {
 #[test]
 fn init_with_model_alone_keeps_an_existing_bind_and_hosts() {
     let tmp = home_with(
-        r#"{"transports":[{"kind":"cloudflared","bind":"0.0.0.0:9511","hosts":["mezame.example.com"]}]}"#,
+        r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"0.0.0.0:9511","hosts":["mezame.example.com"]}]}"#,
     );
     let out = run_with_home(&["init", "--model", "anthropic.claude-opus-5"], tmp.path());
     assert!(out.status.success(), "{}", stderr(&out));
@@ -329,7 +363,7 @@ fn init_with_model_alone_keeps_an_existing_bind_and_hosts() {
 #[test]
 fn init_with_bind_alone_keeps_an_existing_bedrock_section_and_says_so() {
     let tmp = home_with(
-        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],
+        r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],
             "bedrock":{"model":"anthropic.claude-sonnet-5","models":["anthropic.claude-opus-5"],"region":"us-east-1","thinking":"off","thinking_budget":2048,"max_output_tokens":9000}}"#,
     );
     let out = run_with_home(&["init", "--bind", "0.0.0.0:9510"], tmp.path());
@@ -351,7 +385,7 @@ fn init_with_bind_alone_keeps_an_existing_bedrock_section_and_says_so() {
 #[test]
 fn init_with_a_bedrock_flag_replaces_that_key_and_carries_the_rest() {
     let tmp = home_with(
-        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],
+        r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],
             "bedrock":{"model":"anthropic.claude-sonnet-5","region":"us-east-1","profile":"old","thinking":"off"}}"#,
     );
     let out = run_with_home(&["init", "--profile", "new"], tmp.path());
@@ -450,7 +484,7 @@ fn help_names_the_four_init_flags_and_the_no_terminal_remedy_names_model() {
 #[test]
 fn a_file_whose_bedrock_section_is_invalid_refuses_to_start() {
     let tmp = home_with(
-        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],"bedrock":{"model":"m","thinking":"budget"}}"#,
+        r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],"bedrock":{"model":"m","thinking":"budget"}}"#,
     );
     let out = run_with_home(&[], tmp.path());
     assert!(!out.status.success());
@@ -465,7 +499,7 @@ fn a_bind_only_rerun_on_a_file_with_a_bad_bedrock_value_refuses_and_keeps_the_fi
     // used to read it through the validating loader, treat it as absent,
     // and silently drop both the hosts and the section. Now the section is
     // carried forward and refused with the key named; the file stays.
-    let body = r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}],"bedrock":{"model":"m","thinking":"budget"}}"#;
+    let body = r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}],"bedrock":{"model":"m","thinking":"budget"}}"#;
     let tmp = home_with(body);
     let out = run_with_home(&["init", "--bind", "0.0.0.0:9510"], tmp.path());
     assert!(!out.status.success(), "{}", stdout(&out));
@@ -497,7 +531,7 @@ fn init_never_writes_a_section_the_next_start_would_refuse() {
     // small for the default budget, and the write is refused rather than
     // leaving a file that fails on the next start.
     let tmp = home_with(
-        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],"bedrock":{"model":"anthropic.claude-sonnet-5","max_output_tokens":2000}}"#,
+        r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],"bedrock":{"model":"anthropic.claude-sonnet-5","max_output_tokens":2000}}"#,
     );
     let out = run_with_home(
         &[
@@ -539,7 +573,7 @@ fn a_rerun_over_a_file_that_does_not_parse_refuses_and_keeps_the_file() {
     // nothing said; now the run refuses, names the file, and writes
     // nothing.
     for body in [
-        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}],"bedrock":{"model":"m","thinking_budget":"4096"}}"#,
+        r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}],"bedrock":{"model":"m","thinking_budget":"4096"}}"#,
         r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],}"#,
     ] {
         let tmp = home_with(body);

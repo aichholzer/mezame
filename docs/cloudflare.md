@@ -44,6 +44,7 @@ A named Cloudflare Tunnel can route a public hostname at your local Mezame. The 
 
    ```json
    {
+     "version": 2,
      "transports": [
        { "kind": "cloudflared", "bind": "127.0.0.1:9510", "hosts": ["mezame.example.com"] }
      ]

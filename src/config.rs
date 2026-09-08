@@ -1,10 +1,12 @@
 //! On-disk configuration and interactive setup.
 //!
 //! Config lives at `~/.mezame/config.json` and holds server settings
-//! only. A schema change breaks existing users: add fields with
-//! `#[serde(default)]` and leave the existing ones where they are.
-//! Transports live in a list (`TransportConfig`) internally tagged on
-//! `kind`; see the architecture document's configuration reference.
+//! only. The file carries `"version": 2`; a file of another or no version
+//! is refused at startup with one line pointing at `mezame init`, which
+//! rewrites it. Within a version, add fields with `#[serde(default)]` and
+//! leave the existing ones where they are. Transports live in a list
+//! (`TransportConfig`) internally tagged on `kind`; see the architecture
+//! document's configuration reference.
 //!
 //! Everything under `~/.mezame` is created owner-only on Unix: the
 //! directory `0700` and its files `0600`, each file written to a fresh
@@ -48,23 +50,92 @@ pub const MIN_THINKING_BUDGET: u32 = 1024;
 /// The output ceiling of a request when the file sets none.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
+/// The version of the file this release reads and writes.
+pub const CONFIG_VERSION: u32 = 2;
+
+/// The one datastore backend of this release.
+pub const SQLITE_BACKEND: &str = "sqlite";
+
+/// The `datastore` object of `config.json`: which backend holds the
+/// persistent state. `sqlite` is the one value this release accepts; a
+/// second backend is a second value and a second `Store` implementation,
+/// not a schema change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatastoreConfig {
+    #[serde(default = "default_backend")]
+    pub backend: String,
+}
+
+fn default_backend() -> String {
+    SQLITE_BACKEND.to_string()
+}
+
+impl Default for DatastoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+        }
+    }
+}
+
 /// Server settings, as they sit at `~/.mezame/config.json`.
 ///
-/// No `deny_unknown_fields`: a file written by an earlier release carries
-/// keys this version knows nothing about, and they are ignored, the file
-/// is left on disk untouched, and the parsed settings are served. A file
-/// without a `bedrock` section loads exactly as before the section existed
-/// and selects the echo backend.
+/// No `deny_unknown_fields`: a file written by a later release of the same
+/// version carries keys this binary knows nothing about, and they are
+/// ignored, the file is left on disk untouched, and the parsed settings
+/// are served. A file without a `bedrock` section loads exactly as before
+/// the section existed and selects the echo backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Always [`CONFIG_VERSION`] once loaded: the loader checks it before
+    /// anything else is read.
+    pub version: u32,
     pub transports: Vec<TransportConfig>,
+    #[serde(default)]
+    pub datastore: DatastoreConfig,
+    /// The URL browsers reach Mezame at, when a tunnel or proxy fronts it.
+    /// An `https://` value marks the session cookie `Secure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    /// The model ids the picker offers besides the profile's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     /// The Bedrock model and, when the AWS setup needs them, the region and
-    /// profile. Absent means the echo backend.
+    /// profile. Absent means the echo backend. The section moves into the
+    /// datastore once the profile row exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock: Option<BedrockConfig>,
 }
 
 impl Config {
+    /// Refuse a file the process could not run on, naming the key, the
+    /// accepted values and the file.
+    pub fn validate(&self, path: &Path) -> Result<()> {
+        let at = path.display();
+        if self.datastore.backend != SQLITE_BACKEND {
+            bail!(
+                "`datastore.backend` `{}` is not supported; `{SQLITE_BACKEND}` is the one backend \
+                 in this release, in {at}",
+                self.datastore.backend
+            );
+        }
+        if self.models.iter().any(|m| m.trim().is_empty()) {
+            bail!("`models` holds an empty entry, in {at}");
+        }
+        if let Some(padded) = self.models.iter().find(|m| m.as_str() != m.trim()) {
+            bail!("`models` entry `{padded}` has leading or trailing whitespace, in {at}");
+        }
+        if let Some(url) = &self.public_url {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                bail!("`public_url` must begin with `http://` or `https://`, in {at}");
+            }
+        }
+        if let Some(bedrock) = &self.bedrock {
+            bedrock.validate(path)?;
+        }
+        Ok(())
+    }
+
     /// The bind of the first transport, when there is one.
     pub fn bind(&self) -> Option<&str> {
         self.transports.first().map(|t| match t {
@@ -270,9 +341,24 @@ pub enum TransportConfig {
     // config, advertising a transport that does nothing.
 }
 
-pub fn config_path() -> Result<PathBuf> {
+/// `~/.mezame`, the directory every file this module names sits in.
+pub fn mezame_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".mezame/config.json"))
+    Ok(PathBuf::from(home).join(".mezame"))
+}
+
+pub fn config_path() -> Result<PathBuf> {
+    Ok(mezame_dir()?.join("config.json"))
+}
+
+/// The SQLite datastore.
+pub fn datastore_path() -> Result<PathBuf> {
+    Ok(mezame_dir()?.join("mezame.db"))
+}
+
+/// The master key the credential and cookie keys are derived from.
+pub fn master_key_path() -> Result<PathBuf> {
+    Ok(mezame_dir()?.join("master.key"))
 }
 
 /// Path to the persistent browser state (currently-open tabs, history list,
@@ -287,15 +373,46 @@ pub fn load_config() -> Result<Config> {
     load_config_from(&config_path()?)
 }
 
-/// Read and validate the configuration at `path`. A `bedrock` section the
-/// loop could not run is refused here, so the process never starts on a
-/// file it would fail on later.
+/// Read and validate the configuration at `path`. The version is checked
+/// on the raw document before anything else is read, so a file another
+/// release wrote is answered with one line pointing at `mezame init` and
+/// not with a parse error; a `bedrock` section the loop could not run is
+/// refused here too, so the process never starts on a file it would fail
+/// on later.
 pub fn load_config_from(path: &Path) -> Result<Config> {
-    let cfg = read_config_from(path)?;
-    if let Some(bedrock) = &cfg.bedrock {
-        bedrock.validate(path)?;
-    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("Reading {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("Parsing config.json at {}", path.display()))?;
+    check_version(&value, path)?;
+    let cfg: Config = serde_json::from_value(value)
+        .with_context(|| format!("Parsing config.json at {}", path.display()))?;
+    cfg.validate(path)?;
     Ok(cfg)
+}
+
+/// The version a raw document declares, as text for a message: `none` when
+/// the key is absent, the number when it is one, the JSON otherwise.
+fn version_text(value: &serde_json::Value) -> String {
+    match value.get("version") {
+        None => "none".to_string(),
+        Some(v) => v.to_string(),
+    }
+}
+
+/// Refuse a document of another or no version with one line naming the
+/// file, the version found, and the way out.
+pub fn check_version(value: &serde_json::Value, path: &Path) -> Result<()> {
+    let at = path.display();
+    match value.get("version").and_then(serde_json::Value::as_u64) {
+        Some(v) if v == u64::from(CONFIG_VERSION) => Ok(()),
+        _ => bail!(
+            "{at} has version {} and this release ({}) reads version {CONFIG_VERSION}; run \
+             `mezame init` to rewrite it (the hosts are kept)",
+            version_text(value),
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
 }
 
 /// Read the configuration at `~/.mezame/config.json` without validating
@@ -312,25 +429,79 @@ pub fn read_config_from(path: &Path) -> Result<Config> {
     serde_json::from_str(&raw).with_context(|| format!("Parsing config.json at {}", path.display()))
 }
 
+/// The configuration `init` starts from.
+#[derive(Debug, Clone)]
+pub struct ExistingConfig {
+    pub config: Config,
+    /// `Some(version text)` when the file was written by another release:
+    /// only its `transports` (the hosts) were carried, and `init` says so.
+    pub legacy: Option<String>,
+}
+
 /// What `init` starts from: the configuration on disk, `None` when there
 /// is no file, and an error when there is a file that cannot be read or
 /// parsed. A broken file is never taken for an absent one: `init` would
 /// otherwise write a fresh file over it and drop the hosts and the
-/// `bedrock` section it held, with nothing said.
-pub fn read_existing_config() -> Result<Option<Config>> {
-    let path = config_path()?;
-    let raw = match std::fs::read_to_string(&path) {
+/// `bedrock` section it held, with nothing said. A file of another or no
+/// version is carried as far as its `transports` parse, so the server's
+/// pointer at `mezame init` is a working step and the hosts survive it.
+pub fn read_existing_config() -> Result<Option<ExistingConfig>> {
+    read_existing_config_from(&config_path()?)
+}
+
+/// [`read_existing_config`] at `path`.
+pub fn read_existing_config_from(path: &Path) -> Result<Option<ExistingConfig>> {
+    let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("Reading {}", path.display())),
     };
-    let config: Config = serde_json::from_str(&raw).with_context(|| {
+    let broken = || {
         format!(
             "{} exists but does not parse; fix it, or delete it and run `mezame init` again",
             path.display()
         )
-    })?;
-    Ok(Some(config))
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw).with_context(broken)?;
+    if check_version(&value, path).is_ok() {
+        let config: Config = serde_json::from_value(value).with_context(broken)?;
+        return Ok(Some(ExistingConfig {
+            config,
+            legacy: None,
+        }));
+    }
+    let transports: Vec<TransportConfig> = value
+        .get("transports")
+        .cloned()
+        .and_then(|t| serde_json::from_value(t).ok())
+        .unwrap_or_default();
+    Ok(Some(ExistingConfig {
+        config: Config {
+            version: CONFIG_VERSION,
+            transports,
+            datastore: DatastoreConfig::default(),
+            public_url: None,
+            models: Vec::new(),
+            bedrock: None,
+        },
+        legacy: Some(version_text(&value)),
+    }))
+}
+
+/// What `init` says about a file another release wrote, once.
+fn note_legacy(existing: Option<&ExistingConfig>) -> Result<()> {
+    if let Some(ExistingConfig {
+        legacy: Some(version),
+        ..
+    }) = existing
+    {
+        println!(
+            "Existing {} was written by an earlier release (version {version}); keeping its \
+             hosts and dropping the rest.",
+            config_path()?.display()
+        );
+    }
+    Ok(())
 }
 
 /// Create `dir` and any missing parent, owner-only (`0700`) on Unix.
@@ -430,19 +601,26 @@ pub fn write_private_atomic(target: &Path, data: &[u8], durable: bool) -> io::Re
 /// Bedrock settings, then write the config.
 pub(crate) fn init_config() -> Result<Config> {
     let existing = read_existing_config()?;
+    note_legacy(existing.as_ref())?;
+    let existing = existing.map(|e| e.config);
     let bind = prompt_bind()?;
     let bedrock = prompt_bedrock(existing.as_ref().and_then(|c| c.bedrock.clone()))?;
     write_config(&assemble(existing.as_ref(), bind, bedrock), false)
 }
 
-/// One transport with `bind`, the hosts an existing file carried, and the
-/// Bedrock section: the shape both `init` paths write.
+/// One transport with `bind`, the hosts, datastore, public URL and model
+/// list an existing file carried, and the Bedrock section: the shape both
+/// `init` paths write, always at the current version.
 fn assemble(existing: Option<&Config>, bind: String, bedrock: Option<BedrockConfig>) -> Config {
     Config {
+        version: CONFIG_VERSION,
         transports: vec![TransportConfig::Cloudflared {
             bind,
             hosts: existing.map(Config::hosts).unwrap_or_default(),
         }],
+        datastore: existing.map(|c| c.datastore.clone()).unwrap_or_default(),
+        public_url: existing.and_then(|c| c.public_url.clone()),
+        models: existing.map(|c| c.models.clone()).unwrap_or_default(),
         bedrock,
     }
 }
@@ -548,6 +726,8 @@ fn non_empty(flag: &str, value: &str) -> Result<String> {
 /// attach them to.
 pub(crate) fn init_config_with_args(args: &InitArgs) -> Result<Config> {
     let existing = read_existing_config()?;
+    note_legacy(existing.as_ref())?;
+    let existing = existing.map(|e| e.config);
     let bind = match &args.bind {
         Some(addr) => {
             validate_bind_entry(addr).map_err(|message| anyhow!(message))?;
@@ -729,9 +909,7 @@ pub(crate) fn write_config(cfg: &Config, kept: bool) -> Result<Config> {
     // same check here. A section carried forward from a file with a bad
     // value, or a flag that made one, is refused with the key named and
     // the file left as it was.
-    if let Some(section) = &cfg.bedrock {
-        section.validate(&path)?;
-    }
+    cfg.validate(&path)?;
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent).with_context(|| format!("Creating {}", parent.display()))?;
     }

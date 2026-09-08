@@ -13,6 +13,21 @@ The version is tracked in three places and must match:
 The UI bundle surfaces its version in the top-right of the header via a
 build-time Vite define.
 
+## [0.14.0-alpha.3] - 2026-09-08
+
+This alpha assumes a fresh install. There is no migration from 0.13 or
+from an earlier alpha: remove `~/.mezame` (or the Docker volume) left by
+an earlier version and run `mezame init` again. Two files are new under
+`~/.mezame`: the datastore `mezame.db` and the master key `master.key`.
+The entries below say what changed; none of them describes a path from
+the old state.
+
+### Changed
+
+- `config.json` carries `"version": 2`. A file without a version, or with
+  another one, is refused at startup with one line pointing at
+  `mezame init`, which rewrites it at version 2 and keeps the hosts.
+
 ## [0.14.0-alpha.2] - 2026-09-07
 
 This alpha assumes a fresh install. There is no migration from 0.13 or

@@ -1,6 +1,6 @@
 [package]
 name = "mezame"
-version = "0.14.0-alpha.2"
+version = "0.14.0-alpha.3"
 edition = "2021"
 rust-version = "1.94.1"
 build = "build.rs"
@@ -40,6 +40,12 @@ exclude = [
 
 [dependencies]
 anyhow = "1.0.103"
+# Atomically swappable configuration in `AppState`, the shape hot reload
+# needs later; read per request.
+arc-swap = "1.9"
+# Argon2id for password hashes: the crate's defaults (m=19,456 KiB, t=2,
+# p=1) into a PHC string with its own salt, verified by parsing the string.
+argon2 = "0.6"
 # The AWS credential chain (profiles, SSO, assumed roles, the instance
 # metadata service) and the Bedrock Runtime client. Both set the
 # `rust-version` above. `default-features = false` on each: the
@@ -55,8 +61,17 @@ aws-sdk-bedrockruntime = { version = "1.143", default-features = false, features
 # `additionalModelRequestFields` takes, and Cargo does not expose a
 # transitive crate by path.
 aws-smithy-types = "1.6.3"
+# Already in the normal graph through `axum`'s `ws` feature, so zero new
+# crates. Direct because the session cookie's MAC is base64url without
+# padding, and the `URL_SAFE_NO_PAD` engine refuses padding, non-alphabet
+# bytes and non-zero trailing bits, which the cookie property rests on.
+base64 = "0.22"
 axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
-dialoguer = { version = "0.12.0", default-features = false }
+# XChaCha20-Poly1305 over credential payloads at rest: a 24-byte nonce per
+# write and the row id as associated data.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+# `password` for the masked admin prompt of `init`.
+dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
 futures-util = "0.3.31"
 # Not a new crate at this lockfile: 0.2 is what axum's `ws` feature already
 # pulls in (tokio-tungstenite 0.24 -> tungstenite -> rand 0.8 -> rand_core
@@ -66,6 +81,10 @@ futures-util = "0.3.31"
 # whose tungstenite moves to rand 0.9. The 0.3 API renamed the call:
 # `getrandom::getrandom(&mut buf)` becomes `getrandom::fill(&mut buf)`.
 getrandom = "0.2"
+# HKDF-SHA256 derives the credential and cookie sub-keys from the master
+# key; HMAC-SHA256 signs the session cookie.
+hkdf = "0.13"
+hmac = "0.13"
 # Both already in the normal graph through axum, so zero new crates. They
 # are direct dependencies because `axum::serve` sets no timer on hyper,
 # which silently disables hyper's header-read timeout; `http::serve` owns
@@ -73,8 +92,12 @@ getrandom = "0.2"
 hyper = { version = "1.9", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio", "service"] }
 rust-embed = { version = "8.5.0", features = ["interpolate-folder-path"] }
+# SQLite compiled from source (`bundled`): no system library, FTS5 and the
+# JSON functions in, the same C toolchain rustc already links with.
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
+sha2 = { version = "0.11", default-features = false }
 socket2 = "0.5"
 tokio = { version = "1.43.0", features = ["fs", "macros", "rt-multi-thread", "net", "sync", "signal"] }
 

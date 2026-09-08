@@ -133,6 +133,7 @@ The section it writes holds `model`, `region` and `profile`. A hand-edited
 
 ```json
 {
+  "version": 2,
   "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }],
   "bedrock": {
     "model": "global.anthropic.claude-sonnet-5",

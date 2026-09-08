@@ -96,6 +96,7 @@ Mezame/
 
 ```json
 {
+  "version": 2,
   "transports": [
     { "kind": "cloudflared", "bind": "127.0.0.1:9510", "hosts": ["mezame.example.com"] }
   ],
@@ -108,6 +109,9 @@ Mezame/
 }
 ```
 
+- `version`: always `2` for this release. A file without it, or with another
+  value, is refused at startup with one line pointing at `mezame init`, which
+  rewrites the file at version 2 and keeps the hosts.
 - `transports`: list of transport entries. Each entry is internally tagged by
   `kind`. Only `"cloudflared"` is implemented today, and running more than one
   entry at once is not yet supported. Keep the list at a single element. The

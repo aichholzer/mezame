@@ -70,6 +70,7 @@ async fn load_config_reads_a_well_formed_json_file() {
     let dir = tmp.path().join(".mezame");
     std::fs::create_dir_all(&dir).unwrap();
     let body = json!({
+        "version": 2,
         "transports": [
             { "kind": "cloudflared", "bind": "127.0.0.1:9510" }
         ],

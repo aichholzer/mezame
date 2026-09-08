@@ -108,7 +108,7 @@ fn empty_transports_config_bails() {
     // nothing in silence is the failure mode this guards. It exercises
     // the `[]` arm of run()'s transport match, plus the full
     // config-discovery and runtime-build path that precedes it.
-    let tmp = home_with_config(r#"{ "transports": [] }"#);
+    let tmp = home_with_config(r#"{ "version": 2, "transports": [] }"#);
     let out = run_with_home(&[], tmp.path());
 
     assert!(
@@ -128,6 +128,7 @@ fn multiple_transports_config_bails() {
     // `_` arm. Serving only the first entry in silence is the failure
     // mode this guards.
     let body = r#"{
+        "version": 2,
         "transports": [
             { "kind": "cloudflared", "bind": "127.0.0.1:9510" },
             { "kind": "cloudflared", "bind": "127.0.0.1:9511" }
@@ -252,7 +253,7 @@ fn free_port() -> u16 {
 fn a_bedrock_configuration_starts_with_no_credentials_and_names_its_backend() {
     let port = free_port();
     let body = format!(
-        r#"{{"transports":[{{"kind":"cloudflared","bind":"127.0.0.1:{port}"}}],"bedrock":{{"model":"anthropic.claude-sonnet-5","region":"us-east-1"}}}}"#
+        r#"{{"version":2,"transports":[{{"kind":"cloudflared","bind":"127.0.0.1:{port}"}}],"bedrock":{{"model":"anthropic.claude-sonnet-5","region":"us-east-1"}}}}"#
     );
     let (backend, status) = start_and_fetch_root(&body, port);
     assert!(
@@ -267,7 +268,9 @@ fn a_bedrock_configuration_starts_with_no_credentials_and_names_its_backend() {
 #[test]
 fn a_configuration_without_a_bedrock_section_names_the_echo() {
     let port = free_port();
-    let body = format!(r#"{{"transports":[{{"kind":"cloudflared","bind":"127.0.0.1:{port}"}}]}}"#);
+    let body = format!(
+        r#"{{"version":2,"transports":[{{"kind":"cloudflared","bind":"127.0.0.1:{port}"}}]}}"#
+    );
     let (backend, status) = start_and_fetch_root(&body, port);
     assert!(backend.starts_with("Backend: echo"), "{backend}");
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");

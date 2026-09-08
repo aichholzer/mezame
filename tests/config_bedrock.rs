@@ -27,7 +27,8 @@ fn load(body: &str) -> Result<Config, String> {
     load_config_from(&path).map_err(|e| format!("{e:#}"))
 }
 
-const TRANSPORT: &str = r#""transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}]"#;
+const TRANSPORT: &str =
+    r#""version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}]"#;
 
 fn with_bedrock(section: &str) -> String {
     format!("{{{TRANSPORT},\"bedrock\":{section}}}")
@@ -247,27 +248,41 @@ fn a_malformed_value_is_a_parse_error_naming_the_file() {
 #[test]
 fn a_written_file_holds_only_the_keys_that_are_set() {
     let cfg = Config {
+        version: 2,
         transports: vec![TransportConfig::Cloudflared {
             bind: "127.0.0.1:9510".into(),
             hosts: Vec::new(),
         }],
+        datastore: Default::default(),
+        public_url: None,
+        models: vec![],
         bedrock: Some(BedrockConfig::for_model("anthropic.claude-sonnet-5")),
     };
     let value: Value = serde_json::to_value(&cfg).unwrap();
     assert_eq!(
         value,
         json!({
+            "version": 2,
             "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }],
+            "datastore": { "backend": "sqlite" },
             "bedrock": { "model": "anthropic.claude-sonnet-5" }
         })
     );
     let echo = Config {
+        version: 2,
         transports: cfg.transports.clone(),
+        datastore: Default::default(),
+        public_url: None,
+        models: vec![],
         bedrock: None,
     };
     assert_eq!(
         serde_json::to_value(&echo).unwrap(),
-        json!({ "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }] }),
+        json!({
+            "version": 2,
+            "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }],
+            "datastore": { "backend": "sqlite" }
+        }),
         "no `bedrock` key at all for the echo"
     );
     let full = BedrockConfig {
@@ -289,7 +304,11 @@ fn a_written_file_holds_only_the_keys_that_are_set() {
     let path = write(
         &tmp,
         &serde_json::to_string_pretty(&Config {
+            version: 2,
             transports: cfg.transports.clone(),
+            datastore: Default::default(),
+            public_url: None,
+            models: vec![],
             bedrock: Some(full.clone()),
         })
         .unwrap(),
@@ -302,7 +321,7 @@ fn a_written_file_holds_only_the_keys_that_are_set() {
 
 #[test]
 fn hosts_walks_every_transport_as_the_guard_does() {
-    let cfg = load(r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":[]},{"kind":"cloudflared","bind":"0.0.0.0:9511","hosts":["a.example","b.example"]}]}"#).unwrap();
+    let cfg = load(r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":[]},{"kind":"cloudflared","bind":"0.0.0.0:9511","hosts":["a.example","b.example"]}]}"#).unwrap();
     assert_eq!(cfg.hosts(), vec!["a.example", "b.example"]);
     assert_eq!(cfg.bind(), Some("127.0.0.1:9510"));
     assert_eq!(ThinkingMode::from_str("off"), Ok(ThinkingMode::Off));

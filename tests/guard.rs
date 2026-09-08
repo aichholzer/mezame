@@ -88,6 +88,10 @@ fn the_bind_host_and_the_configured_hosts_come_from_the_config() {
             bind: "mezame.lan:9510".to_string(),
             hosts: vec!["Mezame.Example.com:443".to_string(), " ".to_string()],
         }],
+        version: 2,
+        datastore: Default::default(),
+        public_url: None,
+        models: vec![],
         bedrock: None,
     };
     let policy = RequestPolicy::from_config(&config);
