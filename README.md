@@ -348,6 +348,20 @@ under, and start it again.
 A turn is in flight on that session, started here or on another device. It
 unlocks when that turn ends.
 
+**The turn fails with "AWS refused the credentials"**
+The keys or the session token the SDK found were rejected at AWS's front
+door: a mistyped secret, an expired session token, or a profile whose
+credentials have lapsed. The message is fixed on purpose: AWS's own text can
+quote the signed request, token included. Check the variables or the profile
+the `Backend:` line names.
+
+**The turn fails with "The model could not read the reasoning recorded earlier"**
+The model signs its reasoning against the conversation that produced it and
+refused a replay whose prefix had changed (an evicted turn, or a model switch
+on an account that enforces the binding). Mezame drops the reasoning and
+retries once on its own; this message means the retry failed too. Send the
+message again; the conversation continues without the earlier reasoning.
+
 **The turn fails with "Bedrock refused the request"**
 Access was denied. Either the model is not enabled for this account in this
 region (Bedrock console, Model access), or the credentials the SDK found lack

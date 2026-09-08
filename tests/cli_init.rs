@@ -531,3 +531,32 @@ fn init_never_writes_a_section_the_next_start_would_refuse() {
     );
     assert!(out.status.success(), "{}", stderr(&out));
 }
+
+#[test]
+fn a_rerun_over_a_file_that_does_not_parse_refuses_and_keeps_the_file() {
+    // A broken file is not an absent one. Treating it as absent wrote a
+    // fresh file with no hosts and no bedrock section over it, with
+    // nothing said; now the run refuses, names the file, and writes
+    // nothing.
+    for body in [
+        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":["mezame.example.com"]}],"bedrock":{"model":"m","thinking_budget":"4096"}}"#,
+        r#"{"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],}"#,
+    ] {
+        let tmp = home_with(body);
+        for args in [
+            &["init", "--bind", "0.0.0.0:9510"][..],
+            &["init", "--model", "anthropic.claude-sonnet-5"][..],
+        ] {
+            let out = run_with_home(args, tmp.path());
+            assert!(!out.status.success(), "{body}: {}", stdout(&out));
+            let err = stderr(&out);
+            assert!(err.contains("does not parse"), "{err}");
+            assert!(err.contains("config.json"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(config_at(tmp.path())).unwrap(),
+                body,
+                "nothing was written"
+            );
+        }
+    }
+}

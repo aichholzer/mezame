@@ -5,6 +5,7 @@
 
 import {
   applyServerMessage,
+  rehydrateAfterTurn,
   deriveLabel,
   renderHistoryText,
   shouldCloseAbsentSession,
@@ -355,6 +356,34 @@ describe('applyServerMessage / prompt_done', () => {
     expect(s.busy).toBe(false);
   });
 
+  it('keeps the usage on a bubble whose turn survived a reconnect', () => {
+    // This tab's own turn: echo, a partial bubble, then the socket drops
+    // and the `ready` of the reconnect reports the turn still running.
+    // The marker this tab already holds stays put, the later chunks merge
+    // into the bubble it opened, and the counts land on it.
+    const s = makeSession({ hydrated: true, sessionId: 'abc' });
+    applyServerMessage(s, { type: 'append', role: 'user', text: '> q\n' });
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'hel' });
+    applyServerMessage(s, { type: 'ready', sessionId: 'abc', resumed: true, busy: true });
+    expect(s.rehydrateOnTurnEnd).toBe(true);
+    applyServerMessage(s, { type: 'append', role: 'agent', text: 'lo' });
+    const usage = { input: 5, output: 2, cacheRead: 0, cacheWrite: 0 };
+    applyServerMessage(s, { type: 'prompt_done', usage });
+    const agents = s.log.filter(
+      (e): e is Extract<LogEntry, { kind: 'text' }> => e.kind === 'text' && e.role === 'agent'
+    );
+    expect(agents).toHaveLength(1);
+    expect(agents[0].text).toBe('hello\n');
+    expect(agents[0].usage).toEqual(usage);
+  });
+
+  it('clears a stale marker when a reconnect finds no turn running', () => {
+    const s = makeSession({ hydrated: true, sessionId: 'abc', turnStart: 3 });
+    applyServerMessage(s, { type: 'ready', sessionId: 'abc', resumed: true, busy: false });
+    expect(s.turnStart).toBeUndefined();
+    expect(s.rehydrateOnTurnEnd).toBeFalsy();
+  });
+
   it('skips a trailing sys entry and lands on the agent one', () => {
     const s = makeSession();
     applyServerMessage(s, { type: 'append', role: 'agent', text: 'answer' });
@@ -591,5 +620,40 @@ describe('applyServerMessage idle anchor', () => {
     const s = makeSession({ lastActivityAt: 1 });
     applyServerMessage(s, { type: 'ready', sessionId: 'x', resumed: false, busy: false });
     expect(s.lastActivityAt).toBeGreaterThan(1);
+  });
+});
+
+// ---------- rehydrate after a partly watched turn ----------
+
+describe('rehydrateAfterTurn', () => {
+  it('rebuilds the log from history and puts the usage on the answer', async () => {
+    const s = makeSession({ sessionId: 'abc', hydrated: true });
+    // What a mid-turn attach holds: the tail of the answer alone.
+    applyServerMessage(s, { type: 'append', role: 'agent', text: ' half' });
+    s.rehydrateOnTurnEnd = true;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          entries: [
+            { role: 'user', text: 'q', timestamp: 1 },
+            { role: 'thought', text: 'hmm', timestamp: 2 },
+            { role: 'agent', text: 'first half', timestamp: 3 }
+          ]
+        })
+      }))
+    );
+    const usage = { input: 65, output: 4, cacheRead: 0, cacheWrite: 0 };
+    await rehydrateAfterTurn(s, usage);
+    expect(s.rehydrateOnTurnEnd).toBe(false);
+    expect(s.log.map((e) => (e.kind === 'text' ? `${e.role}:${e.text}` : e.kind))).toEqual([
+      'user:> q\n',
+      'thought',
+      'agent:first half\n'
+    ]);
+    const answer = s.log[2];
+    expect(answer.kind === 'text' ? answer.usage : undefined).toEqual(usage);
+    vi.unstubAllGlobals();
   });
 });

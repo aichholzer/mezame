@@ -143,6 +143,24 @@ fn each_refusal_names_the_key_and_the_file() {
             r#"{"model":"m","max_output_tokens":0}"#,
             "`bedrock.max_output_tokens` must be at least 1",
         ),
+        // Blank and padded values are not defaults: the SDK takes them
+        // literally and every request fails.
+        (
+            r#"{"model":" m "}"#,
+            "`bedrock.model` has leading or trailing whitespace",
+        ),
+        (
+            r#"{"model":"m","models":["m"," other "]}"#,
+            "`bedrock.models` entry ` other ` has leading or trailing whitespace",
+        ),
+        (
+            r#"{"model":"m","region":""}"#,
+            "`bedrock.region` is empty; remove the key to use the AWS default",
+        ),
+        (
+            r#"{"model":"m","profile":"  "}"#,
+            "`bedrock.profile` is empty; remove the key to use the default credential chain",
+        ),
     ];
     for (section, names) in cases {
         let err = load(&with_bedrock(section)).unwrap_err();

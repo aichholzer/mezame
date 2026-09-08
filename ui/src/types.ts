@@ -219,6 +219,12 @@ export type Session = {
    * that produced no agent text cannot stamp its counts on the previous
    * answer. Cleared when the turn ends. */
   turnStart?: number;
+  /** Set when this tab joined or rejoined a session while a turn was
+   * running. The broadcast never replays what was streamed before the
+   * attach, so the log holds a partial answer until the turn ends; on
+   * that turn's `prompt_done` the log is rebuilt from `/history`, which
+   * is whole by then. Cleared once the rebuild has been requested. */
+  rehydrateOnTurnEnd?: boolean;
 };
 
 export type ClosedEntry = {

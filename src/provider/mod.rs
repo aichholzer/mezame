@@ -174,6 +174,12 @@ pub enum ProviderError {
     BeforeStream {
         retryable: bool,
         rejected: bool,
+        /// The service could not read the reasoning blocks the request
+        /// replayed: their signatures no longer match the conversation
+        /// (the prefix changed, or the account enforces the binding and
+        /// the model switched). The loop drops every reasoning block it
+        /// holds and retries the request once.
+        stale_reasoning: bool,
         message: String,
     },
 }
@@ -190,6 +196,15 @@ impl ProviderError {
     pub fn is_rejected(&self) -> bool {
         match self {
             ProviderError::BeforeStream { rejected, .. } => *rejected,
+        }
+    }
+
+    /// Whether the service refused the replayed reasoning blocks.
+    pub fn is_stale_reasoning(&self) -> bool {
+        match self {
+            ProviderError::BeforeStream {
+                stale_reasoning, ..
+            } => *stale_reasoning,
         }
     }
 }

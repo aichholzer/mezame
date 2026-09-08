@@ -92,6 +92,19 @@ describe('LogPane usage footer', () => {
     expect(screen.getAllByTitle('Copy message')).toHaveLength(2);
   });
 
+  it('keeps the previous answer\'s copy controls while the new turn thinks', () => {
+    // Between Enter and the first agent chunk the trailing agent bubble is
+    // the finished previous answer. The turn marker sits past it, so the
+    // gate leaves it alone: both copy controls stay.
+    const log: LogEntry[] = [
+      agentEntry('done', USAGE),
+      { kind: 'text', id: 'u2', role: 'user', text: '> next\n', timestamp: 2 }
+    ];
+    render(<LogPane session={makeSession({ thinking: true, turnStart: 2, log })} isActive />);
+    expect(screen.getAllByTitle('Copy message')).toHaveLength(2);
+    expect(screen.getByTestId('usage-footer')).toBeInTheDocument();
+  });
+
   it('shows no meta row at all for a trailing bubble in flux', () => {
     render(
       <LogPane session={makeSession({ thinking: true, log: [agentEntry('pon')] })} isActive />

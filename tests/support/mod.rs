@@ -476,6 +476,9 @@ pub enum ScriptedStream {
         rejected: bool,
         message: String,
     },
+    /// Fail before any event because the replayed reasoning could not be
+    /// read: the loop drops its reasoning blocks and retries once.
+    StaleReasoning,
     /// Panic when the `stream()` future is polled.
     Panicking(String),
 }
@@ -570,7 +573,14 @@ impl ScriptedProvider {
             } => Err(ProviderError::BeforeStream {
                 retryable,
                 rejected,
+                stale_reasoning: false,
                 message,
+            }),
+            ScriptedStream::StaleReasoning => Err(ProviderError::BeforeStream {
+                retryable: false,
+                rejected: false,
+                stale_reasoning: true,
+                message: "Invalid `signature` in `thinking` block.".to_string(),
             }),
             ScriptedStream::Panicking(message) => panic!("{message}"),
             ScriptedStream::PendingSend => unreachable!("resolved by the caller"),

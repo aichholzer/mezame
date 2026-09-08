@@ -666,7 +666,7 @@ export const renderHistoryText = (entry: {
   text: string;
 }): string => (entry.role === 'user' ? `> ${entry.text}\n` : `${entry.text}\n`);
 
-const loadHistory = async (s: Session) => {
+const loadHistory = async (s: Session, usage?: Usage) => {
   const sessionId = s.sessionId;
   if (!sessionId) {
     return;
@@ -724,7 +724,24 @@ const loadHistory = async (s: Session) => {
   if (s.inFlight) {
     s.turnStart = s.log.length;
   }
+  // A rebuild that follows a turn's end carries that turn's counts: they
+  // belong to the last answer, which the rebuild has just made whole.
+  if (usage) {
+    const at = lastAgentTextIndex(s.log);
+    const entry = at >= 0 ? s.log[at] : undefined;
+    if (entry && entry.kind === 'text') {
+      entry.usage = usage;
+    }
+  }
   notify();
+};
+
+/** After a turn this tab watched only partly, rebuild the log from the
+ * transcript, which is whole once `prompt_done` has been sent. Exported
+ * for the suite; `handleMessage` is the one production caller. */
+export const rehydrateAfterTurn = (s: Session, usage?: Usage): Promise<void> => {
+  s.rehydrateOnTurnEnd = false;
+  return loadHistory(s, usage);
 };
 
 // ---------- WebSocket lifecycle ----------
@@ -994,6 +1011,14 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
 
   applyServerMessage(s, msg);
 
+  // A turn this tab joined part-way through has ended; the log holds
+  // whatever was broadcast after the attach and nothing before it. The
+  // transcript is whole now, so the log is rebuilt from it, with the
+  // turn's counts on the answer.
+  if (msg.type === 'prompt_done' && s.rehydrateOnTurnEnd) {
+    void rehydrateAfterTurn(s, isUsage(msg.usage) ? msg.usage : undefined);
+  }
+
   if (msg.type === 'ready') {
     // Seed from /history only on the tab's first hydrate. `wasHydrated`
     // is captured before `applyServerMessage` flips the flag. A
@@ -1083,10 +1108,19 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       s.inFlight = msg.busy === true;
       setBusy(s, msg.busy === true);
       // An attach into a running turn saw none of its echo; whatever the
-      // log holds now belongs to earlier turns. `loadHistory` moves the
-      // marker again once it has rebuilt the log.
+      // log holds now belongs to earlier turns, unless this tab's own
+      // turn is what is running (a reconnect mid-turn), in which case the
+      // marker it already holds stays and the chunks that follow merge
+      // into the bubble it opened. `loadHistory` moves the marker again
+      // once it has rebuilt the log. Either way the frames broadcast
+      // while this tab was away are gone, so the turn's end triggers a
+      // rebuild from `/history`. A `ready` with no turn running clears a
+      // marker a dropped connection may have left behind.
       if (msg.busy === true) {
-        s.turnStart = s.log.length;
+        s.turnStart ??= s.log.length;
+        s.rehydrateOnTurnEnd = true;
+      } else {
+        s.turnStart = undefined;
       }
       setStatus(s, 'connected');
       markActivity(s);

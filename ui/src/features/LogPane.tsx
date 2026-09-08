@@ -213,7 +213,11 @@ export const LogPane = ({ session, isActive }: Props) => {
   // hidden until prompt_done lands. Earlier agent entries within
   // the same turn (interleaved with tool calls) are already final
   // and keep their footer.
-  const trailingAgentIndex = lastAgentTextIndex(session.log);
+  // Bounded by the current turn: between the user's Enter and the first
+  // agent chunk the trailing agent bubble is the previous turn's finished
+  // answer, and it must keep its footer. A marker past every agent entry
+  // gives -1, which gates nothing until the new turn's first chunk.
+  const trailingAgentIndex = lastAgentTextIndex(session.log, session.turnStart ?? 0);
 
   // Auto-scroll when new content arrives if the user is pinned to the
   // bottom. useLayoutEffect so the scroll happens in the same frame as

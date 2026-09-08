@@ -297,6 +297,14 @@ pub fn user_message_from_blocks(blocks: &[Value]) -> Result<Message, BlockError>
                                     "does not decode as base64",
                                 )
                             })?;
+                            if data.is_empty() {
+                                return Err(unsupported(
+                                    index,
+                                    "resource",
+                                    media_type,
+                                    "holds no data",
+                                ));
+                            }
                             out.push(Block::Text {
                                 text: format!("Attached file {uri} ({media_type})"),
                             });
@@ -359,6 +367,9 @@ fn image_block(
     }
     let data = base64_decode(data)
         .ok_or_else(|| unsupported(index, kind, media_type, "does not decode as base64"))?;
+    if data.is_empty() {
+        return Err(unsupported(index, kind, media_type, "holds no data"));
+    }
     Ok(Block::Image {
         media_type: media_type.to_string(),
         data,
@@ -635,6 +646,13 @@ impl Conversation {
     /// user entry stays in the transcript, `entries` (what the browser was
     /// already shown) are recorded after it, and the exchange leaves every
     /// later request. Returns `false` when no exchange is open.
+    ///
+    /// What the service saw was not the newest message alone: the request
+    /// builder merges every unanswered user message immediately before it
+    /// into one, so those exchanges (closed with no reply: a failed or
+    /// cancelled request, a reply with no text) were part of the refused
+    /// content and are rejected with it. Leaving any of them would resend
+    /// the refused content on every later turn.
     pub fn reject_open(&mut self, entries: Vec<HistoryEntry>) -> bool {
         let Some(back) = self.exchanges.back_mut() else {
             return false;
@@ -644,9 +662,52 @@ impl Conversation {
         }
         back.status = ExchangeStatus::Rejected;
         back.entries += entries.len();
+        let last = self.exchanges.len() - 1;
+        for exchange in self.exchanges.iter_mut().take(last).rev() {
+            if exchange.status == ExchangeStatus::Closed && exchange.assistant.is_none() {
+                exchange.status = ExchangeStatus::Rejected;
+            } else if exchange.status == ExchangeStatus::Closed {
+                break;
+            }
+        }
         self.transcript.record(entries);
         self.enforce_budget();
         true
+    }
+
+    /// Drop every reasoning block (`thinking` and `opaque`) from the
+    /// assistant messages held, so the next request replays none. Returns
+    /// how many blocks were dropped.
+    ///
+    /// A reasoning block's signature is bound to the conversation prefix
+    /// that produced it. Once that prefix has changed, the model refuses
+    /// the block, and the only recovery a Converse client has is to send
+    /// the history without its reasoning. The text of each reply stays,
+    /// so does the transcript: the thought pane keeps showing what the
+    /// browser was already shown.
+    pub fn strip_reasoning(&mut self) -> usize {
+        let mut dropped = 0;
+        for exchange in self.exchanges.iter_mut() {
+            let Some(assistant) = exchange.assistant.as_mut() else {
+                continue;
+            };
+            let before = assistant.blocks.len();
+            let mut freed = 0;
+            assistant.blocks.retain(|block| match block {
+                Block::Thinking { .. } | Block::Opaque { .. } => {
+                    freed += block.payload_len();
+                    false
+                }
+                _ => true,
+            });
+            let removed = before - assistant.blocks.len();
+            if removed > 0 {
+                dropped += removed;
+                exchange.payload -= freed;
+                self.payload -= freed;
+            }
+        }
+        dropped
     }
 
     /// The messages the next request is built from, in order, with the
@@ -708,12 +769,22 @@ impl Conversation {
 
     /// Pop whole exchanges from the front while the budget or the entry
     /// cap is exceeded, never the back exchange.
+    ///
+    /// Removing an earlier turn while keeping later ones changes the prefix
+    /// every retained reasoning block is bound to, so an eviction also
+    /// drops the reasoning of what remains; the request after it carries
+    /// the text of each reply and nothing the model would refuse.
     fn enforce_budget(&mut self) {
+        let mut evicted_any = false;
         while self.exchanges.len() > 1 && self.transcript.over_budget(self.payload) {
             if let Some(evicted) = self.exchanges.pop_front() {
                 self.transcript.evict_front(evicted.entries);
                 self.payload -= evicted.payload;
+                evicted_any = true;
             }
+        }
+        if evicted_any {
+            self.strip_reasoning();
         }
     }
 }

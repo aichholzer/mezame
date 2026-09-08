@@ -406,13 +406,24 @@ async fn untargeted_events_carry_no_target_stamp() {
 
 #[tokio::test]
 async fn cancel_command_forwards_session_cancel_to_agent() {
-    // Requirement 7 criterion 13: the Backend's cancel method is invoked
-    // exactly once, and the arm broadcasts nothing.
+    // Requirement 7 criterion 13: with a turn in flight, the Backend's
+    // cancel method is invoked exactly once, and the arm broadcasts
+    // nothing of its own.
     let registry = HubRegistry::new();
-    let backend = Arc::new(ScriptedBackend::new());
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![])));
     let mut attached = registry
         .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
         .await;
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("hold")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    let echo = next_event(&mut attached.outbound).await.expect("the echo");
+    assert_eq!(echo["role"], "user");
 
     attached
         .commands
@@ -430,10 +441,46 @@ async fn cancel_command_forwards_session_cancel_to_agent() {
         1,
         "exactly one cancel"
     );
+    // The scripted turn resolves with an error on cancel; the frames that
+    // follow are the turn's own end, and nothing from the cancel arm.
+    let rest = collect_until(&mut attached.outbound, "prompt_done").await;
+    let types: Vec<&str> = rest.iter().filter_map(|f| f["type"].as_str()).collect();
+    assert_eq!(types, vec!["error", "prompt_done"]);
+}
+
+#[tokio::test]
+async fn a_cancel_sent_right_behind_a_prompt_reaches_the_turn_it_was_aimed_at() {
+    // Both commands sit in the inbox when the loop wakes. The turn task
+    // and the cancel task are spawned with no order between them; the
+    // cancel waits until the turn has called `prompt`, so it finds the
+    // handle rather than an empty slot, and the turn ends.
+    let registry = HubRegistry::new();
+    let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![])));
+    let mut attached = registry
+        .register_for_test(backend.clone(), SESSION_ID.into(), ready_event(), None)
+        .await;
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("go")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .expect("send Prompt");
+    attached
+        .commands
+        .send(HubCommand::Cancel)
+        .await
+        .expect("send Cancel");
     assert!(
-        attached.outbound.try_recv().is_err(),
-        "the cancel arm broadcasts nothing"
+        wait_for_invocation(&backend, &Invocation::Cancel).await,
+        "the cancel reaches the Backend"
     );
+    assert_eq!(backend.prompt_count(), 1, "the prompt ran too");
+    // The cancel ended the turn: echo, then the cancelled turn's end.
+    let frames = collect_until(&mut attached.outbound, "prompt_done").await;
+    let types: Vec<&str> = frames.iter().filter_map(|f| f["type"].as_str()).collect();
+    assert_eq!(types, vec!["append", "error", "prompt_done"]);
 }
 
 #[tokio::test]
@@ -1445,7 +1492,7 @@ async fn a_stalled_model_change_stalls_nothing_else_on_the_session() {
     // nothing.
     let registry = HubRegistry::new();
     let backend = Arc::new(ScriptedBackend::new().set_model_pending());
-    let attached = registry
+    let mut attached = registry
         .register_for_test_with_grace(
             Duration::from_millis(50),
             backend.clone(),
@@ -1481,15 +1528,21 @@ async fn a_stalled_model_change_stalls_nothing_else_on_the_session() {
     .await;
     assert!(flapped.is_ok(), "attaching never waits on the owner loop");
 
-    // The inbox is live: a cancel reaches the Backend with the change
-    // still parked.
+    // The inbox is live: a prompt is echoed and runs to its end with the
+    // change still parked. (A bare cancel would prove nothing: with no
+    // turn in flight the hub drops it.)
+    backend.push_turn(ScriptedTurn::success(vec![]));
     attached
         .commands
-        .send(HubCommand::Cancel)
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("still alive")],
+            attach_id: attached.attach_id,
+        })
         .await
-        .expect("send Cancel");
+        .expect("send Prompt");
+    let frames = collect_until(&mut attached.outbound, "prompt_done").await;
     assert!(
-        wait_for_invocation(&backend, &Invocation::Cancel).await,
+        frames.iter().any(|f| f["type"] == "prompt_done"),
         "the loop is not held behind the model change"
     );
 
@@ -1753,10 +1806,11 @@ async fn an_attach_and_detach_inside_one_wake_leave_the_grace_window_whole() {
 
 #[tokio::test]
 async fn a_cancel_with_no_turn_open_leaves_the_next_turn_untouched() {
-    // The trait's obligation (src/backend.rs): a cancel with no turn open
-    // is a no-op. The scripted Backend used to store a release anyway,
-    // which the next `Pending` turn consumed at once, so a test could
-    // pass for the wrong reason. Requirement 5 criterion 5.
+    // A cancel with no turn in flight is dropped by the hub and never
+    // reaches the Backend: delivered late, it would cancel whatever turn a
+    // peer starts next. The scripted Backend used to store a release
+    // anyway, which the next `Pending` turn consumed at once, so a test
+    // could pass for the wrong reason. Requirement 5 criterion 5.
     let registry = HubRegistry::new();
     let backend = Arc::new(ScriptedBackend::with_turn(ScriptedTurn::pending(vec![
         agent_append("working"),
@@ -1770,7 +1824,12 @@ async fn a_cancel_with_no_turn_open_leaves_the_next_turn_untouched() {
         .send(HubCommand::Cancel)
         .await
         .expect("send Cancel");
-    assert!(wait_for_invocation(&backend, &Invocation::Cancel).await);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        backend.count_of(&Invocation::Cancel),
+        0,
+        "a cancel with nothing to cancel is dropped at the hub"
+    );
 
     attached
         .commands

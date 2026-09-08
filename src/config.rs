@@ -138,8 +138,26 @@ impl BedrockConfig {
         if self.model.trim().is_empty() {
             bail!("`bedrock.model` must name a model id, in {at}");
         }
+        if self.model != self.model.trim() {
+            bail!("`bedrock.model` has leading or trailing whitespace, in {at}");
+        }
         if self.models.iter().any(|m| m.trim().is_empty()) {
             bail!("`bedrock.models` holds an empty entry, in {at}");
+        }
+        if let Some(padded) = self.models.iter().find(|m| m.as_str() != m.trim()) {
+            bail!("`bedrock.models` entry `{padded}` has leading or trailing whitespace, in {at}");
+        }
+        // An empty region or profile is not the AWS default: the SDK takes
+        // it literally and every request fails. Removing the key is the
+        // way to the default.
+        if self.region.as_deref().is_some_and(|r| r.trim().is_empty()) {
+            bail!("`bedrock.region` is empty; remove the key to use the AWS default, in {at}");
+        }
+        if self.profile.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            bail!(
+                "`bedrock.profile` is empty; remove the key to use the default credential chain, \
+                 in {at}"
+            );
         }
         let configured = match &self.thinking {
             Some(text) => Some(
@@ -294,6 +312,27 @@ pub fn read_config_from(path: &Path) -> Result<Config> {
     serde_json::from_str(&raw).with_context(|| format!("Parsing config.json at {}", path.display()))
 }
 
+/// What `init` starts from: the configuration on disk, `None` when there
+/// is no file, and an error when there is a file that cannot be read or
+/// parsed. A broken file is never taken for an absent one: `init` would
+/// otherwise write a fresh file over it and drop the hosts and the
+/// `bedrock` section it held, with nothing said.
+pub fn read_existing_config() -> Result<Option<Config>> {
+    let path = config_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Reading {}", path.display())),
+    };
+    let config: Config = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "{} exists but does not parse; fix it, or delete it and run `mezame init` again",
+            path.display()
+        )
+    })?;
+    Ok(Some(config))
+}
+
 /// Create `dir` and any missing parent, owner-only (`0700`) on Unix.
 ///
 /// An existing directory is left as it is, mode included: a directory a
@@ -390,7 +429,7 @@ pub fn write_private_atomic(target: &Path, data: &[u8], durable: bool) -> io::Re
 /// `mezame init` with no arguments: ask for the bind address and the
 /// Bedrock settings, then write the config.
 pub(crate) fn init_config() -> Result<Config> {
-    let existing = read_config().ok();
+    let existing = read_existing_config()?;
     let bind = prompt_bind()?;
     let bedrock = prompt_bedrock(existing.as_ref().and_then(|c| c.bedrock.clone()))?;
     write_config(&assemble(existing.as_ref(), bind, bedrock), false)
@@ -508,7 +547,7 @@ fn non_empty(flag: &str, value: &str) -> Result<String> {
 /// `--profile` with no model anywhere is refused: there is nothing to
 /// attach them to.
 pub(crate) fn init_config_with_args(args: &InitArgs) -> Result<Config> {
-    let existing = read_config().ok();
+    let existing = read_existing_config()?;
     let bind = match &args.bind {
         Some(addr) => {
             validate_bind_entry(addr).map_err(|message| anyhow!(message))?;

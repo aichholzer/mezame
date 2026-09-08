@@ -22,7 +22,7 @@ use std::time::Duration;
 use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_config::{BehaviorVersion, Region};
-use aws_sdk_bedrockruntime::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_bedrockruntime::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamInputBuilder;
 use aws_sdk_bedrockruntime::operation::converse_stream::{
     ConverseStreamError, ConverseStreamInput,
@@ -249,6 +249,10 @@ pub fn map_stop_reason(reason: &BedrockStopReason) -> StopReason {
         BedrockStopReason::ContentFiltered | BedrockStopReason::GuardrailIntervened => {
             StopReason::ContentFiltered
         }
+        // Anthropic's classifier decline. The SDK enum does not name it
+        // yet; matched by its string so the loop's refusal rule reaches
+        // it the day Bedrock forwards it.
+        other if other.as_str() == "refusal" => StopReason::Refusal,
         other => StopReason::Other(other.as_str().to_string()),
     }
 }
@@ -379,8 +383,41 @@ pub struct Classified {
     pub retryable: bool,
     /// The service refused the request for its content.
     pub rejected: bool,
+    /// The service could not read the reasoning blocks the request
+    /// replayed; the loop drops them and retries once.
+    pub stale_reasoning: bool,
     /// The text shown.
     pub text: String,
+}
+
+/// The error codes of a signature or token failure at AWS's front door.
+/// Their messages can echo the canonical request, `x-amz-security-token`
+/// included, so none of them is ever relayed.
+const CREDENTIAL_ERROR_CODES: &[&str] = &[
+    "InvalidSignatureException",
+    "SignatureDoesNotMatch",
+    "IncompleteSignature",
+    "IncompleteSignatureException",
+    "UnrecognizedClientException",
+    "ExpiredTokenException",
+    "ExpiredToken",
+    "InvalidClientTokenId",
+    "AuthFailure",
+];
+
+/// What a browser is told when AWS refused the credentials themselves.
+pub const CREDENTIALS_REFUSED_ERROR: &str = "AWS refused the credentials: check     `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, or the     active profile, and that the session token has not expired.";
+
+/// What a browser is told when the replayed reasoning could not be read
+/// and the retry without it failed too.
+pub const STALE_REASONING_ERROR: &str = "The model could not read the reasoning     recorded earlier in this conversation. It was dropped; send the message again.";
+
+/// The first line of a service message. AWS appends diagnostics after a
+/// blank line on some errors, and a signature failure's diagnostics carry
+/// the canonical request, so only the first line ever reaches a browser or
+/// a log.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
 }
 
 /// Classify a service error by its variant and message.
@@ -391,69 +428,105 @@ where
     let message = err
         .service_message()
         .or_else(|| err.message())
-        .map(str::to_string);
+        .map(|m| first_line(m).to_string());
     let fallback = || {
         message
             .clone()
+            .filter(|m| !m.is_empty())
             .or_else(|| err.code().map(str::to_string))
             .unwrap_or_else(|| chain_text(err))
     };
+    let plain = |retryable: bool, rejected: bool, text: String| Classified {
+        retryable,
+        rejected,
+        stale_reasoning: false,
+        text,
+    };
+    // A signature or token failure arrives as an unmodelled error whose
+    // message is never shown: it can echo the request AWS signed, token
+    // included.
+    if err
+        .code()
+        .is_some_and(|code| CREDENTIAL_ERROR_CODES.contains(&code))
+    {
+        return plain(false, false, CREDENTIALS_REFUSED_ERROR.to_string());
+    }
     let lower = message.as_deref().map(str::to_ascii_lowercase);
     let names_throughput = lower
         .as_deref()
         .is_some_and(|m| m.contains("on-demand throughput"));
-    // The service refusing the whole request as too long is the history,
-    // not the new message: marking the new exchange rejected would leave
-    // the oversized prefix in place and fail every later turn the same way.
+    // The request as a whole does not fit the model. Whether the history
+    // or the new message is to blame, keeping the message helps nothing in
+    // a phase with no compaction: the history case fails the next turn
+    // either way, and the new-message case recovers only if the message
+    // leaves later requests. So it is a rejection.
     let too_long = lower
         .as_deref()
         .is_some_and(|m| m.contains("too long") || m.contains("context window"));
+    // The replayed reasoning no longer matches the conversation the model
+    // sees: a prefix the signatures are bound to has changed, or the
+    // account enforces the binding across a model switch.
+    let stale_reasoning = lower.as_deref().is_some_and(|m| {
+        m.contains("signature") && (m.contains("thinking") || m.contains("reasoning"))
+    });
     match err.service_kind() {
-        ServiceKind::AccessDenied => Classified {
-            retryable: false,
-            rejected: false,
-            text: format!(
+        ServiceKind::AccessDenied => plain(
+            false,
+            false,
+            format!(
                 "Bedrock refused the request: check that model access is enabled for `{model}` in \
                  this region and that the credentials may call \
                  `bedrock:InvokeModelWithResponseStream`."
             ),
-        },
-        ServiceKind::Validation | ServiceKind::ResourceNotFound if names_throughput => Classified {
-            retryable: false,
-            rejected: false,
-            text: format!(
+        ),
+        ServiceKind::Validation | ServiceKind::ResourceNotFound if names_throughput => plain(
+            false,
+            false,
+            format!(
                 "`{model}` needs an inference profile id here: try `global.{model}` or a geo \
                  prefix such as `us.`."
             ),
-        },
-        ServiceKind::Validation if too_long => Classified {
+        ),
+        ServiceKind::Validation if too_long => plain(false, true, CONTEXT_WINDOW_ERROR.to_string()),
+        ServiceKind::Validation if stale_reasoning => Classified {
             retryable: false,
             rejected: false,
-            text: CONTEXT_WINDOW_ERROR.to_string(),
+            stale_reasoning: true,
+            text: STALE_REASONING_ERROR.to_string(),
         },
-        ServiceKind::Validation => Classified {
-            retryable: false,
-            rejected: true,
-            text: format!(
+        ServiceKind::Validation => plain(
+            false,
+            true,
+            format!(
                 "Bedrock rejected the request: {}.",
                 fallback().trim_end_matches('.')
             ),
-        },
-        ServiceKind::Throttling => Classified {
-            retryable: true,
-            rejected: false,
-            text: format!("Bedrock is throttling requests for `{model}`; try again shortly."),
-        },
-        ServiceKind::Transient => Classified {
-            retryable: true,
-            rejected: false,
-            text: fallback(),
-        },
-        ServiceKind::ResourceNotFound | ServiceKind::Other => Classified {
-            retryable: false,
-            rejected: false,
-            text: fallback(),
-        },
+        ),
+        ServiceKind::Throttling => plain(
+            true,
+            false,
+            format!("Bedrock is throttling requests for `{model}`; try again shortly."),
+        ),
+        ServiceKind::Transient => plain(true, false, fallback()),
+        ServiceKind::ResourceNotFound | ServiceKind::Other => plain(false, false, fallback()),
+    }
+}
+
+/// The one line a failed call writes to stderr: the service's error code
+/// and the first line of its message for a service error, the cause chain
+/// for everything else. Never the SDK's debug rendering, which carries the
+/// whole response body and, on a signature failure, the signed request.
+pub fn describe_error<E, R>(err: &SdkError<E, R>) -> String
+where
+    E: StdError + 'static,
+    R: Debug,
+{
+    match err {
+        // The SDK renders a modelled error as its variant name and message
+        // and an unmodelled one as `unhandled error (<code>)` with no body;
+        // the first line of either is the record.
+        SdkError::ServiceError(service) => first_line(&service.err().to_string()).to_string(),
+        other => chain_text(other),
     }
 }
 
@@ -476,6 +549,7 @@ where
         SdkError::TimeoutError(_) => Classified {
             retryable: true,
             rejected: false,
+            stale_reasoning: false,
             text: format!("Could not reach Bedrock: {}.", chain_text(err)),
         },
         SdkError::DispatchFailure(dispatch) => {
@@ -485,6 +559,7 @@ where
                 return Classified {
                     retryable: true,
                     rejected: false,
+                    stale_reasoning: false,
                     text: format!("Could not reach Bedrock: {}.", chain_text(err)),
                 };
             }
@@ -504,12 +579,14 @@ where
             Classified {
                 retryable: false,
                 rejected: false,
+                stale_reasoning: false,
                 text,
             }
         }
         _ => Classified {
             retryable: false,
             rejected: false,
+            stale_reasoning: false,
             text: chain_text(err),
         },
     }
@@ -580,7 +657,7 @@ where
                         crate::hub::warn(&format!(
                             "Bedrock stream for {} failed: {}",
                             state.model,
-                            DisplayErrorContext(&err)
+                            describe_error(&err)
                         ));
                         state.pending.push_back(TurnEvent::Error {
                             retryable: classified.retryable,
@@ -677,11 +754,35 @@ pub fn vendor(model_id: &str) -> Option<&str> {
 
 /// Whether reasoning blocks this adapter recorded are replayed to
 /// `model_id`: yes unless the id names a vendor other than Anthropic, whose
-/// models refuse them. An id with no readable vendor, such as an
-/// application inference profile ARN, is taken to front the Anthropic
+/// models refuse them, or a Claude model from before extended thinking
+/// (the rule marks it `off`), whose API has no reasoning block type and
+/// refuses one as an unknown block. An id with no readable vendor, such as
+/// an application inference profile ARN, is taken to front the Anthropic
 /// model that produced the blocks, because only an Anthropic model does.
 pub fn replays_reasoning(model_id: &str) -> bool {
-    vendor(model_id).is_none_or(|v| v == "anthropic")
+    let anthropic = vendor(model_id).is_none_or(|v| v == "anthropic");
+    let predates_thinking =
+        parse_claude_id(model_id).is_some() && thinking_rule(model_id) == ThinkingMode::Off;
+    anthropic && !predates_thinking
+}
+
+/// The most output tokens `model_id` accepts in one reply, when the model
+/// is known to cap below the configured default: the Claude 3 line takes
+/// 4,096, its 3.5 Haiku and second 3.5 Sonnet 8,192. `None` for every
+/// other id, whose ceiling is above any default this configuration sends.
+pub fn max_output_ceiling(model_id: &str) -> Option<u32> {
+    let id = parse_claude_id(model_id)?;
+    if id.major != 3 {
+        return None;
+    }
+    match (id.minor, id.family.as_deref()) {
+        (Some(7), _) => None,
+        (Some(5), Some("haiku")) => Some(8192),
+        // The second 3.5 Sonnet (October 2024) takes 8,192; the first
+        // (June 2024) 4,096. The date is the only difference in the id.
+        (Some(5), Some("sonnet")) if model_id.contains("20241022") => Some(8192),
+        _ => Some(4096),
+    }
 }
 
 /// The `additionalModelRequestFields` document for a thinking mode, or
@@ -861,7 +962,10 @@ pub fn build_request(request: &ProviderRequest) -> ConverseStreamInputBuilder {
     for message in to_bedrock_messages(&request.messages, &request.model) {
         builder = builder.messages(message);
     }
-    let max_tokens = request.max_output_tokens.min(i32::MAX as u32) as i32;
+    // A model that caps replies below the configured ceiling would refuse
+    // the whole request; the ceiling is clamped to what it accepts.
+    let ceiling = max_output_ceiling(&request.model).unwrap_or(u32::MAX);
+    let max_tokens = request.max_output_tokens.min(ceiling).min(i32::MAX as u32) as i32;
     builder = builder.inference_config(
         InferenceConfiguration::builder()
             .max_tokens(max_tokens)
@@ -934,11 +1038,12 @@ impl Provider for BedrockProvider {
                     crate::hub::warn(&format!(
                         "Bedrock request for {} failed: {}",
                         request.model,
-                        DisplayErrorContext(&err)
+                        describe_error(&err)
                     ));
                     ProviderError::BeforeStream {
                         retryable: classified.retryable,
                         rejected: classified.rejected,
+                        stale_reasoning: classified.stale_reasoning,
                         message: classified.text,
                     }
                 })?;

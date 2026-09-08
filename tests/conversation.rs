@@ -320,3 +320,196 @@ fn the_entry_cap_evicts_whole_exchanges_and_never_the_newest() {
     assert_eq!(conversation.exchange_count(), 1);
     assert_eq!(conversation.history().len(), 7);
 }
+
+// ---------- review fixes, 2026-09-08 ----------
+
+fn thinking(text: &str) -> Block {
+    Block::Thinking {
+        text: text.to_string(),
+        signature: Some("sig".to_string()),
+        provider: "bedrock".to_string(),
+        model: "m".to_string(),
+    }
+}
+
+fn statuses(conversation: &Conversation) -> Vec<ExchangeStatus> {
+    conversation.exchanges().map(|e| e.status).collect()
+}
+
+#[test]
+fn a_rejection_covers_the_unanswered_run_before_it() {
+    // The request the service refused was the merge of every unanswered
+    // user message before the new one, so those exchanges are rejected
+    // with it; an exchange that got a reply, and everything before it,
+    // stays.
+    let mut c = Conversation::new();
+    c.begin(user(vec![text("a")]), entry("user", "a", 1));
+    c.complete(None, vec![]); // failed before any reply: closed, no assistant
+    c.begin(user(vec![text("b")]), entry("user", "b", 2));
+    c.complete(
+        Some(assistant(vec![text("B")])),
+        vec![entry("agent", "B", 3)],
+    );
+    c.begin(user(vec![text("c")]), entry("user", "c", 4));
+    c.complete(None, vec![]);
+    c.begin(user(vec![text("d")]), entry("user", "d", 5));
+    c.complete(None, vec![]);
+    c.begin(user(vec![text("e")]), entry("user", "e", 6));
+    assert!(c.reject_open(vec![]));
+    assert_eq!(
+        statuses(&c),
+        vec![
+            ExchangeStatus::Closed,
+            ExchangeStatus::Closed,
+            ExchangeStatus::Rejected,
+            ExchangeStatus::Rejected,
+            ExchangeStatus::Rejected,
+        ]
+    );
+    // The next request carries a, b and B: nothing the service refused.
+    assert_eq!(texts(&c), vec!["User:a", "User:b", "Assistant:B"]);
+    // The transcript keeps every entry.
+    assert_eq!(c.history().len(), 6);
+}
+
+#[test]
+fn strip_reasoning_drops_every_reasoning_block_and_keeps_the_text() {
+    let mut c = Conversation::new();
+    c.begin(user(vec![text("a")]), entry("user", "a", 1));
+    c.complete(
+        Some(assistant(vec![
+            thinking("think"),
+            Block::Opaque {
+                provider: "bedrock".into(),
+                model: "m".into(),
+                raw: serde_json::json!({ "redactedContent": "AQID" }),
+            },
+            text("A"),
+        ])),
+        vec![entry("thought", "think", 2), entry("agent", "A", 3)],
+    );
+    c.begin(user(vec![text("b")]), entry("user", "b", 4));
+    c.complete(
+        Some(assistant(vec![thinking("more"), text("B")])),
+        vec![entry("agent", "B", 5)],
+    );
+    let before = c.bytes();
+    assert_eq!(c.strip_reasoning(), 3);
+    assert!(
+        c.bytes() < before,
+        "the signatures and the opaque payload left the budget"
+    );
+    assert_eq!(
+        texts(&c),
+        vec!["User:a", "Assistant:A", "User:b", "Assistant:B"]
+    );
+    assert!(c
+        .messages()
+        .iter()
+        .all(|m| m.blocks.iter().all(|b| matches!(b, Block::Text { .. }))));
+    // The transcript still shows the thought.
+    assert_eq!(c.history().len(), 5);
+    assert_eq!(c.strip_reasoning(), 0, "nothing left to drop");
+}
+
+#[test]
+fn an_eviction_drops_the_reasoning_of_what_remains() {
+    // Removing an earlier turn changes the prefix every later reasoning
+    // block is bound to, so the eviction takes the reasoning with it and
+    // the next request replays none.
+    // Budget 80: the two exchanges hold 60 bytes (54 of text, 6 of
+    // signatures); the third question tips them over and the front one
+    // goes.
+    let mut c = Conversation::with_budget_for_test(80, 10_000);
+    c.begin(
+        user(vec![text("first question")]),
+        entry("user", "first question", 1),
+    );
+    c.complete(
+        Some(assistant(vec![thinking("t1"), text("first answer")])),
+        vec![entry("agent", "first answer", 2)],
+    );
+    c.begin(
+        user(vec![text("second question")]),
+        entry("user", "second question", 3),
+    );
+    c.complete(
+        Some(assistant(vec![thinking("t2"), text("second answer")])),
+        vec![entry("agent", "second answer", 4)],
+    );
+    assert_eq!(c.exchange_count(), 2, "both fit so far");
+    c.begin(
+        user(vec![text("a third question that tips the budget over")]),
+        entry("user", "a third question that tips the budget over", 5),
+    );
+    assert!(c.exchange_count() < 3, "the front exchange was evicted");
+    for message in c.messages() {
+        assert!(
+            message
+                .blocks
+                .iter()
+                .all(|b| !matches!(b, Block::Thinking { .. } | Block::Opaque { .. })),
+            "reasoning survived the eviction: {message:?}"
+        );
+    }
+    assert!(
+        texts(&c).iter().any(|t| t == "Assistant:second answer"),
+        "the text stays"
+    );
+}
+
+#[test]
+fn a_rejected_exchange_with_reply_entries_evicts_whole() {
+    // A rejected exchange that streamed a partial reply holds two entries;
+    // when the budget evicts it, both leave the transcript, or the two
+    // stores drift for the life of the session. Budget 64: the exchanges
+    // hold 16 bytes before the long question and 65 with it, so the front
+    // exchange (two entries) goes and 55 remain.
+    let mut c = Conversation::with_budget_for_test(64, 10_000);
+    c.begin(user(vec![text("bad")]), entry("user", "bad", 1));
+    assert!(c.reject_open(vec![entry("agent", "partial", 2)]));
+    c.begin(user(vec![text("ok")]), entry("user", "ok", 3));
+    c.complete(
+        Some(assistant(vec![text("fine")])),
+        vec![entry("agent", "fine", 4)],
+    );
+    let long = "a long enough question to evict the first exchange";
+    c.begin(user(vec![text(long)]), entry("user", long, 5));
+    assert_eq!(
+        history_texts(&c),
+        vec![
+            "user:ok".to_string(),
+            "agent:fine".to_string(),
+            format!("user:{long}")
+        ]
+    );
+    assert_eq!(c.exchange_count(), 2);
+    assert_eq!(
+        texts(&c),
+        vec![
+            "User:ok".to_string(),
+            "Assistant:fine".to_string(),
+            format!("User:{long}")
+        ]
+    );
+}
+
+#[test]
+fn an_image_with_no_data_is_refused_before_any_request() {
+    use mezame::conversation::{user_message_from_blocks, BlockError};
+    use serde_json::json;
+    for block in [
+        json!({ "type": "image", "mimeType": "image/png" }),
+        json!({ "type": "image", "mimeType": "image/png", "data": "" }),
+        json!({ "type": "image", "mimeType": "image/png", "data": null }),
+        json!({ "type": "resource", "resource": { "uri": "file:///x.pdf", "mimeType": "application/pdf", "blob": "" } }),
+    ] {
+        let err = user_message_from_blocks(std::slice::from_ref(&block)).unwrap_err();
+        match err {
+            BlockError::Unsupported { reason, .. } => {
+                assert!(reason.contains("holds no data"), "{block}: {reason}")
+            }
+            other => panic!("{block}: {other:?}"),
+        }
+    }
+}

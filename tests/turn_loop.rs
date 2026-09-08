@@ -932,3 +932,351 @@ async fn a_cancel_that_lands_before_the_turn_is_polled_cancels_that_turn() {
     result.unwrap();
     assert_eq!(provider.request_count(), 1);
 }
+
+// ---------- review fixes, 2026-09-08 ----------
+
+fn image(data: &str) -> Value {
+    json!({ "type": "image", "mimeType": "image/png", "data": data })
+}
+
+fn thinking_turn() -> ScriptedStream {
+    events(vec![
+        TurnEvent::MessageStart {
+            model: SONNET.into(),
+        },
+        TurnEvent::ThinkingStart { id: "0".into() },
+        TurnEvent::ThinkingDelta {
+            id: "0".into(),
+            text: "hmm".into(),
+        },
+        TurnEvent::ThinkingEnd {
+            id: "0".into(),
+            signature: Some("sig".into()),
+        },
+        TurnEvent::TextDelta("Hi".into()),
+        end_turn(),
+        usage(),
+    ])
+}
+
+#[tokio::test]
+async fn a_rejection_excludes_the_unanswered_run_merged_into_the_refused_request() {
+    // Turn 1 fails before any event for a transient reason: its message
+    // stays for the next request. Turn 2 is refused for its content: what
+    // the service saw was turns 1 and 2 merged, so both leave. Turn 3
+    // carries its own text alone.
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        ScriptedStream::BeforeStream {
+            retryable: true,
+            rejected: false,
+            message: "throttled".into(),
+        },
+        ScriptedStream::BeforeStream {
+            retryable: false,
+            rejected: true,
+            message: "Bedrock rejected the request: image too large.".into(),
+        },
+        events(vec![end_turn()]),
+    ]));
+    let backend = backend(&provider);
+    assert!(turn(&backend, text("one")).await.0.is_err());
+    assert!(turn(&backend, text("two")).await.0.is_err());
+    let (result, _) = turn(&backend, text("three")).await;
+    assert!(result.is_ok());
+    let requests = provider.requests();
+    assert_eq!(
+        requests[1].roles,
+        vec![Role::User, Role::User],
+        "the unanswered first message rode along and the builder merges the two"
+    );
+    assert_eq!(
+        requests[2].roles,
+        vec![Role::User],
+        "both refused messages are gone"
+    );
+    assert_eq!(
+        requests[2].messages[0].blocks,
+        vec![Block::Text {
+            text: "three".into()
+        }]
+    );
+    assert_eq!(
+        history_texts(&backend).await,
+        vec!["user:one", "user:two", "user:three"]
+    );
+}
+
+#[tokio::test]
+async fn a_too_long_rejection_leaves_the_message_out_of_later_requests() {
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        ScriptedStream::BeforeStream {
+            retryable: false,
+            rejected: true,
+            message: mezame::provider::CONTEXT_WINDOW_ERROR.into(),
+        },
+        events(vec![TurnEvent::TextDelta("ok".into()), end_turn()]),
+    ]));
+    let backend = backend(&provider);
+    let (result, _) = turn(&backend, text("a huge paste")).await;
+    assert!(result.unwrap_err().to_string().contains("context"));
+    let (result, _) = turn(&backend, text("hello")).await;
+    assert!(result.is_ok());
+    let requests = provider.requests();
+    assert_eq!(requests[1].messages.len(), 1);
+    assert_eq!(
+        requests[1].messages[0].blocks,
+        vec![Block::Text {
+            text: "hello".into()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn stale_reasoning_is_dropped_and_the_request_retried_once() {
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        thinking_turn(),
+        ScriptedStream::StaleReasoning,
+        events(vec![TurnEvent::TextDelta("ok".into()), end_turn()]),
+    ]));
+    let backend = backend(&provider);
+    assert!(turn(&backend, text("one")).await.0.is_ok());
+    let (result, frames) = turn(&backend, text("two")).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        frames,
+        vec![json!({ "type": "append", "role": "agent", "text": "ok" })]
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3, "the refused request was sent once more");
+    assert!(
+        requests[1].messages[1]
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. })),
+        "the first attempt replayed the reasoning"
+    );
+    assert!(
+        requests[2].messages[1]
+            .blocks
+            .iter()
+            .all(|b| !matches!(b, Block::Thinking { .. } | Block::Opaque { .. })),
+        "the retry carried none"
+    );
+    assert_eq!(
+        requests[2].messages[1].blocks,
+        vec![Block::Text { text: "Hi".into() }]
+    );
+    // The transcript keeps the thought the browser was shown.
+    assert_eq!(
+        history_texts(&backend).await,
+        vec![
+            "user:one",
+            "thought:hmm",
+            "agent:Hi",
+            "user:two",
+            "agent:ok"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_second_stale_refusal_is_reported_and_not_retried_again() {
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        thinking_turn(),
+        ScriptedStream::StaleReasoning,
+        ScriptedStream::StaleReasoning,
+        events(vec![end_turn()]),
+    ]));
+    let backend = backend(&provider);
+    assert!(turn(&backend, text("one")).await.0.is_ok());
+    let (result, _) = turn(&backend, text("two")).await;
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("Invalid `signature`"), "{message}");
+    assert_eq!(provider.request_count(), 3, "one retry, not two");
+    assert!(!backend.has_open_exchange_for_test());
+    // Not a rejection: the message rides into the next request beside
+    // the new one.
+    assert!(turn(&backend, text("three")).await.0.is_ok());
+    assert_eq!(
+        provider.requests()[3].roles,
+        vec![Role::User, Role::Assistant, Role::User, Role::User]
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_stop_followed_by_a_cancel_still_rejects_the_exchange() {
+    // The stop arrives, the counts do not yet, and the user clicks Stop.
+    // The stop reason decides: the exchange is rejected however the
+    // stream ended after it, so the refused content is never resent.
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        ScriptedStream::Pending {
+            first: vec![
+                TurnEvent::TextDelta("I cannot".into()),
+                TurnEvent::Stop(StopReason::Refusal),
+            ],
+        },
+        events(vec![end_turn()]),
+    ]));
+    let backend = Arc::new(backend(&provider));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let running = Arc::clone(&backend);
+    let handle = tokio::spawn(async move { running.prompt(text("bad"), tx).await });
+    // Both scripted events have been applied once the append is out.
+    let first = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first["type"], "append");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    backend.cancel().await;
+    let result = handle.await.unwrap();
+    assert!(
+        result.is_ok(),
+        "a cancel resolves without an error: {result:?}"
+    );
+    assert!(!backend.has_open_exchange_for_test());
+    assert!(turn(&backend, text("next")).await.0.is_ok());
+    let requests = provider.requests();
+    assert_eq!(requests[1].roles, vec![Role::User]);
+    assert_eq!(
+        requests[1].messages[0].blocks,
+        vec![Block::Text {
+            text: "next".into()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn the_system_prompt_is_byte_identical_across_the_turns_of_a_conversation() {
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        events(vec![TurnEvent::TextDelta("a".into()), end_turn()]),
+        events(vec![TurnEvent::TextDelta("b".into()), end_turn()]),
+    ]));
+    let backend = backend(&provider);
+    assert!(turn(&backend, text("one")).await.0.is_ok());
+    assert!(turn(&backend, text("two")).await.0.is_ok());
+    let requests = provider.requests();
+    assert_eq!(requests[0].system_static, requests[1].system_static);
+    assert_eq!(requests[0].date_line, requests[1].date_line);
+    assert!(requests[0].date_line.starts_with("Today's date is "));
+}
+
+#[tokio::test]
+async fn an_opaque_block_streams_no_frame_and_is_replayed_in_order() {
+    let raw = json!({ "redactedContent": "AQID" });
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        events(vec![
+            TurnEvent::MessageStart {
+                model: SONNET.into(),
+            },
+            TurnEvent::ThinkingStart { id: "0".into() },
+            TurnEvent::ThinkingDelta {
+                id: "0".into(),
+                text: "t".into(),
+            },
+            TurnEvent::ThinkingEnd {
+                id: "0".into(),
+                signature: Some("sig".into()),
+            },
+            TurnEvent::OpaqueBlock { raw: raw.clone() },
+            TurnEvent::TextDelta("Hi".into()),
+            end_turn(),
+            usage(),
+        ]),
+        events(vec![end_turn()]),
+    ]));
+    let backend = backend(&provider);
+    let (result, frames) = turn(&backend, text("q")).await;
+    assert!(result.is_ok());
+    assert_eq!(
+        frames,
+        vec![
+            json!({ "type": "thought", "text": "t" }),
+            json!({ "type": "append", "role": "agent", "text": "Hi" }),
+        ],
+        "the opaque block reaches no browser"
+    );
+    assert!(turn(&backend, text("again")).await.0.is_ok());
+    let blocks = &provider.requests()[1].messages[1].blocks;
+    assert_eq!(blocks.len(), 3);
+    assert!(matches!(&blocks[0], Block::Thinking { .. }));
+    assert_eq!(
+        blocks[1],
+        Block::Opaque {
+            provider: "bedrock".into(),
+            model: SONNET.into(),
+            raw
+        }
+    );
+    assert!(matches!(&blocks[2], Block::Text { text } if text == "Hi"));
+}
+
+#[tokio::test]
+async fn an_attachment_reaches_the_request_but_not_the_user_entry() {
+    let provider = Arc::new(ScriptedProvider::with_stream(events(vec![end_turn()])));
+    let backend = backend(&provider);
+    let blocks = vec![
+        json!({ "type": "text", "text": "summarise" }),
+        json!({ "type": "resource", "resource": { "uri": "file:///notes.txt", "mimeType": "text/plain", "text": "body" } }),
+    ];
+    assert!(turn(&backend, blocks).await.0.is_ok());
+    assert_eq!(history_texts(&backend).await, vec!["user:summarise"]);
+    let sent = &provider.requests()[0].messages[0].blocks;
+    assert_eq!(sent.len(), 2);
+    assert!(matches!(&sent[1], Block::Text { text } if text.contains("body")));
+}
+
+#[tokio::test]
+async fn the_limit_check_counts_an_earlier_unanswered_message() {
+    // Twelve images fail for a transient reason and stay for the next
+    // request; twelve more would make twenty-four in one merged message,
+    // over the limit of twenty. Refused locally: no request, nothing
+    // recorded.
+    let provider = Arc::new(ScriptedProvider::with_stream(
+        ScriptedStream::BeforeStream {
+            retryable: true,
+            rejected: false,
+            message: "throttled".into(),
+        },
+    ));
+    let backend = backend(&provider);
+    let twelve = |label: &str| {
+        let mut blocks = vec![json!({ "type": "text", "text": label })];
+        blocks.extend((0..12).map(|_| image("AQ==")));
+        blocks
+    };
+    assert!(turn(&backend, twelve("first")).await.0.is_err());
+    let (result, _) = turn(&backend, twelve("second")).await;
+    let message = result.unwrap_err().to_string();
+    assert!(message.to_lowercase().contains("limit"), "{message}");
+    assert_eq!(
+        provider.request_count(),
+        1,
+        "the second was refused before any request"
+    );
+    assert_eq!(history_texts(&backend).await, vec!["user:first"]);
+}
+
+#[test]
+fn the_idle_timeout_is_five_minutes() {
+    assert_eq!(mezame::turn::IDLE_TIMEOUT, Duration::from_secs(300));
+}
+
+#[tokio::test]
+async fn history_timestamps_never_decrease() {
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        thinking_turn(),
+        events(vec![TurnEvent::TextDelta("b".into()), end_turn()]),
+    ]));
+    let backend = backend(&provider);
+    assert!(turn(&backend, text("one")).await.0.is_ok());
+    assert!(turn(&backend, text("two")).await.0.is_ok());
+    let history = backend.history().await;
+    assert_eq!(history.len(), 5);
+    for pair in history.windows(2) {
+        assert!(pair[0].timestamp <= pair[1].timestamp, "{history:?}");
+    }
+    // A turn's entries share one stamp, at or after the user's.
+    assert_eq!(history[1].timestamp, history[2].timestamp);
+    assert!(history[0].timestamp <= history[1].timestamp);
+}

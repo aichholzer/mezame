@@ -66,7 +66,7 @@ use std::time::Duration;
 use anyhow::Result;
 use futures_util::FutureExt;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify, RwLock};
 use tokio::time::{Instant, Sleep};
 
 use crate::backend::{
@@ -903,6 +903,9 @@ async fn drive(state: HubLoopState) {
     let (model_done_tx, mut model_done_rx) = mpsc::unbounded_channel::<Result<Value>>();
     let mut model_change = ModelChange::default();
 
+    // See `CommandContext::turn_started`.
+    let mut turn_started: Option<watch::Receiver<bool>> = None;
+
     // When the current detached-but-busy hold began. `None` whenever a
     // browser is attached or no turn is running.
     let mut inflight_hold_since: Option<Instant> = None;
@@ -925,6 +928,7 @@ async fn drive(state: HubLoopState) {
                             outstanding: &outstanding,
                             model_change: &mut model_change,
                             model_done_tx: &model_done_tx,
+                            turn_started: &mut turn_started,
                         },
                         c,
                     ),
@@ -937,6 +941,7 @@ async fn drive(state: HubLoopState) {
             // echo can land in the gap and unlock a composer early.
             Some(TurnDone { result, guard }) = turn_done_rx.recv() => {
                 drop(guard);
+                turn_started = None;
                 // A permission the turn left unanswered has no turn to
                 // answer into now.
                 lock_outstanding(&outstanding).clear();
@@ -1125,12 +1130,16 @@ async fn run_turn(
     outstanding: Outstanding,
     guard: InflightGuard,
     done: mpsc::UnboundedSender<TurnDone>,
+    started: watch::Sender<bool>,
 ) {
     // `catch_unwind` turns a panicking turn into an outcome this task can
     // still report. Without it the task dies and every composer on the
     // session stays locked. It covers the polled future and nothing the
     // Backend spawns, which is what the trait's obligations say.
     let mut turn = Box::pin(AssertUnwindSafe(backend.prompt(blocks, events_tx)).catch_unwind());
+    // `prompt` has run: the Backend's cancel handle exists, and a cancel
+    // waiting on this may go through.
+    let _ = started.send(true);
     let mut drained = false;
     let result = loop {
         tokio::select! {
@@ -1233,6 +1242,11 @@ struct CommandContext<'a> {
     outstanding: &'a Outstanding,
     model_change: &'a mut ModelChange,
     model_done_tx: &'a mpsc::UnboundedSender<Result<Value>>,
+    /// Flips to `true` once the turn in flight has called the Backend's
+    /// `prompt`, which is when its cancel handle exists. `None` between
+    /// turns. A cancel waits on it so it reaches the turn it was aimed at
+    /// rather than a slot the turn task has not filled yet.
+    turn_started: &'a mut Option<watch::Receiver<bool>>,
 }
 
 /// Act on one browser command. Synchronous: nothing here waits on the
@@ -1272,6 +1286,8 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
             };
             let _ = ctx.outbound.send(Arc::new(user_echo_event(&blocks)));
             let (events_tx, events_rx) = mpsc::unbounded_channel::<Value>();
+            let (started_tx, started_rx) = watch::channel(false);
+            *ctx.turn_started = Some(started_rx);
             tokio::spawn(run_turn(
                 Arc::clone(ctx.backend),
                 blocks,
@@ -1282,6 +1298,7 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
                 Arc::clone(ctx.outstanding),
                 guard,
                 ctx.turn_done_tx.clone(),
+                started_tx,
             ));
         }
         HubCommand::PermissionResponse { id, option_id } => {
@@ -1304,10 +1321,27 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) {
             });
         }
         HubCommand::Cancel => {
-            // Spawned, so a slow Backend cannot stall the command inbox
-            // and the grace arm behind one call.
+            // A cancel with no turn in flight is dropped here: delivered,
+            // it would reach whatever turn a peer starts next. One that
+            // has a turn to reach waits until that turn has installed its
+            // handle, since the turn task and this one are spawned with no
+            // order between them. Spawned, so a slow Backend cannot stall
+            // the command inbox and the grace arm behind one call.
+            if ctx.inflight.load(Ordering::SeqCst) == 0 {
+                warn(&format!(
+                    "Session {}: cancel dropped, no turn is in flight",
+                    ctx.session_id
+                ));
+                return;
+            }
             let backend = Arc::clone(ctx.backend);
+            let started = ctx.turn_started.clone();
             tokio::spawn(async move {
+                if let Some(mut started) = started {
+                    // `Err` means the turn task is gone before it called
+                    // `prompt`; cancelling then finds nothing, harmlessly.
+                    let _ = started.wait_for(|ready| *ready).await;
+                }
                 backend.cancel().await;
             });
         }

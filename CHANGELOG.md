@@ -43,9 +43,31 @@ what changed; none of them describes a path from the old state.
   figures in the tooltip. A reload shows none: `/history` carries no
   usage in this alpha.
 - The loop refuses a request that would overflow the model's context
-  with a clear message instead of a failed turn, drops an exchange the
-  model refused or filtered so it never poisons the next turn, times a
-  stalled stream out after five minutes, and answers a cancel at once.
+  with a clear message and leaves that message out of later requests,
+  drops an exchange the model refused or filtered (and every unanswered
+  message that was merged into the refused request) so it never poisons
+  the next turn, times a stalled stream out after five minutes, and
+  answers a cancel at once. A cancel that arrives with no turn running is
+  dropped rather than held for the next turn.
+- The system prompt is frozen for the life of a conversation, so the
+  reasoning blocks a Claude 5 model signs against it stay valid; when the
+  model refuses replayed reasoning all the same (an evicted turn, a model
+  switch on an enforcing account), the reasoning is dropped and the
+  request retried once, and nothing is replayed to a Claude 3 model, whose
+  API has no reasoning block. Replies are capped at what the model
+  accepts (8,192 or 4,096 tokens on the Claude 3 line) whatever
+  `max_output_tokens` says.
+- AWS signature and token failures are reported with a fixed message;
+  their own text can quote the signed request, session token included,
+  and is never relayed or logged. Every other service message reaches the
+  browser and the log as its first line only.
+- A browser that joins or rejoins a session while a turn is running
+  rebuilds its log from the transcript when that turn ends, so it shows
+  the whole answer rather than the part it saw streamed.
+- `mezame init` over a `config.json` it cannot parse refuses and leaves
+  the file alone instead of writing a fresh one over the hosts and the
+  `bedrock` section it held; a blank `region` or `profile`, or a model id
+  with surrounding whitespace, is refused at load with the key named.
 
 - The container passes `AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`,
   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and

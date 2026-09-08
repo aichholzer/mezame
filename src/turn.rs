@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::backend::{extract_user_text, now_ms, Backend, EntryBody, HistoryEntry, TurnOutcome};
 use crate::conversation::{self, Block, Conversation, Message, Role};
-use crate::prompt::{assemble, preamble, today_utc};
+use crate::prompt::{assemble, preamble, today_utc, SystemPrompt};
 use crate::provider::bedrock::{thinking_rule, PROVIDER_NAME};
 use crate::provider::{
     LoopSettings, Provider, ProviderError, ProviderRequest, StopReason, ThinkingMode, TurnEvent,
@@ -125,6 +125,13 @@ struct State {
     conversation: Conversation,
     model: String,
     thinking: ThinkingMode,
+    /// The system prompt every request of this conversation carries,
+    /// assembled when the conversation is empty and frozen after that. A
+    /// reasoning block's signature is bound to the system prompt it was
+    /// produced under, so the date line may change between conversations
+    /// and never within one; the frozen text is also what keeps the
+    /// system cache point warm.
+    system: Option<SystemPrompt>,
     /// Set by `shutdown`: a later `prompt` resolves at once and a turn
     /// resolving afterwards persists nothing.
     closed: bool,
@@ -162,6 +169,7 @@ impl LoopBackend {
                 conversation: Conversation::new(),
                 model: settings.model.clone(),
                 thinking,
+                system: None,
                 closed: false,
             }),
             turn: Mutex::new(None),
@@ -232,13 +240,18 @@ impl LoopBackend {
         }
 
         // 2. Record the user side, then snapshot what the request needs.
-        let (messages, model, thinking) = {
+        let (messages, system, model, thinking) = {
             let mut state = lock(&self.state);
             if state.closed {
                 return Err(anyhow!(CLOSED_ERROR));
             }
             let text = extract_user_text(&blocks).unwrap_or_default();
             let timestamp = clamped_now(&state.conversation);
+            // A fresh conversation takes today's prompt; a running one
+            // keeps the prompt it started under.
+            if state.conversation.exchange_count() == 0 || state.system.is_none() {
+                state.system = Some(assemble(&[preamble()], today_utc()));
+            }
             state.conversation.begin(
                 user,
                 HistoryEntry {
@@ -248,29 +261,51 @@ impl LoopBackend {
             );
             let messages: Vec<Message> =
                 state.conversation.messages().into_iter().cloned().collect();
-            (messages, state.model.clone(), state.thinking)
+            let system = state.system.clone().expect("set above");
+            (messages, system, state.model.clone(), state.thinking)
         };
 
         // 3. Open the stream, under the cancel handle: the SDK's retries
-        //    could otherwise run for minutes with the composer locked.
-        let request = ProviderRequest {
+        //    could otherwise run for minutes with the composer locked. A
+        //    request refused for the reasoning it replayed is sent once
+        //    more without any reasoning: the recovery the provider allows.
+        let mut request = ProviderRequest {
             model: model.clone(),
-            system: assemble(&[preamble()], today_utc()),
+            system,
             messages,
             thinking,
             thinking_budget: self.settings.thinking_budget,
             max_output_tokens: self.settings.max_output_tokens,
         };
         let mut accumulator = Accumulator::new(&model);
-        let stream = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return self.finish(Ended::Cancelled, accumulator, &events, &model, started);
-            }
-            opened = self.provider.stream(request) => match opened {
-                Ok(stream) => stream,
-                Err(error) => {
-                    return self.finish(Ended::BeforeStream(error), accumulator, &events, &model, started);
+        let mut retried = false;
+        let stream = loop {
+            let attempt = request.clone();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return self.finish(Ended::Cancelled, accumulator, &events, &model, started);
+                }
+                opened = self.provider.stream(attempt) => match opened {
+                    Ok(stream) => break stream,
+                    Err(error) if error.is_stale_reasoning() && !retried => {
+                        retried = true;
+                        let dropped = {
+                            let mut state = lock(&self.state);
+                            let dropped = state.conversation.strip_reasoning();
+                            request.messages =
+                                state.conversation.messages().into_iter().cloned().collect();
+                            dropped
+                        };
+                        crate::hub::log(&format!(
+                            "turn session={} model={model} dropped {dropped} reasoning block(s) the \
+                             model could not read and retried the request",
+                            self.session_id
+                        ));
+                    }
+                    Err(error) => {
+                        return self.finish(Ended::BeforeStream(error), accumulator, &events, &model, started);
+                    }
                 }
             }
         };
@@ -347,13 +382,12 @@ impl LoopBackend {
                     // A reply the model refused or the service filtered is
                     // content the next request must not carry again: the
                     // exchange is rejected, its entries kept for the
-                    // transcript. Everything else closes the exchange.
+                    // transcript, however the stream ended after the stop
+                    // (a cancel or a stall before the counts arrive
+                    // included). Everything else closes the exchange.
                     let refused = matches!(
-                        (&ended, &stop),
-                        (
-                            Ended::Complete,
-                            Some(StopReason::Refusal) | Some(StopReason::ContentFiltered)
-                        )
+                        &stop,
+                        Some(StopReason::Refusal) | Some(StopReason::ContentFiltered)
                     );
                     if refused {
                         state.conversation.reject_open(entries);

@@ -549,15 +549,18 @@ fn service_rows_are_keyed_on_the_variant_not_on_metadata() {
         Classified {
             retryable: false,
             rejected: true,
+            stale_reasoning: false,
             text:
                 "Bedrock rejected the request: The text field in the ContentBlock object is blank."
                     .into()
         }
     );
 
-    // The service refusing the request as too long is the history, not
-    // the new message: not a rejection, and the browser gets the
-    // context-window advice.
+    // The service refusing the request as too long is a rejection: the
+    // message that overflowed leaves later requests (the only recovery
+    // when the new message is the cause; when the history is, the next
+    // turn fails either way), and the browser gets the context-window
+    // advice.
     let too_long = classify_service(
         &ConverseStreamError::ValidationException(
             ValidationException::builder()
@@ -570,7 +573,8 @@ fn service_rows_are_keyed_on_the_variant_not_on_metadata() {
         too_long,
         Classified {
             retryable: false,
-            rejected: false,
+            rejected: true,
+            stale_reasoning: false,
             text: mezame::provider::CONTEXT_WINDOW_ERROR.into()
         }
     );
@@ -616,6 +620,7 @@ fn service_rows_are_keyed_on_the_variant_not_on_metadata() {
         Classified {
             retryable: false,
             rejected: false,
+            stale_reasoning: false,
             text: "no such model".into()
         }
     );
@@ -1378,6 +1383,7 @@ fn a_provider_error_displays_its_message_and_carries_the_rejection_flag() {
     let rejected = ProviderError::BeforeStream {
         retryable: false,
         rejected: true,
+        stale_reasoning: false,
         message: "Bedrock rejected the request: blank text.".into(),
     };
     assert_eq!(
@@ -1389,9 +1395,18 @@ fn a_provider_error_displays_its_message_and_carries_the_rejection_flag() {
     let throttled = ProviderError::BeforeStream {
         retryable: true,
         rejected: false,
+        stale_reasoning: false,
         message: "throttled".into(),
     };
     assert!(!throttled.is_rejected());
+    assert!(!throttled.is_stale_reasoning());
+    let stale = ProviderError::BeforeStream {
+        retryable: false,
+        rejected: false,
+        stale_reasoning: true,
+        message: "stale".into(),
+    };
+    assert!(stale.is_stale_reasoning() && !stale.is_rejected());
     assert!(std::error::Error::source(&throttled).is_none());
 }
 
@@ -1407,4 +1422,177 @@ fn thinking_modes_serialise_in_lowercase_and_refuse_anything_else() {
     }
     assert!(serde_json::from_str::<ThinkingMode>("\"Adaptive\"").is_err());
     assert!(serde_json::from_str::<ThinkingMode>("\"budget\"").is_err());
+}
+
+// ---------- review fixes, 2026-09-08 ----------
+
+#[test]
+fn a_refusal_stop_reason_is_mapped_by_name() {
+    // The SDK enum has no `refusal` variant yet; the string is matched so
+    // the loop's refusal rule reaches it the day Bedrock forwards it.
+    assert_eq!(
+        map_stop_reason(&BedrockStop::from("refusal")),
+        StopReason::Refusal
+    );
+    assert_eq!(
+        map_stop_reason(&BedrockStop::from("brand_new")),
+        StopReason::Other("brand_new".into())
+    );
+}
+
+#[test]
+fn a_signature_failure_is_never_relayed_and_messages_keep_their_first_line() {
+    use aws_sdk_bedrockruntime::error::ErrorMetadata;
+    use mezame::provider::bedrock::{describe_error, CREDENTIALS_REFUSED_ERROR};
+    let body = "The request signature we calculated does not match the signature you provided.\n\n\
+                The Canonical String for this request should have been\n\
+                'POST\n/model/x/converse-stream\n\nx-amz-security-token:SECRETTOKEN\n'";
+    let err = ConverseStreamError::generic(
+        ErrorMetadata::builder()
+            .code("InvalidSignatureException")
+            .message(body)
+            .build(),
+    );
+    let classified = classify_service(&err, MODEL);
+    assert_eq!(classified.text, CREDENTIALS_REFUSED_ERROR);
+    assert!(!classified.retryable && !classified.rejected && !classified.stale_reasoning);
+    // The stderr line carries the code and nothing of the body.
+    let sdk: SdkError<ConverseStreamError, ()> = SdkError::service_error(err, ());
+    let line = describe_error(&sdk);
+    assert!(line.contains("InvalidSignatureException"), "{line}");
+    assert!(!line.contains("SECRETTOKEN"), "{line}");
+
+    // Any other multi-line message is cut at its first line, in the
+    // browser text and in the log line alike.
+    let validation = ConverseStreamError::ValidationException(
+        ValidationException::builder()
+            .message("The text field is blank.\n\nDiagnostics: x-amz-security-token:SECRETTOKEN")
+            .build(),
+    );
+    let classified = classify_service(&validation, MODEL);
+    assert_eq!(
+        classified.text,
+        "Bedrock rejected the request: The text field is blank."
+    );
+    let sdk: SdkError<ConverseStreamError, ()> = SdkError::service_error(validation, ());
+    let line = describe_error(&sdk);
+    assert_eq!(line, "ValidationException: The text field is blank.");
+    for code in [
+        "SignatureDoesNotMatch",
+        "UnrecognizedClientException",
+        "ExpiredTokenException",
+        "InvalidClientTokenId",
+    ] {
+        let err = ConverseStreamError::generic(
+            ErrorMetadata::builder()
+                .code(code)
+                .message("x-amz-security-token:SECRETTOKEN")
+                .build(),
+        );
+        assert_eq!(
+            classify_service(&err, MODEL).text,
+            CREDENTIALS_REFUSED_ERROR,
+            "{code}"
+        );
+    }
+}
+
+#[test]
+fn stale_reasoning_is_classified_for_the_retry() {
+    use mezame::provider::bedrock::STALE_REASONING_ERROR;
+    let err = ConverseStreamError::ValidationException(
+        ValidationException::builder()
+            .message(
+                "messages.5.content.0: Invalid `signature` in `thinking` block. The block is \
+                 bound to a different conversation.",
+            )
+            .build(),
+    );
+    let classified = classify_service(&err, MODEL);
+    assert!(classified.stale_reasoning);
+    assert!(!classified.rejected && !classified.retryable);
+    assert_eq!(classified.text, STALE_REASONING_ERROR);
+    // Through the SDK error too.
+    let sdk: SdkError<ConverseStreamError, ()> = SdkError::service_error(err, ());
+    assert!(classify_error(&sdk, MODEL).stale_reasoning);
+    // The reasoning wording of the Converse API's own message.
+    let converse = ConverseStreamError::ValidationException(
+        ValidationException::builder()
+            .message("The reasoning content signature is invalid.")
+            .build(),
+    );
+    assert!(classify_service(&converse, MODEL).stale_reasoning);
+}
+
+#[test]
+fn reasoning_is_not_replayed_to_a_model_from_before_thinking() {
+    let messages = [
+        user(vec![text_block("a")]),
+        assistant(vec![thinking_block("t", Some("s")), text_block("b")]),
+        user(vec![text_block("c")]),
+    ];
+    for old in [
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "us.anthropic.claude-3-haiku-20240307-v1:0",
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    ] {
+        assert!(!replays_reasoning(old), "{old}");
+        let built = to_bedrock_messages(&messages, old);
+        assert_eq!(built[1].content().len(), 1, "{old}");
+        assert!(matches!(&built[1].content()[0], ContentBlock::Text(t) if t == "b"));
+    }
+    for thinking_model in [
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "global.anthropic.claude-sonnet-5",
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abcd1234",
+    ] {
+        assert!(replays_reasoning(thinking_model), "{thinking_model}");
+    }
+}
+
+#[test]
+fn the_output_ceiling_clamps_the_request_for_models_that_cap_below_the_default() {
+    use mezame::provider::bedrock::max_output_ceiling;
+    assert_eq!(
+        max_output_ceiling("anthropic.claude-3-5-haiku-20241022-v1:0"),
+        Some(8192)
+    );
+    assert_eq!(
+        max_output_ceiling("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+        Some(8192)
+    );
+    assert_eq!(
+        max_output_ceiling("anthropic.claude-3-5-sonnet-20240620-v1:0"),
+        Some(4096)
+    );
+    assert_eq!(
+        max_output_ceiling("anthropic.claude-3-haiku-20240307-v1:0"),
+        Some(4096)
+    );
+    assert_eq!(
+        max_output_ceiling("anthropic.claude-3-opus-20240229-v1:0"),
+        Some(4096)
+    );
+    assert_eq!(
+        max_output_ceiling("anthropic.claude-3-7-sonnet-20250219-v1:0"),
+        None
+    );
+    assert_eq!(max_output_ceiling(MODEL), None);
+    assert_eq!(max_output_ceiling("amazon.nova-pro-v1:0"), None);
+
+    let mut haiku = request(vec![user(vec![text_block("a")])]);
+    haiku.model = "anthropic.claude-3-5-haiku-20241022-v1:0".into();
+    haiku.thinking = ThinkingMode::Off;
+    let built = build_request(&haiku).build().unwrap();
+    assert_eq!(built.inference_config().unwrap().max_tokens(), Some(8192));
+    // A configured ceiling below the model's stands.
+    haiku.max_output_tokens = 1000;
+    let built = build_request(&haiku).build().unwrap();
+    assert_eq!(built.inference_config().unwrap().max_tokens(), Some(1000));
+    // A model with no known cap takes the configured value whole.
+    let built = build_request(&request(vec![user(vec![text_block("a")])]))
+        .build()
+        .unwrap();
+    assert_eq!(built.inference_config().unwrap().max_tokens(), Some(16384));
 }
