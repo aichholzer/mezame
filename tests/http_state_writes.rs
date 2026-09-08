@@ -15,7 +15,7 @@ use mezame::http::{build_router, AppState};
 use mezame::hub::HubRegistry;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 fn home_lock() -> &'static Mutex<()> {
@@ -28,9 +28,8 @@ fn set_home(p: &Path) {
 }
 
 fn state() -> Arc<AppState> {
-    let (state_changes, _) = broadcast::channel(8);
-    Arc::new(AppState {
-        config: Arc::new(Config {
+    AppState::for_test(
+        Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
                 hosts: vec![],
@@ -40,18 +39,29 @@ fn state() -> Arc<AppState> {
             public_url: None,
             models: vec![],
             bedrock: None,
-        }),
-        hubs: HubRegistry::new(),
-        state_changes,
-        shutdown: Arc::new(Notify::new()),
-    })
+        },
+        HubRegistry::new(),
+        8,
+    )
 }
 
-fn put(body: Value) -> Request<Body> {
+/// A write as a logged-in browser's own page sends it.
+fn put(cookie: &str, body: Value) -> Request<Body> {
     Request::put("/state")
+        .header(axum::http::header::COOKIE, cookie)
+        .header("sec-fetch-site", "same-origin")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
+}
+
+/// A state and the cookie of a user logged into it.
+async fn state_and_cookie() -> (Arc<AppState>, String) {
+    let app_state = state();
+    let cookie = app_state
+        .login_for_test("alice", "correct horse battery")
+        .await;
+    (app_state, cookie)
 }
 
 /// The temporary siblings left in `dir`, if any.
@@ -80,12 +90,13 @@ async fn concurrent_put_state_writers_all_get_204_and_leave_one_complete_file() 
     let pad = "x".repeat(8192);
 
     for round in 0..8u32 {
-        let app_state = state();
+        let (app_state, cookie) = state_and_cookie().await;
         let writes = (0..8u32).map(|writer| {
             let app = build_router(app_state.clone());
             let body = json!({ "round": round, "writer": writer, "pad": pad });
+            let cookie = cookie.clone();
             async move {
-                app.oneshot(put(body))
+                app.oneshot(put(&cookie, body))
                     .await
                     .expect("router did not respond")
                     .status()
@@ -119,8 +130,9 @@ async fn put_state_creates_a_private_directory_and_an_owner_only_file() {
     let tmp = TempDir::new().unwrap();
     set_home(tmp.path());
 
-    let status = build_router(state())
-        .oneshot(put(json!({ "sessions": [] })))
+    let (app_state, cookie) = state_and_cookie().await;
+    let status = build_router(app_state)
+        .oneshot(put(&cookie, json!({ "sessions": [] })))
         .await
         .expect("router did not respond")
         .status();
@@ -160,10 +172,10 @@ async fn a_failed_write_leaves_the_existing_file_alone_and_no_temp_behind() {
     std::fs::write(dir.join("state.json"), b"{\"kept\":true}").unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let app_state = state();
+    let (app_state, cookie) = state_and_cookie().await;
     let mut ticks = app_state.state_changes.subscribe();
     let status = build_router(app_state)
-        .oneshot(put(json!({ "sessions": [] })))
+        .oneshot(put(&cookie, json!({ "sessions": [] })))
         .await
         .expect("router did not respond")
         .status();

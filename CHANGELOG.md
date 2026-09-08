@@ -22,11 +22,33 @@ an earlier version and run `mezame init` again. Two files are new under
 The entries below say what changed; none of them describes a path from
 the old state.
 
+### Added
+
+- A login. A session cookie (`mezame_session`: `HttpOnly`, `SameSite=Lax`,
+  `Path=/`, 90 days, renewed on any response once under 30 remain, `Secure`
+  when the request arrived over HTTPS or `public_url` says so) carries it;
+  `POST /login` issues it, `POST /logout` clears it on that device only, and
+  `GET /me` says who holds it. Every other route answers 401 without it,
+  except the UI shell and its assets; a socket opened without one completes
+  its handshake and closes with code 4401, `login required`, because a
+  browser cannot read a refused upgrade's status. Passwords are stored as
+  argon2id hashes in the datastore; a wrong name and a wrong password are
+  one 401 that costs one verification either way; ten failed attempts on a
+  username in a minute answer 429 with `Retry-After`. A password change
+  ends every earlier cookie of that user. No command creates a user yet and
+  the browser has no login form yet; both arrive later in this alpha.
+
 ### Changed
 
 - `config.json` carries `"version": 2`. A file without a version, or with
   another one, is refused at startup with one line pointing at
   `mezame init`, which rewrites it at version 2 and keeps the hosts.
+- A write or a socket upgrade that carries no `Origin` is judged by
+  `Sec-Fetch-Site`: `same-origin` and `none` pass, `same-site` and
+  `cross-site` are refused, and a request carrying neither header is
+  refused with 403 and a line saying a script adds `Sec-Fetch-Site: none`.
+  Behind a proxy that rewrites `Host`, `Origin` is compared with
+  `X-Forwarded-Host` when present.
 
 ## [0.14.0-alpha.2] - 2026-09-07
 

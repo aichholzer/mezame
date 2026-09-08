@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use support::ScriptedBackend;
 use tempfile::TempDir;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 fn home_lock() -> &'static Mutex<()> {
@@ -41,9 +41,8 @@ fn dummy_state() -> Arc<AppState> {
 /// A state whose transport lists `hosts`, the public names a tunnel or
 /// proxy in front of Mezame carries.
 fn state_with_hosts(hosts: &[&str]) -> Arc<AppState> {
-    let (state_changes, _) = broadcast::channel(8);
-    Arc::new(AppState {
-        config: Arc::new(Config {
+    AppState::for_test(
+        Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
@@ -53,16 +52,33 @@ fn state_with_hosts(hosts: &[&str]) -> Arc<AppState> {
             public_url: None,
             models: vec![],
             bedrock: None,
-        }),
-        hubs: HubRegistry::new(),
-        state_changes,
-        shutdown: Arc::new(Notify::new()),
-    })
+        },
+        HubRegistry::new(),
+        8,
+    )
 }
 
-/// Send a single request through the router and return (status, body).
+/// What a logged-in browser's own page adds to a request: the cookie, and
+/// `Sec-Fetch-Site: same-origin` when the request says nothing else about
+/// where it came from (the guard refuses a write or an upgrade with neither
+/// `Origin` nor `Sec-Fetch-Site`).
+async fn as_browser(state: &AppState, mut req: Request<Body>) -> Request<Body> {
+    let cookie = state.login_for_test("alice", "correct horse battery").await;
+    req.headers_mut()
+        .insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+    if !req.headers().contains_key("origin") && !req.headers().contains_key("sec-fetch-site") {
+        req.headers_mut()
+            .insert("sec-fetch-site", "same-origin".parse().unwrap());
+    }
+    req
+}
+
+/// Send a single request through the router as a logged-in browser and
+/// return (status, body, headers).
 async fn run_request(req: Request<Body>) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
-    let app = build_router(dummy_state());
+    let state = dummy_state();
+    let req = as_browser(&state, req).await;
+    let app = build_router(state);
     let res = app.oneshot(req).await.expect("router did not respond");
     let status = res.status();
     let headers = res.headers().clone();
@@ -140,13 +156,14 @@ async fn put_state_fires_state_changed_broadcast() {
 
     let state = dummy_state();
     let mut rx = state.state_changes.subscribe();
-    let app = build_router(state);
 
     let payload = json!({ "sessions": [{ "id": "s1", "label": "1" }] });
     let req = Request::put("/state")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
+    let req = as_browser(&state, req).await;
+    let app = build_router(state);
     let res = app.oneshot(req).await.expect("router responded");
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
@@ -265,9 +282,8 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
         )
         .await;
 
-    let (state_changes, _) = broadcast::channel(8);
-    let state = Arc::new(AppState {
-        config: Arc::new(Config {
+    let state = AppState::for_test(
+        Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
                 hosts: vec![],
@@ -277,16 +293,17 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
             public_url: None,
             models: vec![],
             bedrock: None,
-        }),
+        },
         hubs,
-        state_changes,
-        shutdown: Arc::new(Notify::new()),
-    });
+        8,
+    );
+    let cookie = state.login_for_test("alice", "correct horse battery").await;
 
     let app = build_router(state);
     let res = app
         .oneshot(
             Request::get("/history?session=hist-session")
+                .header(axum::http::header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -508,6 +525,7 @@ async fn get_state_serves_an_empty_object_for_malformed_json() {
 
 /// Send one request through a router built on `state`.
 async fn run_on(state: Arc<AppState>, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let req = as_browser(&state, req).await;
     let res = build_router(state)
         .oneshot(req)
         .await
@@ -694,20 +712,41 @@ async fn a_read_over_get_carries_no_origin_check() {
 }
 
 #[tokio::test]
-async fn a_client_sending_neither_header_is_served() {
-    // Every other case in this file sends neither `Host` nor `Origin`,
-    // which no browser does: hyper refuses an HTTP/1.1 request without a
-    // `Host` before this layer runs, and a browser attaches `Origin` to
-    // every request the check covers. The two absences mean a client that
-    // is not a browser, and the checks are aimed at browsers.
+async fn a_write_carrying_neither_origin_nor_sec_fetch_site_is_refused() {
+    // Phase 0 let a request with no `Origin` through as a non-browser
+    // client. Behind a login every write is a browser's, and a browser
+    // sends `Origin` or `Sec-Fetch-Site` on every request the check covers;
+    // neither means a client that is not a browser, refused 403 ahead of
+    // the login layer (phase 2 Requirement 6 criterion 3). A script adds
+    // `Sec-Fetch-Site: none`.
     let _g = home_lock().lock().await;
     let tmp = TempDir::new().unwrap();
     set_home(tmp.path());
 
-    let req = Request::put("/state")
+    let state = dummy_state();
+    let cookie = state.login_for_test("alice", "correct horse battery").await;
+    let bare = Request::put("/state")
+        .header(axum::http::header::COOKIE, cookie.clone())
         .header("content-type", "application/json")
         .body(Body::from(r#"{"sessions":[]}"#))
         .unwrap();
-    let (status, _, _) = run_request(req).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    let res = build_router(state.clone()).oneshot(bare).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(res.into_body(), 4096).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("Sec-Fetch-Site"),
+        "the body names the way out"
+    );
+    // The same write with the script's marker goes through.
+    let marked = Request::put("/state")
+        .header(axum::http::header::COOKIE, cookie)
+        .header("sec-fetch-site", "none")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"sessions":[]}"#))
+        .unwrap();
+    let res = build_router(state).oneshot(marked).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // A plain GET is not covered: nothing beyond the cookie is needed.
+    let (status, _, _) = run_request(Request::get("/").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
 }

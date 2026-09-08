@@ -292,9 +292,19 @@ pub async fn guard_request(
     }
 
     if origin_is_checked(&req) {
+        // Behind a proxy that rewrites `Host` to the upstream, the public
+        // name the browser used is in `X-Forwarded-Host`; that is what the
+        // page's `Origin` will name.
+        let compared = req
+            .headers()
+            .get("x-forwarded-host")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or(authority);
         if let Some(origin) = req.headers().get(header::ORIGIN) {
             let origin = String::from_utf8_lossy(origin.as_bytes()).into_owned();
-            let authority = authority.unwrap_or_default();
+            let authority = compared.unwrap_or_default();
             if !policy.origin_allowed(&origin, &authority) {
                 let shown_origin = echo(&origin);
                 let shown_host = echo(&authority);
@@ -320,6 +330,41 @@ pub async fn guard_request(
                 )
                     .into_response();
             }
+        } else if let Some(site) = req.headers().get("sec-fetch-site") {
+            // A browser that sent no `Origin` still says where the request
+            // came from. `same-origin` and `none` (a typed address) pass;
+            // `same-site` and `cross-site` are another site's page.
+            let site = String::from_utf8_lossy(site.as_bytes())
+                .trim()
+                .to_ascii_lowercase();
+            if site != "same-origin" && site != "none" {
+                let shown = echo(&site);
+                policy.note(format!(
+                    "Refused a {} with Sec-Fetch-Site {shown:?}: a page on another site.",
+                    req.method()
+                ));
+                return (
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "Sec-Fetch-Site {shown:?} names a page on another site; only \
+                         same-origin requests may write or open a socket.\n"
+                    ),
+                )
+                    .into_response();
+            }
+        } else {
+            // Neither header: not a browser. Behind a login every write is a
+            // browser's; a script adds `Sec-Fetch-Site: none` or an Origin.
+            policy.note(format!(
+                "Refused a {} that carried neither Origin nor Sec-Fetch-Site.",
+                req.method()
+            ));
+            return (
+                StatusCode::FORBIDDEN,
+                "This request carries neither an Origin nor a Sec-Fetch-Site header. A browser \
+                 sends one; a script adds `Sec-Fetch-Site: none`.\n",
+            )
+                .into_response();
         }
     }
 

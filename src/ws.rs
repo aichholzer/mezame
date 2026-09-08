@@ -24,10 +24,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -168,7 +168,21 @@ pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
     Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<crate::http::AppState>>,
+    headers: HeaderMap,
 ) -> Response {
+    // The login first. A browser cannot read the status of a refused
+    // upgrade, so the handshake completes and the socket closes with a
+    // code the client can tell from a network drop.
+    if state.current_user(&headers).await.is_none() {
+        return ws.on_upgrade(|mut socket| async move {
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: LOGIN_REQUIRED_CLOSE,
+                    reason: "login required".into(),
+                })))
+                .await;
+        });
+    }
     let session_id = match decide_session(params.get("session").map(String::as_str)) {
         SessionDecision::Mint => new_session_id(),
         SessionDecision::Accept(id) => id,
@@ -198,6 +212,10 @@ pub(crate) async fn ws_upgrade(
             }
         })
 }
+
+/// The close code an upgrade with no valid cookie ends with; the client
+/// reads it as "log in again", not as a drop to retry.
+pub const LOGIN_REQUIRED_CLOSE: u16 = 4401;
 
 /// Serialise a JSON value into a WS text frame.
 fn text_msg(value: Value) -> Message {

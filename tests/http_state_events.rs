@@ -19,16 +19,14 @@ use futures_util::StreamExt;
 use mezame::config::{Config, TransportConfig};
 use mezame::http::{build_router, AppState};
 use mezame::hub::HubRegistry;
-use tokio::sync::{broadcast, Notify};
 use tokio::time::timeout;
 use tower::ServiceExt;
 
 /// `capacity` is the broadcast buffer. A small one makes a lagging
 /// receiver reachable without pushing thousands of messages.
 fn test_state(capacity: usize) -> Arc<AppState> {
-    let (state_changes, _) = broadcast::channel(capacity);
-    Arc::new(AppState {
-        config: Arc::new(Config {
+    AppState::for_test(
+        Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
                 hosts: vec![],
@@ -38,11 +36,10 @@ fn test_state(capacity: usize) -> Arc<AppState> {
             public_url: None,
             models: vec![],
             bedrock: None,
-        }),
-        hubs: HubRegistry::new(),
-        state_changes,
-        shutdown: Arc::new(Notify::new()),
-    })
+        },
+        HubRegistry::new(),
+        capacity,
+    )
 }
 
 /// Open the stream and hand back its body.
@@ -55,8 +52,12 @@ fn test_state(capacity: usize) -> Arc<AppState> {
 /// `Arc<AppState>` once this returns. That is load-bearing for
 /// `stream_ends_when_the_last_sender_is_dropped` below.
 async fn open_stream(state: Arc<AppState>) -> BodyDataStream {
+    let cookie = state.login_for_test("alice", "correct horse battery").await;
     let app = build_router(state);
-    let req = Request::get("/state/events").body(Body::empty()).unwrap();
+    let req = Request::get("/state/events")
+        .header(axum::http::header::COOKIE, cookie)
+        .body(Body::empty())
+        .unwrap();
     let res = app.oneshot(req).await.expect("router responded");
     assert_eq!(res.status(), StatusCode::OK);
     let ct = res

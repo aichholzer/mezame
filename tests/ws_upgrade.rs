@@ -25,7 +25,7 @@ use mezame::ws::MAX_WS_MESSAGE_BYTES;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, oneshot, Notify};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HOST, ORIGIN};
@@ -63,9 +63,8 @@ async fn serve_with_header_timeout(header_read_timeout: Duration) -> Server {
 
 /// The state every server here is built from.
 fn state_with_registry(hubs: HubRegistry) -> Arc<AppState> {
-    let (state_changes, _) = broadcast::channel(8);
-    Arc::new(AppState {
-        config: Arc::new(Config {
+    AppState::for_test(
+        Config {
             transports: vec![TransportConfig::Cloudflared {
                 bind: "127.0.0.1:0".to_string(),
                 hosts: vec![],
@@ -75,11 +74,18 @@ fn state_with_registry(hubs: HubRegistry) -> Arc<AppState> {
             public_url: None,
             models: vec![],
             bedrock: None,
-        }),
+        },
         hubs,
-        state_changes,
-        shutdown: Arc::new(Notify::new()),
-    })
+        8,
+    )
+}
+
+/// The cookie of a logged-in test user on `server`.
+async fn cookie_for(server: &Server) -> String {
+    server
+        .state
+        .login_for_test("alice", "correct horse battery")
+        .await
 }
 
 async fn serve_configured(hubs: HubRegistry, header_read_timeout: Duration) -> Server {
@@ -95,14 +101,57 @@ async fn serve_configured(hubs: HubRegistry, header_read_timeout: Duration) -> S
     Server { addr, state }
 }
 
-/// Connect to `path` as a browser would.
+/// Connect to `path` as a logged-in browser would.
 async fn connect(server: &Server, path: &str) -> Socket {
-    let url = format!("ws://{}{path}", server.addr);
-    let (socket, _response) = timeout(Duration::from_secs(5), connect_async(&url))
+    let cookie = cookie_for(server).await;
+    connect_as(server, path, Some(&cookie), None)
         .await
-        .expect("the handshake completes within 5s")
-        .expect("the handshake is accepted");
-    socket
+        .expect("the handshake is accepted")
+}
+
+/// A handshake attempt as a browser sends one: with `cookie` when given,
+/// with `extra` set, and with `Sec-Fetch-Site: none` unless the extra
+/// header already says where the request came from (tungstenite itself
+/// sends neither `Origin` nor `Sec-Fetch-Site`, which the guard refuses).
+/// The socket, or the HTTP status the server refused the handshake with.
+async fn connect_as(
+    server: &Server,
+    path: &str,
+    cookie: Option<&str>,
+    extra: Option<(tokio_tungstenite::tungstenite::http::HeaderName, &str)>,
+) -> Result<Socket, u16> {
+    use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN};
+    let url = format!("ws://{}{path}", server.addr);
+    let mut request = url.into_client_request().expect("a client request");
+    if let Some(cookie) = cookie {
+        request
+            .headers_mut()
+            .insert(COOKIE, cookie.parse().expect("a header value"));
+    }
+    let sec_fetch_site: tokio_tungstenite::tungstenite::http::HeaderName =
+        "sec-fetch-site".parse().unwrap();
+    let says_where = match &extra {
+        Some((name, value)) => {
+            request
+                .headers_mut()
+                .insert(name.clone(), value.parse().expect("a header value"));
+            *name == ORIGIN || *name == sec_fetch_site
+        }
+        None => false,
+    };
+    if !says_where {
+        request
+            .headers_mut()
+            .insert(sec_fetch_site, "none".parse().unwrap());
+    }
+    match timeout(Duration::from_secs(5), connect_async(request))
+        .await
+        .expect("the attempt settles within 5s")
+    {
+        Ok((socket, _response)) => Ok(socket),
+        Err(WsError::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("expected a socket or an HTTP refusal, got {other:?}"),
+    }
 }
 
 /// The next text frame on `socket` as JSON, within five seconds.
@@ -204,22 +253,21 @@ async fn an_upgrade_with_a_refused_session_parameter_is_rejected_before_the_hand
     // case are all refused ahead of the handshake, so no WebSocket exists,
     // `attach_or_create` never runs, and no hub is created for the request.
     let server = serve().await;
+    let cookie = cookie_for(&server).await;
     for refused in ["../x", "test", "FEDCBA9876543210FEDCBA9876543210"] {
-        let url = format!("ws://{}/ws?session={refused}", server.addr);
-        let outcome = timeout(Duration::from_secs(5), connect_async(&url))
-            .await
-            .expect("the attempt settles within 5s");
-
+        let outcome = connect_as(
+            &server,
+            &format!("/ws?session={refused}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
         match outcome {
             Ok(_) => panic!("the handshake for {refused:?} should have been refused"),
-            Err(WsError::Http(response)) => {
-                assert_eq!(
-                    response.status(),
-                    400,
-                    "a value Mezame binds no hub to is a bad request: {refused:?}"
-                );
-            }
-            Err(other) => panic!("expected an HTTP 400 for {refused:?}, got {other:?}"),
+            Err(status) => assert_eq!(
+                status, 400,
+                "a value Mezame binds no hub to is a bad request: {refused:?}"
+            ),
         }
 
         assert!(
@@ -338,28 +386,84 @@ async fn a_prompt_past_the_text_ceiling_is_answered_with_an_error_over_a_real_so
     assert_eq!(done["type"], "prompt_done");
 }
 
-/// A handshake attempt with `header` set to `value`, as a browser's own
-/// page or a hostile one would send it: the socket, or the HTTP status
-/// the server refused the handshake with.
+/// A logged-in handshake attempt with `header` set to `value`, as a
+/// browser's own page or a hostile one would send it: the socket, or the
+/// HTTP status the server refused the handshake with.
 async fn connect_with_header(
     server: &Server,
     path: &str,
     header: tokio_tungstenite::tungstenite::http::HeaderName,
     value: &str,
 ) -> Result<Socket, u16> {
-    let url = format!("ws://{}{path}", server.addr);
-    let mut request = url.into_client_request().expect("a client request");
-    request
-        .headers_mut()
-        .insert(header, value.parse().expect("a header value"));
-    match timeout(Duration::from_secs(5), connect_async(request))
-        .await
-        .expect("the attempt settles within 5s")
-    {
-        Ok((socket, _response)) => Ok(socket),
-        Err(WsError::Http(response)) => Err(response.status().as_u16()),
-        Err(other) => panic!("expected a socket or an HTTP refusal, got {other:?}"),
+    let cookie = cookie_for(server).await;
+    connect_as(server, path, Some(&cookie), Some((header, value))).await
+}
+
+/// The close frame a socket ends with, within five seconds.
+async fn next_close(socket: &mut Socket) -> (u16, String) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(Ok(message))) = timeout(Duration::from_secs(5), socket.next()).await else {
+            break;
+        };
+        if let Message::Close(Some(frame)) = message {
+            return (frame.code.into(), frame.reason.to_string());
+        }
     }
+    panic!("no close frame arrived");
+}
+
+#[tokio::test]
+async fn an_upgrade_with_no_cookie_completes_and_closes_4401() {
+    // Requirement 6 criterion 2: a browser cannot read the status of a
+    // refused upgrade, so the handshake completes and the socket closes
+    // with a code the client can tell from a network drop. No `ready`.
+    let server = serve().await;
+    let mut socket = connect_as(&server, "/ws", None, None)
+        .await
+        .expect("the handshake completes");
+    let (code, reason) = next_close(&mut socket).await;
+    assert_eq!(code, 4401);
+    assert_eq!(reason, "login required");
+}
+
+#[tokio::test]
+async fn an_upgrade_with_a_stale_or_forged_cookie_closes_4401() {
+    let server = serve().await;
+    // A cookie signed before the password changed: the epoch moved on.
+    let cookie = cookie_for(&server).await;
+    let user = server
+        .state
+        .store
+        .user_by_name("alice")
+        .await
+        .unwrap()
+        .expect("the test user");
+    server
+        .state
+        .store
+        .bump_session_epoch(&user.id)
+        .await
+        .unwrap();
+    let mut socket = connect_as(&server, "/ws", Some(&cookie), None)
+        .await
+        .expect("the handshake completes");
+    assert_eq!(next_close(&mut socket).await.0, 4401, "a stale epoch");
+    // A forged value.
+    let forged = format!(
+        "mezame_session={}.9999999999.0.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        user.id
+    );
+    let mut socket = connect_as(&server, "/ws", Some(&forged), None)
+        .await
+        .expect("the handshake completes");
+    assert_eq!(next_close(&mut socket).await.0, 4401, "a forged MAC");
+    // A fresh login works again.
+    let fresh = cookie_for(&server).await;
+    let mut socket = connect_as(&server, "/ws", Some(&fresh), None)
+        .await
+        .expect("accepted");
+    assert_eq!(next_text(&mut socket).await["type"], "ready");
 }
 
 #[tokio::test]
@@ -426,8 +530,17 @@ async fn an_upgrade_for_a_new_session_is_answered_503_before_the_handshake_when_
         .expect("a sessionId string")
         .to_string();
 
+    let cookie = cookie_for(&server).await;
     let url = format!("ws://{}/ws", server.addr);
-    match timeout(Duration::from_secs(5), connect_async(&url))
+    let mut request = url.into_client_request().expect("a client request");
+    request.headers_mut().insert(
+        tokio_tungstenite::tungstenite::http::header::COOKIE,
+        cookie.parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert("sec-fetch-site", "none".parse().unwrap());
+    match timeout(Duration::from_secs(5), connect_async(request))
         .await
         .expect("the attempt settles within 5s")
     {
@@ -503,8 +616,8 @@ async fn a_connection_that_sends_no_request_is_closed_after_the_header_read_time
 async fn an_idle_keep_alive_connection_is_closed_after_the_header_read_timeout() {
     // hyper re-arms the header timer for every request head on a kept-alive
     // connection, so the same timeout is the idle limit between requests.
-    // `/history` with an unknown id answers from memory and touches no
-    // file, so the case reads nothing under `HOME`.
+    // `/history` without a cookie is answered 401 by the login layer from
+    // memory and touches no file, so the case reads nothing under `HOME`.
     let server = serve_with_header_timeout(Duration::from_millis(200)).await;
     let mut stream = TcpStream::connect(server.addr)
         .await
@@ -520,7 +633,7 @@ async fn an_idle_keep_alive_connection_is_closed_after_the_header_read_timeout()
         .expect("the server must close an idle keep-alive connection");
     let text = String::from_utf8_lossy(&bytes);
     assert!(
-        text.starts_with("HTTP/1.1 200"),
+        text.starts_with("HTTP/1.1 401"),
         "the request was answered before the idle close, got {text:?}"
     );
     assert!(
@@ -576,7 +689,8 @@ async fn shutdown_closes_the_listener_and_serve_returns() {
         .await
         .expect("the request is answered within 2s")
         .expect("read the status line");
-    assert_eq!(&head, b"HTTP/1.1 200");
+    // 401: no cookie, answered from memory before the shutdown fires.
+    assert_eq!(&head, b"HTTP/1.1 401");
 
     shutdown_tx.send(()).expect("the serve task is waiting");
     let outcome = timeout(Duration::from_secs(2), serving)

@@ -1075,7 +1075,8 @@ Stated plainly, including the limits.
   `users.session_epoch` is bumped by a password change, by `mezame passwd`
   and by an admin "log out everywhere"; a cookie with a stale epoch is
   rejected. No login-session table, no purge job. Login rate limiting is a
-  per-username and per-peer fixed window in memory; argon2id at roughly
+  per-username fixed window in memory (a per-peer window is not built:
+  behind the tunnel every request shares one address); argon2id at roughly
   100 ms per attempt is most of the defence.
 - **Cross-site protection**: no CSRF tokens. All bodies are JSON, which axum's
   `Json` extractor already enforces, and one middleware rejects any non-GET

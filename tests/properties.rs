@@ -1492,3 +1492,74 @@ proptest! {
         }
     }
 }
+
+// ---------- phase 2: identity ----------
+
+fn cookie_key() -> [u8; 32] {
+    mezame::store::crypto::MasterKey::from_bytes_for_test([3u8; 32])
+        .keys()
+        .cookie
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: store-auth-persistence, Property 2: A cookie changed anywhere
+    // fails to verify. For any valid cookie and any single-byte change to
+    // its rendered value that keeps it ASCII, `verify` returns `None`.
+    #[test]
+    fn property_p2_a_cookie_changed_anywhere_fails_to_verify(
+        epoch in 0u64..1_000,
+        now in 1_000_000_000i64..2_000_000_000,
+        position in 0usize..200,
+        replacement in 0x21u8..0x7f,
+    ) {
+        let key = cookie_key();
+        let cookie = mezame::auth::Cookie::issue(
+            "0123456789abcdef0123456789abcdef",
+            epoch,
+            now,
+        );
+        let value = mezame::auth::sign(&cookie, &key);
+        prop_assert_eq!(mezame::auth::verify(&value, &key, now), Some(cookie));
+        let mut bytes = value.clone().into_bytes();
+        let at = position % bytes.len();
+        if bytes[at] == replacement {
+            return Ok(());
+        }
+        bytes[at] = replacement;
+        let altered = String::from_utf8(bytes).expect("ASCII stays UTF-8");
+        prop_assert_eq!(mezame::auth::verify(&altered, &key, now), None);
+    }
+
+    // Feature: store-auth-persistence, Property 3: The limiter admits ten.
+    // For any sequence of 1 to 40 attempts at increasing instants inside one
+    // window, the first ten pass and every later one is refused with a wait
+    // no longer than the time left in the window.
+    #[test]
+    fn property_p3_the_limiter_admits_ten(
+        offsets in proptest::collection::vec(0u64..59_000, 1..40),
+    ) {
+        let limiter = mezame::auth::RateLimiter::default();
+        let start = std::time::Instant::now();
+                let mut instants: Vec<u64> = offsets;
+        instants.sort_unstable();
+        // The window opens at the first attempt, not at the origin.
+        let opened = instants[0];
+        for (i, ms) in instants.iter().enumerate() {
+            let at = start + std::time::Duration::from_millis(*ms);
+            let outcome = limiter.check("u:alice", at);
+            if i < mezame::auth::LOGIN_LIMIT as usize {
+                prop_assert!(outcome.is_ok(), "attempt {i} at {ms} ms");
+            } else {
+                let left = outcome.expect_err("refused past ten");
+                let remaining = mezame::auth::LOGIN_WINDOW
+                    .saturating_sub(std::time::Duration::from_millis(*ms - opened));
+                prop_assert!(
+                    left <= remaining.max(std::time::Duration::from_secs(1)),
+                    "wait {left:?} past the window's {remaining:?}"
+                );
+            }
+        }
+    }
+}

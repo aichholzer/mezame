@@ -33,6 +33,7 @@
 //! The crate is exposed as a library so integration tests in `tests/` can
 //! import internals. The thin binary in `src/main.rs` calls `run()`.
 
+pub mod auth;
 pub mod backend;
 pub mod config;
 pub mod conversation;
@@ -48,7 +49,7 @@ pub mod ws;
 #[cfg(unix)]
 pub mod unix;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use std::sync::Arc;
 
@@ -60,6 +61,9 @@ use crate::http::run_cloudflared;
 use crate::hub::{HubRegistry, NewBackend};
 use crate::provider::bedrock::{build_client, BedrockProvider};
 use crate::provider::Provider;
+use crate::store::crypto::{KeyError, Keys, MasterKey};
+use crate::store::sqlite::SqliteStore;
+use crate::store::Store;
 use crate::turn::LoopBackend;
 
 /// Top-level CLI entry point. Synchronous because `init_config` reads
@@ -123,7 +127,15 @@ pub fn run() -> Result<()> {
             [one] => match one.clone() {
                 TransportConfig::Cloudflared { bind, .. } => {
                     let hubs = build_registry(cfg.bedrock.as_ref(), &path).await;
-                    run_cloudflared(cfg, bind, hubs).await
+                    let (store, keys) = open_store()?;
+                    let users = store.count_users().await.map_err(|e| anyhow!("{e}"))?;
+                    eprintln!(
+                        "Datastore: {} {} ({users} user{})",
+                        store.backend_name(),
+                        crate::config::datastore_path()?.display(),
+                        if users == 1 { "" } else { "s" }
+                    );
+                    run_cloudflared(cfg, bind, hubs, store, keys).await
                 }
             },
             _ => bail!(
@@ -132,6 +144,35 @@ pub fn run() -> Result<()> {
             ),
         }
     })
+}
+
+/// The master key and the datastore, in the order that keeps a restored
+/// database from being silently re-keyed: a datastore found without its
+/// key stops the start with the backup set named, since nothing sealed in
+/// it could be opened; with neither present both are created.
+fn open_store() -> Result<(Arc<dyn Store>, Keys)> {
+    let dir = crate::config::mezame_dir()?;
+    crate::config::ensure_private_dir(&dir)
+        .with_context(|| format!("Creating {}", dir.display()))?;
+    let datastore = crate::config::datastore_path()?;
+    let key_path = crate::config::master_key_path()?;
+    let key = if datastore.exists() {
+        MasterKey::load(&key_path).map_err(|e| match e {
+            KeyError::NotFound(_) => anyhow!(
+                "{} exists but {} does not: the datastore's credentials cannot be opened without \
+                 it. Restore ~/.mezame from its backup, or run `mezame init` to create a new key \
+                 and re-enter the Bedrock credential.",
+                datastore.display(),
+                key_path.display()
+            ),
+            other => anyhow!("{other}"),
+        })?
+    } else {
+        MasterKey::load_or_create(&key_path).map_err(|e| anyhow!("{e}"))?
+    };
+    let keys = key.keys();
+    let store = SqliteStore::open(&datastore, keys.clone()).map_err(|e| anyhow!("{e}"))?;
+    Ok((Arc::new(store), keys))
 }
 
 /// The registry every session is built from: hubs over Bedrock when the

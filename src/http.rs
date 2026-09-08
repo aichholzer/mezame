@@ -19,16 +19,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use axum::{
     body::Body,
-    extract::{Query, State},
-    http::{header, HeaderValue, StatusCode, Uri},
-    middleware,
+    extract::{rejection::JsonRejection, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::stream::Stream;
@@ -37,23 +38,39 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch, Notify};
 
+use crate::auth::{
+    self, clear_cookie_header, cookie_value, dummy_hash, set_cookie_header, sign, verify,
+    verify_password, AuthUser, Cookie, RateLimiter,
+};
 use crate::config::{ensure_private_dir, state_path, write_private_atomic, Config};
 use crate::guard::{guard_request, RequestPolicy};
 use crate::hub::{warn, HubRegistry};
+use crate::store::crypto::Keys;
+use crate::store::{Store, UserRow};
 use crate::ws::ws_upgrade;
 
-/// Shared state for the axum router. Bundles the static `Config` with
-/// the live `HubRegistry` so the WS handler can attach to existing
-/// hubs or create new ones for fresh sessions, plus a broadcast
-/// channel that fires whenever `state.json` is rewritten so connected
-/// browsers can re-sync their session list without a manual reload.
+/// Unix seconds, as the server sees them. A test installs its own.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Shared state for the axum router. Bundles the configuration with the
+/// live `HubRegistry` so the WS handler can attach to existing hubs or
+/// create new ones for fresh sessions, the store and the keys every
+/// identity check reads, plus a broadcast channel that fires whenever
+/// `state.json` is rewritten so connected browsers can re-sync their
+/// session list without a manual reload.
 pub struct AppState {
-    pub config: Arc<Config>,
+    /// Read per request; swappable so a later phase can reload it.
+    pub config: ArcSwap<Config>,
     pub hubs: HubRegistry,
+    pub store: Arc<dyn Store>,
+    pub keys: Keys,
+    pub limiter: RateLimiter,
+    pub clock: Clock,
     /// Tick channel: `put_state` fires `()` on every successful
     /// rename. Browsers subscribed to `/state/events` receive an
     /// SSE event and refetch `/state`. Receivers that lag behind
@@ -98,12 +115,22 @@ struct UiAssets;
 // checks in `guard_request`, compared in constant time, with a 401 that
 // echoes nothing and a UI that stops reconnecting on it.
 
-pub(crate) async fn run_cloudflared(cfg: Config, bind: String, hubs: HubRegistry) -> Result<()> {
+pub(crate) async fn run_cloudflared(
+    cfg: Config,
+    bind: String,
+    hubs: HubRegistry,
+    store: Arc<dyn Store>,
+    keys: Keys,
+) -> Result<()> {
     let (state_changes, _) = broadcast::channel(64);
     let shutdown = Arc::new(Notify::new());
     let state = Arc::new(AppState {
-        config: Arc::new(cfg),
+        config: ArcSwap::from_pointee(cfg),
         hubs,
+        store,
+        keys,
+        limiter: RateLimiter::default(),
+        clock: Arc::new(auth::now_unix),
         state_changes,
         shutdown: shutdown.clone(),
     });
@@ -277,21 +304,222 @@ pub fn enable_tcp_keepalive(listener: &TcpListener) {
 /// out from `run_cloudflared` so integration tests can drive it via
 /// `tower::ServiceExt::oneshot` without binding a TCP port.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // The one layer, outermost: every route and the fallback sit behind
-    // the `Host` allowlist and the `Origin` check. The policy is read
-    // from the config once, here.
-    let policy = Arc::new(RequestPolicy::from_config(&state.config));
-    Router::new()
+    // Two routers. The public one holds the UI shell and its assets, the
+    // login, `/me` (which answers 401 as data) and `/ws` (which completes
+    // the handshake and then closes 4401, since a browser cannot read the
+    // status of a refused upgrade). Everything else sits behind
+    // `require_user`. Outermost, the `Host` allowlist and the `Origin` /
+    // `Sec-Fetch-Site` check cover both; the policy is read from the
+    // config once, here.
+    let policy = Arc::new(RequestPolicy::from_config(&state.config.load()));
+    let public = Router::new()
         .route("/ws", get(ws_upgrade))
-        .route("/state", get(get_state).put(put_state))
-        .route("/state/events", get(state_events))
-        .route("/history", get(get_history))
+        .route("/login", post(login))
+        .route("/me", get(me))
         // SPA fallback: /, /assets/*, and any unknown path resolve against
         // the embedded UI bundle, with index.html as the fallback for
         // client-side routes.
-        .fallback(get(serve_ui_asset))
+        .fallback(get(serve_ui_asset));
+    let protected = Router::new()
+        .route("/logout", post(logout))
+        .route("/state", get(get_state).put(put_state))
+        .route("/state/events", get(state_events))
+        .route("/history", get(get_history))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_user));
+    public
+        .merge(protected)
         .layer(middleware::from_fn_with_state(policy, guard_request))
         .with_state(state)
+}
+
+/// The body every route behind the login answers with when there is no
+/// valid cookie.
+pub const LOGIN_REQUIRED: &str = "login required\n";
+
+impl AppState {
+    /// A state over an in-memory store and a fixed key, for the suite.
+    #[doc(hidden)]
+    pub fn for_test(config: Config, hubs: HubRegistry, capacity: usize) -> Arc<Self> {
+        let keys = crate::store::crypto::MasterKey::from_bytes_for_test([42u8; 32]).keys();
+        let store = crate::store::sqlite::SqliteStore::open_in_memory(keys.clone())
+            .expect("an in-memory store opens");
+        let (state_changes, _) = broadcast::channel(capacity);
+        Arc::new(AppState {
+            config: ArcSwap::from_pointee(config),
+            hubs,
+            store: Arc::new(store),
+            keys,
+            limiter: RateLimiter::default(),
+            clock: Arc::new(auth::now_unix),
+            state_changes,
+            shutdown: Arc::new(Notify::new()),
+        })
+    }
+
+    /// Whether a cookie set on this request is marked `Secure`: the request
+    /// arrived over TLS at a proxy, or the configured public URL is HTTPS.
+    /// Never inferred from the bind address, so plain-HTTP LAN access keeps
+    /// working.
+    pub fn secure_cookies(&self, headers: &HeaderMap) -> bool {
+        let forwarded_https = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|p| p.trim().eq_ignore_ascii_case("https")));
+        forwarded_https
+            || self
+                .config
+                .load()
+                .public_url
+                .as_deref()
+                .is_some_and(|u| u.starts_with("https://"))
+    }
+
+    /// The user a request's cookie names, when the cookie verifies, the
+    /// user exists and the epoch matches.
+    pub async fn current_user(&self, headers: &HeaderMap) -> Option<(UserRow, Cookie)> {
+        let now = (self.clock)();
+        let value = headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(cookie_value)?;
+        let cookie = verify(value, &self.keys.cookie, now)?;
+        let user = self
+            .store
+            .user_by_id(&cookie.user_id)
+            .await
+            .ok()
+            .flatten()?;
+        if user.session_epoch != cookie.epoch {
+            return None;
+        }
+        Some((user, cookie))
+    }
+
+    /// Create `name` with `password` and sign a cookie for them, for the
+    /// suite: the `Cookie` header value a request carries.
+    #[doc(hidden)]
+    pub async fn login_for_test(&self, name: &str, password: &str) -> String {
+        let user = match self.store.user_by_name(name).await.expect("store") {
+            Some(user) => user,
+            None => {
+                let hash = auth::hash_password(password).expect("a valid password");
+                self.store
+                    .create_user(name, &hash, crate::store::Role::User, (self.clock)() * 1000)
+                    .await
+                    .expect("create the test user")
+            }
+        };
+        let cookie = Cookie::issue(&user.id, user.session_epoch, (self.clock)());
+        format!("{}={}", auth::COOKIE_NAME, sign(&cookie, &self.keys.cookie))
+    }
+}
+
+/// The layer every route behind the login runs under: a valid cookie
+/// becomes an `AuthUser` in the request's extensions and is re-issued on
+/// the response when under thirty days remain; anything else is 401.
+async fn require_user(State(app): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
+    let Some((user, cookie)) = app.current_user(req.headers()).await else {
+        return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
+    };
+    let now = (app.clock)();
+    let renew = cookie.due_for_renewal(now).then(|| {
+        set_cookie_header(
+            &sign(
+                &Cookie::issue(&user.id, user.session_epoch, now),
+                &app.keys.cookie,
+            ),
+            app.secure_cookies(req.headers()),
+        )
+    });
+    req.extensions_mut().insert(AuthUser(user));
+    let mut res = next.run(req).await;
+    if let Some(header) = renew {
+        if let Ok(value) = HeaderValue::from_str(&header) {
+            res.headers_mut().append(header::SET_COOKIE, value);
+        }
+    }
+    res
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+fn user_json(user: &UserRow) -> Value {
+    json!({ "id": user.id, "name": user.name, "role": user.role.as_str() })
+}
+
+/// `POST /login`. The limiter answers first; an unknown name is verified
+/// against the dummy hash so the 401 costs one argon2 run either way; the
+/// body of every 401 is the same.
+async fn login(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<LoginBody>, JsonRejection>,
+) -> Response {
+    let Ok(Json(LoginBody { username, password })) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "expected a JSON body with `username` and `password`\n",
+        )
+            .into_response();
+    };
+    let name = username.trim();
+    if let Err(left) = app
+        .limiter
+        .check(&format!("u:{name}"), std::time::Instant::now())
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                HeaderValue::from(left.as_secs().max(1)),
+            )],
+            "too many login attempts; try again shortly\n",
+        )
+            .into_response();
+    }
+    let stored = app.store.password_hash_of(name).await.ok().flatten();
+    let user = app.store.user_by_name(name).await.ok().flatten();
+    let hash: &str = match stored.as_deref() {
+        Some(hash) => hash,
+        None => dummy_hash(),
+    };
+    let verified = verify_password(&password, hash);
+    let (Some(user), true) = (user, verified) else {
+        return (StatusCode::UNAUTHORIZED, "wrong username or password\n").into_response();
+    };
+    let now = (app.clock)();
+    let cookie = Cookie::issue(&user.id, user.session_epoch, now);
+    let header = set_cookie_header(
+        &sign(&cookie, &app.keys.cookie),
+        app.secure_cookies(&headers),
+    );
+    let mut res = Json(user_json(&user)).into_response();
+    if let Ok(value) = HeaderValue::from_str(&header) {
+        res.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    res
+}
+
+/// `POST /logout`: clears the cookie on this device and nothing else.
+async fn logout() -> Response {
+    let mut res = StatusCode::NO_CONTENT.into_response();
+    if let Ok(value) = HeaderValue::from_str(&clear_cookie_header()) {
+        res.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    res
+}
+
+/// `GET /me`: who the cookie says, or 401. Public, so the browser can ask
+/// without the answer being a refusal.
+async fn me(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match app.current_user(&headers).await {
+        Some((user, _)) => Json(user_json(&user)).into_response(),
+        None => (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response(),
+    }
 }
 
 /// Resolve when the process receives SIGINT (Ctrl+C) or SIGTERM (systemd
