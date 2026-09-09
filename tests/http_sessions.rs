@@ -42,7 +42,6 @@ fn state_with(hubs: HubRegistry) -> Arc<AppState> {
             datastore: Default::default(),
             public_url: None,
             models: vec![],
-            bedrock: None,
         },
         hubs,
         16,

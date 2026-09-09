@@ -72,11 +72,13 @@ jobs:
         shell: bash
         run: test "$(docker run --rm mezame:local id -u)" = 1000
 
-      - name: Write the config the way a user without a terminal does
-        # Requirement 20 criteria 6 and 13, through `init --bind`. The fresh
-        # named volume inherits the image's ownership, which is what makes
-        # the write succeed under the unprivileged user.
-        run: docker compose run --rm -T setup mezame init --bind 0.0.0.0:9510
+      - name: Set up the way a user without a terminal does
+        # Requirement 20 criteria 6 and 13, through `init` with its flags:
+        # the bind, the admin and the password on standard input (a literal
+        # here, not a secret). The fresh named volume inherits the image's
+        # ownership, which is what makes the write succeed under the
+        # unprivileged user.
+        run: echo 'change-me' | docker compose run --rm -T setup mezame init --bind 0.0.0.0:9510 --admin admin --password-stdin
 
       - name: Serve, and read the UI shell and the request checks through the published port
         # Requirement 20 criterion 10. `--wait` returns once the health
@@ -99,16 +101,16 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:9510/state)" = 403
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9510/state)" = 401
 
-      - name: Write a Bedrock configuration and start with no credentials
-        # Requirement 14 criterion 3 of the Bedrock spec: a `bedrock`
-        # section with no credentials anywhere must still start and serve
-        # the UI; the credential lookup is lazy and a turn is what would
-        # fail. The runner holds no AWS secret. `init` on the existing
-        # volume keeps the bind and adds the section.
+      - name: Set a Bedrock model and start with no credentials
+        # Requirement 14 criterion 3 of the Bedrock spec: a Bedrock profile
+        # with no credentials anywhere must still start and serve the UI;
+        # the credential lookup is lazy and a turn is what would fail. The
+        # runner holds no AWS secret. A second `init` on the volume keeps
+        # the bind and the admin and writes the profile and credential rows.
         shell: bash
         run: |
           docker compose down mezame
-          docker compose run --rm -T setup mezame init --bind 0.0.0.0:9510 --model anthropic.claude-sonnet-5 --region us-east-1
+          docker compose run --rm -T setup mezame init --model anthropic.claude-sonnet-5 --region us-east-1
           docker compose up -d --wait --wait-timeout 120 mezame
           test "$(docker inspect -f '{{.State.Health.Status}}' mezame)" = healthy
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9510/)" = 200

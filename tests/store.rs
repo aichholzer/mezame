@@ -1017,3 +1017,65 @@ fn errors_render_one_line_each() {
     assert_eq!(MessageRole::Assistant.as_str(), "assistant");
     let _: Value = json!(null);
 }
+
+#[tokio::test]
+async fn dropping_every_credential_takes_the_profiles_that_used_them_and_counts() {
+    // `init` beside a datastore whose key is gone: nothing sealed can be
+    // opened, so the credential rows go, with the profiles pointing at
+    // them and the grants under them, and the users stay.
+    let store = store();
+    let admin = store
+        .create_user("admin", "h", Role::Admin, 1)
+        .await
+        .unwrap()
+        .id;
+    assert_eq!(
+        store.drop_all_credentials().await.unwrap(),
+        0,
+        "nothing to drop"
+    );
+    let first = store
+        .create_credential(None, &admin, "bedrock", "Bedrock", &json!({}), 1)
+        .await
+        .unwrap();
+    let second = store
+        .create_credential(Some(&admin), &admin, "bedrock", "Bedrock", &json!({}), 2)
+        .await
+        .unwrap();
+    store
+        .upsert_global_profile(&NewProfile {
+            model: "anthropic.claude-sonnet-5".into(),
+            credential_id: Some(first.id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(store.drop_all_credentials().await.unwrap(), 2);
+    assert!(
+        store.global_profile().await.unwrap().is_none(),
+        "the profile went"
+    );
+    assert!(store.credentials(None, "bedrock").await.unwrap().is_empty());
+    assert!(store
+        .credentials(Some(&admin), "bedrock")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        store.credential_payload(&second.id).await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(store.count_users().await.unwrap(), 1, "the users stay");
+    // A profile with no credential is not touched: it names nothing sealed.
+    store
+        .upsert_global_profile(&NewProfile {
+            model: "anthropic.claude-opus-5".into(),
+            credential_id: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.drop_all_credentials().await.unwrap(), 0);
+    assert!(store.global_profile().await.unwrap().is_some());
+}

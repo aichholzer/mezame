@@ -330,6 +330,10 @@ pub trait Store: Send + Sync {
     /// The one way a payload leaves the store.
     fn credential_payload(&self, id: &str) -> StoreFuture<'_, Value>;
     fn delete_credential(&self, id: &str) -> StoreFuture<'_, ()>;
+    /// Every credential row and every profile row that used one, in one
+    /// transaction; how many credentials went. For `init` beside a
+    /// datastore whose key is gone: nothing sealed in it can be opened.
+    fn drop_all_credentials(&self) -> StoreFuture<'_, u64>;
 
     fn global_profile(&self) -> StoreFuture<'_, Option<ProfileRow>>;
     fn upsert_global_profile(&self, profile: &NewProfile) -> StoreFuture<'_, ProfileRow>;

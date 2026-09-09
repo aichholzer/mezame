@@ -77,8 +77,45 @@ the old state.
   as before. The echo writes nothing and keeps its in-memory transcript.
 - The per-turn log line names the session's owner: `user=<name>` follows
   `session=<id>`.
+- `mezame init` sets up the whole install in one sitting: the bind
+  address, the admin account (username, password entered twice) and,
+  optionally, the Bedrock model with its region and profile. The flags
+  `--bind ADDR`, `--admin NAME`, `--password-stdin` (the password on the
+  first line of standard input), `--model ID`, `--region NAME` and
+  `--profile NAME` answer every question for a run with no terminal; a
+  setting no flag names keeps its current value, and `--admin` on a
+  datastore that already has a user is skipped and said so. The summary
+  names the config path, the datastore and its user count, the admin
+  created or kept, and the backend, and never a password, a hash, a
+  region or a profile. `init` also drops `~/.mezame/state.json` and says
+  so, and beside a datastore whose key is gone it drops the credential
+  rows that key sealed, with the profiles that used them, and prints the
+  count.
+- `mezame user add NAME [--admin] [--password-stdin]`, `mezame user list`
+  and `mezame passwd NAME [--password-stdin]` manage accounts from the
+  terminal. A name must be non-empty, at most 64 characters and not
+  taken; a password at least 8 characters. A password change signs the
+  user out of every device.
+- A server that starts on a datastore with no user asks for the admin
+  when a terminal is attached, and otherwise exits with one line naming
+  `mezame init --admin NAME --password-stdin`. `mezame --help` lists the
+  commands and describes the three files under `~/.mezame`.
 
 ### Changed
+
+- The Bedrock model, region and profile live in the datastore, not in
+  `config.json`: the model in a global profile row, the region and
+  profile as one encrypted credential row owned by the admin who set it.
+  A `config.json` still carrying a `bedrock` section is refused at
+  startup with a pointer at `mezame init`, and `init` over such a file
+  drops the section and says so; nothing from it is carried into the
+  datastore. The `thinking`, `thinking_budget` and `max_output_tokens`
+  overrides the section took are not settable in this alpha; the loop
+  runs on the phase 1 defaults until a later release adds an editor.
+  Startup prints `Backend: Bedrock <model>` without the region and
+  profile it used to show, then `Datastore: sqlite <path> (<n> users)`.
+  A credential the master key cannot open stops the start naming the
+  credential and `mezame init`, rather than falling back to the echo.
 
 - `config.json` carries `"version": 2`. A file without a version, or with
   another one, is refused at startup with one line pointing at

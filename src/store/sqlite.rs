@@ -926,6 +926,22 @@ impl Store for SqliteStore {
         }))
     }
 
+    fn drop_all_credentials(&self) -> StoreFuture<'_, u64> {
+        Box::pin(self.run("drop_all_credentials", |conn| {
+            let tx = conn.transaction().map_err(sql("drop_all_credentials"))?;
+            tx.execute(
+                "DELETE FROM profiles WHERE credential_id IN (SELECT id FROM credentials)",
+                [],
+            )
+            .map_err(sql("drop_all_credentials"))?;
+            let dropped = tx
+                .execute("DELETE FROM credentials", [])
+                .map_err(sql("drop_all_credentials"))?;
+            tx.commit().map_err(sql("drop_all_credentials"))?;
+            Ok(dropped as u64)
+        }))
+    }
+
     fn global_profile(&self) -> StoreFuture<'_, Option<ProfileRow>> {
         Box::pin(self.run("global_profile", |conn| global_profile_of(conn)))
     }

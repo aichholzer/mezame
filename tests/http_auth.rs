@@ -34,7 +34,6 @@ fn config(public_url: Option<&str>) -> Config {
         datastore: Default::default(),
         public_url: public_url.map(str::to_string),
         models: vec![],
-        bedrock: None,
     }
 }
 

@@ -92,7 +92,6 @@ fn the_bind_host_and_the_configured_hosts_come_from_the_config() {
         datastore: Default::default(),
         public_url: None,
         models: vec![],
-        bedrock: None,
     };
     let policy = RequestPolicy::from_config(&config);
     assert!(

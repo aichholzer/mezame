@@ -177,7 +177,6 @@ fn config() -> Config {
         datastore: Default::default(),
         public_url: None,
         models: vec![],
-        bedrock: None,
     }
 }
 

@@ -36,7 +36,6 @@ fn test_state(capacity: usize) -> Arc<AppState> {
             datastore: Default::default(),
             public_url: None,
             models: vec![],
-            bedrock: None,
         },
         HubRegistry::new(),
         capacity,

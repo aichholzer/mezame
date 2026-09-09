@@ -44,7 +44,6 @@ fn a_version_2_file_loads_with_its_defaults() {
     assert_eq!(cfg.datastore.backend, "sqlite");
     assert_eq!(cfg.public_url, None);
     assert!(cfg.models.is_empty());
-    assert!(cfg.bedrock.is_none());
     assert_eq!(cfg.bind(), Some("127.0.0.1:9510"));
 }
 
@@ -170,7 +169,6 @@ fn a_written_config_carries_its_version_and_datastore_and_loads_back() {
         datastore: DatastoreConfig::default(),
         public_url: Some("https://mezame.example.com".into()),
         models: vec!["m".into()],
-        bedrock: None,
     };
     let value: Value = serde_json::to_value(&cfg).unwrap();
     assert_eq!(
@@ -208,6 +206,7 @@ fn what_init_starts_from() {
     .unwrap();
     let existing = read_existing_config_from(&path).unwrap().unwrap();
     assert!(existing.legacy.is_none());
+    assert!(!existing.had_bedrock);
     assert_eq!(existing.config.models, vec!["m"]);
     assert_eq!(existing.config.public_url.as_deref(), Some("http://x"));
 
@@ -223,7 +222,10 @@ fn what_init_starts_from() {
     assert_eq!(existing.config.version, CONFIG_VERSION);
     assert_eq!(existing.config.bind(), Some("0.0.0.0:9511"));
     assert_eq!(existing.config.hosts(), vec!["mezame.example.com"]);
-    assert!(existing.config.bedrock.is_none());
+    assert!(
+        existing.had_bedrock,
+        "the section it carried is noted, for `init` to say so"
+    );
     assert!(existing.config.models.is_empty());
 
     std::fs::write(&path, format!("{{\"version\":1,{TRANSPORT}}}")).unwrap();
@@ -257,10 +259,89 @@ fn what_init_starts_from() {
     // legacy file.
     std::fs::write(
         &path,
-        format!("{{\"version\":2,{TRANSPORT},\"bedrock\":{{\"model\":\"m\",\"thinking_budget\":\"4096\"}}}}"),
+        format!("{{\"version\":2,{TRANSPORT},\"models\":\"m\"}}"),
     )
     .unwrap();
     let err = format!("{:#}", read_existing_config_from(&path).unwrap_err());
     assert!(err.contains("does not parse"), "{err}");
     let _ = Path::new("unused");
+}
+
+// ---------- step 6: the `bedrock` key goes, and the cases the section's
+// suite held that were never about the section ----------
+
+#[test]
+fn a_bedrock_key_is_refused_with_the_datastore_pointer() {
+    // Requirement 9 criterion 1: the settings live in the datastore now,
+    // and a file still carrying them is not read as saying nothing.
+    let err = load(&format!(
+        "{{\"version\":2,{TRANSPORT},\"bedrock\":{{\"model\":\"anthropic.claude-sonnet-5\"}}}}"
+    ))
+    .unwrap_err();
+    assert!(err.contains("`bedrock` section"), "{err}");
+    assert!(err.contains("datastore"), "{err}");
+    assert!(err.contains("mezame init --model ID"), "{err}");
+    assert!(err.contains("config.json"), "{err}");
+    // An empty object under the key is refused the same way: the key is
+    // what is checked, before anything in it is read.
+    let err = load(&format!("{{\"version\":2,{TRANSPORT},\"bedrock\":{{}}}}")).unwrap_err();
+    assert!(err.contains("`bedrock` section"), "{err}");
+    // The version gate comes first: a versionless file with the key gets
+    // the version line, whose `init` drops the key.
+    let err = load(&format!("{{{TRANSPORT},\"bedrock\":{{}}}}")).unwrap_err();
+    assert!(err.contains("has version none"), "{err}");
+}
+
+#[test]
+fn hosts_walks_every_transport_as_the_guard_does() {
+    let cfg = load(r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510","hosts":[]},{"kind":"cloudflared","bind":"0.0.0.0:9511","hosts":["a.example","b.example"]}]}"#).unwrap();
+    assert_eq!(cfg.hosts(), vec!["a.example", "b.example"]);
+    assert_eq!(cfg.bind(), Some("127.0.0.1:9510"));
+}
+
+#[test]
+fn read_config_from_parses_without_validating() {
+    use mezame::config::read_config_from;
+    let tmp = TempDir::new().unwrap();
+    let path = write(
+        &tmp,
+        &format!("{{\"version\":2,{TRANSPORT},\"public_url\":\"ftp://x\"}}"),
+    );
+    let cfg = read_config_from(&path).unwrap();
+    assert_eq!(cfg.public_url.as_deref(), Some("ftp://x"));
+    assert!(load_config_from(&path).is_err());
+}
+
+#[test]
+fn a_malformed_value_is_a_parse_error_naming_the_file() {
+    let err = load(&format!(
+        "{{\"version\":2,{TRANSPORT},\"models\":\"lots\"}}"
+    ))
+    .unwrap_err();
+    assert!(err.contains("Parsing config.json"), "{err}");
+    let err = load(&format!("{{\"version\":2,{TRANSPORT},\"public_url\":5}}")).unwrap_err();
+    assert!(err.contains("Parsing config.json"), "{err}");
+}
+
+#[test]
+fn a_written_file_holds_only_the_keys_that_are_set() {
+    let echo = Config {
+        version: 2,
+        transports: vec![TransportConfig::Cloudflared {
+            bind: "127.0.0.1:9510".into(),
+            hosts: Vec::new(),
+        }],
+        datastore: Default::default(),
+        public_url: None,
+        models: vec![],
+    };
+    assert_eq!(
+        serde_json::to_value(&echo).unwrap(),
+        json!({
+            "version": 2,
+            "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }],
+            "datastore": { "backend": "sqlite" }
+        }),
+        "no `bedrock` key, no empty `models`, no null `public_url`"
+    );
 }

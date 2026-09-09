@@ -127,8 +127,14 @@ impl FromStr for ThinkingMode {
     }
 }
 
-/// What a turn loop is configured with. `BedrockConfig::settings` builds
-/// it with the defaults applied.
+/// The budget an `enabled` thinking request sends when the profile sets
+/// none.
+pub const DEFAULT_THINKING_BUDGET: u32 = 4096;
+/// The output ceiling of a request when the profile sets none.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+/// What a turn loop is configured with, the defaults applied by
+/// `mezame::settings_from_profile`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopSettings {
     /// The model selected at startup.
