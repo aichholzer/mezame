@@ -95,7 +95,11 @@ fn make_transcript(entries: usize) -> Vec<HistoryEntry> {
                     }]),
                 }),
             };
-            HistoryEntry { body, timestamp }
+            HistoryEntry {
+                body,
+                timestamp,
+                usage: None,
+            }
         })
         .collect()
 }

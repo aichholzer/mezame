@@ -40,6 +40,7 @@ pub mod backend;
 pub mod config;
 pub mod conversation;
 pub mod guard;
+pub mod history;
 pub mod http;
 pub mod hub;
 pub mod prompt;
@@ -55,17 +56,18 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use std::sync::Arc;
 
+use crate::backend::{TRANSCRIPT_BUDGET_BYTES, TRANSCRIPT_MAX_ENTRIES};
 use crate::config::{
     config_path, init_config, init_config_with_args, load_config, parse_init_args, BedrockConfig,
     TransportConfig,
 };
 use crate::http::run_cloudflared;
-use crate::hub::{HubRegistry, NewBackend};
+use crate::hub::{BackendFactory, HubRegistry, NewBackend};
 use crate::provider::bedrock::{build_client, BedrockProvider};
-use crate::provider::Provider;
+use crate::provider::{LoopSettings, Provider};
 use crate::store::crypto::{KeyError, Keys, MasterKey};
 use crate::store::sqlite::SqliteStore;
-use crate::store::Store;
+use crate::store::{MessageWindow, Store};
 use crate::turn::LoopBackend;
 
 /// Top-level CLI entry point. Synchronous because `init_config` reads
@@ -128,8 +130,9 @@ pub fn run() -> Result<()> {
             [] => bail!("No transports configured. Re-run `mezame init`."),
             [one] => match one.clone() {
                 TransportConfig::Cloudflared { bind, .. } => {
-                    let hubs = build_registry(cfg.bedrock.as_ref(), &path).await;
                     let (store, keys) = open_store()?;
+                    let hubs =
+                        build_registry(cfg.bedrock.as_ref(), &path, Arc::clone(&store)).await;
                     let users = store.count_users().await.map_err(|e| anyhow!("{e}"))?;
                     eprintln!(
                         "Datastore: {} {} ({users} user{})",
@@ -211,7 +214,16 @@ fn open_store() -> Result<(Arc<dyn Store>, Keys)> {
 /// with no AWS setup still serves the browser and reports the problem
 /// there. With no region anywhere the SDK's chain ends at the instance
 /// metadata service, which costs about a second here outside EC2.
-async fn build_registry(bedrock: Option<&BedrockConfig>, path: &std::path::Path) -> HubRegistry {
+///
+/// A Bedrock hub is built in two phases: the session's stored rows are
+/// loaded first, with no registry lock held, under the same bounds the
+/// loop keeps in memory with headroom for the stored encoding; then the
+/// loop is built from them and writes every later turn to `store`.
+async fn build_registry(
+    bedrock: Option<&BedrockConfig>,
+    path: &std::path::Path,
+    store: Arc<dyn Store>,
+) -> HubRegistry {
     let Some(section) = bedrock else {
         eprintln!("Backend: echo (no `bedrock` section in {})", path.display());
         return HubRegistry::new();
@@ -225,13 +237,56 @@ async fn build_registry(bedrock: Option<&BedrockConfig>, path: &std::path::Path)
     );
     let provider: Arc<dyn Provider> = Arc::new(BedrockProvider::new(client));
     let settings = section.settings();
-    HubRegistry::with_factory(Arc::new(move |session_id| {
-        let backend = LoopBackend::new(Arc::clone(&provider), settings.clone(), session_id);
-        Ok(NewBackend {
-            session_info: Some(backend.session_info()),
-            backend: Arc::new(backend),
-        })
-    }))
+    HubRegistry::with_factory(persistent_factory(provider, settings, store))
+}
+
+/// The factory of a persisting deployment: `prepare` loads the session's
+/// window, `build` rebuilds a [`LoopBackend`] from it for the owner.
+pub fn persistent_factory(
+    provider: Arc<dyn Provider>,
+    settings: LoopSettings,
+    store: Arc<dyn Store>,
+) -> BackendFactory {
+    let loader = Arc::clone(&store);
+    BackendFactory::persistent(
+        move |session_id| {
+            let store = Arc::clone(&loader);
+            let session_id = session_id.to_string();
+            Box::pin(async move {
+                match store
+                    .load_window(
+                        &session_id,
+                        TRANSCRIPT_MAX_ENTRIES,
+                        2 * TRANSCRIPT_BUDGET_BYTES,
+                    )
+                    .await
+                {
+                    Ok(window) => window,
+                    Err(e) => {
+                        crate::hub::warn(&format!(
+                            "Session {session_id}: the stored conversation could not be loaded \
+                             ({e}); the session starts empty"
+                        ));
+                        MessageWindow::default()
+                    }
+                }
+            })
+        },
+        move |session_id, window, owner| {
+            let mut backend = LoopBackend::new(
+                Arc::clone(&provider),
+                settings.clone(),
+                session_id,
+                &owner.user_name,
+                Some(Arc::clone(&store)),
+            );
+            backend.restore(window);
+            Ok(NewBackend {
+                session_info: Some(backend.session_info()),
+                backend: Arc::new(backend),
+            })
+        },
+    )
 }
 
 fn print_help() {

@@ -990,7 +990,9 @@ async fn a_mint_against_a_full_registry_answers_503_and_writes_no_row() {
 
 #[tokio::test]
 async fn a_mint_whose_backend_cannot_be_built_leaves_no_row() {
-    let failing = HubRegistry::with_factory(Arc::new(|_| Err(anyhow::anyhow!("no backend today"))));
+    let failing = HubRegistry::with_factory(mezame::hub::BackendFactory::in_memory(|_, _| {
+        Err(anyhow::anyhow!("no backend today"))
+    }));
     let server = serve_with_registry(failing).await;
     let alice = user_id(&server, "alice").await;
     let mut socket = connect(&server, "/ws").await;

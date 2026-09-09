@@ -48,7 +48,9 @@ use crate::auth::{
     self, clear_cookie_header, cookie_value, dummy_hash, set_cookie_header, sign, verify,
     verify_password, AuthUser, Cookie, RateLimiter,
 };
+use crate::backend::{TRANSCRIPT_BUDGET_BYTES, TRANSCRIPT_MAX_ENTRIES};
 use crate::config::Config;
+use crate::conversation::Conversation;
 
 use crate::guard::{guard_request, RequestPolicy};
 use crate::hub::{warn, HubRegistry};
@@ -983,6 +985,24 @@ async fn get_history(
         }
         Err(e) => return internal(e).into_response(),
     }
-    let entries = app.hubs.history(sid).await.unwrap_or_default();
+    // A persisting deployment serves the store's rows through the same
+    // window and the same rebuild a hub makes, so the browser shows what
+    // the hub holds whether or not one is live; the echo keeps its
+    // transcript in the hub and is served from there.
+    let entries = if app.hubs.persists() {
+        let window = match app
+            .store
+            .load_window(sid, TRANSCRIPT_MAX_ENTRIES, 2 * TRANSCRIPT_BUDGET_BYTES)
+            .await
+        {
+            Ok(window) => window,
+            Err(e) => return internal(e).into_response(),
+        };
+        let mut conversation = Conversation::new();
+        conversation.restore(window);
+        conversation.history()
+    } else {
+        app.hubs.history(sid).await.unwrap_or_default()
+    };
     Json(json!({ "entries": entries })).into_response()
 }

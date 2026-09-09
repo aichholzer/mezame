@@ -26,7 +26,8 @@ use mezame::conversation::{Block, Conversation, Message as CanonicalMessage, Rol
 use mezame::hub::{AttachedHub, HubCommand, HubRegistry};
 use mezame::prompt::{assemble, Date, Part};
 use mezame::provider::bedrock::{thinking_rule, to_bedrock_messages, Normaliser};
-use mezame::provider::{ThinkingMode, TurnEvent};
+use mezame::provider::{ThinkingMode, TurnEvent, Usage};
+use mezame::store::Store;
 use mezame::ws::{decide_session, is_session_id, new_session_id, run_attach_loop, SessionDecision};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -318,7 +319,11 @@ fn arb_history_entry() -> impl Strategy<Value = HistoryEntry> {
         arb_text().prop_map(|text| EntryBody::Thought { text }),
         arb_tool_call().prop_map(EntryBody::ToolCall),
     ];
-    (body, 0i64..4_000_000_000_000).prop_map(|(body, timestamp)| HistoryEntry { body, timestamp })
+    (body, 0i64..4_000_000_000_000).prop_map(|(body, timestamp)| HistoryEntry {
+        body,
+        timestamp,
+        usage: None,
+    })
 }
 
 /// Strings that stress the session id form: whitespace, path separators,
@@ -1458,7 +1463,7 @@ proptest! {
             let stamp = i as i64;
             conversation.begin(
                 CanonicalMessage { role: Role::User, blocks },
-                HistoryEntry { body: EntryBody::User { text: user_text }, timestamp: stamp },
+                HistoryEntry { body: EntryBody::User { text: user_text }, timestamp: stamp, usage: None },
             );
             expected.push_back(1);
             let held = conversation.exchange_count();
@@ -1466,7 +1471,7 @@ proptest! {
             prop_assert!(conversation.history().len() <= 24 || held == 1);
             let assistant = agent_text.map(|text| (
                 CanonicalMessage { role: Role::Assistant, blocks: vec![Block::Text { text: text.clone() }] },
-                HistoryEntry { body: EntryBody::Agent { text }, timestamp: stamp },
+                HistoryEntry { body: EntryBody::Agent { text }, timestamp: stamp, usage: None },
             ));
             match assistant {
                 Some((message, entry)) => {
@@ -1561,5 +1566,178 @@ proptest! {
                 );
             }
         }
+    }
+}
+
+// ---------- phase 2: persistence ----------
+
+/// Where a stored exchange stands. `Open` is the shape a request that got
+/// no reply leaves: the user row alone; in memory the exchange is closed
+/// with no reply once the next one begins, and stays open when it is the
+/// last, which is the one place the two differ and `messages()` does not.
+#[derive(Debug, Clone, Copy)]
+enum StoredStatus {
+    Open,
+    Closed,
+    Rejected,
+}
+
+fn arb_usage() -> impl Strategy<Value = Usage> {
+    (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
+        |(input, output, cache_read, cache_write)| Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        },
+    )
+}
+
+type StoredExchange = (
+    Vec<Block>,
+    String,
+    Option<(Vec<Block>, Option<Usage>)>,
+    StoredStatus,
+);
+
+fn stored_exchanges() -> impl Strategy<Value = Vec<StoredExchange>> {
+    prop::collection::vec(
+        (
+            prop::collection::vec(non_empty_block(), 1..4),
+            "[a-zA-Z0-9 ]{0,40}",
+            prop::option::of((
+                prop::collection::vec(non_empty_block(), 1..4),
+                prop::option::of(arb_usage()),
+            )),
+            prop_oneof![
+                Just(StoredStatus::Open),
+                Just(StoredStatus::Closed),
+                Just(StoredStatus::Rejected),
+            ],
+        ),
+        1..30,
+    )
+}
+
+/// The entries the loop records for a reply: a thought per thinking block
+/// with text, then the agent text, the text blocks joined by one newline.
+fn reply_entries(blocks: &[Block], usage: Option<Usage>, timestamp: i64) -> Vec<HistoryEntry> {
+    let mut entries = Vec::new();
+    for block in blocks {
+        if let Block::Thinking { text, .. } = block {
+            if !text.is_empty() {
+                entries.push(HistoryEntry {
+                    body: EntryBody::Thought { text: text.clone() },
+                    timestamp,
+                    usage: None,
+                });
+            }
+        }
+    }
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        entries.push(HistoryEntry {
+            body: EntryBody::Agent { text },
+            timestamp,
+            usage,
+        });
+    }
+    entries
+}
+
+fn transcript_shape(conversation: &Conversation) -> Vec<(String, Option<Usage>, i64)> {
+    conversation
+        .history()
+        .iter()
+        .map(|entry| (format!("{:?}", entry.body), entry.usage, entry.timestamp))
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    // Feature: store-auth-persistence, Property 1: The store round-trips a
+    // conversation. Written through `append_user`, `append_assistant` and
+    // `mark_rejected`, loaded under a bound large enough for all of it and
+    // rebuilt, a conversation has the same `messages()` and the same
+    // transcript as the one built in memory from the same sequence, both
+    // after `strip_reasoning`.
+    #[test]
+    fn property_p1_the_store_round_trips_a_conversation(exchanges in stored_exchanges()) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        rt.block_on(async move {
+            let keys = mezame::store::crypto::MasterKey::from_bytes_for_test([11u8; 32]).keys();
+            let store = mezame::store::sqlite::SqliteStore::open_in_memory(keys).unwrap();
+            let user = store
+                .create_user("alice", "$argon2id$stub", mezame::store::Role::User, 1)
+                .await
+                .unwrap();
+            store.create_session(&user.id, "p1", None, 1).await.unwrap();
+
+            let mut live = Conversation::new();
+            let count = exchanges.len();
+            for (i, (user_blocks, text, assistant, status)) in exchanges.into_iter().enumerate() {
+                let stamp = i as i64 * 10;
+                let last = i + 1 == count;
+                let user_row = store.append_user("p1", &user_blocks, &text, stamp).await.unwrap();
+                live.begin(
+                    CanonicalMessage { role: Role::User, blocks: user_blocks },
+                    HistoryEntry { body: EntryBody::User { text }, timestamp: stamp, usage: None },
+                );
+                live.set_user_row(user_row);
+                match status {
+                    StoredStatus::Open => {
+                        if !last {
+                            live.complete(None, Vec::new());
+                        }
+                    }
+                    StoredStatus::Closed => match assistant {
+                        Some((blocks, usage)) => {
+                            store.append_assistant("p1", &blocks, usage, false, stamp + 1).await.unwrap();
+                            let entries = reply_entries(&blocks, usage, stamp + 1);
+                            live.complete(
+                                Some(CanonicalMessage { role: Role::Assistant, blocks }),
+                                entries,
+                            );
+                        }
+                        None => {
+                            live.complete(None, Vec::new());
+                        }
+                    },
+                    StoredStatus::Rejected => {
+                        let entries = match &assistant {
+                            Some((blocks, usage)) => {
+                                store.append_assistant("p1", blocks, *usage, true, stamp + 1).await.unwrap();
+                                reply_entries(blocks, *usage, stamp + 1)
+                            }
+                            None => Vec::new(),
+                        };
+                        let rows = live.reject_open(entries).expect("an open exchange");
+                        store.mark_rejected(&rows).await.unwrap();
+                    }
+                }
+            }
+            live.strip_reasoning();
+
+            let window = store.load_window("p1", 10_000, 1 << 30).await.unwrap();
+            prop_assert!(window.complete, "the bound holds every row");
+            let mut restored = Conversation::new();
+            restored.restore(window);
+
+            prop_assert_eq!(restored.messages(), live.messages());
+            prop_assert_eq!(transcript_shape(&restored), transcript_shape(&live));
+            prop_assert_eq!(restored.exchange_count(), live.exchange_count());
+            Ok(())
+        })?;
     }
 }

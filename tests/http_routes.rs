@@ -133,24 +133,28 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
                 text: "ping".to_string(),
             },
             timestamp: 1_000,
+            usage: None,
         },
         HistoryEntry {
             body: EntryBody::Agent {
                 text: "ping".to_string(),
             },
             timestamp: 1_000,
+            usage: None,
         },
         HistoryEntry {
             body: EntryBody::Thought {
                 text: "thinking".to_string(),
             },
             timestamp: 1_100,
+            usage: None,
         },
         HistoryEntry {
             body: EntryBody::Sys {
                 text: "a notice".to_string(),
             },
             timestamp: 1_200,
+            usage: None,
         },
         HistoryEntry {
             body: EntryBody::ToolCall(ToolCall {
@@ -168,6 +172,7 @@ async fn get_history_for_a_registered_hub_returns_its_transcript() {
                 }]),
             }),
             timestamp: 1_300,
+            usage: None,
         },
     ];
 

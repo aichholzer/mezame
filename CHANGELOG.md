@@ -60,6 +60,23 @@ the old state.
   directory, or is, holds or sits inside `~/.mezame`; startup prints a
   `Workspace:` line naming the root or the reason there is none. Nothing
   reads a workspace root yet.
+- Conversations live in the datastore. Each turn writes the prompt as a
+  row before the request goes out and the reply as a row once it is in,
+  with the reply's reasoning, its token counts, and a flag on what the
+  model refused. A session opened again later, after a reload past the
+  grace window or after a restart, is rebuilt from its rows: the newest
+  exchanges that fit the same 16 MiB and 10,000-entry budget the session
+  keeps in memory, with every reply's text replayed to the model and its
+  reasoning dropped, since a later start assembles a new system prompt
+  and the model would refuse reasoning signed under the old one.
+  `/history` is served from the same rows through the same rebuild, so a
+  reload shows what the next request will carry, and an agent entry now
+  carries `usage` when its row holds counts, so the footer under a reply
+  survives a reload (alpha.2 said it would not). A datastore write that
+  fails is reported once per session, and the session runs on in memory
+  as before. The echo writes nothing and keeps its in-memory transcript.
+- The per-turn log line names the session's owner: `user=<name>` follows
+  `session=<id>`.
 
 ### Changed
 

@@ -13,7 +13,7 @@
 //! turn resolving afterwards persists nothing, and every lock recovers
 //! from poison. No lock is held across an await.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,7 @@ use crate::provider::{
     LoopSettings, Provider, ProviderError, ProviderRequest, StopReason, ThinkingMode, TurnEvent,
     Usage,
 };
+use crate::store::{MessageWindow, Store, StoreError};
 
 /// How long the stream may go without an event before the turn is cut.
 ///
@@ -138,10 +139,25 @@ struct State {
 }
 
 /// A [`Backend`] that runs each turn against a [`Provider`].
+///
+/// With a store, every transition of the conversation is written after
+/// it: the user row before the request, the assistant row and the
+/// rejection flags after the reply. The in-memory conversation stays
+/// authoritative for the hub's lifetime; a failed write is logged once per
+/// session and the turn resolves as if it had succeeded, so the store can
+/// lose a row and never a session.
 pub struct LoopBackend {
     provider: Arc<dyn Provider>,
     settings: LoopSettings,
     session_id: String,
+    /// The owner's name, for the per-turn log line.
+    owner_name: String,
+    store: Option<Arc<dyn Store>>,
+    /// Set by the first failed write; the one that sets it writes the log
+    /// line, the rest are counted and silent.
+    store_failed: AtomicBool,
+    store_failures: AtomicUsize,
+    store_failure_lines: AtomicUsize,
     idle_timeout: Duration,
     state: Mutex<State>,
     turn: Mutex<Option<CancelHandle>>,
@@ -156,14 +172,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl LoopBackend {
     /// A loop for `session_id` over `provider`, with `settings.model`
-    /// selected. One per hub.
-    pub fn new(provider: Arc<dyn Provider>, settings: LoopSettings, session_id: &str) -> Self {
+    /// selected, owned by `owner_name` and writing to `store` when one is
+    /// given. One per hub.
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        settings: LoopSettings,
+        session_id: &str,
+        owner_name: &str,
+        store: Option<Arc<dyn Store>>,
+    ) -> Self {
         let thinking = settings
             .thinking
             .unwrap_or_else(|| thinking_rule(&settings.model));
         Self {
             provider,
             session_id: session_id.to_string(),
+            owner_name: owner_name.to_string(),
+            store,
+            store_failed: AtomicBool::new(false),
+            store_failures: AtomicUsize::new(0),
+            store_failure_lines: AtomicUsize::new(0),
             idle_timeout: IDLE_TIMEOUT,
             state: Mutex::new(State {
                 conversation: Conversation::new(),
@@ -175,6 +203,25 @@ impl LoopBackend {
             turn: Mutex::new(None),
             settings,
         }
+    }
+
+    /// Rebuild the conversation from the session's stored rows, before the
+    /// first turn: see [`Conversation::restore`]. What the window holds is
+    /// what the next request replays, less every reasoning block.
+    pub fn restore(&mut self, window: MessageWindow) {
+        lock(&self.state).conversation.restore(window);
+    }
+
+    /// Test-only: how many store writes have failed.
+    #[doc(hidden)]
+    pub fn store_failures_for_test(&self) -> usize {
+        self.store_failures.load(Ordering::SeqCst)
+    }
+
+    /// Test-only: how many failure lines were written; one at most.
+    #[doc(hidden)]
+    pub fn store_failure_lines_for_test(&self) -> usize {
+        self.store_failure_lines.load(Ordering::SeqCst)
     }
 
     /// Test-only: a shorter idle timeout, so a paused-clock test drives
@@ -240,12 +287,17 @@ impl LoopBackend {
         }
 
         // 2. Record the user side, then snapshot what the request needs.
-        let (messages, system, model, thinking) = {
+        //    The store's copy of the user side follows, with the lock
+        //    released: the write is the one await between the record and
+        //    the request, and the row it names is set on the exchange
+        //    once the id is back.
+        let text = extract_user_text(&blocks).unwrap_or_default();
+        let user_blocks = self.store.is_some().then(|| user.blocks.clone());
+        let (messages, system, model, thinking, timestamp) = {
             let mut state = lock(&self.state);
             if state.closed {
                 return Err(anyhow!(CLOSED_ERROR));
             }
-            let text = extract_user_text(&blocks).unwrap_or_default();
             let timestamp = clamped_now(&state.conversation);
             // A fresh conversation takes today's prompt; a running one
             // keeps the prompt it started under.
@@ -255,15 +307,31 @@ impl LoopBackend {
             state.conversation.begin(
                 user,
                 HistoryEntry {
-                    body: EntryBody::User { text },
+                    body: EntryBody::User { text: text.clone() },
                     timestamp,
+                    usage: None,
                 },
             );
             let messages: Vec<Message> =
                 state.conversation.messages().into_iter().cloned().collect();
             let system = state.system.clone().expect("set above");
-            (messages, system, state.model.clone(), state.thinking)
+            (
+                messages,
+                system,
+                state.model.clone(),
+                state.thinking,
+                timestamp,
+            )
         };
+        if let (Some(store), Some(user_blocks)) = (&self.store, user_blocks) {
+            match store
+                .append_user(&self.session_id, &user_blocks, &text, timestamp)
+                .await
+            {
+                Ok(id) => lock(&self.state).conversation.set_user_row(id),
+                Err(e) => self.store_failure("append_user", &e),
+            }
+        }
 
         // 3. Open the stream, under the cancel handle: the SDK's retries
         //    could otherwise run for minutes with the composer locked. A
@@ -284,7 +352,7 @@ impl LoopBackend {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    return self.finish(Ended::Cancelled, accumulator, &events, &model, started);
+                    return self.resolve(Ended::Cancelled, accumulator, &events, &model, started).await;
                 }
                 opened = self.provider.stream(attempt) => match opened {
                     Ok(stream) => break stream,
@@ -298,13 +366,15 @@ impl LoopBackend {
                             dropped
                         };
                         crate::hub::log(&format!(
-                            "turn session={} model={model} dropped {dropped} reasoning block(s) the \
-                             model could not read and retried the request",
-                            self.session_id
+                            "turn session={} user={} model={model} dropped {dropped} reasoning \
+                             block(s) the model could not read and retried the request",
+                            self.session_id, self.owner_name
                         ));
                     }
                     Err(error) => {
-                        return self.finish(Ended::BeforeStream(error), accumulator, &events, &model, started);
+                        return self
+                            .resolve(Ended::BeforeStream(error), accumulator, &events, &model, started)
+                            .await;
                     }
                 }
             }
@@ -330,8 +400,9 @@ impl LoopBackend {
         // Dropping the stream aborts the connection.
         drop(stream);
 
-        // 5. Persist and resolve.
-        self.finish(ended, accumulator, &events, &model, started)
+        // 5. Record, write and resolve.
+        self.resolve(ended, accumulator, &events, &model, started)
+            .await
     }
 }
 
@@ -350,9 +421,27 @@ impl Drop for HandleSlot<'_> {
     }
 }
 
+/// One write the store receives after a turn's in-memory record, in the
+/// order the loop issues them.
+enum StoreWrite {
+    /// The assistant row: the kept blocks, the counts when known, flagged
+    /// when the reply was refused.
+    Assistant {
+        blocks: Vec<Block>,
+        usage: Option<Usage>,
+        rejected: bool,
+        created: i64,
+    },
+    /// The user rows of the exchanges a rejection covered.
+    Rejected { user_ids: Vec<i64> },
+}
+
 impl LoopBackend {
-    /// Persist what the turn produced, resolve it, and write the log line.
-    fn finish(
+    /// Record what the turn produced, write the store's copy of it, and
+    /// resolve. The record and the log line are synchronous under the
+    /// lock; the writes follow with the lock released and the turn still
+    /// open, so a browser learns of `prompt_done` after the rows exist.
+    async fn resolve(
         &self,
         ended: Ended,
         accumulator: Accumulator,
@@ -360,17 +449,35 @@ impl LoopBackend {
         model: &str,
         started: Instant,
     ) -> Result<TurnOutcome> {
+        let (outcome, writes) = self.finish(ended, accumulator, events, model, started);
+        self.persist(writes).await;
+        outcome
+    }
+
+    /// Record what the turn produced, resolve it, and write the log line.
+    /// Returns the outcome and the writes the store is owed for it.
+    fn finish(
+        &self,
+        ended: Ended,
+        accumulator: Accumulator,
+        events: &mpsc::UnboundedSender<Value>,
+        model: &str,
+        started: Instant,
+    ) -> (Result<TurnOutcome>, Vec<StoreWrite>) {
         let usage = accumulator.usage;
         let stop = accumulator.stop.clone();
+        let mut writes = Vec::new();
         let outcome: Result<TurnOutcome> = {
             // A turn resolving after `shutdown` finds a cleared conversation:
-            // `complete` and `reject_open` on an empty deque change nothing,
-            // so the clear holds without a check here.
+            // `complete` and `reject_open` on an empty deque change nothing
+            // and say so, so the clear holds and nothing is written.
             let mut state = lock(&self.state);
             match &ended {
                 Ended::BeforeStream(error) => {
                     if error.is_rejected() {
-                        state.conversation.reject_open(Vec::new());
+                        if let Some(user_ids) = state.conversation.reject_open(Vec::new()) {
+                            writes.push(StoreWrite::Rejected { user_ids });
+                        }
                     } else {
                         state.conversation.complete(None, Vec::new());
                     }
@@ -378,7 +485,8 @@ impl LoopBackend {
                 }
                 _ => {
                     let timestamp = clamped_now(&state.conversation);
-                    let (assistant, entries) = accumulator.kept(timestamp);
+                    let (assistant, entries) = accumulator.kept(timestamp, usage);
+                    let blocks = assistant.as_ref().map(|message| message.blocks.clone());
                     // A reply the model refused or the service filtered is
                     // content the next request must not carry again: the
                     // exchange is rejected, its entries kept for the
@@ -390,9 +498,26 @@ impl LoopBackend {
                         Some(StopReason::Refusal) | Some(StopReason::ContentFiltered)
                     );
                     if refused {
-                        state.conversation.reject_open(entries);
-                    } else {
-                        state.conversation.complete(assistant, entries);
+                        if let Some(user_ids) = state.conversation.reject_open(entries) {
+                            if let Some(blocks) = blocks {
+                                writes.push(StoreWrite::Assistant {
+                                    blocks,
+                                    usage,
+                                    rejected: true,
+                                    created: timestamp,
+                                });
+                            }
+                            writes.push(StoreWrite::Rejected { user_ids });
+                        }
+                    } else if state.conversation.complete(assistant, entries) {
+                        if let Some(blocks) = blocks {
+                            writes.push(StoreWrite::Assistant {
+                                blocks,
+                                usage,
+                                rejected: false,
+                                created: timestamp,
+                            });
+                        }
                     }
                     match &ended {
                         Ended::Complete => match &stop {
@@ -438,6 +563,7 @@ impl LoopBackend {
         };
         let log = TurnLog {
             session: &self.session_id,
+            user: &self.owner_name,
             model,
             outcome: match (&ended, &outcome) {
                 (Ended::Cancelled, _) => "cancelled",
@@ -450,7 +576,55 @@ impl LoopBackend {
             error: outcome.as_ref().err().map(|e| e.to_string()),
         };
         crate::hub::log(&log.render());
-        outcome
+        (outcome, writes)
+    }
+
+    /// Issue the store's writes for a turn, in order, with no lock held.
+    /// A failure is counted, reported once per session, and otherwise
+    /// ignored: the conversation in memory is the one the session runs
+    /// on.
+    async fn persist(&self, writes: Vec<StoreWrite>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        for write in writes {
+            match write {
+                StoreWrite::Assistant {
+                    blocks,
+                    usage,
+                    rejected,
+                    created,
+                } => {
+                    if let Err(e) = store
+                        .append_assistant(&self.session_id, &blocks, usage, rejected, created)
+                        .await
+                    {
+                        self.store_failure("append_assistant", &e);
+                    }
+                }
+                StoreWrite::Rejected { user_ids } => {
+                    if user_ids.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = store.mark_rejected(&user_ids).await {
+                        self.store_failure("mark_rejected", &e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Count a failed write and report the first one of the session.
+    fn store_failure(&self, operation: &str, error: &StoreError) {
+        self.store_failures.fetch_add(1, Ordering::SeqCst);
+        if !self.store_failed.swap(true, Ordering::SeqCst) {
+            self.store_failure_lines.fetch_add(1, Ordering::SeqCst);
+            crate::hub::log(&format!(
+                "turn session={} user={} store write {operation} failed: {error}; the session \
+                 continues in memory and later failures on it are not reported",
+                self.session_id, self.owner_name
+            ));
+        }
     }
 }
 
@@ -652,7 +826,7 @@ impl Accumulator {
     /// has no signature and is dropped. A reply that produced no text at
     /// all is not persisted: an assistant message of reasoning alone has
     /// nothing to replay and the provider refuses an empty one.
-    fn kept(self, timestamp: i64) -> (Option<Message>, Vec<HistoryEntry>) {
+    fn kept(self, timestamp: i64, usage: Option<Usage>) -> (Option<Message>, Vec<HistoryEntry>) {
         let has_text = self
             .blocks
             .iter()
@@ -668,6 +842,7 @@ impl Accumulator {
                 Block::Thinking { text, .. } if !text.is_empty() => entries.push(HistoryEntry {
                     body: EntryBody::Thought { text: text.clone() },
                     timestamp,
+                    usage: None,
                 }),
                 _ => {}
             }
@@ -676,6 +851,7 @@ impl Accumulator {
             entries.push(HistoryEntry {
                 body: EntryBody::Agent { text: agent_text },
                 timestamp,
+                usage,
             });
         }
         let assistant = if self.blocks.is_empty() {
@@ -693,6 +869,8 @@ impl Accumulator {
 /// The per-turn log line, rendered by a pure function so a test pins it.
 pub struct TurnLog<'a> {
     pub session: &'a str,
+    /// The owner's name.
+    pub user: &'a str,
     pub model: &'a str,
     pub outcome: &'a str,
     pub stop: Option<&'a StopReason>,
@@ -702,15 +880,16 @@ pub struct TurnLog<'a> {
 }
 
 impl TurnLog<'_> {
-    /// `turn session=<id> model=<id> outcome=<ok|cancelled|error>
+    /// `turn session=<id> user=<name> model=<id> outcome=<ok|cancelled|error>
     /// stop=<reason|-> in=<n> out=<n> cache_read=<n> cache_write=<n> ms=<n>`
     /// followed by ` error=<text>` on error; an unknown count is `-`.
     pub fn render(&self) -> String {
         let count = |n: Option<u32>| n.map_or("-".to_string(), |n| n.to_string());
         let stop = self.stop.map_or("-".to_string(), stop_name);
         let mut line = format!(
-            "turn session={} model={} outcome={} stop={} in={} out={} cache_read={} cache_write={} ms={}",
+            "turn session={} user={} model={} outcome={} stop={} in={} out={} cache_read={} cache_write={} ms={}",
             self.session,
+            self.user,
             self.model,
             self.outcome,
             stop,

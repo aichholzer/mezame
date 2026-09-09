@@ -47,6 +47,8 @@ async fn backend(model: &str) -> LoopBackend {
             max_output_tokens: 16384,
         },
         "live",
+        "live",
+        None,
     )
 }
 

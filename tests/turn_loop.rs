@@ -37,6 +37,8 @@ fn backend(provider: &Arc<ScriptedProvider>) -> LoopBackend {
         Arc::clone(provider) as Arc<dyn mezame::provider::Provider>,
         settings(),
         "test-session",
+        "alice",
+        None,
     )
 }
 
@@ -750,6 +752,7 @@ async fn an_unscripted_request_fails_before_the_stream_and_is_not_rejected() {
 fn the_log_line_renders_each_outcome() {
     let ok = TurnLog {
         session: "s1",
+        user: "alice",
         model: SONNET,
         outcome: "ok",
         stop: Some(&StopReason::EndTurn),
@@ -764,10 +767,11 @@ fn the_log_line_renders_each_outcome() {
     };
     assert_eq!(
         ok.render(),
-        format!("turn session=s1 model={SONNET} outcome=ok stop=end_turn in=1 out=2 cache_read=3 cache_write=4 ms=1234")
+        format!("turn session=s1 user=alice model={SONNET} outcome=ok stop=end_turn in=1 out=2 cache_read=3 cache_write=4 ms=1234")
     );
     let cancelled = TurnLog {
         session: "s1",
+        user: "alice",
         model: SONNET,
         outcome: "cancelled",
         stop: None,
@@ -777,10 +781,11 @@ fn the_log_line_renders_each_outcome() {
     };
     assert_eq!(
         cancelled.render(),
-        format!("turn session=s1 model={SONNET} outcome=cancelled stop=- in=- out=- cache_read=- cache_write=- ms=5")
+        format!("turn session=s1 user=alice model={SONNET} outcome=cancelled stop=- in=- out=- cache_read=- cache_write=- ms=5")
     );
     let error = TurnLog {
         session: "s1",
+        user: "alice",
         model: SONNET,
         outcome: "error",
         stop: Some(&StopReason::Other("weird".into())),
@@ -790,7 +795,7 @@ fn the_log_line_renders_each_outcome() {
     };
     assert_eq!(
         error.render(),
-        format!("turn session=s1 model={SONNET} outcome=error stop=weird in=- out=- cache_read=- cache_write=- ms=9 error=line one line two")
+        format!("turn session=s1 user=alice model={SONNET} outcome=error stop=weird in=- out=- cache_read=- cache_write=- ms=9 error=line one line two")
     );
     assert_eq!(
         stop_name(&StopReason::ContextWindowExceeded),
@@ -803,6 +808,7 @@ fn a_history_entry_carries_the_turn_s_timestamp() {
     let entry = HistoryEntry {
         body: EntryBody::Thought { text: "t".into() },
         timestamp: 5,
+        usage: None,
     };
     assert_eq!(
         serde_json::to_value(&entry).unwrap(),

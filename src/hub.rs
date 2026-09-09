@@ -67,6 +67,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
+use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify, RwLock};
@@ -75,7 +76,7 @@ use tokio::time::{Instant, Sleep};
 use crate::backend::{
     user_echo_event, user_text_len, Backend, EchoBackend, HistoryEntry, TurnOutcome,
 };
-use crate::store::Store;
+use crate::store::{MessageWindow, Store};
 
 /// How long a session stays warm after the last browser detaches. 30s
 /// matches the WS reconnect-backoff cap on the client. A browser coming
@@ -434,15 +435,61 @@ pub struct MintContext {
     pub now: i64,
 }
 
-/// Builds the Backend for a session id. The registry holds one and calls
-/// it under its write lock, so it awaits nothing and returns at once. An
-/// `Err` fails the attach and leaves no hub and no row.
-pub type BackendFactory = Arc<dyn Fn(&str) -> Result<NewBackend> + Send + Sync>;
+/// The first phase of building a Backend: load what the session id has in
+/// the store. Runs with the per-id build gate held and no registry lock,
+/// so a slow load stalls this id's attaches and nothing else.
+pub type PrepareFn = Arc<dyn Fn(&str) -> BoxFuture<'static, MessageWindow> + Send + Sync>;
+
+/// The second phase: build the Backend for a session id from the window
+/// `prepare` loaded, for its owner. The registry calls it under its write
+/// lock, so it awaits nothing and returns at once. An `Err` fails the
+/// attach and leaves no hub and no row.
+pub type BuildFn =
+    Arc<dyn Fn(&str, MessageWindow, &OwnerContext) -> Result<NewBackend> + Send + Sync>;
+
+/// How a registry builds the Backend of each hub, in two phases: `prepare`
+/// with no lock held, `build` under the registry lock.
+#[derive(Clone)]
+pub struct BackendFactory {
+    pub prepare: PrepareFn,
+    pub build: BuildFn,
+    /// Whether the Backends built write their conversation to the store,
+    /// which is where `GET /history` then reads it from. `false` for the
+    /// echo, whose transcript lives in the hub and is served from it.
+    pub persists: bool,
+}
+
+impl BackendFactory {
+    /// A factory whose Backends keep nothing beyond their hub: `prepare`
+    /// loads nothing and resolves at once with an empty window.
+    pub fn in_memory(
+        build: impl Fn(&str, &OwnerContext) -> Result<NewBackend> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            prepare: Arc::new(|_session_id| Box::pin(std::future::ready(MessageWindow::default()))),
+            build: Arc::new(move |session_id, _window, owner| build(session_id, owner)),
+            persists: false,
+        }
+    }
+
+    /// A factory over a store: `prepare` loads the session's window,
+    /// `build` rebuilds a Backend from it that writes every later turn.
+    pub fn persistent(
+        prepare: impl Fn(&str) -> BoxFuture<'static, MessageWindow> + Send + Sync + 'static,
+        build: impl Fn(&str, MessageWindow, &OwnerContext) -> Result<NewBackend> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            prepare: Arc::new(prepare),
+            build: Arc::new(build),
+            persists: true,
+        }
+    }
+}
 
 /// The factory a registry has when none is given: an [`EchoBackend`] per
 /// hub and no `session_info`.
 pub fn echo_factory() -> BackendFactory {
-    Arc::new(|_session_id| {
+    BackendFactory::in_memory(|_session_id, _owner| {
         Ok(NewBackend {
             backend: Arc::new(EchoBackend::new()),
             session_info: None,
@@ -536,6 +583,13 @@ impl HubRegistry {
         Self::with_capacity(capacity, echo_factory())
     }
 
+    /// Whether the Backends this registry builds write their conversation
+    /// to the store, so `GET /history` reads it from there rather than
+    /// from the hub.
+    pub fn persists(&self) -> bool {
+        self.factory.persists
+    }
+
     /// Whether an upgrade naming `session_id` can be served now: a live
     /// session is always joinable, and a new one needs a free slot. An
     /// advisory read for `ws_upgrade`, so a full registry is answered
@@ -610,20 +664,25 @@ impl HubRegistry {
             match self.lookup(session_id).await {
                 Some(hub) => Ok(self.subscribe(hub).await),
                 None => {
-                    // Whether the first prompt titles the session: a new
-                    // row has no title; an existing row is read here,
-                    // with no registry lock held.
-                    let title_pending = match (&mint, &self.store) {
-                        (Some(_), _) => true,
-                        (None, Some(store)) => store
-                            .session(session_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some_and(|row| row.title.is_none()),
-                        (None, None) => false,
+                    // The store's part, with the gate held and no registry
+                    // lock: whether the first prompt titles the session (a
+                    // new row has no title; an existing row is read) and
+                    // the rows the Backend is rebuilt from. A minted id has
+                    // no row and no rows, and loads nothing.
+                    let (title_pending, window) = match (&mint, &self.store) {
+                        (Some(_), _) => (true, MessageWindow::default()),
+                        (None, Some(store)) => {
+                            let untitled = store
+                                .session(session_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some_and(|row| row.title.is_none());
+                            (untitled, (self.factory.prepare)(session_id).await)
+                        }
+                        (None, None) => (false, (self.factory.prepare)(session_id).await),
                     };
-                    self.build_and_register(session_id, owner, mint, title_pending)
+                    self.build_and_register(session_id, owner, mint, window, title_pending)
                         .await
                 }
             }
@@ -665,6 +724,7 @@ impl HubRegistry {
         session_id: &str,
         owner: &OwnerContext,
         mint: Option<MintContext>,
+        window: MessageWindow,
         title_pending: bool,
     ) -> Result<AttachedHub> {
         let mut map = self.inner.write().await;
@@ -674,7 +734,13 @@ impl HubRegistry {
             }
             .into());
         }
-        let hub = build_hub(session_id, self.clone(), owner.clone(), title_pending)?;
+        let hub = build_hub(
+            session_id,
+            self.clone(),
+            owner.clone(),
+            window,
+            title_pending,
+        )?;
         // The gate above is what makes the occupied case unreachable
         // here; `or_insert_with` keeps the insert atomic against
         // `register_for_test` all the same.
@@ -891,6 +957,7 @@ fn build_hub(
     session_id: &str,
     registry: HubRegistry,
     owner: OwnerContext,
+    window: MessageWindow,
     title_pending: bool,
 ) -> Result<SessionHub> {
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
@@ -911,7 +978,7 @@ fn build_hub(
     let NewBackend {
         backend,
         session_info,
-    } = (registry.factory)(session_id)?;
+    } = (registry.factory.build)(session_id, window, &owner)?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(COMMAND_CAPACITY);
     let (out_tx, _) = broadcast::channel::<Arc<Value>>(BROADCAST_CAPACITY);

@@ -16,8 +16,8 @@ use std::time::Duration;
 use mezame::backend::Backend;
 use mezame::conversation::Role;
 use mezame::hub::{
-    title_from_prompt, HubCommand, HubRegistry, NewBackend, OwnerContext, RegistryFull,
-    MAX_PROMPT_TEXT_BYTES, SESSION_CLOSED_CLOSE, TITLE_MAX_CHARS,
+    title_from_prompt, BackendFactory, HubCommand, HubRegistry, NewBackend, OwnerContext,
+    RegistryFull, MAX_PROMPT_TEXT_BYTES, SESSION_CLOSED_CLOSE, TITLE_MAX_CHARS,
 };
 use mezame::provider::{LoopSettings, Provider, StopReason, TurnEvent, Usage};
 use mezame::turn::LoopBackend;
@@ -2090,6 +2090,8 @@ fn loop_backend(provider: &Arc<ScriptedProvider>) -> Arc<LoopBackend> {
         Arc::clone(provider) as Arc<dyn Provider>,
         loop_settings(),
         SESSION_ID,
+        "test",
+        None,
     ))
 }
 
@@ -2169,17 +2171,20 @@ async fn a_factory_registry_replays_the_session_info_frame_on_attach_and_the_def
 {
     let provider = Arc::new(ScriptedProvider::new());
     let settings = loop_settings();
-    let registry = HubRegistry::with_factory(Arc::new(move |session_id| {
-        let backend = LoopBackend::new(
-            Arc::clone(&provider) as Arc<dyn Provider>,
-            settings.clone(),
-            session_id,
-        );
-        Ok(NewBackend {
-            session_info: Some(backend.session_info()),
-            backend: Arc::new(backend),
-        })
-    }));
+    let registry =
+        HubRegistry::with_factory(BackendFactory::in_memory(move |session_id, owner| {
+            let backend = LoopBackend::new(
+                Arc::clone(&provider) as Arc<dyn Provider>,
+                settings.clone(),
+                session_id,
+                &owner.user_name,
+                None,
+            );
+            Ok(NewBackend {
+                session_info: Some(backend.session_info()),
+                backend: Arc::new(backend),
+            })
+        }));
     let attached = registry
         .attach_or_create("factory-session", &owner(), None)
         .await
@@ -2248,6 +2253,8 @@ async fn every_failure_of_the_loop_ends_in_prompt_done() {
             Arc::clone(&provider) as Arc<dyn Provider>,
             loop_settings(),
             SESSION_ID,
+            "test",
+            None,
         )
         .with_idle_timeout_for_test(Duration::from_millis(50)),
     );
@@ -2463,4 +2470,190 @@ fn a_title_is_the_collapsed_text_cut_to_forty_characters_or_nothing_for_a_comman
     let title = title_from_prompt(&[text_block(&mixed)]).expect("a title");
     assert_eq!(title.chars().count(), TITLE_MAX_CHARS + 1);
     assert!(title.ends_with("é…"), "{title}");
+}
+
+// ---------- phase 2: the two-phase factory ----------
+
+/// A registry whose hubs run the loop over a scripted provider and load
+/// their rows through a counting store, wired the way the server wires
+/// it. Returns the registry, the counter and the store.
+fn counting_registry() -> (
+    HubRegistry,
+    Arc<support::CountingStore>,
+    Arc<dyn mezame::store::Store>,
+) {
+    let keys = mezame::store::crypto::MasterKey::from_bytes_for_test([9u8; 32]).keys();
+    let inner: Arc<dyn mezame::store::Store> =
+        Arc::new(mezame::store::sqlite::SqliteStore::open_in_memory(keys).unwrap());
+    let counting = Arc::new(support::CountingStore::new(inner));
+    let store: Arc<dyn mezame::store::Store> = counting.clone();
+    let (ticks, _) = broadcast::channel(8);
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider::new());
+    let registry = HubRegistry::with_factory(mezame::persistent_factory(
+        provider,
+        loop_settings(),
+        store.clone(),
+    ))
+    .with_store(store.clone(), ticks);
+    (registry, counting, store)
+}
+
+/// A user row for `name`, so a minted session's row can name them.
+async fn stored_owner(store: &dyn mezame::store::Store, name: &str) -> OwnerContext {
+    let user = store
+        .create_user(name, "$argon2id$stub", mezame::store::Role::User, 1)
+        .await
+        .unwrap();
+    OwnerContext {
+        user_id: user.id,
+        user_name: name.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn two_attaches_racing_on_one_new_id_load_the_window_once() {
+    // Requirement 8 criterion 3 at the registry: the load runs behind the
+    // per-id gate, so the second arrival finds the hub and loads nothing.
+    let (registry, counting, store) = counting_registry();
+    let owner = stored_owner(store.as_ref(), "alice").await;
+    store
+        .create_session(&owner.user_id, "raced-load", None, 1)
+        .await
+        .unwrap();
+
+    let (parked_tx, parked_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        let owner = owner.clone();
+        async move {
+            registry
+                .attach_or_create_parked_for_test("raced-load", &owner, async move {
+                    let _ = parked_tx.send(());
+                    let _ = release_rx.await;
+                })
+                .await
+        }
+    });
+    parked_rx.await.expect("the first arrival holds the gate");
+    let second = tokio::spawn({
+        let registry = registry.clone();
+        let owner = owner.clone();
+        async move { registry.attach_or_create("raced-load", &owner, None).await }
+    });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(counting.loads(), 0, "nothing loads while the gate is held");
+    release_tx.send(()).expect("the first arrival waits");
+
+    let first = first.await.unwrap().expect("the first attach");
+    let second = second.await.unwrap().expect("the second attach");
+    assert_ne!(first.attach_id, second.attach_id);
+    assert_eq!(counting.loads(), 1, "one load for one hub");
+}
+
+#[tokio::test]
+async fn a_slow_window_load_holds_no_registry_lock() {
+    // The load runs before the registry's write lock is taken: while one
+    // session's rows are loading, another session attaches and is served.
+    let parked: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>> = Arc::default();
+    let release: Arc<std::sync::Mutex<Option<oneshot::Receiver<()>>>> = Arc::default();
+    let (parked_tx, parked_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    *parked.lock().unwrap() = Some(parked_tx);
+    *release.lock().unwrap() = Some(release_rx);
+
+    let factory = BackendFactory::persistent(
+        {
+            let parked = parked.clone();
+            let release = release.clone();
+            move |session_id| {
+                let slow = session_id == "slow";
+                let parked = parked.lock().unwrap().take();
+                let release = release.lock().unwrap().take();
+                Box::pin(async move {
+                    if slow {
+                        if let Some(parked) = parked {
+                            let _ = parked.send(());
+                        }
+                        if let Some(release) = release {
+                            let _ = release.await;
+                        }
+                    }
+                    mezame::store::MessageWindow::default()
+                })
+            }
+        },
+        |_session_id, _window, _owner| {
+            Ok(NewBackend {
+                backend: Arc::new(mezame::backend::EchoBackend::new()),
+                session_info: None,
+            })
+        },
+    );
+    let registry = HubRegistry::with_factory(factory);
+
+    let slow = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.attach_or_create("slow", &owner(), None).await }
+    });
+    parked_rx.await.expect("the slow load is under way");
+    assert!(!registry.is_registered_for_test("slow").await);
+
+    let quick = timeout(
+        Duration::from_secs(2),
+        registry.attach_or_create("quick", &owner(), None),
+    )
+    .await
+    .expect("the other session is served while the load runs")
+    .expect("the attach succeeds");
+    assert_eq!(quick.session_id, "quick");
+    assert!(registry.is_registered_for_test("quick").await);
+    assert!(!slow.is_finished());
+
+    release_tx.send(()).expect("the slow load waits");
+    let slow = slow.await.unwrap().expect("the slow attach");
+    assert_eq!(slow.session_id, "slow");
+    assert!(registry.is_registered_for_test("slow").await);
+}
+
+#[tokio::test]
+async fn a_minted_session_loads_nothing_and_an_existing_one_loads_once() {
+    let (registry, counting, store) = counting_registry();
+    let owner = stored_owner(store.as_ref(), "alice").await;
+
+    let minted = registry
+        .attach_or_create(
+            "minted",
+            &owner,
+            Some(mezame::hub::MintContext {
+                workspace_root: None,
+                now: 5,
+            }),
+        )
+        .await
+        .expect("the mint attaches");
+    assert_eq!(minted.session_id, "minted");
+    assert_eq!(counting.loads(), 0, "a new id has no rows to load");
+    assert!(
+        store.session("minted").await.unwrap().is_some(),
+        "the row is created"
+    );
+
+    store
+        .create_session(&owner.user_id, "existing", None, 1)
+        .await
+        .unwrap();
+    let existing = registry
+        .attach_or_create("existing", &owner, None)
+        .await
+        .expect("the attach succeeds");
+    assert_eq!(existing.session_id, "existing");
+    assert_eq!(counting.loads(), 1, "an existing id loads its rows once");
+    let _again = registry
+        .attach_or_create("existing", &owner, None)
+        .await
+        .expect("the second attach joins");
+    assert_eq!(counting.loads(), 1, "a join loads nothing");
 }

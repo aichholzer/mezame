@@ -119,6 +119,33 @@ pub struct HistoryEntry {
     pub body: EntryBody,
     /// Milliseconds since the Unix epoch.
     pub timestamp: i64,
+    /// The four counts of the turn that produced an `agent` entry, when
+    /// the turn reported them; absent on every other entry and absent
+    /// from the JSON when `None`. The browser shows them under the reply
+    /// after a reload, as `prompt_done` showed them live.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_usage"
+    )]
+    pub usage: Option<Usage>,
+}
+
+/// `{input, output, cacheRead, cacheWrite}`, the shape `prompt_done`
+/// carries. Only reached with `Some`: `skip_serializing_if` handles `None`.
+fn serialize_usage<S: serde::Serializer>(
+    usage: &Option<Usage>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match usage {
+        Some(usage) => json!({
+            "input": usage.input,
+            "output": usage.output,
+            "cacheRead": usage.cache_read,
+            "cacheWrite": usage.cache_write,
+        })
+        .serialize(serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// The payload of a transcript entry, tagged on `role`.
@@ -469,12 +496,14 @@ impl Backend for EchoBackend {
                     HistoryEntry {
                         body: EntryBody::User { text: user_text },
                         timestamp,
+                        usage: None,
                     },
                     HistoryEntry {
                         body: EntryBody::Agent {
                             text: reply.clone(),
                         },
                         timestamp,
+                        usage: None,
                     },
                 );
             }

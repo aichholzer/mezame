@@ -23,6 +23,8 @@ use serde_json::Value;
 use crate::backend::{
     entry_text_len, HistoryEntry, Transcript, TRANSCRIPT_BUDGET_BYTES, TRANSCRIPT_MAX_ENTRIES,
 };
+use crate::history::{entries_from_row, user_entry};
+use crate::store::{MessageRole, MessageWindow};
 
 /// The image media types a prompt may carry.
 pub const IMAGE_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -546,6 +548,16 @@ pub struct Exchange {
     entries: usize,
     /// Bytes this exchange holds that its entries do not count.
     payload: usize,
+    /// The store's row for the user message, once written or restored.
+    /// `None` in a conversation nothing persists.
+    user_row: Option<i64>,
+}
+
+impl Exchange {
+    /// The store's row for the user message, when known.
+    pub fn user_row(&self) -> Option<i64> {
+        self.user_row
+    }
 }
 
 /// The conversation the next request is built from and the transcript
@@ -611,8 +623,18 @@ impl Conversation {
             status: ExchangeStatus::Open,
             entries: 1,
             payload,
+            user_row: None,
         });
         self.enforce_budget();
+    }
+
+    /// Name the store's row for the back exchange's user message, once the
+    /// write that produced it has returned. Nothing to name when the deque
+    /// is empty because `clear` ran in between.
+    pub fn set_user_row(&mut self, id: i64) {
+        if let Some(back) = self.exchanges.back_mut() {
+            back.user_row = Some(id);
+        }
     }
 
     /// Close the open exchange with the assistant's message, if any, and
@@ -645,7 +667,9 @@ impl Conversation {
     /// any event, or refused by the model at the end of its reply. Its
     /// user entry stays in the transcript, `entries` (what the browser was
     /// already shown) are recorded after it, and the exchange leaves every
-    /// later request. Returns `false` when no exchange is open.
+    /// later request. Returns the store rows of the user messages it
+    /// rejected, those that are known, so the caller can flag them; `None`
+    /// when no exchange is open and nothing changed.
     ///
     /// What the service saw was not the newest message alone: the request
     /// builder merges every unanswered user message immediately before it
@@ -653,26 +677,115 @@ impl Conversation {
     /// cancelled request, a reply with no text) were part of the refused
     /// content and are rejected with it. Leaving any of them would resend
     /// the refused content on every later turn.
-    pub fn reject_open(&mut self, entries: Vec<HistoryEntry>) -> bool {
-        let Some(back) = self.exchanges.back_mut() else {
-            return false;
-        };
+    pub fn reject_open(&mut self, entries: Vec<HistoryEntry>) -> Option<Vec<i64>> {
+        let back = self.exchanges.back_mut()?;
         if back.status != ExchangeStatus::Open {
-            return false;
+            return None;
         }
         back.status = ExchangeStatus::Rejected;
         back.entries += entries.len();
+        let mut rows: Vec<i64> = back.user_row.into_iter().collect();
         let last = self.exchanges.len() - 1;
         for exchange in self.exchanges.iter_mut().take(last).rev() {
             if exchange.status == ExchangeStatus::Closed && exchange.assistant.is_none() {
                 exchange.status = ExchangeStatus::Rejected;
+                rows.extend(exchange.user_row);
             } else if exchange.status == ExchangeStatus::Closed {
                 break;
             }
         }
+        rows.reverse();
         self.transcript.record(entries);
         self.enforce_budget();
-        true
+        Some(rows)
+    }
+
+    /// Rebuild from a session's stored rows, oldest first, appending to
+    /// whatever is held (an empty conversation, in practice). The window
+    /// is the store's bounded read; the budget this conversation was made
+    /// with is held as each row lands, so what remains is the newest
+    /// exchanges that fit, then every reasoning block is dropped.
+    ///
+    /// A user row opens an exchange whose entry text is the row's `text`,
+    /// the text an attachment contributed staying in the blocks and
+    /// counted as payload, exactly as `begin` counted it live. An
+    /// assistant row closes it with its blocks and the entries
+    /// [`entries_from_row`] derives. A user row flagged `rejected` becomes
+    /// a rejected exchange: an assistant row flagged `rejected` right
+    /// after it contributes its entries and no message, as `reject_open`
+    /// recorded them live; with no such row the rejection carries no
+    /// entries. A user row with no assistant row after it is a closed
+    /// exchange with no reply, the shape a failed or cancelled request
+    /// leaves. An assistant row with no open exchange before it, the
+    /// window having been cut between the two rows of a pair, is skipped.
+    ///
+    /// The reasoning is dropped whether or not the whole history loaded:
+    /// a block's signature is bound to the system prompt it was produced
+    /// under, that prompt's date line is not persisted, and a hub built
+    /// later assembles today's, so a replayed block would be refused. The
+    /// `thought` entries stay.
+    pub fn restore(&mut self, window: MessageWindow) {
+        // Whether the open exchange came from a user row flagged rejected
+        // and awaits the assistant row that may follow it.
+        let mut rejection_pending = false;
+        for row in window.rows {
+            match row.role {
+                MessageRole::User => {
+                    self.settle_open(&mut rejection_pending);
+                    let entry = user_entry(&row);
+                    self.begin(
+                        Message {
+                            role: Role::User,
+                            blocks: row.blocks,
+                        },
+                        entry,
+                    );
+                    self.set_user_row(row.id);
+                    rejection_pending = row.rejected;
+                }
+                MessageRole::Assistant => {
+                    if !self.has_open_exchange() {
+                        continue;
+                    }
+                    let entries = entries_from_row(&row);
+                    // The flag on the reply is evidence enough of a
+                    // refusal: the user row's flag is written after it,
+                    // and may not have been.
+                    if row.rejected {
+                        self.reject_open(entries);
+                    } else if rejection_pending {
+                        // A flagged question with an unflagged reply after
+                        // it is not a shape the loop writes; the flag on
+                        // the question stands and the reply is not carried.
+                        self.reject_open(Vec::new());
+                    } else {
+                        let message = Message {
+                            role: Role::Assistant,
+                            blocks: row.blocks,
+                        };
+                        self.complete(Some(message), entries);
+                    }
+                    rejection_pending = false;
+                }
+            }
+        }
+        self.settle_open(&mut rejection_pending);
+        self.strip_reasoning();
+    }
+
+    /// Close whatever exchange `restore` left open: rejected when its user
+    /// row was flagged, closed with no reply otherwise.
+    fn settle_open(&mut self, rejection_pending: &mut bool) {
+        if !self.has_open_exchange() {
+            *rejection_pending = false;
+            return;
+        }
+        if *rejection_pending {
+            self.reject_open(Vec::new());
+        } else {
+            self.complete(None, Vec::new());
+        }
+        *rejection_pending = false;
     }
 
     /// Drop every reasoning block (`thinking` and `opaque`) from the

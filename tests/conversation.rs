@@ -16,7 +16,11 @@ fn entry(role: &str, text: &str, timestamp: i64) -> HistoryEntry {
         },
         _ => unreachable!(),
     };
-    HistoryEntry { body, timestamp }
+    HistoryEntry {
+        body,
+        timestamp,
+        usage: None,
+    }
 }
 
 fn text(text: &str) -> Block {
@@ -107,7 +111,7 @@ fn complete_with_no_reply_closes_the_exchange_too() {
         Some(assistant(vec![text("late")])),
         vec![entry("agent", "late", 2)]
     ));
-    assert!(!conversation.reject_open(Vec::new()));
+    assert!(conversation.reject_open(Vec::new()).is_none());
     assert_eq!(
         texts(&conversation),
         vec!["User:q"],
@@ -129,10 +133,12 @@ fn a_rejected_exchange_stays_in_the_transcript_and_leaves_the_requests() {
         vec![entry("agent", "fine", 2)],
     );
     conversation.begin(user(vec![text("refused")]), entry("user", "refused", 3));
-    assert!(conversation.reject_open(vec![entry("agent", "partial", 4)]));
+    assert!(conversation
+        .reject_open(vec![entry("agent", "partial", 4)])
+        .is_some());
     assert!(!conversation.has_open_exchange());
     assert!(
-        !conversation.reject_open(Vec::new()),
+        conversation.reject_open(Vec::new()).is_none(),
         "rejecting twice changes nothing"
     );
     assert!(
@@ -161,7 +167,7 @@ fn complete_and_reject_on_an_empty_or_cleared_conversation_do_nothing() {
         Some(assistant(vec![text("x")])),
         vec![entry("agent", "x", 1)]
     ));
-    assert!(!conversation.reject_open(Vec::new()));
+    assert!(conversation.reject_open(Vec::new()).is_none());
     assert_eq!(conversation.exchange_count(), 0);
     assert!(conversation.history().is_empty());
 
@@ -355,7 +361,7 @@ fn a_rejection_covers_the_unanswered_run_before_it() {
     c.begin(user(vec![text("d")]), entry("user", "d", 5));
     c.complete(None, vec![]);
     c.begin(user(vec![text("e")]), entry("user", "e", 6));
-    assert!(c.reject_open(vec![]));
+    assert!(c.reject_open(vec![]).is_some());
     assert_eq!(
         statuses(&c),
         vec![
@@ -467,7 +473,7 @@ fn a_rejected_exchange_with_reply_entries_evicts_whole() {
     // exchange (two entries) goes and 55 remain.
     let mut c = Conversation::with_budget_for_test(64, 10_000);
     c.begin(user(vec![text("bad")]), entry("user", "bad", 1));
-    assert!(c.reject_open(vec![entry("agent", "partial", 2)]));
+    assert!(c.reject_open(vec![entry("agent", "partial", 2)]).is_some());
     c.begin(user(vec![text("ok")]), entry("user", "ok", 3));
     c.complete(
         Some(assistant(vec![text("fine")])),
