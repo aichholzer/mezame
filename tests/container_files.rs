@@ -400,3 +400,45 @@ fn ci_runs_no_ignored_test_and_holds_no_aws_secret() {
         "every live case is #[ignore], with or without a reason"
     );
 }
+
+#[test]
+fn the_setup_line_and_the_workflow_login_are_pinned() {
+    // Requirement 12 criterion 3: the compose comment shows the
+    // non-interactive setup with the admin flags, and the workflow logs
+    // in with a jar and reads the account's routes with it.
+    let compose = repo_file("compose.yaml");
+    assert!(
+        compose.contains("--admin alice --password-stdin"),
+        "the compose comment shows the flag setup"
+    );
+    assert!(
+        compose.contains("echo 'the password' | docker compose run -T --rm setup mezame init"),
+        "the password arrives on standard input"
+    );
+
+    let workflow = repo_file(".github/workflows/container.yml");
+    assert!(
+        workflow.contains("mezame init --bind 0.0.0.0:9510 --admin admin --password-stdin"),
+        "the workflow sets up through the flags"
+    );
+    assert!(
+        workflow.contains("echo 'change-me' |"),
+        "the password is a literal on standard input, not a secret"
+    );
+    assert!(
+        workflow.contains("-c jar.txt -H 'Sec-Fetch-Site: none'"),
+        "the login lands in a jar with the header a script must send"
+    );
+    assert!(
+        workflow.contains(r#"-b jar.txt http://127.0.0.1:9510/state)" = 200"#),
+        "the jar opens /state"
+    );
+    assert!(
+        workflow.contains(r#"-b jar.txt http://127.0.0.1:9510/me)" = 200"#),
+        "the jar opens /me"
+    );
+    assert!(
+        workflow.contains("Backend: Bedrock anthropic.claude-sonnet-5"),
+        "the second init's model is asserted from the logs"
+    );
+}

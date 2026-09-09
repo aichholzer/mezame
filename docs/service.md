@@ -10,10 +10,17 @@ process that exits on the missing config every few seconds, and a service has
 no terminal to answer the prompt on.
 
 ```sh
-mezame init                              # the prompt, in your own shell
-mezame init --bind 127.0.0.1:9510        # the same file with no prompt
-sudo -u youruser -H /home/youruser/.cargo/bin/mezame init --bind 127.0.0.1:9510   # for a system unit
+mezame init                              # the questions, in your own shell
+echo 'the password' | mezame init --bind 127.0.0.1:9510 --admin alice --password-stdin   # no prompt
+echo 'the password' | sudo -u youruser -H /home/youruser/.cargo/bin/mezame init \
+  --bind 127.0.0.1:9510 --admin alice --password-stdin                                    # for a system unit
 ```
+
+The account the service runs under must own `~/.mezame` whole: the config,
+the datastore `mezame.db`, and `master.key` at mode `0600`. The server
+refuses to start on a key another account can read, and cannot open the
+datastore's credentials without it, so keep the two files together in any
+backup.
 
 ## Linux (systemd)
 
@@ -42,11 +49,13 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
 
    `%h` expands to `$HOME`. Adjust the `ExecStart` path if you installed Mezame somewhere else.
 
-   With a `bedrock` section in the config, Mezame needs AWS credentials as the
-   service runs, and the unit has no shell profile to hand them over. The SDK
+   With a Bedrock model configured (`mezame init --model`), Mezame needs AWS
+   credentials as the service runs, and the unit has no shell profile to hand
+   them over. The SDK
    reads `~/.aws/config` and `~/.aws/credentials` under the unit's `HOME`, so a
-   profile that works in your shell works here: name it with `profile` in the
-   config or with `Environment=AWS_PROFILE=work` in `[Service]`. Static keys
+   profile that works in your shell works here: name it with
+   `mezame init --profile work` or with `Environment=AWS_PROFILE=work` in
+   `[Service]`. Static keys
    go in `[Service]` as `Environment=AWS_ACCESS_KEY_ID=...` and
    `Environment=AWS_SECRET_ACCESS_KEY=...`, or in a root-owned file named by
    `EnvironmentFile=`. An SSO profile needs `aws sso login` run as the same
@@ -74,7 +83,13 @@ Pick one of the two patterns below. User service is the simpler choice for a sin
 
 ### System service (multi-user or headless)
 
-Mezame has no auth of its own; on a host with other accounts, every one of them can reach a loopback Mezame at `127.0.0.1:9510`, list its sessions and read its transcripts. Use a system service on a shared host only behind something that knows who the user is.
+The login gates every request, so another account on the host reaching the
+loopback port sees the sign-in form and nothing else. What loopback does not
+protect is the files: on a shared host, `~/.mezame` (the datastore and the
+master key) is only as private as its Unix modes, which Mezame keeps
+owner-only. The cookie crosses loopback unencrypted, which stays on the
+machine; a LAN bind sends it over the wire in the clear, so front anything
+non-local with TLS.
 
 1. Put the unit at `/etc/systemd/system/mezame.service`:
 
@@ -191,7 +206,7 @@ Install as a LaunchAgent under your user account. This runs Mezame whenever you 
 
 ## Shutdown behaviour
 
-Both systemd `stop` and launchd `bootout` send SIGTERM. Mezame catches it, stops accepting new WebSocket connections, and exits. Live browser sessions drop, and the next connect recreates them. Nothing is left behind on disk to clean up: a session and its transcript live in memory only, so a restart starts every conversation fresh. Durable storage is planned; until it lands, treat a restart as losing the transcripts.
+Both systemd `stop` and launchd `bootout` send SIGTERM. Mezame catches it, stops accepting new WebSocket connections, and exits. Live browser sockets drop and reconnect on the next start, and each conversation is served back from the datastore where every finished turn already sits. A turn still streaming when the stop lands is cut short; its prompt is stored, the partial reply is not.
 
 ## Resource limits
 

@@ -19,11 +19,12 @@ back online from across town.
 
 ## What it does
 
-Mezame is an **agent harness**. It serves a browser UI, keeps one session per
-conversation, and runs each prompt as a turn against an Anthropic model on
-Amazon Bedrock, streaming the answer and the model's reasoning back as they
-arrive. Several browsers can attach to one session at the same time; a session
-survives a reload and a reconnect.
+Mezame is an **agent harness**. It serves a browser UI behind a login, keeps
+one session per conversation, and runs each prompt as a turn against an
+Anthropic model on Amazon Bedrock, streaming the answer and the model's
+reasoning back as they arrive. Several browsers can attach to one session at
+the same time, conversations live in a local datastore, and a session survives
+a reload, a reconnect and a restart of the server.
 
 ## What Mezame is not
 
@@ -32,23 +33,23 @@ survives a reload and a reconnect.
 - **Mezame is not a hosted service.** You install it on a machine you control.
   There is no account to create and nothing of yours leaves that machine except
   to whichever provider you configure.
-- **Mezame has no authentication of its own.** Mezame checks that every
-  request names a host it serves and that a WebSocket upgrade or a write comes
-  from a page it served itself, so a hostile page cannot ride your browser into
-  a loopback Mezame; binding loopback keeps the network out, not your own
-  browser. Every request that passes those two checks is trusted: there is no
-  notion of who you are. On any bind other than loopback, anyone who can reach
-  the port can list your sessions (`GET /state` returns every session id), read
-  every transcript (`/history`), join any session and send prompts into it
-  (`/ws`), learn the directory Mezame runs in (the `ready` frame), and rewrite
-  the shared tab list (`PUT /state`). A session id is not a secret on that
-  path. Loopback also does not separate you from other accounts on the same
-  machine: on a shared host, any local user can reach the port. Access control
-  is pushed to the edge: bind an address in your own network and put something
-  in front of it that already knows who you are.
-- **Mezame is not multi-user.** One installation serves one person's sessions.
-  The session list and the settings are shared across every browser that can
-  reach it, deliberately, so your phone and your desktop stay in sync.
+- **Mezame knows who is asking.** Every request carries a signed session
+  cookie, and everything but the sign-in form answers 401 without one; a
+  socket opened without one is closed with its own code, and the browser
+  shows the login. Mezame also checks that every request names a host it
+  serves and that a WebSocket upgrade or a write comes from a page it served
+  itself, so a hostile page cannot ride your browser into a loopback Mezame.
+  Sessions belong to the account that opened them: another account's session
+  answers 404 wherever it is named. The login is the floor, not the whole
+  posture: on a plain-HTTP LAN bind the cookie crosses the network readable,
+  so a public hostname belongs behind TLS, which a Cloudflare Tunnel gives
+  you for free, and an identity layer at the edge remains a good second
+  factor.
+- **Mezame is multi-user, minimally.** Accounts are created from the
+  terminal, each sees only its own sessions and settings, and every browser
+  signed in to one account stays in sync. There are two roles, `admin` and
+  `user`, which nothing distinguishes yet, and no interface for sharing a
+  provider credential between accounts; those arrive in a later phase.
 - **Mezame does not touch your files on its own.** It reads and writes
   `~/.mezame/` and nothing else.
 
@@ -73,12 +74,11 @@ mezame init
 mezame
 ```
 
-`mezame init` asks for the address to bind and for the Bedrock model, region
-and profile; the credentials are the ones your AWS CLI already has. Access
-control for the browser is pushed to the edge: bind an address in your network,
-put a Cloudflare Tunnel in front, and let Cloudflare Access gate the hostname
-with your existing identity provider. You already trust that stack with the
-rest of your self-hosted tools.
+`mezame init` asks for the address to bind, the admin account, and the
+Bedrock model, region and profile; the credentials are the ones your AWS CLI
+already has. The login gates every request, and a Cloudflare Tunnel in front
+gives a public hostname TLS and, with Access, a second identity layer from
+your existing provider.
 
 ## Features
 
@@ -95,12 +95,21 @@ What this build does today:
 - Lets you pick among the models listed in the config, shared across every
   attached browser; cancel a turn mid-stream; and attach images and documents
   to a prompt.
-- Several sessions per browser, each its own conversation, in tabs.
+- A login in the browser, and accounts from the terminal: `mezame user add`,
+  `mezame user list`, `mezame passwd`. Each account sees only its own
+  sessions and settings, on every device it signs in from.
+- Conversations live in a local SQLite datastore, so a reload past the grace
+  window or a restart of the server serves the conversation back, token
+  counts included, and the next turn continues it. The Bedrock region and
+  profile are encrypted in the same file under a locally generated master
+  key.
+- Several sessions per browser, each its own conversation, in tabs; one
+  session list per account, served by the server, the same on every device.
 - One session on several devices: open the same conversation on a phone and a
   laptop, and every turn lands on both as it happens.
-- A session survives a reload or a reconnect within a 30-second grace window,
-  and the transcript is served back on attach. A turn still running when the
-  last browser leaves keeps running, for up to 30 minutes.
+- A session survives a reload, a reconnect and a restart, and the transcript
+  is served back on attach. A turn still running when the last browser leaves
+  keeps running, for up to 30 minutes.
 - Recently-closed history with one-click restore.
 - Auto-reconnect with exponential back-off on WebSocket drops.
 - Idle sessions release their resources 30 seconds after the last browser
@@ -118,36 +127,55 @@ mezame init
 mezame
 ```
 
-`mezame init` asks four questions: the address to bind, the Bedrock model id,
-the AWS region and the AWS profile. An empty model keeps the echo backend, which
-returns what you type and reaches no provider; an empty region or profile
-leaves the SDK's defaults in force. The same file with no prompt, for a service
-unit or a container started before setup:
+`mezame init` asks its questions in order: the address to bind; the admin
+username and password (masked, entered twice, skipped when the datastore
+already holds a user); and the Bedrock model id, AWS region and AWS profile,
+each optional. An empty model keeps the echo backend, which returns what you
+type and reaches no provider; an empty region or profile leaves the SDK's
+defaults in force. The same setup with no prompt, for a service unit or a
+container started before setup:
 
 ```sh
-mezame init --bind 127.0.0.1:9510 --model global.anthropic.claude-sonnet-5 --region us-east-1 --profile work
+echo 'the password' | mezame init --bind 127.0.0.1:9510 --admin alice --password-stdin \
+  --model global.anthropic.claude-sonnet-5 --region us-east-1 --profile work
 ```
 
-The section it writes holds `model`, `region` and `profile`. A hand-edited
-`~/.mezame/config.json` with a second model for the picker:
+A setting no flag names keeps its current value. The model goes to a profile
+row in the datastore, and the region and profile to one encrypted credential
+row beside it; the file holds server settings alone. A hand-edited
+`~/.mezame/config.json` at version 2, with a second model for the picker:
 
 ```json
 {
   "version": 2,
   "transports": [{ "kind": "cloudflared", "bind": "127.0.0.1:9510" }],
-  "bedrock": {
-    "model": "global.anthropic.claude-sonnet-5",
-    "models": ["global.anthropic.claude-sonnet-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"],
-    "region": "us-east-1",
-    "profile": "work"
-  }
+  "datastore": { "backend": "sqlite" },
+  "models": ["global.anthropic.claude-haiku-4-5-20251001-v1:0"]
 }
 ```
 
-`models` is the list the browser's picker offers; `init` writes none, so the
-picker offers `model` alone until you add the list. The optional `thinking`,
-`thinking_budget` and `max_output_tokens` keys are in the
-[configuration reference](./docs/architecture.md#configuration-reference).
+`models` is the list the browser's picker offers besides the profile's own
+model; `init` writes none. The thinking mode, its budget and the reply
+ceiling are not settable in this alpha: the mode follows the model (the
+Claude 4.6 line and later think adaptively, the models before it take a
+budget), the budget is 4096 tokens and the ceiling 16384, until a later
+phase adds a profile editor.
+
+Accounts are managed from the terminal:
+
+```sh
+mezame user add carol            # asks for the password twice; --password-stdin for scripts
+mezame user list                 # name, role, creation date
+mezame passwd carol              # a new password; signs carol out everywhere
+```
+
+Under `~/.mezame` live three files, each owner-only: `config.json`,
+`mezame.db` (the datastore: users, sessions and their messages, the Bedrock
+profile and its encrypted credential) and `master.key`, 32 random bytes the
+credential and cookie keys derive from. The key protects a copied
+`mezame.db` and nothing more: whoever can read `~/.mezame` whole, or is
+root on the machine, has both files. Back the two up together; the
+datastore cannot be opened without its key.
 
 Mezame holds no credentials. The AWS SDK finds them where the AWS CLI does:
 `~/.aws/credentials` and `~/.aws/config` under the account Mezame runs as,
@@ -156,8 +184,9 @@ including SSO profiles after `aws sso login`, or the `AWS_ACCESS_KEY_ID`,
 `AWS_BEARER_TOKEN_BEDROCK` for a Bedrock API key. The model must be enabled for
 the account in the Bedrock console under Model access, in the region the config
 names, and the credentials need `bedrock:InvokeModelWithResponseStream` on it.
-Startup prints a `Backend:` line naming the model, region and profile in force,
-or `Backend: echo` when the section is absent.
+Startup prints a `Backend:` line naming the model in force and nothing of
+the region or profile, or `Backend: echo` when no model is set, then a
+`Datastore:` line naming the file and its user count.
 
 This alpha assumes a fresh install. There is no migration from 0.13 or from an
 earlier alpha: remove `~/.mezame` left by an earlier version first.
@@ -236,9 +265,12 @@ docker compose run --rm setup
 
 That runs `mezame init` interactively. **Choose `0.0.0.0:9510` at the bind
 prompt.** The default, `127.0.0.1:9510`, binds loopback inside the container,
-and a published port then answers nothing. Without a terminal,
-`docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510 --model
-global.anthropic.claude-sonnet-5` writes the same config with no prompt.
+and a published port then answers nothing. Without a terminal:
+
+```sh
+echo 'the password' | docker compose run -T --rm setup mezame init \
+  --bind 0.0.0.0:9510 --admin alice --password-stdin --model global.anthropic.claude-sonnet-5
+```
 
 Credentials reach the container from the host: `compose.yaml` passes
 `AWS_PROFILE`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`,
@@ -273,11 +305,13 @@ bind is healthy inside the container and unreachable on the published port. If
 you bound another port, override `healthcheck` in `compose.yaml`.
 
 `compose.yaml` publishes the port on the host's loopback only,
-`127.0.0.1:9510`. Mezame has no authentication of its own, so that is the
-default. To reach it from other machines on a network you trust, change the
-mapping to `"0.0.0.0:9510:9510"`, knowing that on Linux Docker's own firewall
-rules bypass `ufw` and the port opens on every network the host is on. A
-Cloudflare Tunnel running on the host reaches the loopback mapping as it is.
+`127.0.0.1:9510`: the login gates who gets in, and loopback keeps the cookie
+off the network. To reach it from other machines on a network you trust,
+change the mapping to `"0.0.0.0:9510:9510"`, knowing that the cookie then
+crosses that network over plain HTTP and that on Linux Docker's own firewall
+rules bypass `ufw`, so the port opens on every network the host is on. A
+Cloudflare Tunnel running on the host reaches the loopback mapping as it is
+and brings TLS.
 
 Stderr carries Mezame's own logs. One environment variable is worth knowing:
 
@@ -286,40 +320,34 @@ Stderr carries Mezame's own logs. One environment variable is worth knowing:
 
 ## Known gaps
 
-1. **One provider, no tools, no disk.** This build talks to Amazon Bedrock and
+1. **One provider, no tools.** This build talks to Amazon Bedrock and
    nothing else; a second provider arrives with the provider seam's next
-   tenant. The model can read and write nothing but the conversation: no file
-   access, no shell, no web, so a prompt that asks for those gets an answer
-   in words. A transcript lives in memory only (gap 3), and so does the usage
-   footer: a reload shows the conversation without its counts.
-2. **Auth enforcement.** Mezame has no notion of who is connected. What it
-   does check, in `src/guard.rs`, is that a WebSocket upgrade or a write comes
-   from a page it served (`Origin`) and that every request names a host it
-   serves (`Host`). Identity arrives with the accounts work: users, a signed
-   session cookie, and a login in the browser. An interim shared token for
-   non-loopback binds was weighed for this alpha and deliberately not built:
-   it would be replaced wholesale by that work, a static token shared by
-   every device crosses a plain-HTTP LAN in the clear and, as a cookie, is
-   sent to every other service on the same host, and switching it on by
-   default would lock out every container deployment on upgrade. Until then
-   a non-loopback bind is for a network you trust end to end, as the section
-   above says. Validating Cloudflare Access's `Cf-Access-Jwt-Assertion`
-   header (JWKS at `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`)
-   is the other path; the TODO sits in `src/http.rs`.
-3. **A transcript lives as long as its session.** Nothing is written to disk,
-   so a reload after the grace period shows an empty log and a restart loses
-   every conversation. Durable storage is planned.
+   tenant. The model can read and write nothing but the conversation: no
+   file access, no shell, no web, so a prompt that asks for those gets an
+   answer in words.
+2. **Accounts are coarse.** There is a login, per-account sessions and two
+   roles, and passwords are managed from the terminal alone. Nothing yet
+   distinguishes an admin from a user, and there is no interface for
+   sharing a provider credential between accounts. On a plain-HTTP bind the
+   cookie crosses the network readable, so a public hostname belongs behind
+   TLS; validating Cloudflare Access's `Cf-Access-Jwt-Assertion` header as
+   a second factor at the edge remains on the list.
+3. **What persists, and what does not.** Conversations, sessions, users,
+   settings and the Bedrock credential live in the datastore and survive a
+   restart. Still memory-only: a turn in flight when the server stops is
+   cut short, and notices (the grey `sys` lines) are not stored, so a
+   reload shows the conversation without them.
 
 ## Roadmap
 
 None of these ship today, and none block the core loop.
 
-1. **A second provider and a store for credentials.** The Anthropic API
-   directly, then others, behind the same `Provider` trait, with the keys
-   kept in the local database rather than the environment.
-2. **Durable storage and accounts.** A local database for transcripts,
-   settings, and credentials, and a login so an installation can serve more
-   than one person.
+1. **A second provider.** The Anthropic API directly, then others, behind
+   the same `Provider` trait, each credential a row in the datastore as the
+   Bedrock one already is.
+2. **A profile editor and grants.** The model, thinking mode, budget and
+   reply ceiling editable per profile in the browser, and provider
+   credentials shareable between accounts.
 3. **Tools and workspaces.** File reads and writes, shell commands, and an
    approval flow in the browser, scoped to a directory you nominate.
 4. **Telegram transport.** Not implemented: `TransportConfig` carries a
@@ -339,11 +367,44 @@ resulting binary is missing its UI.
 The UI build needs Node.js 24 or newer. Check `node --version` and upgrade.
 
 **No config at `~/.mezame/config.json`**
-Run `mezame init`. It writes the file after one prompt. With no terminal
+Run `mezame init`. It writes the file after its questions. With no terminal
 attached (a service manager, `docker compose up -d`) it exits non-zero, writes
 nothing, and the manager restarts it until the file exists; the log names the
-way out. Run `mezame init --bind ADDR` once, as the account the service runs
-under, and start it again.
+way out. Run `mezame init --bind ADDR --admin NAME --password-stdin` once, as
+the account the service runs under, and start it again.
+
+**The server refuses to start naming `config.json` and a version**
+An earlier release wrote the file. Run `mezame init`; it rewrites the file at
+version 2 and keeps the hosts.
+
+**The server refuses to start naming a `bedrock` section**
+The model, region and profile live in the datastore now. Run
+`mezame init --model ID [--region R] [--profile P]`; it writes the rows and
+drops the section from the file.
+
+**A forgotten password**
+`mezame passwd NAME` sets a new one from the terminal, as the account Mezame
+runs under. There is no reset flow in the browser.
+
+**Logged out on every device after a password change**
+By design: a password change ends every session cookie the account had. Sign
+in again with the new password.
+
+**The server refuses to start naming `master.key` and a mode or length**
+The key must be a regular file of exactly 32 bytes, readable by its owner
+alone. `chmod 600 ~/.mezame/master.key` fixes the mode. A file of another
+length is not the key: restore the real one from backup.
+
+**`mezame.db` exists but `master.key` is missing**
+Nothing sealed in the datastore can be opened without its key, so the server
+stops rather than quietly making a new one. Restore `~/.mezame` from its
+backup; or run `mezame init` to create a new key and re-enter the Bedrock
+credential, which drops the credential rows the old key sealed and says how
+many.
+
+**A model, region or profile changed with `mezame init` is not in force**
+The running server reads the profile and its credential once, at startup.
+Restart it.
 
 **Browser connects, the composer is read-only**
 A turn is in flight on that session, started here or on another device. It
@@ -367,21 +428,21 @@ message again; the conversation continues without the earlier reasoning.
 Access was denied. Either the model is not enabled for this account in this
 region (Bedrock console, Model access), or the credentials the SDK found lack
 `bedrock:InvokeModelWithResponseStream` on it, or the SDK picked up a different
-profile than you meant. The `Backend:` line at startup names the profile and
-region in force; `aws sts get-caller-identity --profile <name>` shows who the
-credentials are.
+profile than you meant. The startup lines no longer name the region or
+profile; re-run `mezame init` to see and keep the current values, and
+`aws sts get-caller-identity --profile <name>` shows who the credentials are.
 
 **The turn fails naming "on-demand throughput"**
 The model id names a version Bedrock does not serve on demand in this region.
 Use the cross-region id (the `global.` or `us.` prefix, as the model card
-lists it), or a version that has on-demand throughput, and put that id under
-`model` and in `models`.
+lists it), or a version that has on-demand throughput, and set it with
+`mezame init --model <id>`; then restart.
 
 **The turn fails with "No AWS region is set"**
 Neither the config, `AWS_REGION` nor the profile names a region, so the SDK
 has nowhere to send the request. Startup does not check this; the first turn
-does. Add `"region": "us-east-1"` (or yours) to the `bedrock` section, or
-export `AWS_REGION`.
+does. Run `mezame init --region us-east-1` (or yours) and restart, or export
+`AWS_REGION`.
 
 **The turn fails with "No AWS credentials were found"**
 Startup does not resolve credentials; the first turn does, and the SDK's chain

@@ -470,15 +470,6 @@ describe('renderHistoryText', () => {
   });
 });
 
-// ---------- reconcile: vanishing-session guard ----------
-//
-// Regression for the bug where a live session silently disappeared
-// from state.json. Reconcile must only close a local session that is
-// absent from the server's `sessions` snapshot when the server's
-// `closed` history corroborates a deliberate close. An unverified
-// omission (another browser clobbered the list with a partial view)
-// must NOT close the session.
-
 describe('shouldSuspendIdle', () => {
   const ctx = (over: Partial<{ isActive: boolean; visible: boolean; now: number; thresholdMs: number }> = {}) => ({
     isActive: false,

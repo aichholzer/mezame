@@ -46,8 +46,8 @@ const DEFAULTS: Settings = {
 // resolves, a jarring flash for a night-mode feature.
 /** Idle-suspend bounds, in minutes. The Settings slider clamps to this
  * inclusive range; the store clamps again defensively on every set so a
- * hand-edited state.json or an out-of-range number box cannot push the
- * threshold outside it. */
+ * value from an old settings document or an out-of-range number box
+ * cannot push the threshold outside it. */
 export const IDLE_SUSPEND_MIN_MINUTES = 1;
 export const IDLE_SUSPEND_MAX_MINUTES = 60;
 

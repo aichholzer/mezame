@@ -3,12 +3,13 @@
 # First-run setup (interactive, one-off):
 #   docker compose run --rm setup
 #
-# That runs `mezame init`, which asks for the address to bind, then the
-# Bedrock model, region and profile. Choose 0.0.0.0:9510 for the bind. The
-# default, 127.0.0.1:9510, binds loopback inside the container, and the
-# published port below would then answer nothing. Without a terminal,
-# `docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510 --model
-# global.anthropic.claude-sonnet-5` writes the same config with no prompt.
+# That runs `mezame init`, which asks for the address to bind, the admin
+# account, then the Bedrock model, region and profile. Choose 0.0.0.0:9510
+# for the bind. The default, 127.0.0.1:9510, binds loopback inside the
+# container, and the published port below would then answer nothing.
+# Without a terminal, the same setup with no prompt:
+#   echo 'the password' | docker compose run -T --rm setup mezame init \
+#     --bind 0.0.0.0:9510 --admin alice --password-stdin --model global.anthropic.claude-sonnet-5
 #
 # Credentials never live in the image or the volume. The `environment`
 # list on the `mezame` service names the AWS variables bare, which passes
@@ -22,15 +23,18 @@
 # container is your call, which is why it ships commented.
 #
 # The port is published on the host's loopback only: the browser on the
-# host reaches it at http://127.0.0.1:9510 and nothing else does. Mezame
-# has no authentication of its own, so this is the safe default. To reach
-# it from other machines on a network you trust, change the mapping to
-# "0.0.0.0:9510:9510". On Linux, Docker's own firewall rules bypass ufw,
-# so that opens the port on every network the host is on; a Cloudflare
-# Tunnel running on the host reaches the loopback mapping as it is.
+# host reaches it at http://127.0.0.1:9510 and nothing else does. The
+# login gates who gets in, and loopback keeps the session cookie off the
+# network. To reach it from other machines on a network you trust, change
+# the mapping to "0.0.0.0:9510:9510", knowing the cookie then crosses that
+# network over plain HTTP. On Linux, Docker's own firewall rules bypass
+# ufw, so that opens the port on every network the host is on; a
+# Cloudflare Tunnel running on the host reaches the loopback mapping as
+# it is and brings TLS.
 #
-# The container runs as user `mezame` (uid 1000) with its config at
-# /home/mezame/.mezame, on a read-only root filesystem, with every
+# The container runs as user `mezame` (uid 1000) with its files at
+# /home/mezame/.mezame (the config, the datastore and the master key, on
+# the named volume), on a read-only root filesystem, with every
 # capability dropped and no privilege escalation. Start from a fresh
 # volume: one created by an earlier version is not carried over, and
 # `docker compose down -v` removes it. Docker lets the container bind any

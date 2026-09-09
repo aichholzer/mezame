@@ -1,12 +1,42 @@
 # Wire protocol
 
-Mezame speaks JSON text frames to the browser over `/ws`, plus three plain HTTP
-endpoints. This document is the catalogue of those messages, for contributors
-and for anyone plumbing a new client. The README covers the higher-level
-architecture.
+Mezame speaks JSON text frames to the browser over `/ws`, plus a handful of
+plain HTTP endpoints. This document is the catalogue of those messages, for
+contributors and for anyone plumbing a new client. The README covers the
+higher-level architecture.
 
 Eight server events, four client commands. Nothing outside those two sets is
 sent or accepted.
+
+## Authentication
+
+Every endpoint below except the UI shell and its assets, `POST /login` and
+`GET /me` requires a session cookie, and answers 401 with a plain-text body
+without a valid one. A WebSocket upgrade with no valid cookie completes its
+handshake and closes at once with code 4401 and reason `login required`,
+because a browser cannot read a refused upgrade's status; a client treats
+4401 as "sign in again", never as a drop to retry.
+
+- **`POST /login`** takes `{"username": "...", "password": "..."}` and, on
+  success, answers 200 with the user (`id`, `name`, `role`) and a
+  `Set-Cookie` for `mezame_session`: `HttpOnly`, `SameSite=Lax`, `Path=/`,
+  90 days, marked `Secure` when the request arrived over TLS at a proxy or
+  the configured `public_url` is HTTPS. A wrong username and a wrong
+  password are one 401 with one fixed body. Ten failed attempts on a
+  username inside a minute answer 429 with `Retry-After` naming the wait in
+  seconds. Any other body shape is 400.
+- **`POST /logout`** answers 204 and clears the cookie on this device only.
+- **`GET /me`** answers the cookie's user (`id`, `name`, `role`), or 401.
+
+The cookie is signed with a key derived from the server's master key and
+carries the user's session epoch; a password change bumps the epoch, which
+ends every cookie the account had. A cookie with under 30 days left is
+re-issued on any response, so a device in use stays signed in.
+
+Sessions belong to the account that opened them. A session id that does not
+exist, is archived, or belongs to another account is answered the same way
+wherever it is named: 404, with `{"entries": []}` from `/history`, a
+plain-text body from `/sessions/{id}`, and a refused upgrade from `/ws`.
 
 ## Browser to Mezame (JSON text frames over `/ws`)
 
@@ -146,13 +176,19 @@ Details:
   `cacheRead` the input tokens served from the prompt cache and `cacheWrite`
   the input tokens written to it, so the whole input is
   `input + cacheRead + cacheWrite`; `output` counts the reply, reasoning
-  included. A client shows it under the answer; `/history` does not carry it.
+  included. A client shows it under the answer, and `/history` carries the
+  same counts on its agent entries, so a reload shows them again.
 - **`error`** precedes `prompt_done` when a turn failed. `message` holds the
   failure text.
 
-No `tool_call` or `permission_request` frame is sent in the 0.14.0-alpha.2
-release: tools arrive with a later alpha. Their shapes are fixed here so a
-client written now keeps working when they land.
+No `tool_call` or `permission_request` frame is sent in this alpha: tools
+arrive with a later one. Their shapes are fixed here so a client written now
+keeps working when they land.
+
+Two close codes are Mezame's own, and a client treats any other close as a
+drop to retry: `4401`, `login required` (the cookie is gone; sign in), and
+`4404`, `session closed` (the session was archived or deleted under this
+connection; drop the tab and refetch the list).
 
 ## Session history
 
@@ -161,35 +197,38 @@ client written now keeps working when they land.
 ```json
 { "entries": [
   { "role": "user", "text": "hello", "timestamp": 1730000000000 },
-  { "role": "agent", "text": "hello", "timestamp": 1730000000000 },
+  { "role": "agent", "text": "hello", "timestamp": 1730000000000,
+    "usage": { "input": 65, "output": 4, "cacheRead": 0, "cacheWrite": 0 } },
   { "role": "tool_call", "toolCallId": "...", "title": "...", "status": "completed",
     "kind": null, "rawInput": {...}, "content": null, "locations": null,
     "timestamp": 1730000000000 }
 ] }
 ```
 
-A text entry carries `role`, one of `user`, `agent`, `sys` or `thought`, a
-`text` string, and a `timestamp` in milliseconds since the Unix epoch. A `user`
+A text entry carries `role`, one of `user`, `agent` or `thought`, a `text`
+string, and a `timestamp` in milliseconds since the Unix epoch. A `user`
 entry holds neither the `> ` prefix nor the trailing newline of the echo: a
 client adds both when it renders, so the rendered line matches the live echo
-byte for byte.
+byte for byte. An `agent` entry carries `usage`, the turn's four token
+counts, when the provider reported them; no other role does. `sys` notices
+are not stored, so a reload shows the conversation without them; the echo,
+which persists nothing, still serves them from its in-memory transcript.
 
 A tool-call entry is the `tool_call` event with `type` renamed to `role` and a
 `timestamp` added, with the same nullability in every field.
 
-Entries come back in recorded order, with no pagination. The transcript is
-bounded: the shipped Backend retains at most 16 MiB of entry text and 10,000
-entries, evicting the oldest turn first and always keeping the newest, so a
-long conversation returns its most recent window. An absent or empty `session`
-answers 400 with a plain-text body. An id with no live
-session answers 200 with an empty array, and creates nothing; that covers a
-value holding `/`, `\` or `..`, since no such value is ever bound to a session.
-The endpoint answers 200 or 400 and nothing else. It reads no file and never
-consults `HOME`.
+Entries come back in recorded order, with no pagination, served from the
+datastore through the same bounded rebuild a hub makes for itself: at most
+16 MiB of text plus attachment bytes and 10,000 entries, the oldest exchange
+evicted first and the newest always kept, so a long conversation returns its
+most recent window and the browser shows exactly what the next request will
+carry. An absent or empty `session` answers 400 with a plain-text body. An
+id with no row, an archived one, or another account's answers 404 with an
+empty array, and creates nothing; that covers a value holding `/`, `\` or
+`..`, since no such value is ever bound to a session.
 
-A transcript lives as long as its session, which outlives the last browser by
-the grace window and no longer. A reload inside that window shows the
-conversation; one after it shows an empty log.
+A conversation outlives its session's hub, the grace window and the server
+process: a reload or a restart serves it back from the datastore.
 
 ## Limits
 
@@ -250,45 +289,54 @@ A session id is exactly 32 lowercase hexadecimal characters: the form `/ws`
 mints, and the only form it accepts.
 
 `GET /ws` with no `session` query parameter mints one: 16 bytes of operating
-system entropy as 32 lowercase hexadecimal characters. With a `session`
-parameter whose trimmed value is of that form, that value is used and nothing
-is minted. With a trimmed value that is non-empty and of any other form, a
-name a user typed or the minted form in upper case included, the upgrade is
-refused with a 400 before the handshake: no WebSocket is established and no
-session is created.
-
-The UI applies the same form to every session id it reads back from `/state`;
-an entry with an id of any other form is dropped as if it had none.
+system entropy as 32 lowercase hexadecimal characters. The session's row is
+created for the signed-in account once the hub is admitted and built, and
+one `state_changed` event tells the account's other devices about it, so a
+refused or failed upgrade leaves no row. With a `session` parameter whose
+trimmed value is of that form, that value is used and nothing is minted; the
+id must name an open session of the signed-in account, and one that does not
+exist, is archived, or is another account's is refused with 404 before the
+handshake. A trimmed value that is non-empty and of any other form, a name a
+user typed or the minted form in upper case included, is refused with 400
+the same way: no WebSocket is established and no session is created.
 
 A `cwd` query parameter is not read. A session always runs in Mezame's own
 working directory.
 
-## Cross-device UI state
+## Sessions, state and settings
 
-`GET` and `PUT /state` persist the open-tabs list, the recently-closed history,
-the active tab, and the numeric label counter. The backing file is
-`~/.mezame/state.json`. Any browser reaching this Mezame sees the same list,
-which is what keeps your phone and your laptop in step. Mezame does not
-interpret the contents; it stores labels, session ids, and a `settings` object
-the client owns for app-wide preferences such as the theme and the notification
-choice. The UI coerces what it reads back: a label that is not a string shows as
-`?`, a `closedAt` that is not a number reads as the epoch, and an entry with no
-accepted session id is dropped.
+The session list is the server's, per account.
 
-A `GET` with no file present, or with a file that does not parse as JSON,
-answers 200 with `{}`. A `PUT` with a body that parses as JSON writes a fresh
-sibling temporary file unique to that write, owner-only on Unix, and renames it
-over the target, so a reader never sees a partial file and two browsers writing
-at once each get 204 with the later rename winning. A failed write leaves any
-existing file alone, fires no event, and is reported on stderr once per
-process.
+**`GET /state`** answers the account's open sessions, its newest twenty
+archived ones, and its settings object:
 
-`GET /state/events` is a Server-Sent Events stream that emits one
-`state_changed` event per successful `PUT /state`. Browsers read it as a "go
-refetch `/state`" signal, so a session opened in another browser shows up with
-no manual reload. A keep-alive comment every 15 seconds stops an intermediary
-idle-timing out the stream.
+```json
+{
+  "sessions": [{ "id": "<32 hex>", "title": "How do I...", "created": 1730000000000, "updated": 1730000005000 }],
+  "closed":   [{ "id": "<32 hex>", "title": null, "closedAt": 1729990000000 }],
+  "settings": { "theme": "dark" }
+}
+```
 
-Neither endpoint applies per-user scoping and neither requires
-authentication. Both sit behind the `Host` and `Origin` checks above; beyond
-those, the posture is the one the 0.13 release ships.
+`title` is null until the session's first prompt names it (the prompt's
+text, whitespace collapsed, cut to 40 characters) or a rename sets it.
+Mezame does not interpret `settings`; the client owns it for app-wide
+preferences such as the theme.
+
+**`PUT /state`** takes `{"settings": {...}}` of at most 16 KiB serialised,
+replaces the account's settings whole, and answers 204. Any other body is
+400 and changes nothing.
+
+**`PATCH /sessions/{id}`** renames (`{"title": "..."}`, 1 to 200
+characters) or archives and restores (`{"archived": true|false}`), and
+answers 204. Archiving a session with sockets attached closes each with
+code 4404. **`DELETE /sessions/{id}`** forgets the session and its
+messages, 204. Both answer 404 for an id that is not the account's, and
+400 for any other body.
+
+Each successful change, the mint of a new session included, emits one
+`state_changed` event on **`GET /state/events`**, a Server-Sent Events
+stream, to the streams of the account it concerns and no other. Browsers
+read it as a "go refetch `/state`" signal, so a session opened or renamed
+on one device shows up on the rest with no manual reload. A keep-alive
+comment every 15 seconds stops an intermediary idle-timing out the stream.

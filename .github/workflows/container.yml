@@ -96,10 +96,16 @@ jobs:
                     test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:9510/)" = 421
           # A write with neither Origin nor Sec-Fetch-Site is refused by the
           # request guard ahead of the login; a read without a cookie is
-          # answered 401 by the login layer. The login itself lands with the
-          # phase 2 setup step.
+          # answered 401 by the login layer.
           test "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:9510/state)" = 403
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9510/state)" = 401
+          # The login the setup step created: the cookie lands in a jar and
+          # opens the account's own routes. The password is the literal the
+          # workflow set two steps up, not a secret.
+          curl -fsS -c jar.txt -H 'Sec-Fetch-Site: none' -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"change-me"}' http://127.0.0.1:9510/login > /dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' -b jar.txt http://127.0.0.1:9510/state)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' -b jar.txt http://127.0.0.1:9510/me)" = 200
 
       - name: Set a Bedrock model and start with no credentials
         # Requirement 14 criterion 3 of the Bedrock spec: a Bedrock profile

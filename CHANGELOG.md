@@ -155,6 +155,33 @@ the old state.
   Behind a proxy that rewrites `Host`, `Origin` is compared with
   `X-Forwarded-Host` when present.
 
+### Removed
+
+- The `bedrock` section of `config.json`, its `thinking`,
+  `thinking_budget` and `max_output_tokens` overrides included. The model,
+  region and profile live in the datastore (`mezame init --model ID
+  [--region R] [--profile P]` sets them); the three overrides return with
+  the profile editor of a later phase, and until then the thinking mode
+  follows the model, the budget is 4096 tokens and the reply ceiling
+  16384.
+- `~/.mezame/state.json`, and with it the browser's derived tab names and
+  its client-side merge of the session lists. The session list, its
+  titles and the settings are the server's, per user; the active tab is
+  the browser's, per device.
+
+### Notes
+
+- `master.key` protects a copied `mezame.db` and nothing more: whoever
+  can read `~/.mezame` whole, or is root on the machine, has both files.
+  Back the two up together; the datastore cannot be opened without its
+  key, and the server refuses to start rather than quietly re-keying.
+- A `config.json` from an earlier release is refused by its version with
+  one line pointing at `mezame init`, which rewrites the file at version
+  2 and keeps the hosts.
+- The server reads the global profile and its credential once, at
+  startup: a `mezame init` re-run that changes the model, region or
+  profile takes effect on the next start.
+
 ## [0.14.0-alpha.2] - 2026-09-07
 
 This alpha assumes a fresh install. There is no migration from 0.13 or

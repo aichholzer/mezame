@@ -54,6 +54,18 @@ export default defineConfig({
       },
       '/history': {
         target: 'http://127.0.0.1:9510'
+      },
+      '/login': {
+        target: 'http://127.0.0.1:9510'
+      },
+      '/logout': {
+        target: 'http://127.0.0.1:9510'
+      },
+      '/me': {
+        target: 'http://127.0.0.1:9510'
+      },
+      '/sessions': {
+        target: 'http://127.0.0.1:9510'
       }
     }
   },

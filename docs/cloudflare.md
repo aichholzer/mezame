@@ -1,6 +1,6 @@
 # Cloudflare Tunnel and Access
 
-Mezame has no auth of its own. The intended production posture is a named Cloudflare Tunnel fronting Mezame on loopback, with Cloudflare Access gating the public hostname. This document walks through both.
+Mezame has a login of its own, and a public hostname still belongs behind a tunnel: the tunnel brings TLS, without which the session cookie crosses the network readable, and Cloudflare Access in front adds an identity layer from your existing provider before a request ever reaches Mezame. This document walks through both.
 
 ## Expose via Cloudflare Tunnel
 
@@ -80,16 +80,16 @@ cloudflared tunnel route dns <your-tunnel-name> mezame.example.com
 
 Reload `cloudflared`. WebSocket upgrades are forwarded by default and `/ws` needs no special flags.
 
-This recipe puts `cloudflared` on one machine and Mezame on another, so Mezame has to bind an address that machine can reach (`0.0.0.0:9510` or a LAN address), and Cloudflare Access gates only the public hostname. Every host on that network segment reaches port 9510 directly with no Access in the way, and Mezame has no auth of its own: such a peer can list your sessions from `GET /state`, read any transcript, attach to any session and rewrite the shared state. When the network is not one you trust end to end, run `cloudflared` on the Mezame host with `service: http://localhost:9510` and a loopback bind, or firewall port 9510 to the `cloudflared` host.
+This recipe puts `cloudflared` on one machine and Mezame on another, so Mezame has to bind an address that machine can reach (`0.0.0.0:9510` or a LAN address), and Cloudflare Access gates only the public hostname. Every host on that network segment reaches port 9510 directly with no Access in the way. Mezame's own login still stands there, but it crosses that segment over plain HTTP: a peer that can read the traffic can read the session cookie, and one that can reach the port can try passwords against `/login` (rate-limited per username, never unlimited). When the network is not one you trust end to end, run `cloudflared` on the Mezame host with `service: http://localhost:9510` and a loopback bind, or firewall port 9510 to the `cloudflared` host.
 
 Then list the hostname under `hosts` in the transport entry of Mezame's `~/.mezame/config.json` (step 5 above shows the shape) and restart Mezame. Without it, every request arriving through the tunnel is answered 421, because Mezame serves only hostnames it has been told about. If your ingress rule sets `originRequest.httpHostHeader` instead, the entry is still needed: the browser's `Origin` carries the public hostname, and Mezame accepts an upgrade or a write from a listed hostname whatever `Host` was rewritten to.
 
 ## Put Cloudflare Access in front (strongly recommended)
 
-Once a public hostname points at Mezame, anyone who finds the URL can drive your local agent. Treat this as non-optional:
+Once a public hostname points at Mezame, anyone who finds the URL reaches its sign-in form. Mezame's login is the last line, not the only one you want on the open internet; Access keeps unknown visitors from ever reaching it:
 
 1. Cloudflare Zero Trust, Access, Applications, Add application, Self-hosted.
 2. Application domain: `mezame.example.com`.
 3. Policy: allow only your email, passkey, or IdP identity.
 
-Access injects a signed `Cf-Access-Jwt-Assertion` header on every request. Mezame does not validate the session today; see the "Auth enforcement" entry under Known gaps in the main README.
+Access injects a signed `Cf-Access-Jwt-Assertion` header on every request. Mezame does not validate that header today, so Access is a second, independent layer in front of Mezame's own login rather than a replacement for it; validating it is on the list (see Known gaps in the main README).

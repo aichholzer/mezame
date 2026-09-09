@@ -7,10 +7,12 @@ flowchart LR
   browser[Browser]
   mezame["Mezame"]
   transport["Transport layer"]
+  store[("SQLite datastore")]
   bedrock["Amazon Bedrock"]
 
   browser <-- WS --> mezame
   mezame --- transport
+  mezame --- store
   mezame -- ConverseStream --> bedrock
 ```
 
@@ -25,21 +27,28 @@ flowchart LR
 - What produces a turn sits behind one trait, `backend::Backend`, with six
   operations: run a turn, cancel it, answer a permission request, change the
   model, report the transcript, shut down. The hub owns the wire and knows
-  nothing else about it. With a `bedrock` section in the configuration a
-  session gets `turn::LoopBackend`, which runs each turn against a
+  nothing else about it. With a Bedrock profile in the datastore a session
+  gets `turn::LoopBackend`, which runs each turn against a
   `provider::Provider`; the one provider is `provider::bedrock`, which calls
   `ConverseStream` through the AWS SDK and normalises its event stream into
   text, reasoning, a stop reason and token counts. The conversation lives in
   `conversation::Conversation`, carried from turn to turn with a cache point
   on the last user message, and the system prompt is assembled in `prompt`.
-  Without that section a session gets `EchoBackend`, which returns the text it
-  was given, so the transport can be exercised with no account.
+  Every turn is written to the datastore as it happens (the prompt before the
+  request, the reply after it), and a hub built later, after a reload past
+  the grace window or a restart, rebuilds the conversation from its rows.
+  Without a profile a session gets `EchoBackend`, which returns the text it
+  was given, so the transport can be exercised with no AWS account; the echo
+  persists nothing.
 - Mezame binds loopback by default; `mezame init` also offers `0.0.0.0` for
   trusted-LAN setups. Public reachability can be delegated to an existing
   Cloudflare Tunnel on your network. Two checks in `src/guard.rs` keep pages
   from other sites out of a loopback Mezame: every request must name a host
   Mezame serves in `Host`, and an upgrade or a write must come from a page
-  Mezame served, read from `Origin`. Neither needs to know who the user is.
+  Mezame served, read from `Origin` or, when a request carries none, judged
+  by `Sec-Fetch-Site`. Behind them sits the login: every route but the UI
+  shell, `/login` and `/me` requires the session cookie, and each account
+  reaches only its own sessions.
 - The web UI is a React + Tailwind v4 app under `ui/`. The `build.rs` step runs
   the Vite build; the compiled bundle is baked into the binary via `rust-embed`
   so the release binary stays self-contained.
@@ -59,17 +68,25 @@ Mezame/
 ├── src/
 │   ├── main.rs                 # thin CLI shim; calls mezame::run()
 │   ├── lib.rs                  # CLI entry (run/help/version), module wiring, transport dispatch
+│   ├── auth.rs                 # passwords (argon2id), the session cookie, the login limiter
 │   ├── backend.rs              # the Backend seam, transcript types, the EchoBackend
-│   ├── config.rs               # on-disk settings, the `bedrock` section, interactive setup
+│   ├── config.rs               # the on-disk settings file and the paths under ~/.mezame
 │   ├── conversation.rs         # canonical blocks, attachment limits, the per-session Conversation
-│   ├── guard.rs                # the Host allowlist and the Origin check, ahead of every route
+│   ├── guard.rs                # the Host allowlist and the Origin/Sec-Fetch-Site check
+│   ├── history.rs              # the transcript entries a stored message row stands for
 │   ├── hub.rs                  # multi-attach session hub: one session, many browsers
-│   ├── http.rs                 # cloudflared transport, UI assets, /state, /history
+│   ├── http.rs                 # cloudflared transport, UI assets, login, /state, /sessions, /history
+│   ├── init.rs                 # mezame init, the first-start bootstrap, the user commands
 │   ├── prompt.rs               # the system prompt: preamble, static text, the date line
 │   ├── provider/
 │   │   ├── mod.rs              # the Provider trait, TurnEvent, ThinkingMode, LoopSettings
 │   │   └── bedrock.rs          # ConverseStream: request builder, normaliser, error classifier
-│   ├── turn.rs                 # LoopBackend: one turn against a Provider, cancel, idle timeout
+│   ├── store/
+│   │   ├── mod.rs              # the Store trait and its rows
+│   │   ├── sqlite.rs           # the SQLite implementation, on its own thread
+│   │   ├── crypto.rs           # the master key, the derived keys, the credential cipher
+│   │   └── migrations/         # numbered SQL, applied forward-only at open
+│   ├── turn.rs                 # LoopBackend: one turn against a Provider, cancel, idle timeout, the writes
 │   ├── ws.rs                   # the upgrade, the per-attach loop, the client command set
 │   └── unix.rs                 # tiny Unix FFI helpers (kill, setsid)
 ├── tests/
@@ -84,10 +101,10 @@ Mezame/
 │       ├── main.tsx
 │       ├── index.css
 │       ├── types.ts            # wire-protocol and state types
-│       ├── hooks/useMezame.ts   # store, WS lifecycle, state sync
-│       ├── features/           # SideBar, LogPane, InputRow, ...
+│       ├── hooks/useMezame.ts   # store, WS lifecycle, the server's session list
+│       ├── features/           # SideBar, LogPane, InputRow, LoginGate, ...
 │       ├── components/         # CopyButton + shadcn primitives
-│       └── lib/                # utils, time helpers
+│       └── lib/                # apiFetch, the auth state, settings, helpers
 ```
 
 ## Configuration reference
@@ -100,12 +117,9 @@ Mezame/
   "transports": [
     { "kind": "cloudflared", "bind": "127.0.0.1:9510", "hosts": ["mezame.example.com"] }
   ],
-  "bedrock": {
-    "model": "global.anthropic.claude-sonnet-5",
-    "models": ["global.anthropic.claude-sonnet-5", "global.anthropic.claude-haiku-4-5-20251001-v1:0"],
-    "region": "us-east-1",
-    "profile": "work"
-  }
+  "datastore": { "backend": "sqlite" },
+  "public_url": "https://mezame.example.com",
+  "models": ["global.anthropic.claude-haiku-4-5-20251001-v1:0"]
 }
 ```
 
@@ -120,14 +134,10 @@ Mezame/
   external tunnel.
 - `transports[].bind` (cloudflared only): local bind address. Default is
   loopback; `mezame init` offers `0.0.0.0:9510` if you want LAN reach, and
-  `mezame init --bind ADDR` writes the file with no prompt. Mezame has no auth
-  of its own today: on a non-loopback bind, every host that can reach the port
-  can read the session list from `GET /state`, read any transcript from
-  `/history`, attach to any session over `/ws` and overwrite `state.json`
-  through `PUT /state`. The `Host` and `Origin` checks stop pages in a browser,
-  not a peer with `curl`. Anything non-loopback relies on Cloudflare Access
-  gating the public hostname and on every host on the network segment being
-  trusted, because Access never sees the LAN port.
+  `mezame init --bind ADDR` writes the file with no prompt. The login gates
+  every route on any bind; on a plain-HTTP non-loopback bind the cookie
+  crosses the network readable, so a public hostname belongs behind a tunnel
+  that brings TLS.
 - `transports[].hosts` (cloudflared only, optional): the hostnames Mezame
   answers to besides IP addresses, `localhost`, `.localhost` and `.local`
   names, and the host part of `bind`. A tunnel or proxy passes the public
@@ -137,44 +147,60 @@ Mezame/
   write, whatever the proxy rewrote `Host` to. Absent means no extra names;
   `mezame init` writes none on a fresh file and keeps the list a readable
   existing file holds when it rewrites one.
+- `datastore` (optional, default `{"backend": "sqlite"}`): which backend holds
+  the persistent state. `sqlite` is the one value this release accepts; the
+  key exists so a second backend is a value and an implementation, not a
+  schema change.
+- `public_url` (optional): the URL browsers reach Mezame at when a tunnel or
+  proxy fronts it. An `https://` value marks the session cookie `Secure`.
+- `models` (optional, default empty): the model ids the browser's picker
+  offers besides the profile's own model.
 
-- `bedrock` (optional): the provider section. Absent, every session answers
-  with an echo and startup says so. Present, `model` is required and the rest
-  have defaults:
-  - `bedrock.model`: the Bedrock model id a new session starts on, for
-    example `global.anthropic.claude-sonnet-5`. Only Anthropic ids are
-    accepted.
-  - `bedrock.models` (default `[model]`): the ids the browser's model picker
-    offers. `model` is added when the list omits it.
-  - `bedrock.region` (default: the SDK's chain, `AWS_REGION`, then the
-    profile's region): the region the runtime endpoint is in. With no region
-    anywhere the SDK's last resort is the EC2 metadata service; startup still
-    succeeds after that lookup gives up, and the first turn fails naming the
-    missing region. Set it here to be sure.
-  - `bedrock.profile` (default: the SDK's chain, `AWS_PROFILE`, then
-    `default`): the `~/.aws` profile to sign with.
-  - `bedrock.thinking` (default: by model rule): `adaptive`, `enabled` or
-    `off`. The rule is `adaptive` for the Claude 4.6 line and later and
-    `enabled` for the earlier models that take a budget. The Fable and Mythos
-    ids always think: `off` sends nothing for them, reasoning still runs and
-    bills, and the thought pane stays empty.
-  - `bedrock.thinking_budget` (default `4096`, minimum `1024`): the
-    reasoning token budget in `enabled` mode.
-  - `bedrock.max_output_tokens` (default `16384`): the reply ceiling per
-    turn; must exceed `thinking_budget` when a budget is in force.
+The Bedrock model, region and profile are not in this file: `mezame init
+--model ID [--region R] [--profile P]` writes them to the datastore, the
+model as the global profile row and the region and profile as one encrypted
+credential row. A file still carrying the `bedrock` section an earlier
+release wrote is refused at startup with a pointer at `mezame init`, which
+drops it. The `thinking`, `thinking_budget` and `max_output_tokens` overrides
+the section carried are not settable in this release: the mode follows the
+model (`adaptive` for the Claude 4.6 line and later, `enabled` with a budget
+for the models before it), the budget is 4096 and the reply ceiling 16384,
+until a later phase adds a profile editor.
 
-  Credentials are never in this file. The SDK finds them where the AWS CLI
-  does: `~/.aws/credentials` and `~/.aws/config` (including SSO and
-  `credential_process`), or `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
-  `AWS_SESSION_TOKEN`, or `AWS_BEARER_TOKEN_BEDROCK` for a Bedrock API key.
+Credentials for AWS itself are never stored. The SDK finds them where the
+AWS CLI does: `~/.aws/credentials` and `~/.aws/config` (including SSO and
+`credential_process`), or `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN`, or `AWS_BEARER_TOKEN_BEDROCK` for a Bedrock API key.
 
 Keys this version does not know are ignored and left on disk untouched, so a
 file written by an earlier release loads with no edit and no re-run of
 `mezame init`.
 
-`~/.mezame`, and any missing parent, is created owner-only (`0700`) on Unix, and
-`config.json` and `state.json` are written `0600`, each through a fresh
-temporary sibling renamed into place; an existing directory keeps its mode.
-Because the target is never opened for writing, a symlink at `config.json` or
-`state.json` is replaced by the rename rather than written through, and the
-directory itself must be writable by the account Mezame runs as.
+`~/.mezame`, and any missing parent, is created owner-only (`0700`) on Unix.
+`config.json` is written `0600` through a fresh temporary sibling renamed
+into place, so a symlink at the target is replaced rather than written
+through and a reader never sees a partial file; `mezame.db` and `master.key`
+are created `0600` too, the key through an exclusive sibling published with a
+hard link so an existing key is never overwritten. The directory must be
+writable by the account Mezame runs as.
+
+## Data model
+
+One SQLite file, `~/.mezame/mezame.db`, in WAL mode, opened by a single
+store thread the async side reaches over a channel. Migrations are numbered
+SQL files under `src/store/migrations/`, applied forward-only at open, each
+in one transaction; a database from a later release is refused. The tables:
+
+- `users`: name, argon2id password hash, role, session epoch, settings.
+- `workspaces`: a user's named roots; the default one is created at their
+  first session when the server's directory is eligible.
+- `sessions`: one per conversation, owned by a user, with title and
+  archival timestamps.
+- `messages`: one row per side of an exchange, the blocks as JSON, the user
+  entry text, the token counts, and a flag for content the model refused.
+- `credentials`: provider credentials, the payload encrypted with a key
+  derived from `master.key` and the row id as associated data.
+- `profiles`: which model runs and which credential signs for it; one
+  global row today.
+- `grants`, `mcp_grants`, `mcp_servers`, `memories`: seats for later
+  phases, created now so the schema needs no rewrite.

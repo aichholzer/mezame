@@ -23,7 +23,7 @@ import {
 
 // Settings pane. A cog button in the sidebar footer (beside the theme
 // picker) opens a dialog that hosts app-wide preferences. The pane is
-// built as a list of rows. Every preference here is saved to `state.json`
+// built as a list of rows. Every preference here is saved through `PUT /state`
 // through PUT /state, so it follows the user across devices.
 
 /** Reactive read of the send-on-Enter preference from the settings store. */

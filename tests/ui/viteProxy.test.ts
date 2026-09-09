@@ -11,8 +11,16 @@ describe('the Vite dev proxy', () => {
   const proxy =
     (config as { server?: { proxy?: Record<string, unknown> } }).server?.proxy ?? {};
 
-  it('forwards the three routes the page talks to', () => {
-    expect(Object.keys(proxy).sort()).toEqual(['/history', '/state', '/ws']);
+  it('forwards every route the page talks to', () => {
+    expect(Object.keys(proxy).sort()).toEqual([
+      '/history',
+      '/login',
+      '/logout',
+      '/me',
+      '/sessions',
+      '/state',
+      '/ws'
+    ]);
   });
 
   it('never rewrites Host, which the Origin check compares against', () => {

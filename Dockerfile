@@ -7,9 +7,10 @@
 #
 # First run, one-off setup:
 #   docker compose run --rm setup
-#   # answer the bind prompt with 0.0.0.0:9510, then the model, region and profile
-#   # or, with no terminal:
-#   docker compose run -T --rm setup mezame init --bind 0.0.0.0:9510 --model global.anthropic.claude-sonnet-5
+#   # answer the bind prompt with 0.0.0.0:9510, then the admin account,
+#   # then the model, region and profile; or, with no terminal:
+#   echo 'the password' | docker compose run -T --rm setup mezame init \
+#     --bind 0.0.0.0:9510 --admin alice --password-stdin --model global.anthropic.claude-sonnet-5
 #
 # AWS credentials reach the container from the host through the variables
 # compose.yaml passes through, or the commented ~/.aws mount there.
@@ -41,7 +42,9 @@ FROM rust:1-alpine3.23@sha256:4743b6231029d726d7a0f81d730a7c9f4eff23225a4499c01e
 # driver. The AWS SDK's TLS library, aws-lc-rs, compiles its C sources
 # during the build with that same gcc and musl-dev through the `cc`
 # crate, and ships pregenerated bindings for the musl targets, so it
-# needs no cmake, no clang and no bindgen here. nodejs and npm are for
+# needs no cmake, no clang and no bindgen here. The bundled SQLite the
+# datastore uses compiles from source through the same cc crate with the
+# same gcc and musl-dev: nothing beyond them. nodejs and npm are for
 # the UI build: nodejs comes from Alpine's main repository and npm from
 # community, and the image enables both.
 RUN apk add --no-cache musl-dev nodejs npm
@@ -80,8 +83,9 @@ USER mezame
 
 EXPOSE 9510
 
-# Config and cross-device UI state. Mount a named volume here so
-# `mezame init` is answered once.
+# The config, the datastore and the master key. Mount a named volume here
+# so `mezame init` is answered once and the conversations survive the
+# container.
 VOLUME ["/home/mezame/.mezame"]
 
 # Liveness, not correctness: one GET of the UI shell on the exposed port,

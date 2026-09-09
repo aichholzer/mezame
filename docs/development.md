@@ -33,7 +33,7 @@ Two terminals:
 # terminal 1: Rust on :9510
 cargo run --release
 
-# terminal 2: Vite with HMR on :5173, proxies /ws, /state and /history
+# terminal 2: Vite with HMR on :5173, proxies /ws and the HTTP endpoints
 cd ui
 npm run dev
 ```
@@ -53,7 +53,8 @@ configuration.
 | What produces a turn                  | implement `Backend` in `src/backend.rs`; `build_hub` in `src/hub.rs` picks the one a session gets             |
 | New browser to Mezame message type     | `parse_browser_command` in `src/ws.rs` (parse it) and `handle_command` in `src/hub.rs` (act on it)          |
 | New Mezame to browser message type     | Stream it from a Backend, or emit it from the hub loop in `src/hub.rs`; type in `ui/src/types.ts`; handle in `handleMessage` in `ui/src/hooks/useMezame.ts` |
-| New transcript entry shape            | `EntryBody` in `src/backend.rs`; the history branch of `loadHistory` in `ui/src/hooks/useMezame.ts`           |
+| New transcript entry shape            | `EntryBody` in `src/backend.rs`; `entries_from_row` in `src/history.rs`; the history branch of `loadHistory` in `ui/src/hooks/useMezame.ts` |
+| New table or column                   | a new numbered file under `src/store/migrations/` (never an edit of an applied one), a row type and trait method in `src/store/mod.rs`, the implementation in `src/store/sqlite.rs` |
 | Auth middleware                       | `guard_request` in `src/guard.rs` is the one layer in front of every route (`.layer(...)` in `build_router`, `src/http.rs`); an identity check goes beside it, after the `Host` and `Origin` checks |
 | New transport (telegram, matrix, ...) | add a variant to `TransportConfig` in `src/config.rs` and an arm in `run` (`src/lib.rs`); implement a sibling module |
 | UI tweak                              | edit under `ui/src/`; `npm run dev` for HMR or full `cargo build` for the embedded path                      |
@@ -69,14 +70,25 @@ a coverage floor via
 `Cargo.toml` edit without its `Cargo.lock` fails on every push, and fails the
 `docs` job if `cargo package --list` names a repository-only file.
 
-`.github/workflows/container.yml` builds the image, writes a config through
-`mezame init --bind`, serves it and reads `/` and the request checks through
-the published port. It runs when a file the image depends on changes, weekly,
+`.github/workflows/container.yml` builds the image, sets it up through
+`mezame init` with the flags (the admin's password on standard input), serves
+it, logs in with `curl` and reads `/`, `/state` and `/me` through the
+published port. It runs when a file the image depends on changes, weekly,
 and on demand; the schedule fires only on the default branch. Locally,
 `tests/container_files.rs` pins the shape of the Dockerfile, `compose.yaml`
 and the build-context allowlist on every `cargo test`. The base images are
 pinned by digest; the Dockerfile's header has the recipe for reading a current
 digest from the registry without Docker.
+
+The datastore in tests is `SqliteStore::open_in_memory()`: the real
+implementation, the real migrations, no file. The store runs on one thread
+of its own and the async side reaches it over a channel, so no SQLite handle
+ever crosses an await; keep SQL inside `src/store/` and reach the rest of
+the crate through the `Store` trait. The binary suites (`tests/cli_*.rs`)
+are the exception: they run `mezame` as a child process against a temporary
+`HOME`, where a real file is the point. `FailingStore` and `CountingStore`
+in `tests/support/mod.rs` wrap a real store to script failures and count
+calls.
 
 Most integration tests drive the hub through `ScriptedBackend` in
 `tests/support/mod.rs`: a Backend whose every answer the test supplies up
@@ -106,13 +118,12 @@ passes. `ci.yml` runs no `--ignored` test and holds no AWS secret.
 
 Notable coverage already in place:
 
-- **Config paths and load.** `tests/config_paths.rs` covers `config_path`,
-  `state_path`, and `load_config` including the error branches;
-  `tests/config_compat.rs` pins that a 0.13.x file loads unchanged and serves
-  its bind; `tests/config_fs.rs` covers the owner-only directory and file
-  writers; `tests/cli_init.rs` covers `mezame init --bind`; and
-  `tests/http_state_writes.rs` covers `/state` under concurrent and failing
-  writes.
+- **Config paths and load.** `tests/config_paths.rs` covers the paths under
+  `~/.mezame` and `load_config` including the error branches;
+  `tests/config_v2.rs` the version gate and the v2 keys; `tests/config_fs.rs`
+  the owner-only directory and file writers; `tests/cli_init.rs` the whole
+  `mezame init` flag path on the binary; `tests/cli_users.rs` the user
+  commands and the password-change epoch through a served binary.
 - **The seam.** `tests/backend.rs` covers the `EchoBackend`, the echo text
   derivation, the session id form, and the upgrade decision. Session id
   uniqueness is bounded past one process run, so that case re-executes its own
@@ -121,13 +132,18 @@ Notable coverage already in place:
   builder-made stream events and checks the request builder, the thinking
   rule per model id, the cache point, the block conversion and the error
   classifier. `tests/prompt.rs` and `tests/conversation.rs` cover the system
-  prompt and the conversation budget. `tests/config_bedrock.rs` and
-  `tests/cli_init.rs` cover the `bedrock` section and the three `init` flags.
+  prompt and the conversation budget, restore included.
 - **The loop.** `tests/turn_loop.rs` drives `LoopBackend` through
   `ScriptedProvider`: the mapping and limits, cancel before and during the
   stream, the idle timeout, refusals and filtered replies, the stop and usage
-  ordering, and the log line. `tests/cli_binary.rs` starts the binary with a
-  `bedrock` section and no credentials and reads the `Backend:` line.
+  ordering, and the log line. `tests/persistence.rs` covers what the loop
+  writes to the store, the rebuild of a session from its rows, and `/history`
+  served from them. `tests/store.rs` and `tests/store_crypto.rs` cover the
+  store itself and the key. `tests/cli_binary.rs` starts the binary over a
+  datastore the flags set up, with no credentials, and reads the `Backend:`
+  and `Datastore:` lines. `tests/auth.rs`, `tests/http_auth.rs` and
+  `tests/http_sessions.rs` cover the cookie, the login and the per-account
+  session routes.
 - **Hub plumbing.** `tests/hub.rs` drives the multi-attach hub: broadcast
   fan-out, `_target` stamping, the grace counter and its capped in-flight hold,
   the frames that end a turn, and the mid-turn second-prompt drop.
@@ -144,17 +160,20 @@ Notable coverage already in place:
   and 403 answers over the router and over a real socket.
 - **The container.** `tests/container_files.rs` pins the Dockerfile, the
   compose file and the build-context allowlist as text.
-- **Invariants.** `tests/properties.rs` holds fourteen `proptest` properties
-  at 100 cases each: the nine of alpha.1 (broadcast fidelity, targeted
-  delivery, turn ordering, the in-flight trajectory, grace and shutdown,
-  session ids, the echo agreement, the serialisation shape, and the `busy`
-  pairing) and five for the Bedrock line (the normaliser's text is the text
-  the builders were fed, a request built from any conversation alternates
-  roles from `user`, the thinking rule is total over model ids and agrees
-  with its table, the conversation and the transcript evict together, and
-  the system prompt's assembly is a function of its inputs). Each is tagged
-  with the design property it validates. The async ones run on a paused
-  clock, which is what keeps them cheap.
+- **Invariants.** `tests/properties.rs` holds seventeen `proptest`
+  properties at 100 cases each: the nine of alpha.1 (broadcast fidelity,
+  targeted delivery, turn ordering, the in-flight trajectory, grace and
+  shutdown, session ids, the echo agreement, the serialisation shape, and
+  the `busy` pairing), five for the Bedrock line (the normaliser's text is
+  the text the builders were fed, a request built from any conversation
+  alternates roles from `user`, the thinking rule is total over model ids
+  and agrees with its table, the conversation and the transcript evict
+  together, and the system prompt's assembly is a function of its inputs),
+  and three for this alpha (a conversation written through the store and
+  loaded back is the same conversation, any single-byte change to a cookie
+  fails its check, and the login limiter admits exactly ten per window).
+  Each is tagged with the design property it validates. The async ones run
+  on a paused clock, which is what keeps them cheap.
 
 ## Debugging
 
@@ -164,11 +183,13 @@ Notable coverage already in place:
   in flight writes one naming the session.
 - A refused `Host` or `Origin` writes one line to stderr, once per distinct
   value and at most 64 values per run (`src/guard.rs`); the response body names
-  the value refused. The first failed write of `state.json` writes one line
-  naming the path.
+  the value refused. A failed datastore write inside a turn is reported once
+  per session with the operation named; the turn resolves and the session
+  runs on in memory.
 - Browser devtools, Network, WS view shows every frame in both directions.
-- `curl 'http://127.0.0.1:9510/history?session=<id>'` shows what a reload would
-  seed the log from.
+- `curl -b 'mezame_session=<cookie>' 'http://127.0.0.1:9510/history?session=<id>'`
+  shows what a reload would seed the log from; the cookie is in the browser's
+  devtools under Application, Cookies.
 
 ## Releasing
 

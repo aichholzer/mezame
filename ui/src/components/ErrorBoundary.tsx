@@ -2,8 +2,8 @@ import { Component, type ErrorInfo, type ReactNode } from 'react';
 
 // The one place a render error lands. Without a boundary React unmounts
 // the whole tree and the page goes blank with the cause only in the
-// console; an entry from the shared, unauthenticated `state.json` used to
-// be able to do that on every load. Reload is the only action offered. A
+// console; a bad entry in the old shared state file used to be able to
+// do that on every load. Reload is the only action offered. A
 // "reset saved tabs" button was considered and dropped: every other open
 // browser writes its own tab list straight back through the sync before
 // the reload lands, so the button could not keep its promise.
