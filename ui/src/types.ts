@@ -107,8 +107,9 @@ export type LogEntry =
     role: Role;
     text: string;
     timestamp: number;
-    /** Set on the last agent entry of a live turn by `prompt_done`;
-     * `/history` carries no usage, so a reload shows none. */
+    /** Set on the last agent entry of a live turn by `prompt_done`,
+     * and on a rebuilt agent entry whose `/history` row carries the
+     * counts, so the footer survives a reload. */
     usage?: Usage;
   }
   | {
@@ -147,15 +148,20 @@ export type LogEntry =
 export type Status = 'connecting' | 'connected' | 'reconnecting' | 'error';
 
 export type Session = {
-  /** Client-local id; stable across reloads because it's persisted. */
+  /** The server's session id, which is the tab's identity from `init`
+   * and from a minted tab's first `ready` on; a local placeholder id
+   * before that. */
   id: string;
   /** Display label shown in the tab bar. */
   label: string;
   /** The session id Mezame minted, reported on the first `ready`. Null
-   * until then. Persisted, and sent back as `?session=` on every
-   * reconnect, so a reload or a second device reaches the same
-   * conversation. */
+   * until then; sent back as `?session=` on every reconnect, so a
+   * reload or a second device reaches the same conversation. */
   sessionId: string | null;
+  /** A name given before the session's row exists: from the new-session
+   * dialog, or a rename that beat the first `ready`. Written to the row
+   * as its title once the id is known, then cleared. */
+  pendingTitle?: string;
   /** The working directory Mezame runs in, as the `ready` event reported
    * it. The server's own process directory is its only source.
    * Display-only. */
@@ -227,16 +233,10 @@ export type Session = {
   rehydrateOnTurnEnd?: boolean;
 };
 
+/** A closed session, as the server's `/state` lists it. `id` is the
+ * session id; restore and forget name it. */
 export type ClosedEntry = {
   id: string;
   label: string;
-  sessionId: string;
   closedAt: number;
-};
-
-export type PersistedState = {
-  sessions: Array<Pick<Session, 'id' | 'label' | 'sessionId'>>;
-  closed: ClosedEntry[];
-  activeId: string | null;
-  nextLabel: number;
 };

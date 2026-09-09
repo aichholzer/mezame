@@ -132,3 +132,25 @@ describe('SettingsDialog idle-suspend control', () => {
     expect(slider.max).toBe(String(IDLE_SUSPEND_MAX_MINUTES));
   });
 });
+
+// ---------- persistence shape ----------
+
+describe('settings persistence', () => {
+  it('PUTs /state with the settings object alone', async () => {
+    vi.useFakeTimers();
+    setSendOnEnter(false);
+    setIdleSuspendMinutes(30);
+    await vi.advanceTimersByTimeAsync(300);
+    vi.useRealTimers();
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    const put = fetchMock.mock.calls.find(
+      ([, init]) => (init as RequestInit | undefined)?.method === 'PUT'
+    );
+    expect(put).toBeDefined();
+    const [url, init] = put as [string, RequestInit];
+    expect(url).toBe('/state');
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(Object.keys(body)).toEqual(['settings']);
+    expect(body.settings).toMatchObject({ sendOnEnter: false, idleSuspendMinutes: 30 });
+  });
+});

@@ -1,6 +1,6 @@
-// Settings store. Persisted to `state.json` via the existing PUT /state
-// endpoint, alongside the session list. Read on init, written on each
-// change.
+// Settings store. Persisted per user through `PUT /state`, whose body
+// is the settings object alone; the session list is the server's and
+// travels separately. Read on init, written on each change.
 //
 // Holds the notification preference, the theme, the send-on-Enter chord
 // and the idle-suspend threshold. More will land here as other features
@@ -12,6 +12,8 @@ export type NotificationPreference = 'unset' | 'pending' | 'on' | 'off';
  * and tracks live changes: an OS day/night schedule flips the app
  * automatically. `light`/`dark` are explicit overrides. */
 export type ThemePreference = 'system' | 'light' | 'dark';
+
+import { apiFetch } from '@/lib/api';
 
 type Settings = {
   notifications: NotificationPreference;
@@ -67,7 +69,10 @@ const isThemePreference = (v: unknown): v is ThemePreference =>
 const STATE_URL = '/state';
 
 let current: Settings = { ...DEFAULTS };
-let initStarted = false;
+
+// Guards a concurrent run alone, never a second one: completion and
+// `resetSettings` both re-arm it.
+let initInFlight: Promise<void> | null = null;
 
 const listeners = new Set<() => void>();
 
@@ -153,18 +158,22 @@ const writeThemeToStorage = (next: ThemePreference): void => {
   }
 };
 
-/** Hydrate from /state on app boot. Idempotent. */
-export const initSettings = async (): Promise<void> => {
-  if (initStarted) {
-    return;
-  }
-  initStarted = true;
+/** Hydrate from /state on entry into the signed-in state. Re-runnable
+ * after `resetSettings`; a concurrent call joins the run in flight. */
+export const initSettings = (): Promise<void> => {
+  initInFlight ??= doInitSettings().finally(() => {
+    initInFlight = null;
+  });
+  return initInFlight;
+};
+
+const doInitSettings = async (): Promise<void> => {
   // Seed theme from the synchronous localStorage mirror so the
   // in-memory snapshot agrees with what `bootTheme` already painted,
   // before the (slower, authoritative) /state read below.
   current = { ...current, theme: readThemeFromStorage() };
   try {
-    const res = await fetch(STATE_URL);
+    const res = await apiFetch(STATE_URL);
     if (!res.ok) {
       return;
     }
@@ -208,10 +217,9 @@ export const initSettings = async (): Promise<void> => {
 
 let persistTimer: number | null = null;
 
-/** Debounced PUT /state. Reads the existing state, merges in the
- * settings, writes the result. Mirrors how `useMezame.scheduleSync`
- * persists session state but lives separately because settings change
- * cadence and shape are different. */
+/** Debounced `PUT /state {"settings": {...}}`: the body is the settings
+ * object alone, which is all the endpoint takes; the session list is
+ * the server's own and never rides along. */
 const persist = async (): Promise<void> => {
   if (persistTimer !== null) {
     clearTimeout(persistTimer);
@@ -219,22 +227,10 @@ const persist = async (): Promise<void> => {
   persistTimer = window.setTimeout(async () => {
     persistTimer = null;
     try {
-      // Read-then-write: server is the source of truth for fields we
-      // do not own (sessions, closed, activeId, nextLabel).
-      const existing: Record<string, unknown> = {};
-      try {
-        const res = await fetch(STATE_URL);
-        if (res.ok) {
-          Object.assign(existing, (await res.json()) as Record<string, unknown>);
-        }
-      } catch {
-        // Best effort: write only what we own if the read failed.
-      }
-      const body = { ...existing, settings: { ...current } };
-      await fetch(STATE_URL, {
+      await apiFetch(STATE_URL, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify({ settings: { ...current } })
       });
     } catch {
       // Persistence is best-effort; UI keeps working with the in-memory
@@ -243,11 +239,26 @@ const persist = async (): Promise<void> => {
   }, 250);
 };
 
+/** Back to the defaults, the theme taken from its `localStorage`
+ * mirror, with the `initSettings` guard re-armed and any pending write
+ * cancelled. Runs whenever the auth state leaves the signed-in user, so
+ * the next account starts from its own stored settings and not the last
+ * one's. */
+export const resetSettings = (): void => {
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  current = { ...DEFAULTS, theme: readThemeFromStorage() };
+  initInFlight = null;
+  notify();
+};
+
 /** Reset internal state for tests. Not exported via the package's
  * public API; tests reach for it via the typed import. */
 export const __resetSettingsForTests = (): void => {
   current = { ...DEFAULTS };
-  initStarted = false;
+  initInFlight = null;
   if (persistTimer !== null) {
     clearTimeout(persistTimer);
     persistTimer = null;

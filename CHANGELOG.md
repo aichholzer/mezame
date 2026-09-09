@@ -100,6 +100,28 @@ the old state.
   when a terminal is attached, and otherwise exits with one line naming
   `mezame init --admin NAME --password-stdin`. `mezame --help` lists the
   commands and describes the three files under `~/.mezame`.
+- The browser has a login. The page asks who holds the cookie on load
+  and shows a sign-in form until someone does; a wrong entry shows one
+  fixed line whichever half was wrong, and a rate-limited one names the
+  wait. The sidebar footer gains a log-out button. Any request answered
+  401, a socket closed with code 4401, or the log-out button empties
+  the page back to the form: every socket is closed, every timer
+  cleared, the lists and settings dropped to their defaults, and the
+  next sign-in starts clean from the server, so one page load can serve
+  two accounts in a row with nothing carried across.
+- The browser's session list is the server's. It is fetched on entry
+  and refetched whole on every change event, so every device shows the
+  same tabs with the same names; the one local addition is a tab whose
+  first connect is still in flight. Rename, close, restore and forget
+  each send one request and apply optimistically; a failure refetches
+  at once, which undoes the change. A restored session connects only
+  after the server confirms. A session closed elsewhere disappears, and
+  a socket closed with code 4404 takes its tab with it. A new session
+  named in the dialog writes its name to the server as the title on
+  first connect; an unnamed one shows `New session` until its first
+  prompt names it. The active tab is remembered per device. A reload
+  shows the token counts under each answer again, now that `/history`
+  carries them.
 
 ### Changed
 
@@ -122,9 +144,10 @@ the old state.
   `mezame init`, which rewrites it at version 2 and keeps the hosts.
 - `~/.mezame/state.json` is gone. The tab list and the settings it held
   now live in the datastore, per user; `PUT /state` takes the settings
-  document alone and answers 400 to the old body. The active tab moves to
-  the browser's own storage later in this alpha, when the browser learns
-  the new shape.
+  document alone and answers 400 to the old body. The active tab lives
+  in the browser's own storage, per device. The browser's own derived
+  tab names and its merge of the two lists went with the file: the
+  server's list and the server's titles are what every device shows.
 - A write or a socket upgrade that carries no `Origin` is judged by
   `Sec-Fetch-Site`: `same-origin` and `none` pass, `same-site` and
   `cross-site` are refused, and a request carrying neither header is

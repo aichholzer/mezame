@@ -1,4 +1,4 @@
-import { HistoryIcon, PlusIcon, XIcon } from 'lucide-react';
+import { HistoryIcon, LogOutIcon, PlusIcon, XIcon } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
@@ -13,6 +13,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { SettingsDialog } from '@/features/SettingsDialog';
 import { ThemeToggle } from '@/features/ThemeToggle';
 import { useSidebarWidth } from '@/hooks/useSidebarWidth';
+import { logout } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 import type { Attention, ClosedEntry, Session } from '@/types';
 
@@ -280,8 +281,8 @@ export const SideBar = ({
               ) : (
                 closed.map((entry) => (
                   <DropdownMenuItem
-                    key={entry.sessionId}
-                    onSelect={() => onRestore(entry.sessionId)}
+                    key={entry.id}
+                    onSelect={() => onRestore(entry.id)}
                     className="flex-col items-stretch gap-0.5"
                   >
                     <div className="flex items-center justify-between gap-2">
@@ -292,7 +293,7 @@ export const SideBar = ({
                         onClick={(ev) => {
                           ev.stopPropagation();
                           ev.preventDefault();
-                          onForget(entry.sessionId);
+                          onForget(entry.id);
                         }}
                         aria-label="Forget"
                       >
@@ -453,11 +454,26 @@ export const SideBar = ({
           })}
         </div>
 
-        {/* Footer: theme picker, pinned bottom-left. Sits below the
-         * scrollable session list and above the resize handle. */}
+        {/* Footer: theme picker, settings and the way out, pinned
+         * bottom-left. Sits below the scrollable session list and above
+         * the resize handle. */}
         <div className="flex items-center gap-2 border-t border-[color:var(--outline-variant)] px-3 py-3">
           <ThemeToggle />
           <SettingsDialog />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="ml-auto size-9"
+                onClick={() => void logout()}
+                aria-label="Log out"
+              >
+                <LogOutIcon className="size-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top">Log out</TooltipContent>
+          </Tooltip>
         </div>
 
         {/* Resize handle. A 6 px-wide strip pinned to the right edge

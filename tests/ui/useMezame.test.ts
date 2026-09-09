@@ -4,13 +4,14 @@
 // WebSocket, no fetch.
 
 import {
+  __testState,
   applyServerMessage,
+  mezameActions,
   rehydrateAfterTurn,
-  deriveLabel,
   renderHistoryText,
-  shouldCloseAbsentSession,
   shouldSuspendIdle
 } from '@/hooks/useMezame';
+import { setUnauthorizedHandler } from '@/lib/api';
 import type { LogEntry, ServerMessage, Session } from '@/types';
 
 /** Build a session with the same defaults the production factory uses. */
@@ -478,81 +479,6 @@ describe('renderHistoryText', () => {
 // omission (another browser clobbered the list with a partial view)
 // must NOT close the session.
 
-describe('shouldCloseAbsentSession', () => {
-  const closedIds = (...ids: string[]) => new Set(ids);
-
-  it('closes a session whose id is in the server closed history', () => {
-    const s = { sessionId: 'sid-1' };
-    expect(shouldCloseAbsentSession(s, closedIds('sid-1'))).toBe(true);
-  });
-
-  it('keeps a session absent from the snapshot but NOT in closed history', () => {
-    // The clobber case: another browser PUT a partial list that
-    // omitted this session. With no closed-history corroboration,
-    // reconcile keeps it.
-    const s = { sessionId: 'sid-1' };
-    expect(shouldCloseAbsentSession(s, closedIds('sid-other'))).toBe(false);
-    expect(shouldCloseAbsentSession(s, closedIds())).toBe(false);
-  });
-
-  it('keeps a session that has no id yet', () => {
-    const s = { sessionId: null };
-    expect(shouldCloseAbsentSession(s, closedIds('sid-1'))).toBe(false);
-  });
-});
-
-// ---------- deriveLabel ----------
-//
-// Pure heuristic that turns a session's first prompt into a short tab
-// label. No network, no model. Returns null when the prompt is not a
-// useful label so the caller keeps the numeric placeholder.
-
-describe('deriveLabel', () => {
-  it('returns null for empty or whitespace-only text', () => {
-    expect(deriveLabel('')).toBeNull();
-    expect(deriveLabel('   ')).toBeNull();
-  });
-
-  it('returns null for slash commands', () => {
-    expect(deriveLabel('/clear')).toBeNull();
-  });
-
-  it('returns null when the first sentence is shorter than two chars', () => {
-    expect(deriveLabel('a')).toBeNull();
-    expect(deriveLabel('...')).toBeNull();
-  });
-
-  it('uses a short prompt verbatim', () => {
-    expect(deriveLabel('Fix the login bug')).toBe('Fix the login bug');
-    expect(deriveLabel('Hi')).toBe('Hi');
-  });
-
-  it('collapses runs of whitespace', () => {
-    expect(deriveLabel('   Add   dark   mode   toggle   ')).toBe('Add dark mode toggle');
-  });
-
-  it('keeps only the first sentence', () => {
-    expect(deriveLabel('Refactor the parser. Then add tests.')).toBe('Refactor the parser');
-  });
-
-  it('caps the label at ten words', () => {
-    expect(
-      deriveLabel('one two three four five six seven eight nine ten eleven twelve')
-    ).toBe('one two three four five six seven eight nine ten');
-  });
-
-  it('strips fenced code blocks before deriving', () => {
-    expect(deriveLabel('Look at ```const x = 1``` please')).toBe('Look at please');
-  });
-
-  it('strips URLs before deriving', () => {
-    expect(deriveLabel('Check https://example.com/foo now')).toBe('Check now');
-  });
-});
-
-
-// ---------- idle suspend ----------
-
 describe('shouldSuspendIdle', () => {
   const ctx = (over: Partial<{ isActive: boolean; visible: boolean; now: number; thresholdMs: number }> = {}) => ({
     isActive: false,
@@ -655,5 +581,345 @@ describe('rehydrateAfterTurn', () => {
     const answer = s.log[2];
     expect(answer.kind === 'text' ? answer.usage : undefined).toEqual(usage);
     vi.unstubAllGlobals();
+  });
+
+  it('attaches the usage a history entry carries, so a reload keeps the footer', async () => {
+    // Requirement 11 criterion 7: `/history` agent entries carry the
+    // counts now; the rebuilt log keeps them with no live turn involved.
+    const s = makeSession({ sessionId: 'abc', hydrated: true });
+    const usage = { input: 65, output: 4, cacheRead: 1370, cacheWrite: 0 };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          entries: [
+            { role: 'user', text: 'q', timestamp: 1, usage },
+            { role: 'agent', text: 'first', timestamp: 2, usage },
+            { role: 'agent', text: 'second', timestamp: 3 }
+          ]
+        })
+      }))
+    );
+    await rehydrateAfterTurn(s);
+    const [q, first, second] = s.log;
+    expect(q.kind === 'text' ? q.usage : 'set').toBeUndefined();
+    expect(first.kind === 'text' ? first.usage : undefined).toEqual(usage);
+    expect(second.kind === 'text' ? second.usage : 'set').toBeUndefined();
+    vi.unstubAllGlobals();
+  });
+});
+
+// ---------- the server's list, through the store singletons ----------
+//
+// These cases drive `mezameActions` against stubbed sockets, event
+// stream and fetch: what `init` builds, what a tick's refetch applies,
+// what each action sends, and what a failure undoes.
+
+type RouteAnswer = { status: number; body?: unknown } | undefined;
+
+class FakeSocket {
+  static instances: FakeSocket[] = [];
+  url: string;
+  readyState = 1; // OPEN
+  closeCalls = 0;
+  onopen: (() => void) | null = null;
+  onclose: ((e: { code: number }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: ((e: { data: string }) => void) | null = null;
+  constructor(url: string) {
+    this.url = url;
+    FakeSocket.instances.push(this);
+  }
+  close(): void {
+    this.closeCalls += 1;
+  }
+  send(): void {}
+  /** Deliver a `ready` frame as the server would. */
+  ready(sessionId: string): void {
+    this.onmessage?.({
+      data: JSON.stringify({ type: 'ready', sessionId, resumed: false, busy: false })
+    });
+  }
+}
+
+class FakeEventSource {
+  static instances: FakeEventSource[] = [];
+  static CLOSED = 2;
+  readyState = 0;
+  private listeners = new Map<string, Array<() => void>>();
+  constructor(_url: string) {
+    FakeEventSource.instances.push(this);
+  }
+  addEventListener(type: string, fn: () => void): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(fn);
+    this.listeners.set(type, list);
+  }
+  close(): void {
+    this.readyState = 2;
+  }
+  emit(type: string): void {
+    for (const fn of this.listeners.get(type) ?? []) {
+      fn();
+    }
+  }
+}
+
+/** Every request the stubbed fetch saw. */
+let requests: Array<{ url: string; method: string; body?: unknown }> = [];
+/** What `/state` answers now. */
+let stateDoc: unknown = { sessions: [], closed: [], settings: {} };
+/** Per-case overrides, matched on method + prefix. */
+let routes: Array<{ method: string; prefix: string; answer: RouteAnswer }> = [];
+
+const jsonResponse = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+const installFetch = () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      requests.push({
+        url,
+        method,
+        body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
+      });
+      const route = routes.find((r) => r.method === method && url.startsWith(r.prefix));
+      if (route?.answer) {
+        return jsonResponse(route.answer.body ?? null, route.answer.status);
+      }
+      if (url.startsWith('/state')) {
+        return jsonResponse(stateDoc);
+      }
+      if (url.startsWith('/history')) {
+        return jsonResponse({ entries: [] });
+      }
+      if (url.startsWith('/sessions/')) {
+        return new Response(null, { status: 204 });
+      }
+      return jsonResponse({});
+    })
+  );
+};
+
+const flush = async () => {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+const tick = async () => {
+  FakeEventSource.instances.at(-1)?.emit('state_changed');
+  await flush();
+};
+
+const ids = () => __testState().sessions.map((s) => s.id);
+const labels = () => __testState().sessions.map((s) => s.label);
+const socketFor = (sessionId: string) =>
+  FakeSocket.instances.filter((w) => w.url.endsWith(`session=${sessionId}`));
+
+describe('the session list is the server_s', () => {
+  beforeEach(() => {
+    mezameActions.reset();
+    FakeSocket.instances = [];
+    FakeEventSource.instances = [];
+    requests = [];
+    routes = [];
+    stateDoc = { sessions: [], closed: [], settings: {} };
+    installFetch();
+    vi.stubGlobal('WebSocket', FakeSocket as unknown as typeof WebSocket);
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource);
+    try {
+      localStorage.clear();
+    } catch {
+      // fine
+    }
+  });
+
+  afterEach(() => {
+    mezameActions.reset();
+    vi.unstubAllGlobals();
+  });
+
+  it('init builds the tabs from /state, newest first, and connects each', async () => {
+    stateDoc = {
+      sessions: [
+        { id: 'aaa1', title: 'Alpha' },
+        { id: 'bbb2', title: null }
+      ],
+      closed: [{ id: 'ccc3', title: 'Gone', closedAt: 5 }]
+    };
+    await mezameActions.init();
+    expect(ids()).toEqual(['bbb2', 'aaa1']);
+    expect(labels()).toEqual(['New session', 'Alpha']);
+    expect(__testState().closed).toEqual([{ id: 'ccc3', label: 'Gone', closedAt: 5 }]);
+    expect(socketFor('aaa1')).toHaveLength(1);
+    expect(socketFor('bbb2')).toHaveLength(1);
+    expect(__testState().activeId).toBe('bbb2');
+  });
+
+  it('a tick applies the list whole: a removed session disappears, a new one appears', async () => {
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'bbb2', title: 'Beta' }], closed: [] };
+    await mezameActions.init();
+    const beta = socketFor('bbb2')[0];
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'ddd4', title: 'Delta' }], closed: [] };
+    await tick();
+    expect(ids()).toEqual(['ddd4', 'aaa1']);
+    expect(beta.closeCalls).toBeGreaterThan(0);
+    expect(socketFor('ddd4')).toHaveLength(1);
+  });
+
+  it('a refetch during a minted tab_s connect window keeps the pending tab', async () => {
+    await mezameActions.init(); // empty list mints one pending tab
+    expect(__testState().sessions).toHaveLength(1);
+    expect(__testState().sessions[0].sessionId).toBeNull();
+    const pendingId = ids()[0];
+    await tick(); // the server list is still empty
+    expect(ids()).toEqual([pendingId]);
+  });
+
+  it('a ready after such a refetch leaves one tab whose id is the server_s', async () => {
+    await mezameActions.init();
+    mezameActions.newSession('Named');
+    const pending = FakeSocket.instances.at(-1);
+    expect(pending?.url.endsWith('/ws')).toBe(true);
+    // The mint's row and its tick land before the socket's `ready`.
+    stateDoc = { sessions: [{ id: 'mint1', title: null }], closed: [] };
+    await tick();
+    expect(ids()).toContain('mint1');
+    const duplicates = __testState().sessions.filter((s) => s.id === 'mint1');
+    expect(duplicates).toHaveLength(1);
+    const tabs = __testState().sessions.length;
+
+    pending?.ready('mint1');
+    await flush();
+    const holders = __testState().sessions.filter((s) => s.id === 'mint1');
+    expect(holders).toHaveLength(1);
+    expect(holders[0].sessionId).toBe('mint1');
+    expect(holders[0].label).toBe('Named');
+    expect(__testState().sessions.length).toBe(tabs - 1);
+    // The named tab titles its row on the first ready...
+    const patch = requests.find((r) => r.method === 'PATCH' && r.url === '/sessions/mint1');
+    expect(patch?.body).toEqual({ title: 'Named' });
+    // ...and the next tick's refetch keeps the name while the title is
+    // still null on the server.
+    await tick();
+    const after = __testState().sessions.find((s) => s.id === 'mint1');
+    expect(after?.label).toBe('Named');
+  });
+
+  it('each action sends its one request', async () => {
+    stateDoc = {
+      sessions: [{ id: 'aaa1', title: 'Alpha' }],
+      closed: [{ id: 'ccc3', title: 'Gone', closedAt: 5 }]
+    };
+    await mezameActions.init();
+    requests = [];
+
+    mezameActions.renameSession('aaa1', '  Renamed  ');
+    await flush();
+    expect(requests).toContainEqual({
+      url: '/sessions/aaa1',
+      method: 'PATCH',
+      body: { title: 'Renamed' }
+    });
+
+    mezameActions.restoreFromHistory('ccc3');
+    await flush();
+    expect(requests).toContainEqual({
+      url: '/sessions/ccc3',
+      method: 'PATCH',
+      body: { archived: false }
+    });
+    expect(socketFor('ccc3')).toHaveLength(1);
+    expect(__testState().closed).toEqual([]);
+
+    mezameActions.closeSession('ccc3');
+    await flush();
+    expect(requests).toContainEqual({
+      url: '/sessions/ccc3',
+      method: 'PATCH',
+      body: { archived: true }
+    });
+    expect(__testState().closed).toEqual([
+      expect.objectContaining({ id: 'ccc3', label: 'Gone' })
+    ]);
+
+    mezameActions.forgetHistory('ccc3');
+    await flush();
+    expect(requests).toContainEqual({ url: '/sessions/ccc3', method: 'DELETE', body: undefined });
+    expect(__testState().closed).toEqual([]);
+  });
+
+  it('a 400 refetches and the optimistic rename is undone', async () => {
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    await mezameActions.init();
+    routes = [{ method: 'PATCH', prefix: '/sessions/aaa1', answer: { status: 400 } }];
+    mezameActions.renameSession('aaa1', 'Nope');
+    expect(labels()).toEqual(['Nope']);
+    await flush();
+    expect(labels()).toEqual(['Alpha']);
+  });
+
+  it('a 500 refetches and the closed tab is re-added', async () => {
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    await mezameActions.init();
+    routes = [{ method: 'PATCH', prefix: '/sessions/aaa1', answer: { status: 500 } }];
+    mezameActions.closeSession('aaa1');
+    expect(ids()).not.toContain('aaa1');
+    await flush();
+    expect(ids()).toContain('aaa1');
+    expect(__testState().closed).toEqual([]);
+  });
+
+  it('a failed restore removes the tab again and opens no socket', async () => {
+    stateDoc = {
+      sessions: [],
+      closed: [{ id: 'ccc3', title: 'Gone', closedAt: 5 }]
+    };
+    await mezameActions.init();
+    routes = [{ method: 'PATCH', prefix: '/sessions/ccc3', answer: { status: 500 } }];
+    mezameActions.restoreFromHistory('ccc3');
+    expect(ids()).toContain('ccc3');
+    await flush();
+    expect(ids()).not.toContain('ccc3');
+    expect(__testState().closed).toEqual([
+      expect.objectContaining({ id: 'ccc3', label: 'Gone' })
+    ]);
+    expect(socketFor('ccc3')).toHaveLength(0);
+  });
+
+  it('a 4401 close reports the loss and schedules no reconnect', async () => {
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    await mezameActions.init();
+    const lost = vi.fn();
+    setUnauthorizedHandler(lost);
+    const before = FakeSocket.instances.length;
+    socketFor('aaa1')[0].onclose?.({ code: 4401 });
+    await flush();
+    expect(lost).toHaveBeenCalledTimes(1);
+    expect(FakeSocket.instances.length).toBe(before);
+    expect(__testState().sessions[0].reconnectTimer).toBeNull();
+    setUnauthorizedHandler(() => {});
+  });
+
+  it('a 4404 close removes the session and refetches', async () => {
+    stateDoc = {
+      sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'bbb2', title: 'Beta' }],
+      closed: []
+    };
+    await mezameActions.init();
+    requests = [];
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    socketFor('bbb2')[0].onclose?.({ code: 4404 });
+    await flush();
+    expect(ids()).toEqual(['aaa1']);
+    expect(requests.some((r) => r.method === 'GET' && r.url === '/state')).toBe(true);
   });
 });

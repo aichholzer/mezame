@@ -10,10 +10,13 @@ import { useAttentionBadge } from '@/hooks/useAttentionBadge';
 import { useKeyboardInset } from '@/hooks/useKeyboardInset';
 import { useNotifications } from '@/hooks/useNotifications';
 import { useApplyTheme } from '@/hooks/useTheme';
+import { LoginGate } from '@/features/LoginGate';
 import { mezameActions, useMezame } from '@/hooks/useMezame';
+import { checkMe, useAuth } from '@/lib/auth';
 import { initSettings } from '@/lib/settings';
 
 export const App = () => {
+  const auth = useAuth();
   const { sessions, closed, activeId, activeSession } = useMezame();
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   // Mobile-only: drawer state for the sidebar. Desktop ignores it
@@ -39,10 +42,28 @@ export const App = () => {
     return () => document.removeEventListener('visibilitychange', onVisibility);
   }, []);
 
+  // Who holds the cookie, once per load; the answer moves the state off
+  // `unknown` and decides which shell renders.
   useEffect(() => {
-    void mezameActions.init();
-    void initSettings();
+    void checkMe();
   }, []);
+
+  // Each entry into the signed-in state seeds both stores: the first
+  // load, and every later login after a logout or an expiry emptied
+  // them.
+  useEffect(() => {
+    if (auth.status === 'user') {
+      void mezameActions.init();
+      void initSettings();
+    }
+  }, [auth.status]);
+
+  if (auth.status !== 'user') {
+    // A blank shell while `/me` is in flight, so the page never flashes
+    // the login form at someone who is signed in; the form once it is
+    // known nobody is.
+    return auth.status === 'anonymous' ? <LoginGate /> : <div className="h-[100dvh]" />;
+  }
 
   return (
     <div

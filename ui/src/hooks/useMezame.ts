@@ -13,7 +13,6 @@ import type {
   ClosedEntry,
   LogEntry,
   PermissionOption,
-  PersistedState,
   PromptBlock,
   ServerMessage,
   Session,
@@ -21,6 +20,7 @@ import type {
   ToolCallLocation,
   Usage
 } from '@/types';
+import { apiFetch, AuthError, authLost } from '@/lib/api';
 import { getIdleSuspendMinutes } from '@/lib/settings';
 
 // Multi-session store.
@@ -32,7 +32,8 @@ import { getIdleSuspendMinutes } from '@/lib/settings';
 // legacy JS already thinks this way.
 
 const STATE_URL = '/state';
-const HISTORY_MAX = 20;
+/** Where the active tab lives, per device. */
+const ACTIVE_KEY = 'mezame.activeSession';
 
 type Snapshot = {
   sessions: Session[];
@@ -46,7 +47,6 @@ type Listener = () => void;
 let sessions: Session[] = [];
 let closed: ClosedEntry[] = [];
 let activeId: string | null = null;
-let nextLabel = 1;
 
 let version = 0;
 let snapshot: Snapshot = { sessions, closed, activeId, version };
@@ -139,442 +139,55 @@ const markActivity = (s: Session) => {
   s.lastActivityAt = Date.now();
 };
 
-// ---------- persistence ----------
-
-let syncTimer: number | null = null;
-
-const scheduleSync = () => {
-  if (suppressNextSync) {
-    suppressNextSync = false;
-    return;
-  }
-  if (syncTimer !== null) {
-    clearTimeout(syncTimer);
-  }
-  syncTimer = window.setTimeout(doSync, 400);
-};
-
-/**
- * Build the `sessions` array to PUT to `/state`, merging this browser's
- * local view with any sessions recorded only on the server.
- *
- * `/state` is last-writer-wins per top-level key and `doSync` owns the
- * `sessions` array. A blind write of just the local list silently drops
- * a session another device opened but this browser has not yet learned
- * about: a backgrounded tab whose `/state/events` stream missed ticks,
- * a device just switched to, or an init race. That is how a live
- * session vanished from `state.json` while its conversation stayed on
- * disk.
- *
- * Absence from the local list is ambiguous, exactly as on the read path
- * (`shouldCloseAbsentSession`): it can mean "we never knew about it"
- * (carry it forward) or "we closed it" (let the close propagate). We
- * disambiguate with the same positive evidence: a deliberately closed
- * session is recorded in a `closed` list. So we carry forward every
- * server session we lack locally that is not recorded as closed on
- * EITHER side. The reconcile has the same keep-don't-drop bias.
- *
- * Pure and exported so the regression test can drive it without module
- * state or `fetch`.
- *
- * @internal
- */
-/** The session id form the server accepts: exactly 32 lowercase
- * hexadecimal characters, what `/ws` mints. Mirrors `is_session_id` in
- * `src/ws.rs`; the two move together. Stricter than the server in one
- * way: the server trims surrounding whitespace before it checks, and no
- * code path here ever persists a padded id, so none is accepted.
- *
- * @internal
- */
-export const SESSION_ID_FORM = /^[0-9a-f]{32}$/;
-
-const acceptedSessionId = (value: unknown): string | null =>
-  typeof value === 'string' && SESSION_ID_FORM.test(value) ? value : null;
-
-/** True when a persisted session or closed entry carries a session id
- * this build can attach to: one of the form the server accepts.
- *
- * Applied at every point a persisted entry is read. An entry with an id
- * of any other form is discarded like one with none: the server refuses
- * it with a 400 before the handshake, and the tab would otherwise pulse
- * "reconnecting" forever with no cause shown. It also handles a
- * `state.json` written by 0.13.x, whose ids sit under a key this version
- * does not read: those entries are discarded, the UI starts with one fresh
- * tab, and the next sync rewrites both lists under the new key.
- *
- * @internal
- */
-export const hasSessionId = (entry: {
-  sessionId?: string | null;
-}): entry is { sessionId: string } => acceptedSessionId(entry.sessionId) !== null;
-
-/** A persisted session entry as the UI restores it, or null when the
- * entry has no string `id` or no accepted session id. The label is
- * coerced to a string: `state.json` is shared and unauthenticated, and an
- * object-valued label made React throw on render and blanked the page on
- * every load.
- *
- * @internal
- */
-/** A persisted session entry with an accepted id, as `restoreSession`
- * takes it. */
-export type RestorableSession = { id: string; label: string; sessionId: string };
-
-export const coercePersistedSession = (entry: unknown): RestorableSession | null => {
-  if (!entry || typeof entry !== 'object') {
-    return null;
-  }
-  const e = entry as { id?: unknown; label?: unknown; sessionId?: unknown };
-  const sessionId = acceptedSessionId(e.sessionId);
-  if (typeof e.id !== 'string' || sessionId === null) {
-    return null;
-  }
-  return { id: e.id, label: typeof e.label === 'string' ? e.label : '?', sessionId };
-};
-
-/** A persisted closed entry as the UI keeps it, or null when it names no
- * accepted session id. Gated on the session id alone, as the reads always
- * were: the closed list is keyed, restored and forgotten by `sessionId`.
- * A missing `id` is filled from it, a non-string label reads as `?`, and
- * a `closedAt` that is not a finite number reads as 0. Every coercion is
- * deterministic on purpose: reconcile compares the coerced list to the
- * one it holds, and a value that differed per call would mark every SSE
- * tick dirty and ping-pong PUTs between browsers.
- *
- * @internal
- */
-export const coerceClosedEntry = (entry: unknown): ClosedEntry | null => {
-  if (!entry || typeof entry !== 'object') {
-    return null;
-  }
-  const e = entry as { id?: unknown; label?: unknown; sessionId?: unknown; closedAt?: unknown };
-  const sessionId = acceptedSessionId(e.sessionId);
-  if (sessionId === null) {
-    return null;
-  }
-  return {
-    id: typeof e.id === 'string' ? e.id : sessionId,
-    label: typeof e.label === 'string' ? e.label : '?',
-    sessionId,
-    closedAt: typeof e.closedAt === 'number' && Number.isFinite(e.closedAt) ? e.closedAt : 0
-  };
-};
-
-const isClosedEntry = (entry: ClosedEntry | null): entry is ClosedEntry => entry !== null;
-const isPersistedSession = (entry: RestorableSession | null): entry is RestorableSession =>
-  entry !== null;
-
-export const mergeSessionsForSync = (
-  localSessions: PersistedState['sessions'],
-  localClosed: ClosedEntry[],
-  existing: Partial<PersistedState> | null
-): PersistedState['sessions'] => {
-  const serverSessions = existing?.sessions;
-  if (!Array.isArray(serverSessions)) {
-    return localSessions;
-  }
-  const localIds = new Set(localSessions.map((s) => s.id));
-  // A deliberately closed session must not be resurrected; honour both
-  // our own `closed` history and the server's. A close that originated
-  // on another device then also suppresses the carry-forward.
-  const closedIds = new Set<string>();
-  for (const c of localClosed) {
-    if (c && hasSessionId(c)) {
-      closedIds.add(c.sessionId);
-    }
-  }
-  const serverClosed = existing?.closed;
-  if (Array.isArray(serverClosed)) {
-    for (const c of serverClosed) {
-      if (c && hasSessionId(c)) {
-        closedIds.add(c.sessionId);
-      }
-    }
-  }
-  const carried: PersistedState['sessions'] = [];
-  for (const entry of serverSessions) {
-    // Only carry entries that name a session, matching the restore guard
-    // in `reconcileFromServer`. A tab elsewhere that has not applied its
-    // first `ready` yet has no id, and there is nothing here to attach to.
-    const carriedEntry = coercePersistedSession(entry);
-    if (!carriedEntry || localIds.has(carriedEntry.id)) {
-      continue;
-    }
-    if (closedIds.has(carriedEntry.sessionId)) {
-      continue;
-    }
-    carried.push(carriedEntry);
-  }
-  return carried.length > 0 ? [...localSessions, ...carried] : localSessions;
-};
-
-export const doSync = async () => {
-  syncTimer = null;
-  const owned: PersistedState = {
-    sessions: sessions.map((s) => ({
-      id: s.id,
-      label: s.label,
-      // Persisted with no gate. Mezame mints the id at upgrade time, so a
-      // tab holds a resumable one from its first `ready` and reaches peer
-      // browsers on its first connect.
-      sessionId: s.sessionId
-    })),
-    closed,
-    activeId,
-    nextLabel
-  };
-  try {
-    // Read-then-merge: `/state` is a shared blob with more than one
-    // writer. We own the session fields above; the settings store
-    // (`lib/settings.ts`) owns `settings`. A blind PUT of only our
-    // fields would clobber `settings` on every session event (open,
-    // rename, close, tab switch, cross-browser reconcile), silently
-    // resetting the user's preferences. Carry across whatever we do not
-    // own. `settings.ts` persist() preserves our fields the same way.
-    //
-    // The `sessions` array is ours, but a blind write of just the local
-    // list has its own hazard: it drops a session another device opened
-    // that we have not synced yet (the residual of the cross-device
-    // clobber the reconcile guards against on the read path).
-    // `mergeSessionsForSync` unions in those server-only sessions first.
-    const existing = await fetchState();
-    const body = {
-      ...(existing ?? {}),
-      ...owned,
-      sessions: mergeSessionsForSync(owned.sessions, closed, existing)
-    };
-    await fetch(STATE_URL, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-  } catch {
-    // Unreachable server: state stays local. WS failures imply mezame is
-    // down; nothing works anyway.
-  }
-};
-
-const fetchState = async (): Promise<Partial<PersistedState> | null> => {
-  try {
-    const res = await fetch(STATE_URL);
-    if (!res.ok) {
-      return null;
-    }
-    return (await res.json()) as Partial<PersistedState>;
-  } catch {
-    return null;
-  }
-};
-
-// ---------- cross-browser session sync ----------
+// ---------- the server's list ----------
 //
-// `state.json` is the cross-device store for the session list. Each
-// browser PUTs to `/state` after a local change (new session, rename,
-// close, switch active). The server is the source of truth: when a
-// tick lands on `/state/events` the browser refetches and reconciles
-// its local list against the server snapshot.
-//
-// Reconciliation is a two-way merge:
-//
-// - Sessions present locally but not on the server were closed
-//   somewhere else; we close them here too. Without this, a close
-//   on browser A could never propagate to browser B because B's
-//   own next PUT would overwrite the server view back to "all
-//   four sessions" and A would see them reappear.
-// - Sessions present on the server but not locally were opened
-//   somewhere else; we restore them.
-// - Sessions present on both keep their local instance (its WS,
-//   log, busy state, etc.) but take label changes from the
-//   server.
-//
-// The active session is preserved when possible: if the server's
-// activeId is different but our active is still in the merged list,
-// we keep our active. If our active was removed by the merge, we
-// fall back to the server's activeId, then to whatever is left.
-//
-// To avoid a "ping-pong" where this browser's reconcile triggers
-// another PUT that triggers another tick, the reconciled state is
-// applied without scheduling a sync. The server already has the
-// snapshot we just merged from; there is nothing to push back.
+// The session list is the server's: `init` and every `state_changed`
+// tick fetch `/state` and apply its `sessions` and `closed` whole. The
+// one local addition is a tab minted on `/ws` whose `ready` has not
+// arrived yet (`sessionId === null`): it is kept through every refetch
+// and adopts the server's id on its first `ready`. Rename, close,
+// restore and forget are each one request to the sessions endpoint with
+// an optimistic local update; the tick-driven refetch confirms it, and
+// a failure refetches at once, which undoes the optimistic change.
 
-let stateEventSource: EventSource | null = null;
-let suppressNextSync = false;
+/** What `/state` answers, as far as this store reads it. */
+type StateDoc = {
+  sessions?: Array<{ id: string; title: string | null }>;
+  closed?: Array<{ id: string; title: string | null; closedAt: number | null }>;
+};
+
+/** The label a session with no title shows. */
+const UNTITLED = 'New session';
 
 // Fallback one-shot latch for the stale-bundle reload when
 // sessionStorage is unavailable (private mode, storage disabled).
 // Prevents the reload-on-every-reconnect loop in that environment.
 let reloadLatched = false;
 
-const reconcileFromServer = async () => {
-  const saved = await fetchState();
-  if (!saved?.sessions || !Array.isArray(saved.sessions)) {
-    return;
-  }
-  const serverIds = new Set<string>();
-  for (const entry of saved.sessions) {
-    if (entry && typeof entry.id === 'string') {
-      serverIds.add(entry.id);
-    }
-  }
-  let dirty = false;
-
-  // Restore sessions present on the server but not locally.
-  for (const entry of saved.sessions) {
-    // Only restore entries that name a session. A tab elsewhere that has
-    // not applied its first `ready` yet has no id; once it does, the id
-    // lands on the server and the next tick brings it across.
-    const restorable = coercePersistedSession(entry);
-    if (!restorable || sessions.some((s) => s.id === restorable.id)) {
-      continue;
-    }
-    restoreSession(restorable);
-    dirty = true;
-  }
-
-  // Close sessions present locally but missing on the server, but
-  // ONLY when we have positive evidence the disappearance was a
-  // deliberate close. Each browser PUTs its own full session list
-  // last-writer-wins. "Absent from the latest server snapshot" is
-  // therefore ambiguous: it can mean "closed on another device"
-  // OR "another device just overwrote the list with a partial view
-  // that happened to omit this session" (an init race, a restore
-  // that didn't carry every tab, etc.). Treating the ambiguous case
-  // as a close is what made live sessions vanish from state.json
-  // with no trace.
-  //
-  // A deliberate close records the session in the server's `closed`
-  // history (see `closeSession`). A clobber does not. So we only close
-  // locally when the session's id shows up in the server's `closed`
-  // list; otherwise we keep it, and our next sync re-adds it to the
-  // server snapshot.
-  //
-  // Tradeoff: if a deliberate close is later evicted from the capped
-  // `closed` history (HISTORY_MAX) before this browser reconciles, we
-  // will keep a tab that was actually closed elsewhere. The stale tab
-  // is benign and self-corrects on the next close.
-  const serverClosedIds = new Set<string>();
-  if (Array.isArray(saved.closed)) {
-    for (const entry of saved.closed) {
-      if (entry && hasSessionId(entry)) {
-        serverClosedIds.add(entry.sessionId);
-      }
-    }
-  }
-  // Iterate over a copy because we mutate `sessions` in the loop.
-  const toClose: string[] = [];
-  for (const s of sessions) {
-    if (serverIds.has(s.id)) {
-      continue;
-    }
-    if (shouldCloseAbsentSession(s, serverClosedIds)) {
-      toClose.push(s.id);
-    }
-  }
-  for (const id of toClose) {
-    closeSessionLocal(id);
-    dirty = true;
-  }
-
-  // Pick up label changes for sessions present on both sides.
-  for (const entry of saved.sessions) {
-    if (!entry || typeof entry.id !== 'string') {
-      continue;
-    }
-    const local = sessions.find((s) => s.id === entry.id);
-    if (!local) {
-      continue;
-    }
-    const newLabel = typeof entry.label === 'string' ? entry.label : null;
-    if (newLabel && newLabel !== local.label) {
-      local.label = newLabel;
-      dirty = true;
-    }
-  }
-
-  // Bump nextLabel so a future `New session` button on this browser
-  // does not collide with a numeric label coined elsewhere.
-  if (typeof saved.nextLabel === 'number' && saved.nextLabel > nextLabel) {
-    nextLabel = saved.nextLabel;
-  }
-
-  // Closed-history list: server view wins. The dropdown is
-  // already a "best effort" archive (capped at HISTORY_MAX). On the
-  // server snapshot the most-recently-closed entries stay consistent
-  // across browsers with no ping-pong.
-  if (Array.isArray(saved.closed)) {
-    const next = saved.closed.map(coerceClosedEntry).filter(isClosedEntry).slice(0, HISTORY_MAX);
-    if (JSON.stringify(next) !== JSON.stringify(closed)) {
-      closed = next;
-      dirty = true;
-    }
-  }
-
-  // If our active was removed, fall back to the server's active or
-  // the first remaining session.
-  if (activeId && !sessions.some((s) => s.id === activeId)) {
-    if (saved.activeId && sessions.some((s) => s.id === saved.activeId)) {
-      activeId = saved.activeId;
-    } else if (sessions.length > 0) {
-      activeId = sessions[0].id;
+const persistActiveId = () => {
+  try {
+    if (activeId === null) {
+      localStorage.removeItem(ACTIVE_KEY);
     } else {
-      activeId = null;
+      localStorage.setItem(ACTIVE_KEY, activeId);
     }
-    dirty = true;
-  }
-
-  if (dirty) {
-    // Suppress the next scheduleSync: we have just applied the
-    // server's view, there is nothing to push back. Cancel any
-    // pending push from before the reconcile too. It would overwrite
-    // the server with the now-stale local snapshot.
-    if (syncTimer !== null) {
-      clearTimeout(syncTimer);
-      syncTimer = null;
-    }
-    suppressNextSync = true;
-    notify();
+  } catch {
+    // Storage unavailable: the active tab is per page load then.
   }
 };
 
-/** Decide whether a local session that is absent from the server's
- * latest `sessions` snapshot should be closed locally during
- * reconcile.
- *
- * Absence is ambiguous under the last-writer-wins `state.json` model:
- * it can mean "closed deliberately on another device" or "another
- * device clobbered the list with a partial view that omitted this
- * session". We only treat it as a close when the server's `closed`
- * history corroborates it; otherwise we keep the session and let the
- * next sync restore it. Pure and exported so the regression test for
- * the vanishing-session bug can drive it without `fetch`.
- *
- * @internal
- */
-export const shouldCloseAbsentSession = (
-  session: Pick<Session, 'sessionId'>,
-  serverClosedIds: Set<string>
-): boolean => {
-  // Never auto-close a tab that has no id yet: it may simply predate our
-  // first PUT.
-  if (!session.sessionId) {
-    return false;
+const readActiveId = (): string | null => {
+  try {
+    return localStorage.getItem(ACTIVE_KEY);
+  } catch {
+    return null;
   }
-  // Require positive evidence of a deliberate close.
-  return serverClosedIds.has(session.sessionId);
 };
 
-/** Local-only session removal used by reconcile. Mirrors the
- * non-persistence side effects of `closeSession` (cancel timer,
- * close socket, fall back to a fresh activeId, archive in `closed`)
- * but does NOT call `scheduleSync` because the caller is reacting
- * to a server snapshot the server already holds. */
-const closeSessionLocal = (id: string) => {
-  const i = sessions.findIndex((x) => x.id === id);
-  if (i < 0) {
-    return;
-  }
-  const s = sessions[i];
+/** Drop a session's socket and timers, marking it closing so the late
+ * `onclose` schedules nothing. Local bookkeeping only; the row is the
+ * caller's business. */
+const dropSocket = (s: Session) => {
   s.closing = true;
   if (s.reconnectTimer !== null) {
     clearTimeout(s.reconnectTimer);
@@ -585,14 +198,124 @@ const closeSessionLocal = (id: string) => {
   } catch {
     // Already disconnected: fine.
   }
-  // We do NOT push to `closed` here: the other browser already
-  // recorded the close in its own history list and we are about
-  // to receive that history via the server snapshot.
+  s.ws = null;
+};
+
+/** Remove one tab locally: what a 4404 close does, the session having
+ * been closed under it elsewhere. */
+const removeSessionLocal = (id: string) => {
+  const i = sessions.findIndex((x) => x.id === id);
+  if (i < 0) {
+    return;
+  }
+  dropSocket(sessions[i]);
   sessions.splice(i, 1);
   if (activeId === id) {
     activeId = sessions.length > 0 ? sessions[Math.max(0, i - 1)].id : null;
+    persistActiveId();
   }
+  notify();
 };
+
+/** Apply a `/state` document whole. A session on both sides keeps its
+ * local instance (socket, log and flags) and takes the server's title
+ * once there is one; a local tab whose id is absent from the list is
+ * removed; a tab that has not received its first `ready`
+ * (`sessionId === null`) is kept through every refetch; a server
+ * session this browser has not seen gets a tab and connects. The server
+ * lists active sessions oldest first and the sidebar shows newest
+ * first, so the order is reversed here. */
+const applyStateDoc = (doc: StateDoc) => {
+  const rows = Array.isArray(doc.sessions) ? doc.sessions : [];
+  const next: Session[] = sessions.filter((s) => s.sessionId === null);
+  for (const row of [...rows].reverse()) {
+    if (!row || typeof row.id !== 'string') {
+      continue;
+    }
+    const local = sessions.find((s) => s.id === row.id);
+    if (local) {
+      // The server's title wins once it has one; a named tab whose
+      // title write has not landed yet keeps its name.
+      if (typeof row.title === 'string' && row.title.length > 0) {
+        local.label = row.title;
+      }
+      next.push(local);
+    } else {
+      const s = makeSession(row.id, row.title ?? UNTITLED, row.id);
+      next.push(s);
+      connect(s);
+    }
+  }
+  for (const s of sessions) {
+    if (s.sessionId !== null && !next.includes(s)) {
+      dropSocket(s);
+    }
+  }
+  sessions = next;
+  closed = (Array.isArray(doc.closed) ? doc.closed : [])
+    .filter((row) => row !== null && typeof row === 'object' && typeof row.id === 'string')
+    .map((row) => ({
+      id: row.id,
+      label: typeof row.title === 'string' && row.title.length > 0 ? row.title : UNTITLED,
+      closedAt: typeof row.closedAt === 'number' && Number.isFinite(row.closedAt) ? row.closedAt : 0
+    }));
+  if (activeId !== null && !sessions.some((s) => s.id === activeId)) {
+    activeId = sessions.length > 0 ? sessions[0].id : null;
+    persistActiveId();
+  }
+  notify();
+};
+
+/** Fetch `/state` and apply it whole. Quiet on failure: a 401 has
+ * already flipped the auth state, and an unreachable server leaves the
+ * local view standing until the next tick. */
+const refetchState = async (): Promise<void> => {
+  let doc: StateDoc;
+  try {
+    const res = await apiFetch(STATE_URL);
+    if (!res.ok) {
+      return;
+    }
+    doc = (await res.json()) as StateDoc;
+  } catch {
+    return;
+  }
+  applyStateDoc(doc);
+};
+
+/** One request to the sessions endpoint. The 204 is confirmed by the
+ * tick-driven refetch; any other status, and any rejection short of a
+ * 401, refetches `/state` at once, and the server's view undoes the
+ * optimistic change the caller made. Resolves true on the 2xx alone. */
+const sessionRequest = async (path: string, method: string, body?: unknown): Promise<boolean> => {
+  try {
+    const res = await apiFetch(path, {
+      method,
+      ...(body === undefined
+        ? {}
+        : {
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+          })
+    });
+    if (res.ok) {
+      return true;
+    }
+  } catch (e) {
+    if (e instanceof AuthError) {
+      return false; // the reset has emptied everything already
+    }
+  }
+  void refetchState();
+  return false;
+};
+
+const sessionPath = (sessionId: string): string =>
+  `/sessions/${encodeURIComponent(sessionId)}`;
+
+// ---------- the state event stream ----------
+
+let stateEventSource: EventSource | null = null;
 
 const startStateEventStream = () => {
   if (typeof EventSource === 'undefined' || stateEventSource !== null) {
@@ -601,13 +324,13 @@ const startStateEventStream = () => {
   const es = new EventSource('/state/events');
   stateEventSource = es;
   es.addEventListener('state_changed', () => {
-    void reconcileFromServer();
+    void refetchState();
   });
   // EventSource auto-reconnects on transport errors with browser
-  // defaults. On a fresh connect we proactively reconcile so a
-  // browser that missed ticks while offline catches up.
+  // defaults. On a fresh connect we proactively refetch so a browser
+  // that missed ticks while offline catches up.
   es.addEventListener('open', () => {
-    void reconcileFromServer();
+    void refetchState();
   });
   es.addEventListener('error', () => {
     if (es.readyState === EventSource.CLOSED) {
@@ -631,6 +354,8 @@ type HistoryEntry =
     text: string;
     /** Unix epoch millis. */
     timestamp: number | null;
+    /** The turn's counts, on an agent entry whose row holds them. */
+    usage?: unknown;
   }
   | {
     /** A tool call from the transcript. The same object as the live
@@ -673,7 +398,7 @@ const loadHistory = async (s: Session, usage?: Usage) => {
   }
   let entries: HistoryEntry[] = [];
   try {
-    const res = await fetch(`/history?session=${encodeURIComponent(sessionId)}`);
+    const res = await apiFetch(`/history?session=${encodeURIComponent(sessionId)}`);
     if (!res.ok) {
       return;
     }
@@ -711,13 +436,19 @@ const loadHistory = async (s: Session, usage?: Usage) => {
       });
       continue;
     }
-    s.log.push({
+    const entry: Extract<LogEntry, { kind: 'text' }> = {
       kind: 'text',
       id: newLogId(),
       role: e.role,
       text: renderHistoryText(e),
       timestamp: e.timestamp ?? Date.now()
-    });
+    };
+    // An agent entry carries the turn's counts when the row holds them,
+    // so the footer under an answer survives a reload.
+    if (e.role === 'agent' && isUsage(e.usage)) {
+      entry.usage = e.usage;
+    }
+    s.log.push(entry);
   }
   // History holds finished turns only. A turn in flight at attach time
   // starts after them, so its counts cannot land on a rebuilt entry.
@@ -792,7 +523,7 @@ const connect = (s: Session) => {
     notify();
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     // Stale-socket guard: if we have already moved on to a newer socket
     // (a reconnect, or a suspend -> resume cycle), this close belongs to a
     // dead one and must not drive reconnection.
@@ -800,6 +531,19 @@ const connect = (s: Session) => {
       return;
     }
     if (s.closing) {
+      return;
+    }
+    // The server's own close codes. 4401: the cookie is gone; the auth
+    // state flips and its reset closes every socket, so nothing here
+    // reconnects. 4404: the session was closed under this tab; it goes,
+    // and the refetch brings whatever else changed.
+    if (event.code === 4401) {
+      authLost();
+      return;
+    }
+    if (event.code === 4404) {
+      removeSessionLocal(s.id);
+      void refetchState();
       return;
     }
     // Intentional idle-suspend: stay grey, do not reconnect. The server's
@@ -1028,14 +772,14 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
     if (msg.resumed && !wasHydrated) {
       void loadHistory(s);
     }
-    // A minted id has to reach the state endpoint even right after a
-    // peer's reconcile set the latch. Without this the id stays
-    // unpersisted until the next rename or close, and no peer browser
-    // learns about the tab.
-    if (!hadSessionId && s.sessionId !== null) {
-      suppressNextSync = false;
+    // A tab named in the new-session dialog titles its row once the
+    // server's id is known. The label already holds the name, so the
+    // next tick's refetch keeps it whether or not the write has landed.
+    if (!hadSessionId && s.sessionId !== null && s.pendingTitle !== undefined) {
+      const title = s.pendingTitle;
+      s.pendingTitle = undefined;
+      void sessionRequest(sessionPath(s.sessionId), 'PATCH', { title });
     }
-    scheduleSync();
   }
 
   notify();
@@ -1096,6 +840,23 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
       // assignment is a no-op, and on a tab's first connect it adopts the
       // id the server just minted.
       s.sessionId = msg.sessionId;
+      // From the first `ready` on, the tab's own id is the server's: a
+      // minted tab adopts it here, the active pointer follows, and any
+      // duplicate tab a refetch already added for the id is dropped in
+      // this one's favour, so exactly one tab holds the session.
+      if (s.id !== msg.sessionId) {
+        const wasActive = activeId === s.id;
+        const duplicate = sessions.findIndex((t) => t !== s && t.id === msg.sessionId);
+        if (duplicate >= 0) {
+          dropSocket(sessions[duplicate]);
+          sessions.splice(duplicate, 1);
+        }
+        s.id = msg.sessionId;
+        if (wasActive) {
+          activeId = msg.sessionId;
+          persistActiveId();
+        }
+      }
       s.effectiveCwd = msg.cwd ?? s.effectiveCwd;
       s.promptCapabilities = msg.promptCapabilities ?? {};
       // `busy` says whether a turn is in flight on this session right
@@ -1292,6 +1053,7 @@ export const applyServerMessage = (s: Session, msg: ServerMessage): void => {
 
 const activate = (id: string) => {
   activeId = id;
+  persistActiveId();
   const s = findSession(id);
   if (s && s.attention) {
     s.attention = null;
@@ -1306,7 +1068,6 @@ const activate = (id: string) => {
     }
   }
   notify();
-  scheduleSync();
 };
 
 /** Clears attention on the active session when the Mezame browser tab
@@ -1361,31 +1122,33 @@ if (typeof document !== 'undefined') {
 
 const newSession = (name: string | null = null) => {
   const id = newId();
-  const label = name && name.length > 0 ? name : String(nextLabel++);
-  const s = makeSession(id, label, null);
+  const named = name !== null && name.trim().length > 0;
+  const s = makeSession(id, named ? name.trim() : UNTITLED, null);
+  if (named) {
+    // Kept locally now, written to the row on the first `ready`, once
+    // the server's id is known.
+    s.pendingTitle = name.trim();
+  }
   // New sessions appear leftmost, right after the fixed `+` button.
   sessions.unshift(s);
   connect(s);
   activate(id);
 };
 
-const restoreSession = (saved: { id: string; label: string; sessionId: string | null }) => {
-  const s = makeSession(saved.id, saved.label, saved.sessionId);
-  // Init-time restore: preserve the order captured in persisted state by
-  // appending. The UI's leftmost-insertion rule only applies to user-
-  // initiated new sessions.
-  sessions.push(s);
-  connect(s);
-};
-
 const renameSession = (id: string, label: string) => {
   const s = findSession(id);
-  if (!s || !label.trim()) {
+  const title = label.trim();
+  if (!s || !title) {
     return;
   }
-  s.label = label.trim();
+  s.label = title;
   notify();
-  scheduleSync();
+  if (s.sessionId !== null) {
+    void sessionRequest(sessionPath(s.sessionId), 'PATCH', { title });
+  } else {
+    // No row yet: the rename becomes the title the first `ready` writes.
+    s.pendingTitle = title;
+  }
 };
 
 const closeSession = (id: string) => {
@@ -1394,30 +1157,15 @@ const closeSession = (id: string) => {
     return;
   }
   const s = sessions[i];
-  s.closing = true;
-  if (s.reconnectTimer !== null) {
-    clearTimeout(s.reconnectTimer);
-    s.reconnectTimer = null;
-  }
-  try {
-    s.ws?.close();
-  } catch {
-    // Already disconnected: fine.
-  }
-  // Only archive a session that names one: there is nothing to reattach
-  // to otherwise.
-  if (s.sessionId) {
-    closed.unshift({
-      id: s.id,
-      label: s.label,
-      sessionId: s.sessionId,
-      closedAt: Date.now()
-    });
-    if (closed.length > HISTORY_MAX) {
-      closed.length = HISTORY_MAX;
-    }
-  }
+  dropSocket(s);
   sessions.splice(i, 1);
+  if (s.sessionId !== null) {
+    // Optimistic: the row moves to the closed list now; the tick-driven
+    // refetch confirms it, and a failure refetches at once, which puts
+    // the tab back.
+    closed.unshift({ id: s.sessionId, label: s.label, closedAt: Date.now() });
+    void sessionRequest(sessionPath(s.sessionId), 'PATCH', { archived: true });
+  }
   if (sessions.length === 0) {
     // Never leave the UI empty.
     notify();
@@ -1429,88 +1177,38 @@ const closeSession = (id: string) => {
   } else {
     notify();
   }
-  scheduleSync();
 };
 
 const restoreFromHistory = (sessionId: string) => {
-  const i = closed.findIndex((e) => e.sessionId === sessionId);
+  const i = closed.findIndex((e) => e.id === sessionId);
   if (i < 0) {
     return;
   }
   const entry = closed.splice(i, 1)[0];
-  const s = makeSession(entry.id, entry.label, entry.sessionId);
+  const s = makeSession(entry.id, entry.label, entry.id);
   // Restoring is user-initiated; place the tab leftmost alongside
-  // freshly-created ones.
+  // freshly-created ones. The socket opens only once the restore has
+  // landed: an upgrade before it would find an archived row and 404.
   sessions.unshift(s);
-  connect(s);
   activate(s.id);
-  scheduleSync();
+  void (async () => {
+    if (await sessionRequest(sessionPath(sessionId), 'PATCH', { archived: false })) {
+      connect(s);
+      notify();
+    }
+    // A failure already refetched: the tab is removed again, the closed
+    // entry is back, and no socket was opened.
+  })();
 };
 
 const forgetHistory = (sessionId: string) => {
-  const i = closed.findIndex((e) => e.sessionId === sessionId);
+  const i = closed.findIndex((e) => e.id === sessionId);
   if (i < 0) {
     return;
   }
   closed.splice(i, 1);
   notify();
-  scheduleSync();
-};
-
-// Derive a short label from the user's first prompt. Pure heuristic: no
-// network and no model. Numeric tab labels stop being anonymous after the
-// first turn.
-//
-// Returns null when the prompt isn't useful as a label (empty, slash
-// command, attachments-only). The caller leaves the original label in
-// that case.
-export const deriveLabel = (text: string): string | null => {
-  const cleaned = text
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/https?:\/\/\S+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!cleaned || cleaned.startsWith('/')) {
-    return null;
-  }
-
-  const locale = typeof navigator !== 'undefined' ? navigator.language : 'en';
-
-  // Sentence boundary: Intl.Segmenter handles CJK punctuation that a
-  // plain /[.!?\n]/ regex would miss.
-  let firstSentence = cleaned;
-  const sentSeg = new Intl.Segmenter(locale, { granularity: 'sentence' });
-  for (const seg of sentSeg.segment(cleaned)) {
-    firstSentence = seg.segment.trim();
-    break;
-  }
-
-  if (firstSentence.length < 2) {
-    return null;
-  }
-
-  // Soft cap so a long single sentence doesn't become the label.
-  // Word segmentation matters for scripts without spaces (CJK). We
-  // slice the original string up to the end of the last word we keep.
-  // Spacing and punctuation between words are preserved verbatim.
-  const MAX_WORDS = 10;
-  const wordSeg = new Intl.Segmenter(locale, { granularity: 'word' });
-  let lastEnd = 0;
-  let wordCount = 0;
-  for (const piece of wordSeg.segment(firstSentence)) {
-    if (piece.isWordLike) {
-      lastEnd = piece.index + piece.segment.length;
-      wordCount += 1;
-      if (wordCount >= MAX_WORDS) {
-        break;
-      }
-    }
-  }
-  if (wordCount === 0) {
-    return null;
-  }
-  return firstSentence.slice(0, lastEnd).trim();
+  void sessionRequest(sessionPath(sessionId), 'DELETE');
 };
 
 const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
@@ -1556,18 +1254,6 @@ const sendPrompt = (text: string, attachments: PromptBlock[] = []) => {
   s.thinking = true;
   s.inFlight = true;
   setBusy(s, true);
-  // Auto-label from the prompt while the tab still carries its bare
-  // numeric placeholder (e.g. "3"). A manual name set through the new
-  // session dialog or a rename is non-numeric and survives. A prompt
-  // `deriveLabel` cannot make a label out of leaves the placeholder in
-  // place, so a later prompt gets another go.
-  if (/^\d+$/.test(s.label)) {
-    const derived = deriveLabel(text);
-    if (derived) {
-      s.label = derived;
-      scheduleSync();
-    }
-  }
   notify();
 };
 
@@ -1632,50 +1318,77 @@ const setPinnedToBottom = (sessionId: string, pinned: boolean) => {
   }
 };
 
-// ---------- init ----------
+// ---------- init and reset ----------
 
-let initStarted = false;
+// Guards a concurrent run alone, never a second one: completion and
+// `reset` both re-arm it, so each entry into the signed-in state runs
+// `init` again.
+let initInFlight: Promise<void> | null = null;
 
-const init = async () => {
-  if (initStarted) {
-    return;
-  }
-  initStarted = true;
-  const saved = await fetchState();
-  if (saved?.closed && Array.isArray(saved.closed)) {
-    closed = saved.closed.map(coerceClosedEntry).filter(isClosedEntry).slice(0, HISTORY_MAX);
-  }
-  // Every persisted entry has to name a session; one that does not is
-  // discarded with no error and no tab is restored for it. Checking the
-  // coerced list rather than the raw one closes the hole a `sessions[0]`
-  // read leaves when the filter removed every entry. The shapes are
-  // coerced here as reconcile coerces them: the file is shared and
-  // unauthenticated, and a label that is not a string used to blank the
-  // page on every load.
-  const restorable = Array.isArray(saved?.sessions)
-    ? saved.sessions.map(coercePersistedSession).filter(isPersistedSession)
-    : [];
-  if (restorable.length > 0) {
-    nextLabel =
-      typeof saved?.nextLabel === 'number' && Number.isFinite(saved.nextLabel)
-        ? saved.nextLabel
-        : restorable.length + 1;
-    for (const entry of restorable) {
-      restoreSession(entry);
+const doInit = async (): Promise<void> => {
+  let doc: StateDoc | null = null;
+  try {
+    const res = await apiFetch(STATE_URL);
+    if (res.ok) {
+      doc = (await res.json()) as StateDoc;
     }
-    const restoreActive =
-      saved?.activeId && sessions.some((s) => s.id === saved.activeId)
-        ? saved.activeId
-        : sessions[0].id;
-    activate(restoreActive);
-  } else {
+  } catch (e) {
+    if (e instanceof AuthError) {
+      return; // the reset has run; the login gate is up
+    }
+    // Unreachable server: start empty; the event stream's first open
+    // refetches once it comes back.
+  }
+  if (doc !== null) {
+    applyStateDoc(doc);
+  }
+  if (sessions.length === 0) {
+    // Never leave the UI empty: a first visit mints a session.
     newSession();
   }
-  // Subscribe to cross-browser change notifications so a session
-  // started elsewhere shows up here without a manual reload.
+  const saved = readActiveId();
+  if (saved !== null && sessions.some((s) => s.id === saved)) {
+    activate(saved);
+  } else if (activeId === null && sessions.length > 0) {
+    activate(sessions[0].id);
+  }
+  // Cross-device change notifications: a session opened elsewhere shows
+  // up here without a manual reload.
   startStateEventStream();
   startIdleScan();
 };
+
+const init = (): Promise<void> => {
+  initInFlight ??= doInit().finally(() => {
+    initInFlight = null;
+  });
+  return initInFlight;
+};
+
+/** Undo everything `init` and the session flow built: every socket
+ * closed with `closing` set, every timer cleared, the event stream
+ * closed, both lists emptied, the active pointer nulled and the `init`
+ * guard re-armed. Runs whenever the auth state leaves the signed-in
+ * user: a 401, a 4401 close, or the logout button. */
+const reset = () => {
+  for (const s of sessions) {
+    dropSocket(s);
+  }
+  if (idleScanTimer !== null) {
+    clearInterval(idleScanTimer);
+    idleScanTimer = null;
+  }
+  stateEventSource?.close();
+  stateEventSource = null;
+  sessions = [];
+  closed = [];
+  activeId = null;
+  initInFlight = null;
+  notify();
+};
+
+/** @internal Test-only view of the module's lists. */
+export const __testState = () => ({ sessions, closed, activeId });
 
 // ---------- public hook ----------
 
@@ -1691,6 +1404,7 @@ export const useMezame = () => {
 
 export const mezameActions = {
   init,
+  reset,
   activate,
   newSession,
   renameSession,
