@@ -451,6 +451,13 @@ impl LoopBackend {
     ) -> Result<TurnOutcome> {
         let (outcome, writes) = self.finish(ended, accumulator, events, model, started);
         self.persist(writes).await;
+        // A hub torn down while this turn ran (an archive, a delete, the
+        // grace timer) left the conversation to us so the reply could be
+        // recorded and written; it is ours to clear now.
+        let mut state = lock(&self.state);
+        if state.closed {
+            state.conversation.clear();
+        }
         outcome
     }
 
@@ -468,9 +475,10 @@ impl LoopBackend {
         let stop = accumulator.stop.clone();
         let mut writes = Vec::new();
         let outcome: Result<TurnOutcome> = {
-            // A turn resolving after `shutdown` finds a cleared conversation:
-            // `complete` and `reject_open` on an empty deque change nothing
-            // and say so, so the clear holds and nothing is written.
+            // A turn resolving after `shutdown` finds the conversation it
+            // began with: `shutdown` leaves it for a turn in flight, so the
+            // reply is recorded and written like any other, and `resolve`
+            // clears it afterwards.
             let mut state = lock(&self.state);
             match &ended {
                 Ended::BeforeStream(error) => {
@@ -690,12 +698,23 @@ impl Backend for LoopBackend {
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
-        if let Some(handle) = lock(&self.turn).clone() {
-            handle.cancel();
-        }
+        // A turn in flight is cancelled and left to finish: it records
+        // what the stream produced, writes the store's copy, and clears
+        // the conversation itself once it sees `closed`. With no turn open
+        // the clear happens here. Either way a later `prompt` resolves at
+        // once and nothing of the conversation outlives the hub.
+        let in_flight = match lock(&self.turn).as_ref() {
+            Some(handle) => {
+                handle.cancel();
+                true
+            }
+            None => false,
+        };
         let mut state = lock(&self.state);
-        state.conversation.clear();
         state.closed = true;
+        if !in_flight {
+            state.conversation.clear();
+        }
         Box::pin(std::future::ready(()))
     }
 }

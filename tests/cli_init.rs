@@ -978,7 +978,10 @@ fn init_beside_a_datastore_with_no_key_drops_its_credentials_and_says_how_many()
         printed.contains("Dropped 1 credential row(s)"),
         "the count is named: {printed}"
     );
-    assert!(printed.contains("had no master key"), "{printed}");
+    assert!(
+        printed.contains("sealed under a key that is not"),
+        "{printed}"
+    );
     assert!(
         printed.contains("Backend: echo"),
         "the profile went with the row: {printed}"
@@ -995,4 +998,173 @@ fn init_beside_a_datastore_with_no_key_drops_its_credentials_and_says_how_many()
     let rows = bedrock_rows(tmp.path());
     assert_eq!(rows.model.as_deref(), Some("anthropic.claude-opus-5"));
     assert_eq!(rows.credentials.len(), 1);
+}
+
+#[test]
+fn a_datastore_holding_only_plain_users_still_gets_its_admin_from_init() {
+    // `mezame user add` runs before any `init` and creates the datastore
+    // itself. The admin question is settled by an admin row, not by any
+    // user row, so `--admin` still creates one here and the credential has
+    // an owner to be granted to.
+    let tmp = TempDir::new().unwrap();
+    let out = run_with_stdin(
+        &["user", "add", "bob", "--password-stdin"],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert_success(&out);
+    let out = run_with_stdin(
+        &[
+            "init",
+            "--admin",
+            "root",
+            "--password-stdin",
+            "--model",
+            "anthropic.claude-sonnet-5",
+        ],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert_success(&out);
+    let printed = stdout(&out);
+    assert!(printed.contains("Admin: created `root`"), "{printed}");
+    assert!(
+        printed.contains("Backend: Bedrock anthropic.claude-sonnet-5"),
+        "{printed}"
+    );
+    let rows = bedrock_rows(tmp.path());
+    assert_eq!(
+        rows.users,
+        vec![
+            ("bob".to_string(), Role::User),
+            ("root".to_string(), Role::Admin)
+        ]
+    );
+    assert_eq!(rows.credentials.len(), 1);
+    assert_eq!(grant_count(tmp.path(), &rows.credentials[0].0), 1);
+
+    // With an admin in place, `--admin` is skipped and the message names
+    // the command that adds another.
+    let out = run_with_stdin(
+        &["init", "--admin", "other", "--password-stdin"],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert_success(&out);
+    assert!(
+        stdout(&out).contains("`mezame user add NAME --admin`"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(bedrock_rows(tmp.path()).users.len(), 2);
+
+    // Without one, `--model` alone names both ways to get an admin.
+    let tmp = TempDir::new().unwrap();
+    let out = run_with_stdin(
+        &["user", "add", "bob", "--password-stdin"],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert_success(&out);
+    let out = run_with_home(
+        &["init", "--model", "anthropic.claude-sonnet-5"],
+        tmp.path(),
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("--admin NAME --password-stdin"), "{err}");
+    assert!(err.contains("mezame user add NAME --admin"), "{err}");
+    assert!(!stdout(&out).contains("Admin: kept"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_key_that_cannot_open_the_rows_drops_them_even_when_the_datastore_has_sessions() {
+    // The rows sealed under a lost key go, with the profile that used them,
+    // and a session that ran on that profile stays, unlinked. The session
+    // is the case that used to fail: its row referenced the profile.
+    let tmp = TempDir::new().unwrap();
+    let first = run_with_stdin(
+        &[
+            "init",
+            "--admin",
+            "alice",
+            "--password-stdin",
+            "--model",
+            "anthropic.claude-sonnet-5",
+        ],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert_success(&first);
+    {
+        let store = open_store(tmp.path());
+        block_on(async {
+            let alice = store.user_by_name("alice").await.unwrap().unwrap();
+            let session = store
+                .create_session(&alice.id, "s1", None, 5)
+                .await
+                .unwrap();
+            assert!(
+                session.profile_id.is_some(),
+                "the session runs on the profile"
+            );
+        });
+    }
+    let key_path = tmp.path().join(".mezame/master.key");
+
+    // The key is gone entirely.
+    std::fs::remove_file(&key_path).unwrap();
+    let out = run_with_home(&["init", "--bind", "0.0.0.0:9510"], tmp.path());
+    assert_success(&out);
+    assert!(
+        stdout(&out).contains("Dropped 1 credential row(s)"),
+        "{}",
+        stdout(&out)
+    );
+    let rows = bedrock_rows(tmp.path());
+    assert!(rows.credentials.is_empty());
+    assert!(rows.model.is_none());
+    {
+        let store = open_store(tmp.path());
+        block_on(async {
+            let session = store
+                .session("s1")
+                .await
+                .unwrap()
+                .expect("the session stays");
+            assert_eq!(
+                session.profile_id, None,
+                "unlinked from the dropped profile"
+            );
+        });
+    }
+
+    // A run that made a fresh key but failed before the drop: the rows are
+    // still unopenable, so the next run drops them all the same.
+    let again = run_with_home(&["init", "--model", "anthropic.claude-opus-5"], tmp.path());
+    assert_success(&again);
+    std::fs::remove_file(&key_path).unwrap();
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&key_path)
+            .unwrap()
+            .write_all(&[3u8; 32])
+            .unwrap();
+    }
+    let out = run_with_home(&["init", "--bind", "0.0.0.0:9510"], tmp.path());
+    assert_success(&out);
+    assert!(
+        stdout(&out).contains("Dropped 1 credential row(s)"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(stdout(&out).contains("Backend: echo"), "{}", stdout(&out));
+    assert!(bedrock_rows(tmp.path()).credentials.is_empty());
 }

@@ -63,8 +63,11 @@ pub fn entries_from_rows(rows: &[MessageRow]) -> Vec<HistoryEntry> {
 }
 
 /// The text of an assistant message's `agent` entry: its text blocks in
-/// order, joined by one newline. A reply streamed live accumulates into
-/// one text block, so the join only matters for a row written with more.
+/// order, concatenated with nothing between them, which is the rule the
+/// live loop keeps. A reply holds more than one text block whenever a
+/// signed reasoning block or an opaque block landed between two text
+/// deltas, so the two rules have to agree or a reload shows text the
+/// browser never saw live.
 pub fn agent_text(blocks: &[Block]) -> String {
     blocks
         .iter()
@@ -72,6 +75,5 @@ pub fn agent_text(blocks: &[Block]) -> String {
             Block::Text { text } => Some(text.as_str()),
             _ => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<String>()
 }

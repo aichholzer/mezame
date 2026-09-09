@@ -22,7 +22,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use axum::{
     body::{Body, Bytes},
-    extract::{rejection::JsonRejection, Path, Query, Request, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{
@@ -55,7 +55,7 @@ use crate::conversation::Conversation;
 use crate::guard::{guard_request, RequestPolicy};
 use crate::hub::{warn, HubRegistry};
 use crate::store::crypto::Keys;
-use crate::store::{SessionList, SessionRow, Store, StoreError, UserRow};
+use crate::store::{SessionList, SessionRow, Store, StoreError, UserRow, USER_NAME_MAX_CHARS};
 
 use crate::ws::ws_upgrade;
 
@@ -273,9 +273,29 @@ pub async fn serve_with(
 
     drop(close_rx);
     drop(listener);
-    close_tx.closed().await;
+    // Every connection task holds a `close_rx`; the drain ends when the
+    // last one drops. A peer that has stopped reading holds its
+    // connection open until its TCP dies, and a streaming response to it
+    // is never polled again, so the wait is bounded: after
+    // [`DRAIN_TIMEOUT`] the process exits with whatever is still open.
+    if tokio::time::timeout(DRAIN_TIMEOUT, close_tx.closed())
+        .await
+        .is_err()
+    {
+        warn(&format!(
+            "Some connections did not close within {} seconds of the shutdown signal; exiting \
+             with them open.",
+            DRAIN_TIMEOUT.as_secs()
+        ));
+    }
     Ok(())
 }
+
+/// How long the shutdown waits for open connections to finish before the
+/// process exits regardless. Long enough for every browser to see its
+/// close frame and for a turn's last frames to go out, short enough that
+/// a service manager's stop never hangs on one dead peer.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An accept error the peer caused, which needs no pause before the next
 /// accept.
@@ -328,7 +348,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let policy = Arc::new(RequestPolicy::from_config(&state.config.load()));
     let public = Router::new()
         .route("/ws", get(ws_upgrade))
-        .route("/login", post(login))
+        // The login body is small by construction: a name of at most 64
+        // characters and a password of at most 1024 bytes. Bounding the
+        // body here keeps a name that never reaches an account from
+        // costing megabytes to read.
+        .route(
+            "/login",
+            post(login).layer(DefaultBodyLimit::max(LOGIN_BODY_LIMIT)),
+        )
         .route("/me", get(me))
         // SPA fallback: /, /assets/*, and any unknown path resolve against
         // the embedded UI bundle, with index.html as the fallback for
@@ -351,6 +378,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// The body every route behind the login answers with when there is no
 /// valid cookie.
 pub const LOGIN_REQUIRED: &str = "login required\n";
+
+/// The most bytes a `/login` body may hold: room for the longest name and
+/// password the rules accept, and the JSON around them, and no more.
+pub const LOGIN_BODY_LIMIT: usize = 4096;
 
 impl AppState {
     /// A state over an in-memory store and a fixed key, for the suite,
@@ -438,24 +469,32 @@ impl AppState {
     }
 
     /// The user a request's cookie names, when the cookie verifies, the
-    /// user exists and the epoch matches.
-    pub async fn current_user(&self, headers: &HeaderMap) -> Option<(UserRow, Cookie)> {
+    /// user exists and the epoch matches: `Ok(None)` for every way the
+    /// cookie can fail, `Err` when the store could not answer, which the
+    /// caller reports as a failure of its own rather than as a signed-out
+    /// user.
+    pub async fn current_user(
+        &self,
+        headers: &HeaderMap,
+    ) -> std::result::Result<Option<(UserRow, Cookie)>, StoreError> {
         let now = (self.clock)();
-        let value = headers
+        let Some(value) = headers
             .get(header::COOKIE)
             .and_then(|v| v.to_str().ok())
-            .and_then(cookie_value)?;
-        let cookie = verify(value, &self.keys.cookie, now)?;
-        let user = self
-            .store
-            .user_by_id(&cookie.user_id)
-            .await
-            .ok()
-            .flatten()?;
+            .and_then(cookie_value)
+        else {
+            return Ok(None);
+        };
+        let Some(cookie) = verify(value, &self.keys.cookie, now) else {
+            return Ok(None);
+        };
+        let Some(user) = self.store.user_by_id(&cookie.user_id).await? else {
+            return Ok(None);
+        };
         if user.session_epoch != cookie.epoch {
-            return None;
+            return Ok(None);
         }
-        Some((user, cookie))
+        Ok(Some((user, cookie)))
     }
 
     /// Create `name` with `password` and sign a cookie for them, for the
@@ -479,10 +518,13 @@ impl AppState {
 
 /// The layer every route behind the login runs under: a valid cookie
 /// becomes an `AuthUser` in the request's extensions and is re-issued on
-/// the response when under thirty days remain; anything else is 401.
+/// the response when under thirty days remain; anything else is 401, and
+/// a store that could not answer is 500, never a sign-out.
 async fn require_user(State(app): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
-    let Some((user, cookie)) = app.current_user(req.headers()).await else {
-        return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response();
+    let (user, cookie) = match app.current_user(req.headers()).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response(),
+        Err(e) => return internal(e).into_response(),
     };
     let now = (app.clock)();
     let renew = cookie.due_for_renewal(now).then(|| {
@@ -496,9 +538,15 @@ async fn require_user(State(app): State<Arc<AppState>>, mut req: Request, next: 
     });
     req.extensions_mut().insert(AuthUser(user));
     let mut res = next.run(req).await;
+    // A handler that set the cookie itself (the logout, clearing it) has
+    // the last word: a renewal appended after it would be the later
+    // header for the same name, and the browser would keep the session
+    // the handler just ended.
     if let Some(header) = renew {
-        if let Ok(value) = HeaderValue::from_str(&header) {
-            res.headers_mut().append(header::SET_COOKIE, value);
+        if !res.headers().contains_key(header::SET_COOKIE) {
+            if let Ok(value) = HeaderValue::from_str(&header) {
+                res.headers_mut().append(header::SET_COOKIE, value);
+            }
         }
     }
     res
@@ -522,14 +570,29 @@ async fn login(
     headers: HeaderMap,
     body: Result<Json<LoginBody>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(LoginBody { username, password })) = body else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "expected a JSON body with `username` and `password`\n",
-        )
-            .into_response();
+    let Json(LoginBody { username, password }) = match body {
+        Ok(body) => body,
+        // A body past the limit is answered as axum answers it, 413; every
+        // other way the body can fail to be the login JSON is one 400.
+        Err(JsonRejection::BytesRejection(too_large)) => return too_large.into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "expected a JSON body with `username` and `password`\n",
+            )
+                .into_response();
+        }
     };
     let name = username.trim();
+    // A name no account can have is refused before it reaches the
+    // limiter: the limiter's cap bounds how many names it holds, not how
+    // long they are, and the body limit alone would let each held name
+    // run to kilobytes. The refusal costs the same verification as a
+    // wrong password against an unknown name.
+    if name.chars().count() > USER_NAME_MAX_CHARS {
+        verify_password(&password, dummy_hash());
+        return (StatusCode::UNAUTHORIZED, "wrong username or password\n").into_response();
+    }
     if let Err(left) = app
         .limiter
         .check(&format!("u:{name}"), std::time::Instant::now())
@@ -544,8 +607,17 @@ async fn login(
         )
             .into_response();
     }
-    let stored = app.store.password_hash_of(name).await.ok().flatten();
-    let user = app.store.user_by_name(name).await.ok().flatten();
+    // A store that cannot answer is a failure of the server, reported as
+    // one; treating it as an unknown name would sign every browser out
+    // and tell the next login its password was wrong.
+    let stored = match app.store.password_hash_of(name).await {
+        Ok(stored) => stored,
+        Err(e) => return internal(e).into_response(),
+    };
+    let user = match app.store.user_by_name(name).await {
+        Ok(user) => user,
+        Err(e) => return internal(e).into_response(),
+    };
     let hash: &str = match stored.as_deref() {
         Some(hash) => hash,
         None => dummy_hash(),
@@ -580,8 +652,9 @@ async fn logout() -> Response {
 /// without the answer being a refusal.
 async fn me(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match app.current_user(&headers).await {
-        Some((user, _)) => Json(user_json(&user)).into_response(),
-        None => (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response(),
+        Ok(Some((user, _))) => Json(user_json(&user)).into_response(),
+        Ok(None) => (StatusCode::UNAUTHORIZED, LOGIN_REQUIRED).into_response(),
+        Err(e) => internal(e).into_response(),
     }
 }
 
@@ -624,9 +697,10 @@ async fn shutdown_signal(shutdown: Arc<Notify>) {
         _ = terminate => warn("Received SIGTERM, shutting down."),
     }
     // Wake every long-poll handler. They release their futures before
-    // axum's drain kicks in. `notify_waiters` only wakes tasks that are
-    // currently waiting; long-pollers attached after this point check the
-    // same flag inline before subscribing.
+    // axum's drain kicks in. `notify_waiters` wakes only a waiter that is
+    // registered, which is why each event stream registers its one
+    // notification future when it opens and keeps it; a stream opened
+    // after this point is on a connection the drain is already closing.
     shutdown.notify_waiters();
 }
 
@@ -897,8 +971,19 @@ async fn delete_session(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// A handler failure the client sees as a 500 with the error's text.
+/// A handler failure the client sees as a 500 with the error's text. The
+/// first one per process is also written to the log, so an operator
+/// reading it finds the datastore named as the cause; the rest are the
+/// client's to see, since a wedged store would otherwise fill the log at
+/// request rate.
 fn internal(e: impl std::fmt::Display) -> (StatusCode, String) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        warn(&format!(
+            "A request failed on the datastore: {e}. Later failures are answered 500 and not \
+             reported here."
+        ));
+    }
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n"))
 }
 
@@ -916,22 +1001,37 @@ async fn state_events(
     Extension(AuthUser(user)): Extension<AuthUser>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = app.state_changes.subscribe();
-    let shutdown = app.shutdown.clone();
     let me = user.id;
-    let stream =
-        futures_util::stream::unfold((rx, shutdown, me), |(mut rx, shutdown, me)| async move {
+    // One notification future for the life of the stream, registered
+    // now: `notify_waiters` wakes only a waiter already registered, and a
+    // future made fresh on each poll of the stream would miss a shutdown
+    // that fired while the stream sat between polls, which is where a
+    // stream whose peer has stopped reading sits. Polled once here so its
+    // registration exists before the first event is awaited; the
+    // registration survives the wakes that follow.
+    let shutdown = app.shutdown.clone();
+    let mut notified: futures_util::future::BoxFuture<'static, ()> =
+        Box::pin(async move { shutdown.notified().await });
+    let _ = std::future::poll_fn(|cx| {
+        let _ = notified.as_mut().poll(cx);
+        std::task::Poll::Ready(())
+    })
+    .await;
+    let stream = futures_util::stream::unfold(
+        (rx, notified, me),
+        |(mut rx, mut notified, me)| async move {
             loop {
                 tokio::select! {
                     // Shutdown wins: end the stream and let axum's
                     // graceful drain finish. Without this the SSE handler
                     // holds a request future that never resolves, and
                     // Ctrl+C hangs.
-                    _ = shutdown.notified() => return None,
+                    () = &mut notified => return None,
                     msg = rx.recv() => match msg {
                         Ok(user_id) if user_id == me => {
                             return Some((
                                 Ok(Event::default().event("state_changed").data("")),
-                                (rx, shutdown, me),
+                                (rx, notified, me),
                             ));
                         }
                         // Another user's state moved: nothing for this stream.
@@ -946,7 +1046,8 @@ async fn state_events(
                     },
                 }
             }
-        });
+        },
+    );
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))

@@ -2657,3 +2657,173 @@ async fn a_minted_session_loads_nothing_and_an_existing_one_loads_once() {
         .expect("the second attach joins");
     assert_eq!(counting.loads(), 1, "a join loads nothing");
 }
+
+#[tokio::test]
+async fn an_attach_finding_the_row_closed_under_the_gate_is_refused_and_builds_nothing() {
+    // An archive that lands between the upgrade's row check and the
+    // registry's build: the registry reads the row again with the gate
+    // held and refuses, so no hub is built on a closed or deleted row.
+    let (registry, counting, store) = counting_registry();
+    let owner = stored_owner(store.as_ref(), "alice").await;
+    store
+        .create_session(&owner.user_id, "closing", None, 1)
+        .await
+        .unwrap();
+    store.set_archived("closing", true, 2).await.unwrap();
+
+    let err = registry
+        .attach_or_create("closing", &owner, None)
+        .await
+        .err()
+        .expect("an archived row is refused");
+    assert!(
+        err.downcast_ref::<mezame::hub::SessionGone>().is_some(),
+        "{err}"
+    );
+    assert!(!registry.is_registered_for_test("closing").await);
+    assert_eq!(counting.loads(), 0, "nothing was loaded for it");
+
+    let err = registry
+        .attach_or_create("never-existed", &owner, None)
+        .await
+        .err()
+        .expect("a missing row is refused the same way");
+    assert!(err.downcast_ref::<mezame::hub::SessionGone>().is_some());
+}
+
+#[tokio::test]
+async fn a_close_racing_an_attach_waits_for_the_gate_and_the_attach_then_sees_the_closed_row() {
+    // The archive commits while an attach is inside the build window.
+    // `close_session` takes the same gate, so it cannot look for the hub
+    // while the attach is between its row check and its registration:
+    // either the hub exists when the close looks, or the attach reads the
+    // archived row and refuses. Here the attach is parked before its row
+    // read, the row is archived, and the close is sent; on release the
+    // attach refuses and nothing is left registered.
+    let (registry, _counting, store) = counting_registry();
+    let owner = stored_owner(store.as_ref(), "alice").await;
+    store
+        .create_session(&owner.user_id, "raced", None, 1)
+        .await
+        .unwrap();
+
+    let (parked_tx, parked_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let attach = tokio::spawn({
+        let registry = registry.clone();
+        let owner = owner.clone();
+        async move {
+            registry
+                .attach_or_create_parked_for_test("raced", &owner, async move {
+                    let _ = parked_tx.send(());
+                    let _ = release_rx.await;
+                })
+                .await
+        }
+    });
+    parked_rx.await.expect("the attach holds the gate");
+    store.set_archived("raced", true, 2).await.unwrap();
+    let close = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.close_session("raced").await }
+    });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!close.is_finished(), "the close waits at the gate");
+
+    release_tx
+        .send(())
+        .expect("the attach waits to be released");
+    let err = attach
+        .await
+        .unwrap()
+        .err()
+        .expect("the attach reads the archived row and refuses");
+    assert!(err.downcast_ref::<mezame::hub::SessionGone>().is_some());
+    assert!(!close.await.unwrap(), "nothing was there to close");
+    assert!(!registry.is_registered_for_test("raced").await);
+}
+
+#[tokio::test]
+async fn a_failed_title_write_is_retried_by_the_next_prompt() {
+    // The title flag is set again when the write fails, so the row does
+    // not stay untitled for the life of the hub after one store hiccup.
+    let keys = mezame::store::crypto::MasterKey::from_bytes_for_test([9u8; 32]).keys();
+    let inner: Arc<dyn mezame::store::Store> =
+        Arc::new(mezame::store::sqlite::SqliteStore::open_in_memory(keys).unwrap());
+    let failing = Arc::new(support::FailingStore::new(inner));
+    let counting = Arc::new(support::CountingStore::new(
+        failing.clone() as Arc<dyn mezame::store::Store>
+    ));
+    let store: Arc<dyn mezame::store::Store> = counting.clone();
+    let (ticks, _) = broadcast::channel(8);
+    let registry = HubRegistry::new().with_store(store.clone(), ticks);
+    let owner = stored_owner(store.as_ref(), "alice").await;
+    let mut attached = registry
+        .attach_or_create(
+            "titled-late",
+            &owner,
+            Some(mezame::hub::MintContext {
+                workspace_root: None,
+                now: 5,
+            }),
+        )
+        .await
+        .expect("the mint attaches");
+
+    failing.fail();
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("first words")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .unwrap();
+    collect_until(&mut attached.outbound, "prompt_done").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while counting.title_writes() < 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(counting.title_writes(), 1);
+    failing.recover();
+    assert_eq!(
+        store.session("titled-late").await.unwrap().unwrap().title,
+        None,
+        "the failed write left the row untitled"
+    );
+
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("second words")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .unwrap();
+    collect_until(&mut attached.outbound, "prompt_done").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while store
+        .session("titled-late")
+        .await
+        .unwrap()
+        .unwrap()
+        .title
+        .is_none()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(counting.title_writes(), 2, "the next prompt tried again");
+    assert_eq!(
+        store
+            .session("titled-late")
+            .await
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("second words")
+    );
+}

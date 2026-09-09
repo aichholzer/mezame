@@ -1019,63 +1019,93 @@ fn errors_render_one_line_each() {
 }
 
 #[tokio::test]
-async fn dropping_every_credential_takes_the_profiles_that_used_them_and_counts() {
-    // `init` beside a datastore whose key is gone: nothing sealed can be
-    // opened, so the credential rows go, with the profiles pointing at
-    // them and the grants under them, and the users stay.
-    let store = store();
-    let admin = store
-        .create_user("admin", "h", Role::Admin, 1)
-        .await
-        .unwrap()
-        .id;
-    assert_eq!(
-        store.drop_all_credentials().await.unwrap(),
-        0,
-        "nothing to drop"
-    );
-    let first = store
-        .create_credential(None, &admin, "bedrock", "Bedrock", &json!({}), 1)
-        .await
-        .unwrap();
-    let second = store
-        .create_credential(Some(&admin), &admin, "bedrock", "Bedrock", &json!({}), 2)
-        .await
-        .unwrap();
-    store
-        .upsert_global_profile(&NewProfile {
+async fn dropping_the_unopenable_credentials_takes_their_profiles_and_frees_their_sessions() {
+    // `init` beside a datastore whose key was replaced: the rows sealed
+    // under the old key go, with the profiles that used them; the sessions
+    // that ran on those profiles stay, unlinked, since `sessions.profile_id`
+    // references the profile with no cascade and a conversation is worth
+    // more than the profile it ran on. A row the key in hand opens is left
+    // alone, so the call is safe on every run.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("mezame.db");
+    let keys_a = MasterKey::from_bytes_for_test([1u8; KEY_LEN]).keys();
+    let keys_b = MasterKey::from_bytes_for_test([2u8; KEY_LEN]).keys();
+
+    let session_id = {
+        let a = SqliteStore::open(&path, keys_a).unwrap();
+        let admin = a
+            .create_user("admin", "h", Role::Admin, 1)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            a.drop_unopenable_credentials().await.unwrap(),
+            0,
+            "nothing to drop"
+        );
+        let sealed = a
+            .create_credential(
+                None,
+                &admin,
+                "bedrock",
+                "Bedrock",
+                &json!({ "region": "x" }),
+                1,
+            )
+            .await
+            .unwrap();
+        a.upsert_global_profile(&NewProfile {
             model: "anthropic.claude-sonnet-5".into(),
-            credential_id: Some(first.id.clone()),
+            credential_id: Some(sealed.id.clone()),
             ..Default::default()
         })
         .await
         .unwrap();
+        // A session stamped with the profile: the row that made the delete
+        // of the profile fail before the sessions were unlinked first.
+        let session = a.create_session(&admin, &new_id(), None, 2).await.unwrap();
+        assert!(
+            session.profile_id.is_some(),
+            "the session runs on the profile"
+        );
+        assert_eq!(
+            a.drop_unopenable_credentials().await.unwrap(),
+            0,
+            "a row this key opens is kept"
+        );
+        session.id
+    };
 
-    assert_eq!(store.drop_all_credentials().await.unwrap(), 2);
+    let b = SqliteStore::open(&path, keys_b).unwrap();
+    assert!(b.global_profile().await.unwrap().is_some());
+    assert_eq!(b.drop_unopenable_credentials().await.unwrap(), 1);
     assert!(
-        store.global_profile().await.unwrap().is_none(),
+        b.global_profile().await.unwrap().is_none(),
         "the profile went"
     );
-    assert!(store.credentials(None, "bedrock").await.unwrap().is_empty());
-    assert!(store
-        .credentials(Some(&admin), "bedrock")
+    assert!(b.credentials(None, "bedrock").await.unwrap().is_empty());
+    assert_eq!(b.count_users().await.unwrap(), 1, "the users stay");
+    let session = b
+        .session(&session_id)
         .await
         .unwrap()
-        .is_empty());
-    assert!(matches!(
-        store.credential_payload(&second.id).await,
-        Err(StoreError::NotFound)
-    ));
-    assert_eq!(store.count_users().await.unwrap(), 1, "the users stay");
-    // A profile with no credential is not touched: it names nothing sealed.
-    store
-        .upsert_global_profile(&NewProfile {
-            model: "anthropic.claude-opus-5".into(),
-            credential_id: None,
-            ..Default::default()
-        })
+        .expect("the session stays");
+    assert_eq!(
+        session.profile_id, None,
+        "unlinked from the dropped profile"
+    );
+    assert_eq!(
+        b.drop_unopenable_credentials().await.unwrap(),
+        0,
+        "idempotent"
+    );
+
+    // Under the new key a fresh credential opens and is kept beside the
+    // rows the drop left.
+    let admin_b = b.list_users().await.unwrap()[0].id.clone();
+    b.create_credential(None, &admin_b, "bedrock", "Bedrock", &json!({}), 3)
         .await
         .unwrap();
-    assert_eq!(store.drop_all_credentials().await.unwrap(), 0);
-    assert!(store.global_profile().await.unwrap().is_some());
+    assert_eq!(b.drop_unopenable_credentials().await.unwrap(), 0);
+    assert_eq!(b.credentials(None, "bedrock").await.unwrap().len(), 1);
 }

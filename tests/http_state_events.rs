@@ -234,3 +234,38 @@ async fn stream_ends_when_the_last_sender_is_dropped() {
         "a closed channel must end the SSE stream, got {ended:?}"
     );
 }
+
+#[tokio::test]
+async fn shutdown_ends_a_stream_that_was_not_waiting_when_it_fired() {
+    // The stream registers its shutdown notification once, when it opens,
+    // and keeps it. A notification that fires while the stream sits
+    // between two polls, which is where a stream whose peer has stopped
+    // reading sits, is therefore not missed: the next poll ends it.
+    let state = test_state(8);
+    let cookie = state.login_for_test("alice", "correct horse battery").await;
+    let alice = state.store.user_by_name("alice").await.unwrap().unwrap();
+    let res = build_router(state.clone())
+        .oneshot(
+            Request::get("/state/events")
+                .header(axum::http::header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut stream = res.into_body().into_data_stream();
+
+    // One event consumed, so the stream has yielded and is between polls.
+    let _ = state.state_changes.send(alice.id.clone());
+    let frame = next_frame(&mut stream).await;
+    assert!(frame.contains("state_changed"), "{frame}");
+
+    // Shutdown fires with nothing polling the stream.
+    state.shutdown.notify_waiters();
+
+    let ended = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream ends on its next poll");
+    assert!(ended.is_none(), "got {ended:?}");
+}

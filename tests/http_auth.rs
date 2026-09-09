@@ -3,6 +3,8 @@
 //! endpoints, the sliding renewal, the `Secure` rule, the limiter, and the
 //! guard's `Sec-Fetch-Site` rule.
 
+mod support;
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -13,12 +15,13 @@ use mezame::auth::{
     LOGIN_LIMIT,
 };
 use mezame::config::{Config, TransportConfig};
-use mezame::http::{build_router, AppState, Clock, LOGIN_REQUIRED};
+use mezame::http::{build_router, AppState, Clock, LOGIN_BODY_LIMIT, LOGIN_REQUIRED};
 use mezame::hub::HubRegistry;
 use mezame::store::crypto::{MasterKey, KEY_LEN};
 use mezame::store::sqlite::SqliteStore;
-use mezame::store::Role;
+use mezame::store::{Role, Store, USER_NAME_MAX_CHARS};
 use serde_json::{json, Value};
+use support::FailingStore;
 use tokio::sync::{broadcast, Notify};
 use tower::ServiceExt;
 
@@ -40,13 +43,19 @@ fn config(public_url: Option<&str>) -> Config {
 /// A state with a clock fixed at `now` and a fresh limiter.
 fn state_at(now: i64, public_url: Option<&str>) -> Arc<AppState> {
     let keys = MasterKey::from_bytes_for_test([9u8; KEY_LEN]).keys();
-    let store = SqliteStore::open_in_memory(keys.clone()).unwrap();
+    let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory(keys.clone()).unwrap());
+    state_over(now, public_url, store)
+}
+
+/// [`state_at`] over a caller-built store.
+fn state_over(now: i64, public_url: Option<&str>, store: Arc<dyn Store>) -> Arc<AppState> {
+    let keys = MasterKey::from_bytes_for_test([9u8; KEY_LEN]).keys();
     let (state_changes, _) = broadcast::channel(8);
     let clock: Clock = Arc::new(move || now);
     Arc::new(AppState {
         config: ArcSwap::from_pointee(config(public_url)),
         hubs: HubRegistry::new(),
-        store: Arc::new(store),
+        store,
         keys,
         limiter: RateLimiter::default(),
         clock,
@@ -87,6 +96,15 @@ fn login_request(username: &str, password: &str) -> Request<Body> {
         .body(Body::from(
             json!({ "username": username, "password": password }).to_string(),
         ))
+        .unwrap()
+}
+
+/// A same-origin JSON `POST` of `body` to `path`.
+fn post_json(path: &str, body: &Value) -> Request<Body> {
+    Request::post(path)
+        .header("sec-fetch-site", "same-origin")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
         .unwrap()
 }
 
@@ -453,4 +471,111 @@ async fn sec_fetch_site_decides_a_write_with_no_origin() {
         .insert("host", "127.0.0.1:9510".parse().unwrap());
     let (status, _, _) = send(&state, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "a foreign Origin is refused");
+}
+
+#[tokio::test]
+async fn logout_on_a_cookie_due_for_renewal_clears_it_and_renews_nothing() {
+    // The renewal a request under thirty days from expiry would earn is
+    // withheld when the handler set the cookie itself: two `Set-Cookie`
+    // headers for one name would let the later, renewing one win, and the
+    // logout would have kept the session it just ended.
+    let state = state_at(NOW, None);
+    let id = create_alice(&state).await;
+    let issued = NOW - 61 * 24 * 60 * 60;
+    let value = auth::sign(&Cookie::issue(&id, 0, issued), &state.keys.cookie);
+    let req = Request::post("/logout")
+        .header("sec-fetch-site", "same-origin")
+        .header(header::COOKIE, format!("{COOKIE_NAME}={value}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, _) = send(&state, req).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let set: Vec<String> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(set.len(), 1, "one Set-Cookie, the clearing one: {set:?}");
+    assert!(
+        set[0].starts_with(&format!("{COOKIE_NAME}=;")),
+        "{}",
+        set[0]
+    );
+    assert!(set[0].contains("Max-Age=0"), "{}", set[0]);
+    // The same old cookie on a read is renewed, as before.
+    let (status, headers, _) = send(&state, get("/state", Some(&value))).await;
+    assert_eq!(status, StatusCode::OK);
+    let renewed = set_cookie_of(&headers).expect("a renewal");
+    assert!(renewed.contains("Max-Age=7776000"), "{renewed}");
+}
+
+#[tokio::test]
+async fn a_name_no_account_can_have_is_refused_without_a_limiter_key_and_the_body_is_bounded() {
+    // The limiter's cap bounds how many names it holds; a name longer than
+    // any account's never becomes one of them, and the body it arrives in
+    // is bounded ahead of the handler.
+    let state = state_at(NOW, None);
+    create_alice(&state).await;
+    let long = "x".repeat(USER_NAME_MAX_CHARS + 1);
+    let body = json!({ "username": long, "password": "correct horse battery" });
+    let (status, _, out) = send(&state, post_json("/login", &body)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "wrong username or password\n"
+    );
+    assert_eq!(state.limiter.len(), 0, "no window was opened for it");
+
+    // The longest name an account can have still gets its window.
+    let edge = "y".repeat(USER_NAME_MAX_CHARS);
+    let body = json!({ "username": edge, "password": "correct horse battery" });
+    let (status, _, _) = send(&state, post_json("/login", &body)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(state.limiter.len(), 1);
+
+    // A body past the limit is refused before it is read as JSON.
+    let padding = "p".repeat(LOGIN_BODY_LIMIT);
+    let body = json!({ "username": "alice", "password": padding });
+    let (status, _, _) = send(&state, post_json("/login", &body)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        state.limiter.len(),
+        1,
+        "the refused body reached no handler"
+    );
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_answer_is_a_500_on_login_and_on_every_cookie_check() {
+    // A datastore outage is the server's failure, reported as one: not a
+    // wrong password to the login, and not a sign-out to every browser.
+    let keys = MasterKey::from_bytes_for_test([9u8; KEY_LEN]).keys();
+    let failing = Arc::new(FailingStore::new(Arc::new(
+        SqliteStore::open_in_memory(keys).unwrap(),
+    )));
+    let state = state_over(NOW, None, failing.clone() as Arc<dyn Store>);
+    let id = create_alice(&state).await;
+    let value = auth::sign(&Cookie::issue(&id, 0, NOW), &state.keys.cookie);
+
+    failing.fail();
+    let body = json!({ "username": "alice", "password": "correct horse battery" });
+    let (status, _, out) = send(&state, post_json("/login", &body)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        String::from_utf8_lossy(&out).contains("failing store"),
+        "the store's own message is the body: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let (status, _, _) = send(&state, get("/me", Some(&value))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "/me");
+    let (status, _, out) = send(&state, get("/state", Some(&value))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "/state");
+    assert_ne!(String::from_utf8_lossy(&out), LOGIN_REQUIRED);
+
+    // Once the store answers again, the same cookie and password work.
+    failing.recover();
+    let (status, _, _) = send(&state, get("/state", Some(&value))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(&state, post_json("/login", &body)).await;
+    assert_eq!(status, StatusCode::OK);
 }

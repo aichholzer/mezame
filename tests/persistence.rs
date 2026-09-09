@@ -400,6 +400,49 @@ async fn a_reply_with_no_text_writes_no_assistant_row() {
 }
 
 #[tokio::test]
+async fn a_hub_torn_down_mid_turn_still_writes_the_reply_the_turn_produced() {
+    // An archive or a delete ends the hub while a reply streams: the
+    // backend is shut down, the turn is cancelled, and what the stream
+    // produced so far is written as the reply, so a restore does not show
+    // the question with no answer and merge it into the next prompt.
+    let store = memory_store();
+    seed(store.as_ref(), "alice", "s1").await;
+    let provider = Arc::new(ScriptedProvider::with_stream(ScriptedStream::Pending {
+        first: vec![TurnEvent::TextDelta("the first half".into())],
+    }));
+    let backend = Arc::new(backend(&provider, Some(store.clone()), "s1"));
+    let running = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move { turn(&backend, text("question")).await })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while provider.request_count() < 1 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The hub's teardown: cancel and shut down while the stream is open.
+    backend.shutdown().await;
+    let outcome = running.await.unwrap().expect("a cancelled turn resolves");
+    assert_eq!(outcome.usage, None);
+
+    let written = rows(store.as_ref(), "s1").await;
+    assert_eq!(written.len(), 2, "the question and the partial reply");
+    assert_eq!(written[0].text.as_deref(), Some("question"));
+    assert_eq!(written[1].blocks, vec![text_block("the first half")]);
+    assert!(!written[1].rejected);
+    // Nothing of the conversation outlives the hub in memory.
+    assert!(backend.history().await.is_empty());
+    assert!(
+        turn(&backend, text("later")).await.is_err(),
+        "the backend is closed"
+    );
+    assert_eq!(
+        rows(store.as_ref(), "s1").await.len(),
+        2,
+        "a closed backend writes nothing"
+    );
+}
+
+#[tokio::test]
 async fn a_failing_store_is_reported_once_and_every_turn_still_resolves() {
     // Requirement 8 criterion 2: the write fails, the turn resolves as if
     // it had not, one line is written for the session, and the next turn
@@ -800,6 +843,14 @@ fn entries_from_rows_maps_each_row_shape_and_carries_usage_on_agent_entries_alon
             ..row(3, MessageRole::Assistant, vec![text_block("no")], None)
         },
         row(4, MessageRole::Assistant, vec![thinking("quiet")], None),
+        // A signed reasoning block between two text deltas splits the
+        // reply into two text blocks; live, the deltas were concatenated.
+        row(
+            5,
+            MessageRole::Assistant,
+            vec![text_block("first "), thinking("mid"), text_block("second")],
+            None,
+        ),
     ];
 
     let entries = entries_from_rows(&rows);
@@ -810,10 +861,13 @@ fn entries_from_rows_maps_each_row_shape_and_carries_usage_on_agent_entries_alon
             "thought:first",
             "agent:done",
             "agent:no",
-            "thought:quiet"
+            "thought:quiet",
+            "thought:mid",
+            "agent:first second"
         ],
         "the entry text is the row's text, an empty thought is dropped, a \
-         flagged row maps the same, a reply with no text has no agent entry"
+         flagged row maps the same, a reply with no text has no agent entry, \
+         and split text is joined as the live loop joined it"
     );
     assert_eq!(
         serde_json::to_value(&entries[0]).unwrap(),

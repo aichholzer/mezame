@@ -159,6 +159,12 @@ type StateDoc = {
 /** The label a session with no title shows. */
 const UNTITLED = 'New session';
 
+/** Bumped by every `reset`. A response that was in flight when the store
+ * was emptied belongs to the account that is gone, or to a state the
+ * next sign-in has replaced; the request that made it compares the
+ * generation it started under with this one and drops a stale answer. */
+let generation = 0;
+
 // Fallback one-shot latch for the stale-bundle reload when
 // sessionStorage is unavailable (private mode, storage disabled).
 // Prevents the reload-on-every-reconnect loop in that environment.
@@ -270,6 +276,7 @@ const applyStateDoc = (doc: StateDoc) => {
  * already flipped the auth state, and an unreachable server leaves the
  * local view standing until the next tick. */
 const refetchState = async (): Promise<void> => {
+  const started = generation;
   let doc: StateDoc;
   try {
     const res = await apiFetch(STATE_URL);
@@ -279,6 +286,9 @@ const refetchState = async (): Promise<void> => {
     doc = (await res.json()) as StateDoc;
   } catch {
     return;
+  }
+  if (started !== generation) {
+    return; // a reset ran while this was in flight: not our state any more
   }
   applyStateDoc(doc);
 };
@@ -315,7 +325,13 @@ const sessionPath = (sessionId: string): string =>
 
 // ---------- the state event stream ----------
 
+const STREAM_RETRY_MIN_MS = 5_000;
+const STREAM_RETRY_MAX_MS = 60_000;
+
 let stateEventSource: EventSource | null = null;
+/** The reopen scheduled after a fatal close, and the delay it will use. */
+let streamRetryTimer: number | null = null;
+let streamRetryDelay = STREAM_RETRY_MIN_MS;
 
 const startStateEventStream = () => {
   if (typeof EventSource === 'undefined' || stateEventSource !== null) {
@@ -330,12 +346,27 @@ const startStateEventStream = () => {
   // defaults. On a fresh connect we proactively refetch so a browser
   // that missed ticks while offline catches up.
   es.addEventListener('open', () => {
+    streamRetryDelay = STREAM_RETRY_MIN_MS;
     void refetchState();
   });
+  // A non-200 answer (a proxy's 502 while the server restarts, a cookie
+  // that has gone stale) closes the source for good, with no retry from
+  // the browser. This stream is the one channel that brings another
+  // device's changes here, so it is reopened after a pause that doubles
+  // while the failures continue; `reset` cancels the pause.
   es.addEventListener('error', () => {
-    if (es.readyState === EventSource.CLOSED) {
-      stateEventSource = null;
+    if (es.readyState !== EventSource.CLOSED) {
+      return;
     }
+    stateEventSource = null;
+    if (streamRetryTimer !== null) {
+      return;
+    }
+    streamRetryTimer = window.setTimeout(() => {
+      streamRetryTimer = null;
+      startStateEventStream();
+    }, streamRetryDelay);
+    streamRetryDelay = Math.min(STREAM_RETRY_MAX_MS, streamRetryDelay * 2);
   });
 };
 
@@ -1326,6 +1357,7 @@ const setPinnedToBottom = (sessionId: string, pinned: boolean) => {
 let initInFlight: Promise<void> | null = null;
 
 const doInit = async (): Promise<void> => {
+  const started = generation;
   let doc: StateDoc | null = null;
   try {
     const res = await apiFetch(STATE_URL);
@@ -1338,6 +1370,9 @@ const doInit = async (): Promise<void> => {
     }
     // Unreachable server: start empty; the event stream's first open
     // refetches once it comes back.
+  }
+  if (started !== generation) {
+    return; // a reset ran while the fetch was out: this init is void
   }
   if (doc !== null) {
     applyStateDoc(doc);
@@ -1380,10 +1415,16 @@ const reset = () => {
   }
   stateEventSource?.close();
   stateEventSource = null;
+  if (streamRetryTimer !== null) {
+    clearTimeout(streamRetryTimer);
+    streamRetryTimer = null;
+  }
+  streamRetryDelay = STREAM_RETRY_MIN_MS;
   sessions = [];
   closed = [];
   activeId = null;
   initInFlight = null;
+  generation += 1;
   notify();
 };
 

@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 
-use crate::hub::{MintContext, OwnerContext, GRACE_PERIOD, SESSION_CLOSED_CLOSE};
+use crate::hub::{MintContext, OwnerContext, SessionGone, GRACE_PERIOD, SESSION_CLOSED_CLOSE};
 
 /// How often the server sends a WebSocket `Ping` to each attached
 /// browser. A live peer answers with a `Pong` (or sends any other
@@ -176,15 +176,22 @@ pub(crate) async fn ws_upgrade(
     // The login first. A browser cannot read the status of a refused
     // upgrade, so the handshake completes and the socket closes with a
     // code the client can tell from a network drop.
-    let Some((user, _cookie)) = state.current_user(&headers).await else {
-        return ws.on_upgrade(|mut socket| async move {
-            let _ = socket
-                .send(Message::Close(Some(CloseFrame {
-                    code: LOGIN_REQUIRED_CLOSE,
-                    reason: "login required".into(),
-                })))
-                .await;
-        });
+    let (user, _cookie) = match state.current_user(&headers).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return ws.on_upgrade(|mut socket| async move {
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: LOGIN_REQUIRED_CLOSE,
+                        reason: "login required".into(),
+                    })))
+                    .await;
+            });
+        }
+        // The store could not answer: a failure of the server, not a
+        // missing login. Refused before the handshake, so the browser
+        // reads a drop to retry rather than a sign-out.
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}\n")).into_response(),
     };
     let owner = OwnerContext {
         user_id: user.id,
@@ -263,11 +270,21 @@ async fn handle_ws(
     let attached = match state.hubs.attach_or_create(&session_id, &owner, mint).await {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("Session {session_id}: could not attach: {e:?}");
             // The queue is empty here, so `try_send` cannot find it full.
-            let _ = to_ws_tx.try_send(text_msg(
-                json!({ "type": "error", "message": format!("{e}") }),
-            ));
+            if e.downcast_ref::<SessionGone>().is_some() {
+                // Closed or deleted since the upgrade checked the row: the
+                // same close a live socket gets, so the browser drops the
+                // tab rather than retrying.
+                let _ = to_ws_tx.try_send(Message::Close(Some(CloseFrame {
+                    code: SESSION_CLOSED_CLOSE,
+                    reason: "session closed".into(),
+                })));
+            } else {
+                eprintln!("Session {session_id}: could not attach: {e:?}");
+                let _ = to_ws_tx.try_send(text_msg(
+                    json!({ "type": "error", "message": format!("{e}") }),
+                ));
+            }
             drop(to_ws_tx);
             finish_writer(&mut writer).await;
             return Ok(());

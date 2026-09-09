@@ -233,14 +233,14 @@ pub fn run(args: &InitArgs) -> Result<()> {
     let summary = runtime.block_on(async move {
         if opened.dropped > 0 {
             println!(
-                "Dropped {} credential row(s) and the profiles that used them: {} had no master \
-                 key beside it, so nothing sealed in it could be opened. Re-enter the Bedrock \
+                "Dropped {} credential row(s) and the profiles that used them: they were sealed \
+                 under a key that is not {}, so they could not be opened. Re-enter the Bedrock \
                  settings below or with `--model`.",
                 opened.dropped,
-                config::datastore_path()?.display()
+                config::master_key_path()?.display()
             );
         }
-        let users = store.count_users().await.map_err(|e| anyhow!("{e}"))?;
+        let has_admin = oldest_admin(store.as_ref()).await?.is_some();
         let current = current_bedrock(store.as_ref()).await?;
 
         let bind = match &args.bind {
@@ -255,18 +255,17 @@ pub fn run(args: &InitArgs) -> Result<()> {
                 .unwrap_or_else(default_bind),
         };
 
-        let admin = if users > 0 {
+        // The admin question is settled by an admin row, not by any user
+        // row: a datastore `mezame user add` filled with plain users still
+        // needs one, since the Bedrock credential is granted to an admin.
+        let admin = if has_admin {
             if args.admin.is_some() {
                 println!(
-                    "The datastore already holds {users} user{}; `--admin` is ignored. `mezame \
-                     user add NAME` adds another.",
-                    plural(users)
+                    "The datastore already holds an admin; `--admin` is ignored. `mezame user \
+                     add NAME --admin` adds another."
                 );
             } else if interactive {
-                println!(
-                    "The datastore already holds {users} user{}; skipping the admin questions.",
-                    plural(users)
-                );
+                println!("The datastore already holds an admin; skipping the admin questions.");
             }
             None
         } else if interactive {
@@ -573,32 +572,29 @@ pub fn open_store() -> Result<(Arc<dyn Store>, Keys)> {
 }
 
 /// The master key and the datastore as `init` opens them: an absent key is
-/// created whether or not a datastore is there, and a datastore that was
-/// there without a key loses its credential rows and the profiles that
-/// used them, since this key cannot open them. An existing key is read
-/// under the same checks as the server's and never rewritten.
+/// created whether or not a datastore is there, and every credential row
+/// the key in hand cannot open goes, with the profiles that used it,
+/// since nothing sealed under another key can ever be read again. That
+/// is decided on the rows themselves, not on whether this run made the
+/// key, so a run that failed between making the key and dropping the rows
+/// leaves the drop to the next one. An existing key is read under the
+/// same checks as the server's and never rewritten.
 pub fn open_or_create_store() -> Result<Opened> {
     let dir = config::mezame_dir()?;
     config::ensure_private_dir(&dir).with_context(|| format!("Creating {}", dir.display()))?;
     let datastore = config::datastore_path()?;
     let key_path = config::master_key_path()?;
-    let datastore_existed = datastore.exists();
-    let key_existed = key_path.symlink_metadata().is_ok();
     let key = MasterKey::load_or_create(&key_path).map_err(|e| anyhow!("{e}"))?;
     let keys = key.keys();
     let store: Arc<dyn Store> =
         Arc::new(SqliteStore::open(&datastore, keys.clone()).map_err(|e| anyhow!("{e}"))?);
-    let dropped = if datastore_existed && !key_existed {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("starting the runtime for init")?;
-        runtime
-            .block_on(store.drop_all_credentials())
-            .map_err(|e| anyhow!("{e}"))?
-    } else {
-        0
-    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting the runtime for init")?;
+    let dropped = runtime
+        .block_on(store.drop_unopenable_credentials())
+        .map_err(|e| anyhow!("{e}"))?;
     Ok(Opened {
         store,
         keys,
@@ -624,7 +620,7 @@ pub async fn apply(store: &dyn Store, answers: Answers, now: i64) -> Result<Summ
             AdminOutcome::Created(row.name)
         }
         None => {
-            if store.count_users().await.map_err(|e| anyhow!("{e}"))? > 0 {
+            if oldest_admin(store).await?.is_some() {
                 AdminOutcome::Kept
             } else {
                 AdminOutcome::None
@@ -674,8 +670,8 @@ async fn replace_bedrock(store: &dyn Store, bedrock: &BedrockAnswers, now: i64) 
     let creator = oldest_admin(store).await?.ok_or_else(|| {
         anyhow!(
             "a Bedrock credential needs an admin to own it and none exists yet: run `mezame \
-             init --admin NAME --password-stdin --model ID`, or answer the admin questions in a \
-             terminal"
+             init --admin NAME --password-stdin --model ID`, or `mezame user add NAME --admin` \
+             and then `mezame init --model ID`"
         )
     })?;
     let previous = store

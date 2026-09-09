@@ -900,6 +900,85 @@ describe('the session list is the server_s', () => {
     setUnauthorizedHandler(() => {});
   });
 
+  it('a /state answer in flight when the store was reset is not applied afterwards', async () => {
+    // The response belongs to the account that signed out (or to a state
+    // the next sign-in replaced): it must not repopulate the lists.
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    await mezameActions.init();
+    let release: (() => void) | null = null;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).startsWith('/state')) {
+          await held;
+          return jsonResponse({ sessions: [{ id: 'old1', title: 'Stale' }], closed: [] });
+        }
+        return jsonResponse({});
+      })
+    );
+    FakeEventSource.instances.at(-1)?.emit('state_changed'); // refetch goes out
+    mezameActions.reset();
+    expect(ids()).toEqual([]);
+    release!();
+    await flush();
+    expect(ids(), 'the stale answer was dropped').toEqual([]);
+    expect(__testState().closed).toEqual([]);
+    expect(FakeSocket.instances.every((w) => !w.url.includes('old1'))).toBe(true);
+  });
+
+  it('an init whose fetch was out when the store was reset builds nothing', async () => {
+    let release: (() => void) | null = null;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).startsWith('/state')) {
+          await held;
+          return jsonResponse({ sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] });
+        }
+        return jsonResponse({});
+      })
+    );
+    const pending = mezameActions.init();
+    mezameActions.reset();
+    release!();
+    await pending;
+    await flush();
+    expect(ids()).toEqual([]);
+    expect(FakeEventSource.instances).toHaveLength(0);
+  });
+
+  it('a fatally closed event stream is reopened after a pause, and reset cancels the pause', async () => {
+    vi.useFakeTimers();
+    try {
+      await mezameActions.init();
+      expect(FakeEventSource.instances).toHaveLength(1);
+      const first = FakeEventSource.instances[0];
+      first.readyState = FakeEventSource.CLOSED;
+      first.emit('error');
+      expect(FakeEventSource.instances, 'not reopened at once').toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(FakeEventSource.instances, 'reopened after the pause').toHaveLength(2);
+
+      // A second failure doubles the pause; a reset in the pause cancels it.
+      const second = FakeEventSource.instances[1];
+      second.readyState = FakeEventSource.CLOSED;
+      second.emit('error');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(FakeEventSource.instances, 'the pause doubled').toHaveLength(2);
+      mezameActions.reset();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(FakeEventSource.instances, 'nothing reopens after a reset').toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a 4404 close removes the session and refetches', async () => {
     stateDoc = {
       sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'bbb2', title: 'Beta' }],

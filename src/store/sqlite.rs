@@ -926,19 +926,48 @@ impl Store for SqliteStore {
         }))
     }
 
-    fn drop_all_credentials(&self) -> StoreFuture<'_, u64> {
-        Box::pin(self.run("drop_all_credentials", |conn| {
-            let tx = conn.transaction().map_err(sql("drop_all_credentials"))?;
-            tx.execute(
-                "DELETE FROM profiles WHERE credential_id IN (SELECT id FROM credentials)",
-                [],
-            )
-            .map_err(sql("drop_all_credentials"))?;
-            let dropped = tx
-                .execute("DELETE FROM credentials", [])
-                .map_err(sql("drop_all_credentials"))?;
-            tx.commit().map_err(sql("drop_all_credentials"))?;
-            Ok(dropped as u64)
+    fn drop_unopenable_credentials(&self) -> StoreFuture<'_, u64> {
+        let key = self.keys.credential;
+        Box::pin(self.run("drop_unopenable_credentials", move |conn| {
+            let sealed: Vec<(String, Vec<u8>, Vec<u8>)> = {
+                let mut stmt = conn
+                    .prepare("SELECT id, nonce, ciphertext FROM credentials")
+                    .map_err(sql("drop_unopenable_credentials"))?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(sql("drop_unopenable_credentials"))?;
+                rows.collect::<Result<_, _>>()
+                    .map_err(sql("drop_unopenable_credentials"))?
+            };
+            let unopenable: Vec<String> = sealed
+                .into_iter()
+                .filter(|(id, nonce, ciphertext)| open(&key, id, nonce, ciphertext).is_err())
+                .map(|(id, _, _)| id)
+                .collect();
+            if unopenable.is_empty() {
+                return Ok(0);
+            }
+            // The sessions that ran on a dropped profile are unlinked first:
+            // `sessions.profile_id` references `profiles(id)` with no
+            // cascade, so the profile could not go otherwise, and a session
+            // is a conversation worth more than the profile it ran on.
+            let tx = conn
+                .transaction()
+                .map_err(sql("drop_unopenable_credentials"))?;
+            for id in &unopenable {
+                tx.execute(
+                    "UPDATE sessions SET profile_id = NULL WHERE profile_id IN \
+                     (SELECT id FROM profiles WHERE credential_id = ?1)",
+                    params![id],
+                )
+                .map_err(sql("drop_unopenable_credentials"))?;
+                tx.execute("DELETE FROM profiles WHERE credential_id = ?1", params![id])
+                    .map_err(sql("drop_unopenable_credentials"))?;
+                tx.execute("DELETE FROM credentials WHERE id = ?1", params![id])
+                    .map_err(sql("drop_unopenable_credentials"))?;
+            }
+            tx.commit().map_err(sql("drop_unopenable_credentials"))?;
+            Ok(unopenable.len() as u64)
         }))
     }
 

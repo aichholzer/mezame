@@ -926,11 +926,11 @@ macro_rules! forward_store {
                     self.inner.delete_credential(&id).await
                 })
             }
-            fn drop_all_credentials(&self) -> StoreFuture<'_, u64> {
+            fn drop_unopenable_credentials(&self) -> StoreFuture<'_, u64> {
                 let gate = ($before)(self);
                 Box::pin(async move {
                     gate?;
-                    self.inner.drop_all_credentials().await
+                    self.inner.drop_unopenable_credentials().await
                 })
             }
             fn global_profile(&self) -> StoreFuture<'_, Option<ProfileRow>> {

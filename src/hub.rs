@@ -61,7 +61,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -377,6 +377,21 @@ impl std::fmt::Display for RegistryFull {
 
 impl std::error::Error for RegistryFull {}
 
+/// The attach found the session's row closed or gone once it held the
+/// per-id gate: an archive or a delete landed after the upgrade's own
+/// check. The socket is closed with [`SESSION_CLOSED_CLOSE`], as a live
+/// socket would have been, and no hub is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionGone;
+
+impl std::fmt::Display for SessionGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the session was closed or deleted")
+    }
+}
+
+impl std::error::Error for SessionGone {}
+
 /// Registry of live hubs keyed by session id. Cheap to clone;
 /// `Arc<RwLock>` lets the WS handler look hubs up without coordinating
 /// with any owner loop.
@@ -649,47 +664,63 @@ impl HubRegistry {
         // map stays bounded by the number of concurrent builds rather
         // than by the number of session ids this process has seen.
         let result = {
-            let key_mutex = {
-                let mut building = self.building.lock().await;
-                building
-                    .entry(session_id.to_string())
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            };
+            let key_mutex = self.build_gate(session_id).await;
             let _guard = key_mutex.lock().await;
             park.await;
-
-            // Re-check now that the gate is held: the first arrival
-            // registered its hub before releasing.
-            match self.lookup(session_id).await {
-                Some(hub) => Ok(self.subscribe(hub).await),
-                None => {
-                    // The store's part, with the gate held and no registry
-                    // lock: whether the first prompt titles the session (a
-                    // new row has no title; an existing row is read) and
-                    // the rows the Backend is rebuilt from. A minted id has
-                    // no row and no rows, and loads nothing.
-                    let (title_pending, window) = match (&mint, &self.store) {
-                        (Some(_), _) => (true, MessageWindow::default()),
-                        (None, Some(store)) => {
-                            let untitled = store
-                                .session(session_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .is_some_and(|row| row.title.is_none());
-                            (untitled, (self.factory.prepare)(session_id).await)
-                        }
-                        (None, None) => (false, (self.factory.prepare)(session_id).await),
-                    };
-                    self.build_and_register(session_id, owner, mint, window, title_pending)
-                        .await
-                }
-            }
+            self.attach_under_gate(session_id, owner, mint).await
         };
 
         self.cleanup_build_slot(session_id).await;
         result
+    }
+
+    /// The slow path proper, with the per-id gate held.
+    async fn attach_under_gate(
+        &self,
+        session_id: &str,
+        owner: &OwnerContext,
+        mint: Option<MintContext>,
+    ) -> Result<AttachedHub> {
+        // Re-check now that the gate is held: the first arrival
+        // registered its hub before releasing.
+        if let Some(hub) = self.lookup(session_id).await {
+            return Ok(self.subscribe(hub).await);
+        }
+        // The store's part, with the gate held and no registry lock: the
+        // row is read again here, because an archive or a delete may have
+        // landed since the upgrade checked it, and `close_session` takes
+        // this same gate, so a row found open now stays open until the hub
+        // is registered and a later close reaches it. The read also says
+        // whether the first prompt titles the session. A minted id has no
+        // row yet and no rows to load.
+        let (title_pending, window) = match (&mint, &self.store) {
+            (Some(_), _) => (true, MessageWindow::default()),
+            (None, Some(store)) => {
+                let row = store
+                    .session(session_id)
+                    .await
+                    .map_err(|e| anyhow!("could not read the session: {e}"))?;
+                match row {
+                    Some(row) if row.archived_at.is_none() => (
+                        row.title.is_none(),
+                        (self.factory.prepare)(session_id).await,
+                    ),
+                    _ => return Err(SessionGone.into()),
+                }
+            }
+            (None, None) => (false, (self.factory.prepare)(session_id).await),
+        };
+        self.build_and_register(session_id, owner, mint, window, title_pending)
+            .await
+    }
+
+    /// The per-id build gate for `session_id`, created on first use.
+    async fn build_gate(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut building = self.building.lock().await;
+        building
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// The hub registered under `session_id`, if there is one.
@@ -833,11 +864,24 @@ impl HubRegistry {
     /// cancelled, every attached socket is closed with
     /// [`SESSION_CLOSED_CLOSE`], and the hub is torn down. Whether a hub
     /// was there to tell.
+    ///
+    /// Taken under the session's build gate, so an attach in the middle of
+    /// building a hub finishes first and is then closed, and one that
+    /// arrives after reads the row the caller has just archived or deleted
+    /// and refuses. Without the gate a close could run between the
+    /// upgrade's row check and the hub's registration and find nothing to
+    /// close, leaving a live hub on a closed row.
     pub async fn close_session(&self, session_id: &str) -> bool {
-        match self.lookup(session_id).await {
-            Some(hub) => hub.commands.send(HubCommand::Close).await.is_ok(),
-            None => false,
-        }
+        let closed = {
+            let key_mutex = self.build_gate(session_id).await;
+            let _guard = key_mutex.lock().await;
+            match self.lookup(session_id).await {
+                Some(hub) => hub.commands.send(HubCommand::Close).await.is_ok(),
+                None => false,
+            }
+        };
+        self.cleanup_build_slot(session_id).await;
+        closed
     }
 
     /// Remove a hub by session id. Called by the owner loop on exit.
@@ -927,7 +971,7 @@ impl HubRegistry {
                 user_id: "test-user".to_string(),
                 user_name: "test".to_string(),
             },
-            title_pending: false,
+            title_pending: Arc::new(AtomicBool::new(false)),
         }));
 
         let mut map = self.inner.write().await;
@@ -1010,7 +1054,7 @@ fn build_hub(
         grace_period: GRACE_PERIOD,
         inflight,
         owner,
-        title_pending,
+        title_pending: Arc::new(AtomicBool::new(title_pending)),
     }));
 
     Ok(hub)
@@ -1049,9 +1093,10 @@ struct HubLoopState {
     /// tick names.
     owner: OwnerContext,
     /// Whether the next accepted prompt derives the session's title. Set
-    /// for a new row and for an existing row with no title; cleared once
-    /// a title has been derived.
-    title_pending: bool,
+    /// for a new row and for an existing row with no title; cleared when
+    /// a title is derived and set again if its write fails, so the next
+    /// prompt retries. Shared with the spawned write for that reason.
+    title_pending: Arc<AtomicBool>,
 }
 
 /// Owner loop: serialises browser commands, sends the frames that end a
@@ -1136,7 +1181,7 @@ async fn drive(state: HubLoopState) {
         grace_period,
         inflight,
         owner,
-        mut title_pending,
+        title_pending,
     } = state;
 
     let outstanding: Outstanding = Arc::default();
@@ -1181,7 +1226,7 @@ async fn drive(state: HubLoopState) {
                                 owner: &owner,
                                 store: registry.store.as_ref(),
                                 ticks: &registry.ticks,
-                                title_pending: &mut title_pending,
+                                title_pending: &title_pending,
                             },
                             c,
                         );
@@ -1510,7 +1555,7 @@ struct CommandContext<'a> {
     store: Option<&'a Arc<dyn Store>>,
     ticks: &'a broadcast::Sender<String>,
     /// See `HubLoopState::title_pending`.
-    title_pending: &'a mut bool,
+    title_pending: &'a Arc<AtomicBool>,
 }
 
 /// What the loop does after a command.
@@ -1581,14 +1626,15 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) -> Flow {
             // next one; a title is written only while the row's is still
             // null, so a rename made before this prompt stands, and the
             // tick goes out only when a row was written.
-            if *ctx.title_pending {
+            if ctx.title_pending.load(Ordering::SeqCst) {
                 if let Some(title) = title_from_prompt(&blocks) {
-                    *ctx.title_pending = false;
+                    ctx.title_pending.store(false, Ordering::SeqCst);
                     if let Some(store) = ctx.store {
                         let store = Arc::clone(store);
                         let ticks = ctx.ticks.clone();
                         let session_id = ctx.session_id.to_string();
                         let user_id = ctx.owner.user_id.clone();
+                        let pending = Arc::clone(ctx.title_pending);
                         tokio::spawn(async move {
                             match store
                                 .set_title_if_null(&session_id, &title, crate::store::now_ms())
@@ -1598,9 +1644,15 @@ fn handle_command(ctx: CommandContext<'_>, cmd: HubCommand) -> Flow {
                                     let _ = ticks.send(user_id);
                                 }
                                 Ok(false) => {}
-                                Err(e) => warn(&format!(
-                                    "Session {session_id}: could not save the title: {e}"
-                                )),
+                                Err(e) => {
+                                    warn(&format!(
+                                        "Session {session_id}: could not save the title: {e}; \
+                                         the next prompt tries again"
+                                    ));
+                                    // The row's title is still null, so
+                                    // the rule still applies.
+                                    pending.store(true, Ordering::SeqCst);
+                                }
                             }
                         });
                     }

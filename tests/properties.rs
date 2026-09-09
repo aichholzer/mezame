@@ -1620,7 +1620,8 @@ fn stored_exchanges() -> impl Strategy<Value = Vec<StoredExchange>> {
 }
 
 /// The entries the loop records for a reply: a thought per thinking block
-/// with text, then the agent text, the text blocks joined by one newline.
+/// with text, then the agent text, the text blocks concatenated with
+/// nothing between them, as the live accumulator concatenates deltas.
 fn reply_entries(blocks: &[Block], usage: Option<Usage>, timestamp: i64) -> Vec<HistoryEntry> {
     let mut entries = Vec::new();
     for block in blocks {
@@ -1640,8 +1641,7 @@ fn reply_entries(blocks: &[Block], usage: Option<Usage>, timestamp: i64) -> Vec<
             Block::Text { text } => Some(text.as_str()),
             _ => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<String>();
     if !text.is_empty() {
         entries.push(HistoryEntry {
             body: EntryBody::Agent { text },
