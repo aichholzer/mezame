@@ -24,7 +24,7 @@ because a browser cannot read a refused upgrade's status; a client treats
   the configured `public_url` is HTTPS. A wrong username and a wrong
   password are one 401 with one fixed body. Ten failed attempts on a
   username inside a minute answer 429 with `Retry-After` naming the wait in
-  seconds. Any other body shape is 400.
+  seconds. Any other body shape is 400; a body over 4 KiB is 413.
 - **`POST /logout`** answers 204 and clears the cookie on this device only.
 - **`GET /me`** answers the cookie's user (`id`, `name`, `role`), or 401.
 
@@ -338,5 +338,7 @@ Each successful change, the mint of a new session included, emits one
 `state_changed` event on **`GET /state/events`**, a Server-Sent Events
 stream, to the streams of the account it concerns and no other. Browsers
 read it as a "go refetch `/state`" signal, so a session opened or renamed
-on one device shows up on the rest with no manual reload. A keep-alive
-comment every 15 seconds stops an intermediary idle-timing out the stream.
+on one device shows up on the rest with no manual reload. A stream that
+fell behind the server's event buffer receives one `state_changed` for
+whatever it missed. A keep-alive comment every 15 seconds stops an
+intermediary idle-timing out the stream.

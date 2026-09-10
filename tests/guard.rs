@@ -1,9 +1,17 @@
 //! The `Host` allowlist and the `Origin` check as pure decisions, apart
-//! from the router. `tests/http_routes.rs` and `tests/ws_upgrade.rs` cover
+//! from the router, and the middleware's choice of the host it compares an
+//! `Origin` with. `tests/http_routes.rs` and `tests/ws_upgrade.rs` cover
 //! the same policy wired in front of the routes.
 
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::routing::post;
+use axum::{middleware, Router};
 use mezame::config::{Config, TransportConfig};
-use mezame::guard::RequestPolicy;
+use mezame::guard::{guard_request, RequestPolicy};
+use tower::ServiceExt;
 
 /// A policy with nothing configured: IP literals and local names only.
 fn bare() -> RequestPolicy {
@@ -171,6 +179,63 @@ fn an_origin_from_anywhere_else_is_refused() {
             "{origin:?} against {host:?} is another page"
         );
     }
+}
+
+/// A `POST` carrying `origin`, sent to `host`, with `X-Forwarded-Host` set
+/// to `forwarded` when given, through one route behind the guard: the
+/// status the middleware answers, 204 when it let the write through.
+async fn post_through_guard(host: &str, forwarded: Option<&str>, origin: &str) -> StatusCode {
+    let app = Router::new()
+        .route("/write", post(|| async { StatusCode::NO_CONTENT }))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(bare()),
+            guard_request,
+        ));
+    let mut req = Request::post("/write")
+        .header("host", host)
+        .header("origin", origin);
+    if let Some(forwarded) = forwarded {
+        req = req.header("x-forwarded-host", forwarded);
+    }
+    app.oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .expect("the router answers")
+        .status()
+}
+
+#[tokio::test]
+async fn a_forwarded_host_is_compared_without_its_port_and_host_with_it() {
+    // Phase 2 Requirement 6 criterion 3: the compared host is
+    // `X-Forwarded-Host` when present, host-only. A proxy that writes its
+    // own listener's port into the header must not fail the page it
+    // serves, and a bracketed IPv6 host keeps its brackets and loses only
+    // the port after them. `Host` keeps the phase 0 rule, port included, so
+    // a page on another port of the same host stays another page.
+    let host = "127.0.0.1:9510";
+    assert_eq!(
+        post_through_guard(host, Some("app.example:8443"), "https://app.example").await,
+        StatusCode::NO_CONTENT,
+        "the forwarded port is not compared"
+    );
+    assert_eq!(
+        post_through_guard(host, Some("other.example"), "https://app.example").await,
+        StatusCode::FORBIDDEN,
+        "the forwarded host still is"
+    );
+    assert_eq!(
+        post_through_guard(host, Some("[::1]:8080"), "http://[::1]:3000").await,
+        StatusCode::NO_CONTENT,
+        "a bracketed IPv6 host loses only its port"
+    );
+    assert_eq!(
+        post_through_guard(host, None, "http://127.0.0.1:8080").await,
+        StatusCode::FORBIDDEN,
+        "Host keeps its port"
+    );
+    assert_eq!(
+        post_through_guard(host, None, "http://127.0.0.1:9510").await,
+        StatusCode::NO_CONTENT
+    );
 }
 
 #[test]

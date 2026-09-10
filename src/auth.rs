@@ -118,17 +118,25 @@ pub fn verify_calls_for_test() -> usize {
     VERIFY_CALLS.with(|calls| calls.get())
 }
 
+static DUMMY: OnceLock<String> = OnceLock::new();
+
 /// A real hash of a random password nobody holds, verified against when the
 /// username is unknown so the 401 costs one argon2 run either way. Made
-/// once per process, on first use.
+/// once per process, on first use; the router makes it when it is built,
+/// so the first unknown name of the process does not pay for the making
+/// on top of its own verification.
 pub fn dummy_hash() -> &'static str {
-    static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes).expect("OS entropy source");
         let password = URL_SAFE_NO_PAD.encode(bytes);
         hash_password(&password).expect("a 43-character password hashes")
     })
+}
+
+/// Whether the dummy hash has been made, read without making it.
+pub fn dummy_hash_primed() -> bool {
+    DUMMY.get().is_some()
 }
 
 /// What a session cookie says.
@@ -183,11 +191,18 @@ pub fn verify(value: &str, key: &[u8; KEY_LEN], now: i64) -> Option<Cookie> {
     if !crate::ws::is_session_id(user_id) {
         return None;
     }
+    let (expiry_text, epoch_text) = (*expiry, *epoch);
     let expiry: i64 = expiry.parse().ok()?;
     let epoch: u64 = epoch.parse().ok()?;
-    // The strict decoder is what makes one string alone verify: padding, a
-    // byte outside the alphabet and a final character with trailing bits
-    // set are each refused.
+    // The parsers take a leading plus sign and leading zeros, and the MAC
+    // is recomputed over the parsed numbers, so a spelling that is not the
+    // one `sign` writes is refused here: one string alone verifies.
+    if expiry.to_string() != expiry_text || epoch.to_string() != epoch_text {
+        return None;
+    }
+    // The strict decoder is what makes one MAC spelling alone verify:
+    // padding, a byte outside the alphabet and a final character with
+    // trailing bits set are each refused.
     let tag = URL_SAFE_NO_PAD.decode(mac).ok()?;
     let payload = format!("{user_id}.{expiry}.{epoch}");
     mac_of(&payload, key).verify_slice(&tag).ok()?;

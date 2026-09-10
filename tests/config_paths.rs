@@ -8,7 +8,8 @@ use std::sync::OnceLock;
 use std::path::Path;
 
 use mezame::config::{
-    config_path, eligible_workspace_root, load_config, Config, TransportConfig, WorkspaceIneligible,
+    config_path, eligible_workspace_root, load_config, mezame_dir, resolve_workspace_root, Config,
+    TransportConfig, WorkspaceIneligible,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -44,6 +45,124 @@ async fn config_path_errors_when_home_unset() {
 
     let err = config_path().expect_err("HOME unset should error");
     assert!(err.to_string().contains("HOME"));
+}
+
+#[tokio::test]
+async fn an_empty_home_is_refused_like_an_unset_one() {
+    // Joined as given, an empty HOME would name `.mezame` relative to the
+    // working directory, and `init` would write the key and the datastore
+    // there; it is refused with the line an unset HOME gets.
+    let _g = home_lock().lock().await;
+    unset_home();
+    let unset = config_path()
+        .expect_err("HOME unset should error")
+        .to_string();
+    std::env::set_var("HOME", "");
+    let empty = config_path()
+        .expect_err("an empty HOME should error")
+        .to_string();
+    assert_eq!(empty, unset, "the same line for both");
+    assert!(empty.contains("HOME"), "{empty}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_home_reached_through_a_symlink_is_still_refused_as_a_workspace_root() {
+    // `getcwd` resolves symlinks and `HOME` is taken as given, so the two
+    // spellings of one home directory never compare equal on the raw paths.
+    // The resolving check canonicalizes both, through the nearest existing
+    // ancestor for `~/.mezame`, which need not exist yet.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    let real = tmp.path().join("realhome");
+    std::fs::create_dir_all(real.join("project")).unwrap();
+    let link = tmp.path().join("linkhome");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    set_home(&link);
+    let dir = mezame_dir().unwrap();
+    assert_eq!(dir, link.join(".mezame"), "built from HOME as given");
+    assert!(!dir.exists(), "the directory does not exist yet");
+    let resolved = real.canonicalize().unwrap();
+    assert!(
+        eligible_workspace_root(&resolved, &dir).is_ok(),
+        "the raw comparison lets the home directory through"
+    );
+
+    assert_eq!(
+        resolve_workspace_root(&resolved, &dir),
+        Err(WorkspaceIneligible::Home),
+        "the home directory is refused however it is spelled"
+    );
+    assert_eq!(
+        resolve_workspace_root(&resolved.join("project"), &dir),
+        Ok(resolved.join("project")),
+        "a directory under it is accepted"
+    );
+    assert_eq!(
+        resolve_workspace_root(&link.join("project"), &dir),
+        Ok(resolved.join("project")),
+        "and named by its canonical path"
+    );
+    std::fs::create_dir_all(real.join(".mezame/inner")).unwrap();
+    assert_eq!(
+        resolve_workspace_root(&resolved.join(".mezame/inner"), &dir),
+        Err(WorkspaceIneligible::MezameDir),
+        "once the directory exists, a directory inside it is refused too"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mezame_dir_that_is_a_symlink_still_refuses_the_home_and_refuses_its_target() {
+    // A datastore kept on another volume: `~/.mezame` is itself a symlink
+    // to a directory elsewhere, so the directory canonicalized whole no
+    // longer has the home as its parent, and a check made on that spelling
+    // alone would let the home directory through. The home is refused on
+    // the spelling built from the canonical home; the link's target, a
+    // directory holding it and one inside it are refused on the canonical
+    // directory, since the key and the datastore sit there in fact.
+    let _g = home_lock().lock().await;
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let target = base.join("data/mz");
+    std::fs::create_dir_all(home.join("project")).unwrap();
+    std::fs::create_dir_all(target.join("inner")).unwrap();
+    std::os::unix::fs::symlink(&target, home.join(".mezame")).unwrap();
+    set_home(&home);
+    let dir = mezame_dir().unwrap();
+    assert_eq!(dir, home.join(".mezame"), "built from HOME as given");
+    assert_eq!(
+        dir.canonicalize().unwrap(),
+        target,
+        "and resolving to the other directory"
+    );
+
+    assert_eq!(
+        resolve_workspace_root(&home, &dir),
+        Err(WorkspaceIneligible::Home),
+        "the home directory is refused although the canonical directory sits elsewhere"
+    );
+    assert_eq!(
+        resolve_workspace_root(&target, &dir),
+        Err(WorkspaceIneligible::MezameDir),
+        "the link's target is ~/.mezame"
+    );
+    assert_eq!(
+        resolve_workspace_root(&target.join("inner"), &dir),
+        Err(WorkspaceIneligible::MezameDir),
+        "and so is a directory inside it"
+    );
+    assert_eq!(
+        resolve_workspace_root(&base.join("data"), &dir),
+        Err(WorkspaceIneligible::MezameDir),
+        "a directory holding the target holds the key and the datastore"
+    );
+    assert_eq!(
+        resolve_workspace_root(&home.join("project"), &dir),
+        Ok(home.join("project")),
+        "a directory under the home is accepted"
+    );
 }
 
 #[test]

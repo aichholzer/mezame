@@ -8,45 +8,76 @@
 //! covered in `tests/ws_upgrade.rs`; here a registered hub is enough to
 //! see that a close reaches it.
 
+#[macro_use]
 mod support;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Request, StatusCode};
 use mezame::config::{Config, TransportConfig};
+use mezame::conversation::Block;
 use mezame::http::{
     build_router, session_patch_of, settings_of_body, AppState, SessionPatch,
     SESSION_TITLE_MAX_CHARS, SETTINGS_MAX_BYTES,
 };
 use mezame::hub::HubRegistry;
-use mezame::store::ARCHIVED_LIST_MAX;
+use mezame::provider::Usage;
+use mezame::store::crypto::{MasterKey, KEY_LEN};
+use mezame::store::sqlite::SqliteStore;
+// The row and window types beyond `ARCHIVED_LIST_MAX` are the ones the
+// `forward_store!` expansion below names.
+use mezame::store::{
+    CredentialRow, MessageStats, MessageWindow, NewProfile, ProfileRow, SessionList, SessionRow,
+    Store, StoreError, StoreFuture, UserRow, WorkspaceRow, ARCHIVED_LIST_MAX,
+};
 use serde_json::{json, Value};
 use support::ScriptedBackend;
 use tower::ServiceExt;
 
 const T0: i64 = 1_700_000_000_000;
 
+fn config() -> Config {
+    Config {
+        transports: vec![TransportConfig::Cloudflared {
+            bind: "127.0.0.1:0".to_string(),
+            hosts: vec![],
+        }],
+        version: 2,
+        datastore: Default::default(),
+        public_url: None,
+        models: vec![],
+    }
+}
+
 fn state() -> Arc<AppState> {
     state_with(HubRegistry::new())
 }
 
 fn state_with(hubs: HubRegistry) -> Arc<AppState> {
-    AppState::for_test(
-        Config {
-            transports: vec![TransportConfig::Cloudflared {
-                bind: "127.0.0.1:0".to_string(),
-                hosts: vec![],
-            }],
-            version: 2,
-            datastore: Default::default(),
-            public_url: None,
-            models: vec![],
-        },
-        hubs,
-        16,
-    )
+    AppState::for_test(config(), hubs, 16)
 }
+
+/// A Store whose session writes find no row, the shape two devices leave
+/// when both forget one session at once: the reads answer as the store
+/// under it does, so the ownership check passes, and `set_title`,
+/// `set_archived` and `delete_session` then answer `NotFound`.
+struct VanishingStore {
+    inner: Arc<dyn Store>,
+}
+
+impl VanishingStore {
+    fn on_load(&self) {}
+    fn on_title_write(&self) {}
+}
+
+forward_store!(VanishingStore, by method |_: &VanishingStore, method: &'static str| {
+    match method {
+        "set_title" | "set_archived" | "delete_session" => Err(StoreError::NotFound),
+        _ => Ok(()),
+    }
+});
 
 /// A user's cookie and id, the user created on first use.
 async fn user(state: &AppState, name: &str) -> (String, String) {
@@ -436,6 +467,43 @@ async fn archive_restore_and_delete_answer_the_owner_and_404_everyone_else() {
     // And is a 404 from then on.
     let (status, _) = send(&state, &alice, Request::delete("/sessions/mine"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_row_gone_between_the_ownership_check_and_the_write_is_the_same_404() {
+    // Requirement 7 criterion 3: a row that does not exist answers 404.
+    // The ownership check reads the row and the write runs by id after
+    // it, so a forget on another device can land in between; the write
+    // then finds no row, which is the 404 of a row that was never there
+    // and not a failure of the server. No tick, since nothing changed.
+    let keys = MasterKey::from_bytes_for_test([42u8; KEY_LEN]).keys();
+    let inner: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory(keys).unwrap());
+    let store: Arc<dyn Store> = Arc::new(VanishingStore { inner });
+    let state = AppState::for_test_with(config(), HubRegistry::new(), 16, Some(store), None);
+    let (alice, alice_id) = user(&state, "alice").await;
+    state
+        .store
+        .create_session(&alice_id, "s1", None, T0)
+        .await
+        .unwrap();
+    let mut ticks = state.state_changes.subscribe();
+
+    for (req, body) in [
+        (
+            Request::patch("/sessions/s1"),
+            Some(json!({ "title": "renamed" })),
+        ),
+        (
+            Request::patch("/sessions/s1"),
+            Some(json!({ "archived": true })),
+        ),
+        (Request::delete("/sessions/s1"), None),
+    ] {
+        let (status, bytes) = send(&state, &alice, req, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(String::from_utf8_lossy(&bytes), "no such session\n");
+        assert!(ticks.try_recv().is_err(), "no tick for a row that is gone");
+    }
 }
 
 #[tokio::test]

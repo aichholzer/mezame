@@ -15,8 +15,11 @@
 //! directory `0700` and its files `0600`, each file written to a fresh
 //! `O_EXCL` sibling and renamed into place, so a symlink at the target is
 //! replaced rather than followed and a reader never sees a partial file.
-//! An existing directory keeps its mode. The state endpoint writes through
-//! the same two helpers.
+//! An existing directory keeps its mode. The helpers live here and their
+//! callers elsewhere: `init.rs` writes the configuration through
+//! `write_private_atomic`, `crypto.rs` takes the master key's sibling from
+//! `temp_sibling`, and `init.rs` and the SQLite store call
+//! `ensure_private_dir` before they create anything under the directory.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -153,9 +156,15 @@ pub enum TransportConfig {
     // config, advertising a transport that does nothing.
 }
 
-/// `~/.mezame`, the directory every file this module names sits in.
+/// `~/.mezame`, the directory every file this module names sits in. An
+/// empty `HOME` is refused like an unset one: joined as it is, it would
+/// name `.mezame` relative to whatever directory the process runs in, and
+/// the key and the datastore would be created there.
 pub fn mezame_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .context("HOME not set")?;
     Ok(PathBuf::from(home).join(".mezame"))
 }
 
@@ -215,6 +224,53 @@ pub fn eligible_workspace_root(
         return Err(WorkspaceIneligible::MezameDir);
     }
     Ok(cwd.to_path_buf())
+}
+
+/// [`eligible_workspace_root`] on the paths as the filesystem spells them.
+/// `getcwd` returns the working directory with every symlink resolved,
+/// while `mezame_dir` is built from `HOME` as it was given, so a home
+/// reached through a symlink would compare unequal to itself and pass
+/// every check. The working directory is canonicalized whole. `mezame_dir`
+/// is compared in two spellings, since the directory itself may be a
+/// symlink to a directory elsewhere, such as a datastore kept on another
+/// volume, and then its canonical parent is no longer the home: the home
+/// canonicalized with the directory's name appended as given, on which the
+/// home and a directory holding it are refused, and the directory
+/// canonicalized whole through its nearest existing ancestor (it need not
+/// exist yet), on which the directory the link points at, and a directory
+/// holding or inside that one, are refused as well. A path that cannot be
+/// canonicalized is compared as given. The root returned is the canonical
+/// one.
+pub fn resolve_workspace_root(
+    cwd: &Path,
+    mezame_dir: &Path,
+) -> std::result::Result<PathBuf, WorkspaceIneligible> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let by_home = match (mezame_dir.parent(), mezame_dir.file_name()) {
+        (Some(home), Some(name)) => canonicalize_through_existing_ancestor(home).join(name),
+        _ => mezame_dir.to_path_buf(),
+    };
+    let root = eligible_workspace_root(&cwd, &by_home)?;
+    let resolved = canonicalize_through_existing_ancestor(mezame_dir);
+    if cwd.starts_with(&resolved) || resolved.starts_with(&cwd) {
+        return Err(WorkspaceIneligible::MezameDir);
+    }
+    Ok(root)
+}
+
+/// `path` with its nearest existing ancestor canonicalized and the rest of
+/// its components appended as given; `path` itself when no ancestor
+/// resolves.
+fn canonicalize_through_existing_ancestor(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            return match path.strip_prefix(ancestor) {
+                Ok(rest) => canonical.join(rest),
+                Err(_) => canonical,
+            };
+        }
+    }
+    path.to_path_buf()
 }
 
 pub fn load_config() -> Result<Config> {
@@ -360,10 +416,13 @@ pub fn read_existing_config_from(path: &Path) -> Result<Option<ExistingConfig>> 
 ///
 /// An existing directory is left as it is, mode included: a directory a
 /// 0.13.x release created stays `0755` until its owner runs `chmod`. A
-/// regular file at the path is an error, which is what keeps `PUT /state`
-/// answering 500 there. `0700` because the directory will hold credential
-/// material and transcripts, and nothing else on the machine needs to
-/// read it; the umask only ever removes bits from it.
+/// regular file at the path is an error, on which the callers stop:
+/// `init` and a first server start before they write the key, `init`
+/// before it writes the configuration, and the SQLite store before it
+/// opens the datastore. `0700` because the directory holds
+/// the master key, the datastore and the configuration, and nothing else
+/// on the machine needs to read them; the umask only ever removes bits
+/// from it.
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -408,9 +467,10 @@ pub fn temp_sibling(target: &Path) -> io::Result<PathBuf> {
 /// before the rename and, best effort, one of the directory after it, for
 /// a file whose loss after a power cut would need `init` to run again: the
 /// directory entry the rename creates is durable only once the directory
-/// itself is synced. The state file skips both, since a torn or missing
-/// state reads as `{}` and on Apple targets an `fsync` is a full device
-/// flush. A failure leaves the target as it was and removes the sibling.
+/// itself is synced. `init` passes it for the configuration; a file that
+/// can be rebuilt may skip both, since on Apple targets an `fsync` is a
+/// full device flush. A failure leaves the target as it was and removes
+/// the sibling.
 pub fn write_private_atomic(target: &Path, data: &[u8], durable: bool) -> io::Result<()> {
     let tmp = temp_sibling(target)?;
     let mut options = std::fs::OpenOptions::new();

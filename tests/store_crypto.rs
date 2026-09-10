@@ -57,7 +57,9 @@ fn a_pre_placed_key_is_returned_unchanged() {
 }
 
 #[test]
-fn a_file_of_another_length_is_refused_naming_the_path() {
+fn a_file_of_another_length_is_refused_naming_the_path_the_mode_and_the_length() {
+    // Requirement 4 criterion 2: one line naming the path and the required
+    // mode and length, whichever of the two the file got wrong.
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("master.key");
     std::fs::write(&path, [1u8; 31]).unwrap();
@@ -69,14 +71,17 @@ fn a_file_of_another_length_is_refused_naming_the_path() {
         "{err:?}"
     );
     let text = err.to_string();
+    assert!(!text.contains('\n'), "one line: {text}");
     assert!(text.contains("master.key"), "{text}");
+    assert!(text.contains("holds 31 bytes"), "{text}");
     assert!(text.contains("exactly 32"), "{text}");
+    assert!(text.contains("0600"), "{text}");
     assert_eq!(std::fs::read(&path).unwrap().len(), 31, "not replaced");
 }
 
 #[cfg(unix)]
 #[test]
-fn a_key_readable_by_others_is_refused_naming_the_mode() {
+fn a_key_readable_by_others_is_refused_naming_the_path_the_mode_and_the_length() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("master.key");
     std::fs::write(&path, [1u8; KEY_LEN]).unwrap();
@@ -85,7 +90,11 @@ fn a_key_readable_by_others_is_refused_naming_the_mode() {
         let err = MasterKey::load(&path).unwrap_err();
         assert!(matches!(err, KeyError::Loose { .. }), "{loose:o}: {err:?}");
         let text = err.to_string();
+        assert!(!text.contains('\n'), "one line: {text}");
+        assert!(text.contains("master.key"), "{text}");
+        assert!(text.contains(&format!("mode {loose:o}")), "{text}");
         assert!(text.contains("0600"), "{text}");
+        assert!(text.contains("32 bytes"), "{text}");
         assert!(text.contains("chmod 600"), "{text}");
         let err = MasterKey::load_or_create(&path).unwrap_err();
         assert!(

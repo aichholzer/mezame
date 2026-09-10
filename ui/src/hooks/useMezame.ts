@@ -149,6 +149,17 @@ const markActivity = (s: Session) => {
 // restore and forget are each one request to the sessions endpoint with
 // an optimistic local update; the tick-driven refetch confirms it, and
 // a failure refetches at once, which undoes the optimistic change.
+// When such a pending tab loses its socket, it goes and the list is
+// fetched; if the list then holds nothing, one session is minted in
+// its place, once per such loss.
+//
+// Two things about a document are not taken at face value. Documents
+// are applied in the order their requests were sent, so a slow answer
+// cannot undo a newer one that has landed already. And a row whose
+// archive this browser has sent, or whose tab this browser closed
+// before the row's id was known, gets no tab from a document whose
+// request went out before that archive landed; the first one requested
+// after it is believed whole, since it was read after the archive.
 
 /** What `/state` answers, as far as this store reads it. */
 type StateDoc = {
@@ -164,6 +175,56 @@ const UNTITLED = 'New session';
  * next sign-in has replaced; the request that made it compares the
  * generation it started under with this one and drops a stale answer. */
 let generation = 0;
+
+/** The count of `/state` requests sent, by `init` and by every refetch,
+ * and the number of the newest one whose answer has been applied. Two
+ * requests on separate connections can complete in either order, and a
+ * document read before a change would undo the one read after it, so
+ * an answer that arrives after a newer one was applied is dropped. The
+ * numbers also place a document relative to the archives this browser
+ * sent. Both only grow; a reset needs no care here, the generation
+ * check drops its stragglers. */
+let refetchSent = 0;
+let refetchApplied = 0;
+
+/** Tabs closed before their first `ready`. Each is out of `sessions`
+ * with `closeOnReady` set and its socket open, waiting for the id the
+ * archive needs; the `ready` arm sends the archive and closes the
+ * socket. Kept here so a document can count them and `reset` can close
+ * them. */
+const closingOnReady = new Set<Session>();
+
+/** Ids whose archive this browser has sent, each with the value of
+ * `refetchSent` when its 204 arrived, or null while the request is out.
+ * A document read before the archive landed still lists such a row as
+ * active and would give it a tab again, so the row is skipped while the
+ * request is out and by every document whose request went out before
+ * the 204 arrived. The first document requested after it was read after
+ * the archive committed and is believed whole: it lists the row only if
+ * a restore elsewhere undid the archive, and the entry goes either way.
+ * Absence from a list is no confirmation on its own, since a document
+ * read before the mint lists nothing either. A failed request drops the
+ * entry (its refetch puts the tab back), as does a restore from the
+ * closed list. */
+const archiving = new Map<string, number | null>();
+
+/** The generation under which a tab with no id yet lost its socket and
+ * left the list, or null when no session is wanted. A reconnect without
+ * an id would mint a second row, so the tab is removed and the list
+ * fetched instead; when the document that follows lists nothing, the
+ * mint never reached the server and the user has no tab, so one is
+ * minted in its place. Cleared by that mint, by any applied document
+ * (the user has tabs, or the mint just happened), by a `ready` (the
+ * user has a live session) and by `reset`. Holding the generation
+ * rather than a boolean means a document applied after a reset cannot
+ * act on a want from before it. */
+let sessionWanted: number | null = null;
+
+/** The tab minted in a dropped tab's place, while its own `ready` has
+ * not arrived. Its socket dropping the same way sets no want: a proxy
+ * that refuses every upgrade gets the original mint and this one, then
+ * a quiet empty list. Cleared by its `ready`, its drop and `reset`. */
+let recoveryMint: Session | null = null;
 
 // Fallback one-shot latch for the stale-bundle reload when
 // sessionStorage is unavailable (private mode, storage disabled).
@@ -228,17 +289,26 @@ const removeSessionLocal = (id: string) => {
  * once there is one; a local tab whose id is absent from the list is
  * removed; a tab that has not received its first `ready`
  * (`sessionId === null`) is kept through every refetch; a server
- * session this browser has not seen gets a tab and connects. The server
+ * session this browser has not seen gets a tab and connects, unless its
+ * archive is not yet known to precede this document's request, or it is
+ * taken for the row of a tab closed before its id was known. `number`
+ * is the request's place in the count of `/state` requests. The server
  * lists active sessions oldest first and the sidebar shows newest
  * first, so the order is reversed here. */
-const applyStateDoc = (doc: StateDoc) => {
+const applyStateDoc = (doc: StateDoc, number: number) => {
   const rows = Array.isArray(doc.sessions) ? doc.sessions : [];
   const next: Session[] = sessions.filter((s) => s.sessionId === null);
+  // While a tab closed before its `ready` waits for its id, the newest
+  // row no tab holds is taken to be its mint, one row per waiting tab,
+  // and gets no tab of its own. The archive that follows the id settles
+  // which row it was, and the tick after that lists the rest.
+  let unclaimed = closingOnReady.size;
   for (const row of [...rows].reverse()) {
     if (!row || typeof row.id !== 'string') {
       continue;
     }
     const local = sessions.find((s) => s.id === row.id);
+    const archive = archiving.get(row.id);
     if (local) {
       // The server's title wins once it has one; a named tab whose
       // title write has not landed yet keeps its name.
@@ -246,6 +316,10 @@ const applyStateDoc = (doc: StateDoc) => {
         local.label = row.title;
       }
       next.push(local);
+    } else if (archive !== undefined && (archive === null || number <= archive)) {
+      // The document may have been read before the archive landed.
+    } else if (unclaimed > 0) {
+      unclaimed -= 1;
     } else {
       const s = makeSession(row.id, row.title ?? UNTITLED, row.id);
       next.push(s);
@@ -257,6 +331,11 @@ const applyStateDoc = (doc: StateDoc) => {
       dropSocket(s);
     }
   }
+  for (const [id, archive] of [...archiving]) {
+    if (archive !== null && number > archive) {
+      archiving.delete(id); // requested after the 204: the list above is the truth about the row
+    }
+  }
   sessions = next;
   closed = (Array.isArray(doc.closed) ? doc.closed : [])
     .filter((row) => row !== null && typeof row === 'object' && typeof row.id === 'string')
@@ -265,18 +344,42 @@ const applyStateDoc = (doc: StateDoc) => {
       label: typeof row.title === 'string' && row.title.length > 0 ? row.title : UNTITLED,
       closedAt: typeof row.closedAt === 'number' && Number.isFinite(row.closedAt) ? row.closedAt : 0
     }));
-  if (activeId !== null && !sessions.some((s) => s.id === activeId)) {
-    activeId = sessions.length > 0 ? sessions[0].id : null;
-    persistActiveId();
+  // The active pointer follows the list: when it names no tab the list
+  // holds, it takes the first tab or, with none, nothing. This covers a
+  // tab removed under it, and a list that was empty when the pointer
+  // was cleared, as after the only pending tab's socket dropped and its
+  // row came back with an id.
+  if (!sessions.some((s) => s.id === activeId)) {
+    const first = sessions.length > 0 ? sessions[0].id : null;
+    if (first !== activeId) {
+      activeId = first;
+      persistActiveId();
+    }
+  }
+  // A tab with no id yet lost its socket since the last document was
+  // applied, and this one is the first since: when it lists nothing,
+  // the mint never reached the server (it restarted during the
+  // handshake, or a proxy refused the upgrade) and the user is left
+  // with no tab and a disabled composer, so one session is minted in
+  // the dropped tab's place. Either way the want is answered here; a
+  // document applied under a later generation belongs to another
+  // sign-in and answers nothing.
+  const wanted = sessionWanted === generation;
+  sessionWanted = null;
+  if (wanted && sessions.length === 0) {
+    recoveryMint = newSession();
   }
   notify();
 };
 
 /** Fetch `/state` and apply it whole. Quiet on failure: a 401 has
  * already flipped the auth state, and an unreachable server leaves the
- * local view standing until the next tick. */
+ * local view standing until the next tick. An answer that lands after
+ * a later refetch's answer was applied is older state and is dropped. */
 const refetchState = async (): Promise<void> => {
   const started = generation;
+  refetchSent += 1;
+  const number = refetchSent;
   let doc: StateDoc;
   try {
     const res = await apiFetch(STATE_URL);
@@ -290,7 +393,28 @@ const refetchState = async (): Promise<void> => {
   if (started !== generation) {
     return; // a reset ran while this was in flight: not our state any more
   }
-  applyStateDoc(doc);
+  if (number < refetchApplied) {
+    return; // a refetch sent after this one has been applied already
+  }
+  refetchApplied = number;
+  applyStateDoc(doc, number);
+};
+
+/** Archive one row: the request goes out and the id is kept out of the
+ * list until a document requested after the 204 has been applied, or
+ * the request fails. */
+const archiveRow = (sessionId: string) => {
+  archiving.set(sessionId, null);
+  void sessionRequest(sessionPath(sessionId), 'PATCH', { archived: true }).then((ok) => {
+    if (!ok) {
+      archiving.delete(sessionId); // the failure's refetch puts the tab back
+    } else if (archiving.has(sessionId)) {
+      // Documents requested from here on were read after the archive
+      // committed. A restore that ran meanwhile took the id out, and a
+      // later 204 for the same id moves the mark forward.
+      archiving.set(sessionId, refetchSent);
+    }
+  });
 };
 
 /** One request to the sessions endpoint. The 204 is confirmed by the
@@ -577,6 +701,28 @@ const connect = (s: Session) => {
       void refetchState();
       return;
     }
+    // A tab whose `ready` has not arrived holds no id to reconnect by,
+    // and a connect without one mints a second session. The server may
+    // have created the row before the socket dropped, so the tab goes
+    // and `/state` is fetched: if the mint landed, the row comes back
+    // once, as a tab with its id. A tab closed before its `ready` loses
+    // its wait the same way; its row, if there is one, shows as a tab.
+    if (s.sessionId === null) {
+      // A tab the user still held leaves a session wanted, which the
+      // document that follows answers. The tab minted to answer an
+      // earlier such want does not ask again, and a tab the user closed
+      // already asks for nothing.
+      if (s === recoveryMint) {
+        recoveryMint = null;
+      } else if (!s.closeOnReady) {
+        sessionWanted = generation;
+      }
+      s.closeOnReady = false;
+      closingOnReady.delete(s);
+      removeSessionLocal(s.id);
+      void refetchState();
+      return;
+    }
     // Intentional idle-suspend: stay grey, do not reconnect. The server's
     // grace timer reclaims the session; we reattach on the next
     // interaction.
@@ -795,13 +941,10 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
   }
 
   if (msg.type === 'ready') {
-    // Seed from /history only on the tab's first hydrate. `wasHydrated`
-    // is captured before `applyServerMessage` flips the flag. A
-    // transient reconnect (which arrives as `resumed: true` from the
-    // hub) then does not refetch history and rebuild the log underneath
-    // the user. The in-memory log from the live session is kept as-is.
-    if (msg.resumed && !wasHydrated) {
-      void loadHistory(s);
+    // The tab minted in a dropped tab's place has its id now, so it can
+    // no longer drop the way the marker guards against.
+    if (s === recoveryMint) {
+      recoveryMint = null;
     }
     // A tab named in the new-session dialog titles its row once the
     // server's id is known. The label already holds the name, so the
@@ -811,9 +954,45 @@ const handleMessage = (s: Session, event: MessageEvent<string>) => {
       s.pendingTitle = undefined;
       void sessionRequest(sessionPath(s.sessionId), 'PATCH', { title });
     }
+    // The user closed this tab before its first `ready`, and the
+    // archive waited for the id that has just arrived: it goes out now
+    // and the socket closes. The tab left the list when it was closed;
+    // the reducer has just dropped any tab a document had added for the
+    // id, so the active pointer is checked. No history is loaded.
+    if (s.closeOnReady && s.sessionId !== null) {
+      archiveClosedOnReady(s, s.sessionId);
+      notify();
+      return;
+    }
+    // The user has a live session: whichever tab's drop left one
+    // wanted, the next document need not mint.
+    sessionWanted = null;
+    // Seed from /history only on the tab's first hydrate. `wasHydrated`
+    // is captured before `applyServerMessage` flips the flag. A
+    // transient reconnect (which arrives as `resumed: true` from the
+    // hub) then does not refetch history and rebuild the log underneath
+    // the user. The in-memory log from the live session is kept as-is.
+    if (msg.resumed && !wasHydrated) {
+      void loadHistory(s);
+    }
   }
 
   notify();
+};
+
+/** Finish the close of a tab that was closed before its first `ready`,
+ * now that the id is known: the row joins the closed list, its archive
+ * is sent, and the socket that waited for the id is dropped. */
+const archiveClosedOnReady = (s: Session, sessionId: string) => {
+  s.closeOnReady = false;
+  closingOnReady.delete(s);
+  dropSocket(s);
+  closed.unshift({ id: sessionId, label: s.label, closedAt: Date.now() });
+  archiveRow(sessionId);
+  if (activeId !== null && !sessions.some((t) => t.id === activeId)) {
+    activeId = sessions.length > 0 ? sessions[0].id : null;
+    persistActiveId();
+  }
 };
 
 /**
@@ -1151,7 +1330,10 @@ if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', resumeActiveOnVisible);
 }
 
-const newSession = (name: string | null = null) => {
+/** Mint a session: a tab with no id, connected without a `session`
+ * parameter, leftmost and active. Returns the tab, so a caller that
+ * must recognise it later (the recovery mint) can hold on to it. */
+const newSession = (name: string | null = null): Session => {
   const id = newId();
   const named = name !== null && name.trim().length > 0;
   const s = makeSession(id, named ? name.trim() : UNTITLED, null);
@@ -1164,6 +1346,7 @@ const newSession = (name: string | null = null) => {
   sessions.unshift(s);
   connect(s);
   activate(id);
+  return s;
 };
 
 const renameSession = (id: string, label: string) => {
@@ -1188,14 +1371,20 @@ const closeSession = (id: string) => {
     return;
   }
   const s = sessions[i];
-  dropSocket(s);
   sessions.splice(i, 1);
   if (s.sessionId !== null) {
+    dropSocket(s);
     // Optimistic: the row moves to the closed list now; the tick-driven
     // refetch confirms it, and a failure refetches at once, which puts
     // the tab back.
     closed.unshift({ id: s.sessionId, label: s.label, closedAt: Date.now() });
-    void sessionRequest(sessionPath(s.sessionId), 'PATCH', { archived: true });
+    archiveRow(s.sessionId);
+  } else {
+    // No id yet, though the server may hold the row already: the socket
+    // stays open, out of the list, until `ready` brings the id the
+    // archive needs. The `ready` arm sends it and closes the socket.
+    s.closeOnReady = true;
+    closingOnReady.add(s);
   }
   if (sessions.length === 0) {
     // Never leave the UI empty.
@@ -1217,13 +1406,28 @@ const restoreFromHistory = (sessionId: string) => {
   }
   const entry = closed.splice(i, 1)[0];
   const s = makeSession(entry.id, entry.label, entry.id);
+  // The row's archive, if it was this browser's and is still unconfirmed,
+  // is undone by this restore; documents may list the row active again.
+  archiving.delete(sessionId);
   // Restoring is user-initiated; place the tab leftmost alongside
   // freshly-created ones. The socket opens only once the restore has
   // landed: an upgrade before it would find an archived row and 404.
   sessions.unshift(s);
   activate(s.id);
+  const started = generation;
   void (async () => {
     if (await sessionRequest(sessionPath(sessionId), 'PATCH', { archived: false })) {
+      if (started !== generation) {
+        return; // a reset ran while the request was out
+      }
+      // A document read before the restore landed, and applied while the
+      // request was out, still listed the row as closed and removed the
+      // tab. A socket for the tab would then belong to no list, so the
+      // list is fetched again instead and the row gets its tab from it.
+      if (!sessions.includes(s)) {
+        void refetchState();
+        return;
+      }
       connect(s);
       notify();
     }
@@ -1358,6 +1562,10 @@ let initInFlight: Promise<void> | null = null;
 
 const doInit = async (): Promise<void> => {
   const started = generation;
+  // Counted with the refetches, so the document's place among the
+  // archives this browser sent is known.
+  refetchSent += 1;
+  const number = refetchSent;
   let doc: StateDoc | null = null;
   try {
     const res = await apiFetch(STATE_URL);
@@ -1374,14 +1582,18 @@ const doInit = async (): Promise<void> => {
   if (started !== generation) {
     return; // a reset ran while the fetch was out: this init is void
   }
+  // Read before the document is applied: applying it points the active
+  // tab at the list's first row and saves that id, which would replace
+  // the one the last page load saved.
+  const saved = readActiveId();
   if (doc !== null) {
-    applyStateDoc(doc);
+    refetchApplied = Math.max(refetchApplied, number);
+    applyStateDoc(doc, number);
   }
   if (sessions.length === 0) {
     // Never leave the UI empty: a first visit mints a session.
     newSession();
   }
-  const saved = readActiveId();
   if (saved !== null && sessions.some((s) => s.id === saved)) {
     activate(saved);
   } else if (activeId === null && sessions.length > 0) {
@@ -1409,6 +1621,14 @@ const reset = () => {
   for (const s of sessions) {
     dropSocket(s);
   }
+  for (const s of closingOnReady) {
+    s.closeOnReady = false;
+    dropSocket(s);
+  }
+  closingOnReady.clear();
+  archiving.clear();
+  sessionWanted = null;
+  recoveryMint = null;
   if (idleScanTimer !== null) {
     clearInterval(idleScanTimer);
     idleScanTimer = null;

@@ -354,6 +354,46 @@ async fn a_burst_past_the_queue_bound_completes_in_order() {
 }
 
 #[tokio::test]
+async fn dropping_the_store_runs_every_queued_write_before_it_returns() {
+    // Requirement 2 criteria 4 and 5: the drop closes the queue and joins
+    // the thread, so a burst that was queued and never awaited, the shape
+    // a task cancelled at shutdown leaves behind, is on disk when the
+    // drop returns. The thread is parked behind one slow job first, so a
+    // drop that did not wait would find the file empty.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("mezame.db");
+    let store =
+        SqliteStore::open(&path, MasterKey::from_bytes_for_test([5u8; KEY_LEN]).keys()).unwrap();
+    let user_id = user(&store, "burst").await;
+    let sid = session(&store, &user_id).await;
+
+    // One poll queues each job, outside the task budget so the queue's
+    // semaphore answers every one of them; the replies are never read.
+    let mut parked = store.run_for_test(|_| std::thread::sleep(Duration::from_millis(300)));
+    assert!(futures_util::poll!(tokio::task::unconstrained(parked.as_mut())).is_pending());
+    for i in 0..250 {
+        let mut write =
+            store.append_user(&sid, &[text(&format!("m{i}"))], &format!("m{i}"), i as i64);
+        assert!(futures_util::poll!(tokio::task::unconstrained(write.as_mut())).is_pending());
+    }
+    drop(parked);
+    drop(store);
+
+    let conn = Connection::open(&path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+            [&sid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 250,
+        "every queued write ran before the drop returned"
+    );
+}
+
+#[tokio::test]
 async fn health_and_backend_name() {
     let store = store();
     assert_eq!(store.backend_name(), "sqlite");

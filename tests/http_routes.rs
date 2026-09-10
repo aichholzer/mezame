@@ -12,14 +12,22 @@ mod support;
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
+use mezame::auth::{
+    dummy_hash_primed, COOKIE_LIFETIME, COOKIE_RENEW_WITHIN, LIMITER_CAP, LOGIN_LIMIT,
+    LOGIN_WINDOW, MAX_PASSWORD_BYTES, MIN_PASSWORD_CHARS,
+};
 use mezame::backend::{
     EntryBody, HistoryEntry, ToolCall, ToolCallStatus, ToolContent, ToolLocation,
 };
 use mezame::config::{Config, TransportConfig};
-use mezame::http::{build_router, AppState};
-use mezame::hub::HubRegistry;
+use mezame::http::{
+    build_router, AppState, LOGIN_BODY_LIMIT, SESSION_TITLE_MAX_CHARS, SETTINGS_MAX_BYTES,
+};
+use mezame::hub::{HubRegistry, TITLE_MAX_CHARS};
+use mezame::store::{ARCHIVED_LIST_MAX, USER_NAME_MAX_CHARS};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 use support::ScriptedBackend;
 use tower::ServiceExt;
 
@@ -551,6 +559,50 @@ async fn a_read_over_get_carries_no_origin_check() {
         json_body(&bytes),
         json!({ "sessions": [], "closed": [], "settings": {} })
     );
+}
+
+#[tokio::test]
+async fn building_the_router_makes_the_dummy_hash() {
+    // The hash an unknown name is verified against is made when the router
+    // is built, so the first such login of a process costs one argon2 run
+    // like every later one, and not the making plus the verification.
+    // Nothing else in this binary logs an unknown name in, so without the
+    // router making it the accessor stays false. Whether it was already
+    // true cannot be asserted: the other cases here build routers too.
+    let _router = build_router(dummy_state());
+    assert!(
+        dummy_hash_primed(),
+        "building the router made the dummy hash"
+    );
+}
+
+#[test]
+fn the_numbers_the_requirements_name_are_the_literals_they_state() {
+    // Requirements 5 and 7 of the phase 2 spec and the phase 1 auto-title
+    // rule each name a number. Every other case asserts through the
+    // constant it tests, so a constant edited in one place would pass them
+    // all; these are the literals, and a drift in any of them fails here.
+    assert_eq!(LIMITER_CAP, 4096, "5.11: limiter keys");
+    assert_eq!(
+        COOKIE_LIFETIME,
+        Duration::from_secs(90 * 24 * 60 * 60),
+        "5.3: ninety days"
+    );
+    assert_eq!(
+        COOKIE_RENEW_WITHIN,
+        Duration::from_secs(30 * 24 * 60 * 60),
+        "5.3: renewed under thirty days"
+    );
+    assert_eq!(LOGIN_LIMIT, 10, "5.10: attempts per window");
+    assert_eq!(LOGIN_WINDOW, Duration::from_secs(60), "5.10: the window");
+    assert_eq!(MAX_PASSWORD_BYTES, 1024, "5.1: the longest password");
+    assert_eq!(MIN_PASSWORD_CHARS, 8, "5.1: the shortest password");
+    assert_eq!(LOGIN_BODY_LIMIT, 4096, "the login body");
+    assert_eq!(SETTINGS_MAX_BYTES, 16 * 1024, "7.2: the settings object");
+    assert_eq!(ARCHIVED_LIST_MAX, 20, "7.1: archived sessions listed");
+    assert_eq!(SESSION_TITLE_MAX_CHARS, 200, "7.3: a rename");
+    assert_eq!(TITLE_MAX_CHARS, 40, "the auto-title");
+    assert_eq!(USER_NAME_MAX_CHARS, 64, "the user name");
 }
 
 #[tokio::test]

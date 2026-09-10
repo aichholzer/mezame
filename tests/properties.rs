@@ -1540,14 +1540,15 @@ proptest! {
     // Feature: store-auth-persistence, Property 3: The limiter admits ten.
     // For any sequence of 1 to 40 attempts at increasing instants inside one
     // window, the first ten pass and every later one is refused with a wait
-    // no longer than the time left in the window.
+    // of exactly the time left in the window, or of one second when less
+    // than that is left, so the header never reads zero.
     #[test]
     fn property_p3_the_limiter_admits_ten(
         offsets in proptest::collection::vec(0u64..59_000, 1..40),
     ) {
         let limiter = mezame::auth::RateLimiter::default();
         let start = std::time::Instant::now();
-                let mut instants: Vec<u64> = offsets;
+        let mut instants: Vec<u64> = offsets;
         instants.sort_unstable();
         // The window opens at the first attempt, not at the origin.
         let opened = instants[0];
@@ -1560,10 +1561,15 @@ proptest! {
                 let left = outcome.expect_err("refused past ten");
                 let remaining = mezame::auth::LOGIN_WINDOW
                     .saturating_sub(std::time::Duration::from_millis(*ms - opened));
-                prop_assert!(
-                    left <= remaining.max(std::time::Duration::from_secs(1)),
-                    "wait {left:?} past the window's {remaining:?}"
-                );
+                let second = std::time::Duration::from_secs(1);
+                if remaining >= second {
+                    prop_assert_eq!(
+                        left, remaining,
+                        "the wait is the time left in the window"
+                    );
+                } else {
+                    prop_assert_eq!(left, second, "floored at one second");
+                }
             }
         }
     }

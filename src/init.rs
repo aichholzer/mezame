@@ -7,7 +7,8 @@
 //! admin row, the Bedrock credential (sealed, with its grant) and the
 //! global profile, the configuration file, and a summary that names no
 //! password, no hash, no region and no profile. The user commands share
-//! the store opening and the password reading with it.
+//! the password reading with it and open the key and the datastore that
+//! are there, creating neither.
 
 use std::io::{self, BufRead as _, IsTerminal as _};
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ use crate::config::{
     self, config_path, default_bind, read_existing_config, validate_bind_entry, Config,
     ExistingConfig, TransportConfig, CONFIG_VERSION, DEFAULT_PORT,
 };
-use crate::store::crypto::{KeyError, Keys, MasterKey};
+use crate::store::crypto::{Keys, MasterKey};
 use crate::store::sqlite::SqliteStore;
 use crate::store::{NewProfile, Role, Store, UserRow, USER_NAME_MAX_CHARS};
 
@@ -81,10 +82,13 @@ pub const INIT_FLAGS_TEXT: &str =
      `--region NAME` and `--profile NAME`";
 
 /// Parse what follows `init`: nothing, or any of the six flags, each value
-/// flag in either of its two spellings and each flag at most once.
+/// flag in either of its two spellings, each flag at most once, and
+/// `--password-stdin` only beside `--admin`, whose password it reads.
 ///
 /// Anything else is an error naming the token, so a typo is refused
-/// instead of dropping into the prompt. Pure, so it has tests.
+/// instead of dropping into the prompt, and a flag the run would not
+/// honour is refused rather than consumed with nothing said. Pure, so it
+/// has tests.
 pub fn parse_init_args(args: &[String]) -> Result<InitArgs> {
     let mut parsed = InitArgs::default();
     let mut tokens = args.iter();
@@ -128,12 +132,21 @@ pub fn parse_init_args(args: &[String]) -> Result<InitArgs> {
         }
         *slot = Some(value);
     }
+    if parsed.password_stdin && parsed.admin.is_none() {
+        bail!(
+            "`--password-stdin` needs `--admin`: the first line of standard input is the \
+             admin's password, e.g. `echo 'the password' | mezame init --admin NAME \
+             --password-stdin`"
+        );
+    }
     Ok(parsed)
 }
 
 /// A flag's value with the whitespace trimmed, refused when nothing is
-/// left. One rule for every flag: no flag clears a setting. Removing one
-/// is a hand edit of the file, or a fresh `init`, as it is for `hosts`.
+/// left. One rule for every flag: no flag clears a setting. The hosts can
+/// be edited in the file. The region and the profile live sealed in the
+/// datastore, where a re-run of `init` keeps them; clearing one is not
+/// possible in this alpha.
 fn non_empty(flag: &str, value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -543,29 +556,63 @@ pub fn has_terminal() -> bool {
 
 // ---------- the key and the store ----------
 
+/// Refuse a datastore found without its key, with one line naming both
+/// paths and pointing at the `~/.mezame` backup set and at `mezame init`.
+/// Nothing sealed in the datastore can be opened without the key, so a
+/// path that would make a new key beside it stops here instead: the
+/// server's start, a start with no configuration that would fall into the
+/// setup, and the user commands. Only `mezame init` itself goes on, since
+/// dropping the sealed rows is the operator's call to make. The check
+/// reads two paths and writes nothing.
+pub fn refuse_keyless_datastore(datastore: &Path, key_path: &Path) -> Result<()> {
+    if datastore.exists() && !key_path.exists() {
+        bail!(
+            "{} exists but {} does not: the datastore's credentials cannot be opened without \
+             it. Restore ~/.mezame from its backup, or run `mezame init` to create a new key \
+             and re-enter the Bedrock credential.",
+            datastore.display(),
+            key_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// The master key and the datastore as the server opens them: a datastore
 /// found without its key stops with the backup set named, since nothing
 /// sealed in it could be opened; with neither present both are created;
 /// a key of the wrong mode or length is refused with the path named.
 pub fn open_store() -> Result<(Arc<dyn Store>, Keys)> {
     let dir = config::mezame_dir()?;
-    config::ensure_private_dir(&dir).with_context(|| format!("Creating {}", dir.display()))?;
     let datastore = config::datastore_path()?;
     let key_path = config::master_key_path()?;
+    refuse_keyless_datastore(&datastore, &key_path)?;
+    config::ensure_private_dir(&dir).with_context(|| format!("Creating {}", dir.display()))?;
     let key = if datastore.exists() {
-        MasterKey::load(&key_path).map_err(|e| match e {
-            KeyError::NotFound(_) => anyhow!(
-                "{} exists but {} does not: the datastore's credentials cannot be opened without \
-                 it. Restore ~/.mezame from its backup, or run `mezame init` to create a new key \
-                 and re-enter the Bedrock credential.",
-                datastore.display(),
-                key_path.display()
-            ),
-            other => anyhow!("{other}"),
-        })?
+        MasterKey::load(&key_path).map_err(|e| anyhow!("{e}"))?
     } else {
         MasterKey::load_or_create(&key_path).map_err(|e| anyhow!("{e}"))?
     };
+    let keys = key.keys();
+    let store = SqliteStore::open(&datastore, keys.clone()).map_err(|e| anyhow!("{e}"))?;
+    Ok((Arc::new(store), keys))
+}
+
+/// The master key and the datastore as the user commands open them: both
+/// have to be there already. The commands print rows or refuse, and
+/// neither is a reason to make a key or a datastore; `mezame init` and
+/// the first start do that, and the line says so. A datastore without its
+/// key is refused with the server's line.
+fn open_existing_store() -> Result<(Arc<dyn Store>, Keys)> {
+    let datastore = config::datastore_path()?;
+    let key_path = config::master_key_path()?;
+    if !datastore.exists() {
+        bail!(
+            "No datastore yet ({} does not exist): run `mezame init` first.",
+            datastore.display()
+        );
+    }
+    refuse_keyless_datastore(&datastore, &key_path)?;
+    let key = MasterKey::load(&key_path).map_err(|e| anyhow!("{e}"))?;
     let keys = key.keys();
     let store = SqliteStore::open(&datastore, keys.clone()).map_err(|e| anyhow!("{e}"))?;
     Ok((Arc::new(store), keys))
@@ -609,7 +656,18 @@ pub fn open_or_create_store() -> Result<Opened> {
 /// the configuration at version 2 with the hosts, `models` and public URL
 /// an existing file held, and the removal of `state.json`. The key and the
 /// datastore are open already.
+///
+/// The configuration is assembled and checked first, under the same rule
+/// the write applies: the values carried forward from an existing file
+/// were read without validation, and one the loader would refuse has to
+/// stop the run before the admin is created or the credential replaced.
+/// Otherwise the run reports a failure having already changed the
+/// datastore, and every re-run does the same until the file is fixed.
 pub async fn apply(store: &dyn Store, answers: Answers, now: i64) -> Result<Summary> {
+    let config_path = config_path()?;
+    let cfg = assemble(answers.existing.as_ref().map(|e| &e.config), answers.bind);
+    cfg.validate(&config_path)?;
+
     let admin = match &answers.admin {
         Some((name, password)) => {
             let hash = hash_password(password).map_err(|e| anyhow!("{e}"))?;
@@ -640,8 +698,6 @@ pub async fn apply(store: &dyn Store, answers: Answers, now: i64) -> Result<Summ
             .map(|profile| profile.model),
     };
 
-    let config_path = config_path()?;
-    let cfg = assemble(answers.existing.as_ref().map(|e| &e.config), answers.bind);
     if answers.existing.as_ref().is_some_and(|e| e.had_bedrock) {
         println!(
             "Dropping the `bedrock` section from {}: the model, region and profile live in the \
@@ -886,9 +942,9 @@ pub fn parse_user_add_args(args: &[String]) -> Result<UserAddArgs> {
 /// `mezame user add NAME [--admin] [--password-stdin]`.
 pub fn user_add(args: &UserAddArgs) -> Result<()> {
     check_user_name(&args.name).map_err(|why| anyhow!("{why}"))?;
+    let (store, _keys) = open_existing_store()?;
     let password = read_password(args.password_stdin, "Password")?;
     let hash = hash_password(&password).map_err(|e| anyhow!("{e}"))?;
-    let (store, _keys) = open_store()?;
     let role = if args.admin { Role::Admin } else { Role::User };
     let row = block_on(async {
         store
@@ -902,7 +958,7 @@ pub fn user_add(args: &UserAddArgs) -> Result<()> {
 
 /// `mezame user list`: one line per user, `<name>  <role>  <created>`.
 pub fn user_list() -> Result<()> {
-    let (store, _keys) = open_store()?;
+    let (store, _keys) = open_existing_store()?;
     let users = block_on(async { store.list_users().await.map_err(|e| anyhow!("{e}")) })?;
     if users.is_empty() {
         println!("No users yet. `mezame init --admin NAME --password-stdin` creates the first.");
@@ -928,7 +984,7 @@ pub fn user_list() -> Result<()> {
 /// cookie of the user ends with the epoch it bumps.
 pub fn passwd(name: &str, password_stdin: bool) -> Result<()> {
     check_user_name(name).map_err(|why| anyhow!("{why}"))?;
-    let (store, _keys) = open_store()?;
+    let (store, _keys) = open_existing_store()?;
     let user = block_on(async { store.user_by_name(name).await.map_err(|e| anyhow!("{e}")) })?
         .ok_or_else(|| anyhow!("no user named `{name}`; `mezame user list` shows them"))?;
     let password = read_password(password_stdin, &format!("New password for {name}"))?;

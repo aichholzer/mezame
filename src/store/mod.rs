@@ -5,10 +5,10 @@
 //! [`StoreFuture`]), so a second backend is a second implementation and
 //! nothing above the trait changes. The rows are plain structs; a `UserRow`
 //! never carries the password hash, which reaches the login handler alone
-//! through `password_hash_of`. Ids of every table but `messages` are 32
-//! lowercase hexadecimal characters from 16 bytes of operating-system
-//! entropy, the form session ids already take, so an id never reveals a
-//! count and a rename touches no path.
+//! through `login_user`, beside the row it belongs to. Ids of every table
+//! but `messages` are 32 lowercase hexadecimal characters from 16 bytes of
+//! operating-system entropy, the form session ids already take, so an id
+//! never reveals a count and a rename touches no path.
 
 pub mod crypto;
 pub mod sqlite;
@@ -257,8 +257,14 @@ pub trait Store: Send + Sync {
     fn user_by_id(&self, id: &str) -> StoreFuture<'_, Option<UserRow>>;
     fn list_users(&self) -> StoreFuture<'_, Vec<UserRow>>;
     fn count_users(&self) -> StoreFuture<'_, u64>;
-    /// The stored PHC string, for the login handler alone.
+    /// The stored PHC string alone, for callers that need no row; the
+    /// login handler reads through `login_user` instead.
     fn password_hash_of(&self, name: &str) -> StoreFuture<'_, Option<String>>;
+    /// The user row and its PHC string from one `SELECT`, for the login
+    /// handler: the hash it verifies against and the epoch it stamps on
+    /// the cookie come from the same snapshot, so a password change that
+    /// lands between two reads cannot pair the old hash with the new epoch.
+    fn login_user(&self, name: &str) -> StoreFuture<'_, Option<(UserRow, String)>>;
     /// Sets the hash and bumps the session epoch in one statement.
     fn set_password_hash(&self, id: &str, hash: &str) -> StoreFuture<'_, ()>;
     /// Bumps the session epoch; returns the new value.

@@ -162,6 +162,12 @@ export type Session = {
    * dialog, or a rename that beat the first `ready`. Written to the row
    * as its title once the id is known, then cleared. */
   pendingTitle?: string;
+  /** Set when the tab was closed before its first `ready`. The server
+   * may hold a row for it already, but the archive needs the id that
+   * `ready` brings, so the tab leaves the list while its socket stays
+   * open for that one message; the archive is sent then and the socket
+   * closed. */
+  closeOnReady?: boolean;
   /** The working directory Mezame runs in, as the `ready` event reported
    * it. The server's own process directory is its only source.
    * Display-only. */

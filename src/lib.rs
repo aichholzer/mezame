@@ -63,7 +63,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::sync::Arc;
 
 use crate::backend::{TRANSCRIPT_BUDGET_BYTES, TRANSCRIPT_MAX_ENTRIES};
-use crate::config::{config_path, load_config, Config, TransportConfig};
+use crate::config::{
+    config_path, datastore_path, load_config, master_key_path, Config, TransportConfig,
+};
 use crate::http::run_cloudflared;
 use crate::hub::{BackendFactory, HubRegistry, NewBackend};
 use crate::init::{
@@ -137,6 +139,11 @@ pub fn run() -> Result<()> {
 
     let path = config_path()?;
     if !path.exists() {
+        // A datastore whose key is gone is refused before the setup is
+        // offered: the setup would write a new key and drop every sealed
+        // row, which is the operator's call to make with `mezame init`,
+        // and a start alters nothing.
+        init::refuse_keyless_datastore(&datastore_path()?, &master_key_path()?)?;
         eprintln!("No config at {}", path.display());
         if !init::has_terminal() {
             // Under a service manager or `docker compose up -d` the prompt
@@ -216,7 +223,7 @@ fn workspace_root() -> Option<std::path::PathBuf> {
         }
     };
     let dir = crate::config::mezame_dir().ok()?;
-    match crate::config::eligible_workspace_root(&cwd, &dir) {
+    match crate::config::resolve_workspace_root(&cwd, &dir) {
         Ok(root) => {
             eprintln!("Workspace: {}", root.display());
             Some(root)

@@ -247,7 +247,12 @@ fn user_takes_add_or_list_and_nothing_else() {
 
 #[test]
 fn user_list_on_an_empty_datastore_says_how_the_first_is_made() {
+    // An `init` that names no admin leaves a datastore with no user in it.
     let tmp = TempDir::new().unwrap();
+    assert_success(&run_with_home(
+        &["init", "--bind", "127.0.0.1:9510"],
+        tmp.path(),
+    ));
     let out = run_with_home(&["user", "list"], tmp.path());
     assert_success(&out);
     assert!(stdout(&out).contains("No users yet"), "{}", stdout(&out));
@@ -255,6 +260,70 @@ fn user_list_on_an_empty_datastore_says_how_the_first_is_made() {
         stdout(&out).contains("--admin NAME --password-stdin"),
         "{}",
         stdout(&out)
+    );
+}
+
+#[test]
+fn the_user_commands_refuse_to_run_before_init_and_create_nothing() {
+    // The commands print rows or refuse; none of them is a reason to make
+    // a key or a datastore. Before `init`, each exits with one line naming
+    // it, and `~/.mezame` gains no key and no datastore.
+    for args in [
+        &["user", "list"][..],
+        &["user", "add", "bob", "--password-stdin"][..],
+        &["passwd", "alice", "--password-stdin"][..],
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let out = run_with_home(args, tmp.path());
+        assert!(!out.status.success(), "{args:?}: {}", stdout(&out));
+        let err = stderr(&out);
+        assert!(err.contains("No datastore yet"), "{args:?}: {err}");
+        assert!(err.contains("`mezame init`"), "{args:?}: {err}");
+        assert_eq!(
+            err.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "{args:?}: one line: {err}"
+        );
+        assert!(
+            !tmp.path().join(".mezame/master.key").exists(),
+            "{args:?}: no key was written"
+        );
+        assert!(
+            !tmp.path().join(".mezame/mezame.db").exists(),
+            "{args:?}: no datastore was created"
+        );
+        assert!(
+            !tmp.path().join(".mezame").exists(),
+            "{args:?}: not even the directory"
+        );
+    }
+
+    // A datastore whose key is gone is refused with the server's line, and
+    // no key is written beside it.
+    let tmp = home_with_admin("127.0.0.1:9510");
+    let key_path = tmp.path().join(".mezame/master.key");
+    let db_path = tmp.path().join(".mezame/mezame.db");
+    std::fs::remove_file(&key_path).unwrap();
+    let before = std::fs::read(&db_path).unwrap();
+    for args in [
+        &["user", "list"][..],
+        &["user", "add", "bob", "--password-stdin"][..],
+        &["passwd", "alice", "--password-stdin"][..],
+    ] {
+        let out = run_with_home(args, tmp.path());
+        assert!(!out.status.success(), "{args:?}: {}", stdout(&out));
+        let err = stderr(&out);
+        assert!(err.contains("backup"), "{args:?}: {err}");
+        assert!(
+            err.contains(&key_path.display().to_string()),
+            "{args:?}: {err}"
+        );
+        assert!(!key_path.exists(), "{args:?}: no key is written");
+    }
+    assert_eq!(
+        std::fs::read(&db_path).unwrap(),
+        before,
+        "the datastore is untouched"
     );
 }
 

@@ -1,12 +1,17 @@
 //! The master key on disk and the cipher over credential payloads.
 //!
-//! `~/.mezame/master.key` holds 32 random bytes, mode `0600`, written once
-//! with an exclusive create on its final path and never through a rename
-//! onto it: two processes that both find no key race to create it, and
-//! `O_CREAT|O_EXCL` makes the loser read the winner instead of replacing a
-//! key another process may already have sealed with. Two sub-keys come off
-//! it by HKDF-SHA256, one for credentials and one for the session cookie,
-//! so neither use ever sees the other's key.
+//! `~/.mezame/master.key` holds 32 random bytes, mode `0600`, written once.
+//! `load_or_create` writes and syncs them to a temporary sibling opened
+//! with `create_new`, then publishes that file onto the final name with a
+//! hard link. Two processes that both find no key race to publish, and
+//! `link(2)` answering `EEXIST` decides the loser, which unlinks its own
+//! sibling and reads the winner's key instead of replacing a key another
+//! process may already have sealed with. The final name is never opened
+//! with an exclusive create of its own: a racing reader would find that
+//! file empty between its creation and its write, where the link publishes
+//! a whole file or nothing. Two sub-keys come off the key by HKDF-SHA256,
+//! one for credentials and one for the session cookie, so neither use ever
+//! sees the other's key.
 //!
 //! A credential payload is sealed with XChaCha20-Poly1305 under the
 //! credential key, a fresh 24-byte nonce per write, and the row id as
@@ -68,15 +73,16 @@ impl fmt::Display for KeyError {
             ),
             KeyError::Loose { path, mode } => write!(
                 f,
-                "{} is readable by others (mode {:o}); the master key must be mode 0600: run \
-                 `chmod 600 {}`",
+                "{} is readable by others (mode {:o}); the master key must be a regular file, \
+                 mode 0600, {KEY_LEN} bytes: run `chmod 600 {}`",
                 path.display(),
                 mode & 0o777,
                 path.display()
             ),
             KeyError::WrongLength { path, len } => write!(
                 f,
-                "{} holds {len} bytes; the master key must hold exactly {KEY_LEN}",
+                "{} holds {len} bytes; the master key must be a regular file, mode 0600, \
+                 exactly {KEY_LEN} bytes",
                 path.display()
             ),
             KeyError::Io { path, source } => write!(f, "{}: {source}", path.display()),

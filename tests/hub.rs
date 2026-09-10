@@ -2827,3 +2827,86 @@ async fn a_failed_title_write_is_retried_by_the_next_prompt() {
         Some("second words")
     );
 }
+
+#[tokio::test]
+async fn an_attach_whose_row_read_fails_is_refused_and_the_next_attach_still_titles_the_session() {
+    // A store error on the row read under the gate fails the attach. It
+    // once built the hub with the title flag off, so the row's null title
+    // was never written for the life of that hub; now no hub is built,
+    // and the attach that follows once the store answers titles the
+    // session on its first prompt.
+    let keys = mezame::store::crypto::MasterKey::from_bytes_for_test([9u8; 32]).keys();
+    let inner: Arc<dyn mezame::store::Store> =
+        Arc::new(mezame::store::sqlite::SqliteStore::open_in_memory(keys).unwrap());
+    let failing = Arc::new(support::FailingStore::new(inner));
+    let counting = Arc::new(support::CountingStore::new(
+        failing.clone() as Arc<dyn mezame::store::Store>
+    ));
+    let store: Arc<dyn mezame::store::Store> = counting.clone();
+    let (ticks, _) = broadcast::channel(8);
+    let registry = HubRegistry::new().with_store(store.clone(), ticks);
+    let owner = stored_owner(store.as_ref(), "alice").await;
+    store
+        .create_session(&owner.user_id, "unread", None, 1)
+        .await
+        .unwrap();
+
+    failing.fail();
+    let err = registry
+        .attach_or_create("unread", &owner, None)
+        .await
+        .err()
+        .expect("a store error refuses the attach");
+    assert!(
+        err.downcast_ref::<mezame::hub::SessionGone>().is_none(),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("could not read the session"),
+        "{err}"
+    );
+    assert!(!registry.is_registered_for_test("unread").await);
+    assert_eq!(counting.title_writes(), 0);
+
+    failing.recover();
+    let mut attached = registry
+        .attach_or_create("unread", &owner, None)
+        .await
+        .expect("the attach succeeds once the store answers");
+    attached
+        .commands
+        .send(HubCommand::Prompt {
+            blocks: vec![text_block("first words")],
+            attach_id: attached.attach_id,
+        })
+        .await
+        .unwrap();
+    collect_until(&mut attached.outbound, "prompt_done").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while store
+        .session("unread")
+        .await
+        .unwrap()
+        .unwrap()
+        .title
+        .is_none()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        counting.title_writes(),
+        1,
+        "the first prompt titles the session"
+    );
+    assert_eq!(
+        store
+            .session("unread")
+            .await
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("first words")
+    );
+}

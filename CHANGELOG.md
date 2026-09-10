@@ -95,7 +95,9 @@ the old state.
   and `mezame passwd NAME [--password-stdin]` manage accounts from the
   terminal. A name must be non-empty, at most 64 characters and not
   taken; a password at least 8 characters. A password change signs the
-  user out of every device.
+  user out of every device. The three need a datastore: before
+  `mezame init` has run they stop with one line saying so and create
+  nothing.
 - A server that starts on a datastore with no user asks for the admin
   when a terminal is attached, and otherwise exits with one line naming
   `mezame init --admin NAME --password-stdin`. `mezame --help` lists the
@@ -153,7 +155,7 @@ the old state.
   `cross-site` are refused, and a request carrying neither header is
   refused with 403 and a line saying a script adds `Sec-Fetch-Site: none`.
   Behind a proxy that rewrites `Host`, `Origin` is compared with
-  `X-Forwarded-Host` when present.
+  `X-Forwarded-Host` when present, by host alone, without a port.
 
 ### Removed
 

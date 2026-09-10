@@ -79,8 +79,10 @@ pub struct AppState {
     /// Tick channel, carrying the id of the user whose state changed: a
     /// session created, renamed, titled, archived, restored or deleted,
     /// or settings written. `/state/events` forwards a tick to that
-    /// user's streams alone, and each refetches `/state`. Receivers that
-    /// lag are skipped ahead; the next tick brings them back in sync.
+    /// user's streams alone, and each refetches `/state`. A receiver that
+    /// lags is sent one event in place of the ticks it missed, since the
+    /// ring is shared by every user and the evicted ticks may have been
+    /// this user's; the refetch it prompts brings the browser back in sync.
     pub state_changes: broadcast::Sender<String>,
     /// The root a user's default workspace is created at on their first
     /// session: the server's working directory when it is eligible.
@@ -346,6 +348,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // `Sec-Fetch-Site` check cover both; the policy is read from the
     // config once, here.
     let policy = Arc::new(RequestPolicy::from_config(&state.config.load()));
+    // The dummy hash an unknown name is verified against is made here, so
+    // the first such login of the process costs one argon2 run like every
+    // later one instead of the two that making it on demand would cost.
+    let _ = dummy_hash();
     let public = Router::new()
         .route("/ws", get(ws_upgrade))
         // The login body is small by construction: a name of at most 64
@@ -609,21 +615,21 @@ async fn login(
     }
     // A store that cannot answer is a failure of the server, reported as
     // one; treating it as an unknown name would sign every browser out
-    // and tell the next login its password was wrong.
-    let stored = match app.store.password_hash_of(name).await {
-        Ok(stored) => stored,
+    // and tell the next login its password was wrong. The row and the
+    // hash come from one read: a password change bumps the epoch in the
+    // statement that replaces the hash, and two reads could pair the old
+    // hash with the new epoch and mint a cookie the change was meant to
+    // refuse.
+    let found = match app.store.login_user(name).await {
+        Ok(found) => found,
         Err(e) => return internal(e).into_response(),
     };
-    let user = match app.store.user_by_name(name).await {
-        Ok(user) => user,
-        Err(e) => return internal(e).into_response(),
-    };
-    let hash: &str = match stored.as_deref() {
-        Some(hash) => hash,
+    let hash: &str = match &found {
+        Some((_, hash)) => hash,
         None => dummy_hash(),
     };
     let verified = verify_password(&password, hash);
-    let (Some(user), true) = (user, verified) else {
+    let (Some((user, _)), true) = (found, verified) else {
         return (StatusCode::UNAUTHORIZED, "wrong username or password\n").into_response();
     };
     let now = (app.clock)();
@@ -667,9 +673,10 @@ async fn me(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
 /// SSE state-events stream) end their futures, and axum's graceful drain
 /// completes. Without it the drain waits on them forever.
 ///
-/// Live WebSocket sessions are dropped on shutdown. Each hub's Backend is
-/// released with it, and its transcript goes: nothing on disk survives a
-/// restart in this phase.
+/// Live WebSocket sessions are dropped on shutdown, and each hub's Backend
+/// is released with it. A persisting deployment's conversations are in the
+/// store and are rebuilt from it on the next start; the echo fallback keeps
+/// nothing.
 async fn shutdown_signal(shutdown: Arc<Notify>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -941,8 +948,16 @@ async fn patch_session(
             outcome
         }
     };
-    if let Err(e) = outcome {
-        return internal(e).into_response();
+    match outcome {
+        Ok(()) => {}
+        // The ownership check passed a moment ago, so a write that found
+        // no row means the row went in between (a forget on another
+        // device racing this rename or archive): the same 404 as a row
+        // that was never there, not a failure of the server.
+        Err(StoreError::NotFound) => {
+            return (StatusCode::NOT_FOUND, NO_SUCH_SESSION).into_response()
+        }
+        Err(e) => return internal(e).into_response(),
     }
     app.tick(&user.id);
     StatusCode::NO_CONTENT.into_response()
@@ -963,8 +978,14 @@ async fn delete_session(
         Ok(None) => return (StatusCode::NOT_FOUND, NO_SUCH_SESSION).into_response(),
         Err(e) => return internal(e).into_response(),
     }
-    if let Err(e) = app.store.delete_session(&id).await {
-        return internal(e).into_response();
+    match app.store.delete_session(&id).await {
+        Ok(()) => {}
+        // Two devices forgetting the same session: the second finds the
+        // row already gone, which is the 404 of a row that does not exist.
+        Err(StoreError::NotFound) => {
+            return (StatusCode::NOT_FOUND, NO_SUCH_SESSION).into_response()
+        }
+        Err(e) => return internal(e).into_response(),
     }
     app.hubs.close_session(&id).await;
     app.tick(&user.id);
@@ -1037,10 +1058,18 @@ async fn state_events(
                         // Another user's state moved: nothing for this stream.
                         Ok(_) => continue,
 
-                        // Lagged: skip and wait for the next message. The
-                        // browser refetches on the next event delivered.
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                            // All senders dropped: end the stream. In practice
+                        // Lagged: the ring is shared by every user, so the
+                        // ticks this receiver missed may have been this
+                        // user's own and are gone for good. The event is
+                        // only a refetch signal, so one is sent in their
+                        // place; the retained ticks follow as usual.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            return Some((
+                                Ok(Event::default().event("state_changed").data("")),
+                                (rx, notified, me),
+                            ));
+                        }
+                        // All senders dropped: end the stream. In practice
                         // this only happens when the server is shutting down.
                         Err(broadcast::error::RecvError::Closed) => return None,
                     },
@@ -1055,21 +1084,23 @@ async fn state_events(
     )
 }
 
-/// `GET /history?session=<id>`: the transcript of the Backend behind that
-/// session id, as an `entries` array holding every entry the Backend
-/// retains, in recorded order, with no pagination. The shipped Backend
-/// bounds what it retains at `TRANSCRIPT_BUDGET_BYTES` of entry text and
-/// `TRANSCRIPT_MAX_ENTRIES` entries (`backend.rs`), the oldest turn
-/// evicted first, so a long conversation comes back as its newest window.
+/// `GET /history?session=<id>`: the conversation behind that session id,
+/// as an `entries` array in recorded order, with no pagination. For a
+/// persisting deployment the entries come from the session's rows in the
+/// store, read through `load_window` and rebuilt with
+/// `Conversation::restore`, the same window and the same rebuild a hub
+/// makes when it starts, so a reload after the grace window and a reload
+/// after a restart both show the conversation. The window is bounded at
+/// `TRANSCRIPT_MAX_ENTRIES` rows and twice `TRANSCRIPT_BUDGET_BYTES` of
+/// stored content, the oldest rows left out first, so a long conversation
+/// comes back as its newest window. The hub's own transcript is served
+/// only for the echo fallback, which persists nothing.
 ///
 /// An absent or empty `session` answers 400 with a plain-text body. A
 /// session the user does not own, or that does not exist, answers 404
 /// with an empty `entries` array, the same answer in both cases, so the
 /// route says nothing about rows that are not theirs. An owned session
-/// with no registered hub answers 200 with an empty array.
-///
-/// A transcript lives as long as its hub. A reload inside the grace window
-/// shows the conversation so far; one after it shows an empty log.
+/// with no rows yet answers 200 with an empty array.
 async fn get_history(
     Query(params): Query<HashMap<String, String>>,
     State(app): State<Arc<AppState>>,

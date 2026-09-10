@@ -9,11 +9,16 @@ import { SettingsDialog } from '@/features/SettingsDialog';
 import {
   __resetSettingsForTests,
   getIdleSuspendMinutes,
+  getNotificationPreference,
   getSendOnEnter,
+  getThemePreference,
   IDLE_SUSPEND_MAX_MINUTES,
   IDLE_SUSPEND_MIN_MINUTES,
+  initSettings,
+  readThemeFromStorage,
   setIdleSuspendMinutes,
   setSendOnEnter,
+  setThemePreference,
   subscribeToSettings
 } from '@/lib/settings';
 
@@ -152,5 +157,67 @@ describe('settings persistence', () => {
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     expect(Object.keys(body)).toEqual(['settings']);
     expect(body.settings).toMatchObject({ sendOnEnter: false, idleSuspendMinutes: 30 });
+  });
+});
+
+// ---------- the read half: /state's settings land in the store ----------
+
+describe('settings init', () => {
+  it('every_field_of_the_state_answer_lands_in_the_store', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              sessions: [],
+              closed: [],
+              settings: { theme: 'dark', sendOnEnter: false, idleSuspendMinutes: 30, notifications: 'on' }
+            })
+        })
+      )
+    );
+    await initSettings();
+    expect(getThemePreference()).toBe('dark');
+    expect(readThemeFromStorage(), 'the theme mirror follows').toBe('dark');
+    expect(getSendOnEnter()).toBe(false);
+    expect(getIdleSuspendMinutes()).toBe(30);
+    expect(getNotificationPreference()).toBe('on');
+  });
+
+  it('a_theme_set_while_init_is_in_flight_stays_the_user_s_and_the_write_carries_it', async () => {
+    vi.useFakeTimers();
+    try {
+      let release: (() => void) | null = null;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'PUT') {
+          return { ok: true, json: () => Promise.resolve({}) };
+        }
+        await held;
+        return {
+          ok: true,
+          json: () => Promise.resolve({ settings: { theme: 'light', sendOnEnter: false } })
+        };
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const pending = initSettings();
+      setThemePreference('dark');
+      await vi.advanceTimersByTimeAsync(300); // the debounced write fires
+      release!();
+      await pending;
+      expect(getThemePreference(), 'the user_s choice stands').toBe('dark');
+      expect(readThemeFromStorage()).toBe('dark');
+      expect(getSendOnEnter(), 'the fields the user left alone are the server_s').toBe(false);
+      const put = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT');
+      expect(put).toBeDefined();
+      const body = JSON.parse(String((put![1] as RequestInit).body)) as { settings: { theme: string } };
+      expect(body.settings.theme).toBe('dark');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -15,18 +15,29 @@
 //!   a hostname listed under `hosts` in the transport config. Anything
 //!   else is answered 421. An IP literal cannot be rebound; a name can, so
 //!   names are allowlisted.
-//! - On a WebSocket upgrade and on every request whose method is not `GET`
-//!   or `HEAD`, an `Origin` header must name the host and port the request
-//!   was sent to, or a hostname listed under `hosts` (the public name a
-//!   tunnel or proxy in front of Mezame may have rewritten out of `Host`).
-//!   Anything else is answered 403. A request without `Origin` passes:
-//!   browsers attach one to every request these checks cover, so its
-//!   absence means a non-browser client.
+//! - A WebSocket upgrade and every request whose method is not `GET` or
+//!   `HEAD` (`POST /login` included) must say where it came from. An
+//!   `Origin` header, when present, must name the host and port the
+//!   request was sent to, or a hostname listed under `hosts` (the public
+//!   name a tunnel or proxy in front of Mezame may have rewritten out of
+//!   `Host`); anything else is answered 403. Without `Origin`, the request
+//!   is judged on `Sec-Fetch-Site`: `same-origin` and `none` pass, and
+//!   `same-site`, `cross-site` and anything else are answered 403. A
+//!   request carrying neither header is answered 403: a browser sends one
+//!   of the two on every request this check covers, and a script adds
+//!   `Sec-Fetch-Site: none`.
+//!
+//! The host an `Origin` is compared with is `X-Forwarded-Host` when a proxy
+//! set it, the port dropped so the proxy's own port cannot fail the page it
+//! serves, and otherwise `Host` with its port, so a page on another port of
+//! the same host stays another page.
 //!
 //! A request with no `Host` and no authority in its URI passes the first
-//! check on the same reasoning: a browser sends `Host` always, and hyper
-//! refuses an HTTP/1.1 request without one before this layer runs. Such a
-//! request still fails the second check if it carries an `Origin`.
+//! check: a browser sends `Host` always, and hyper refuses an HTTP/1.1
+//! request without one before this layer runs. Such a request meets the
+//! second check like any other: an `Origin` it carries is compared with an
+//! empty host and refused unless it names a listed hostname, and without
+//! one it is judged on `Sec-Fetch-Site`.
 //!
 //! Reads over plain `GET` carry no `Origin` check. The browser withholds a
 //! cross-origin response on its own, and the `Host` check is what stops the
@@ -294,12 +305,15 @@ pub async fn guard_request(
     if origin_is_checked(&req) {
         // Behind a proxy that rewrites `Host` to the upstream, the public
         // name the browser used is in `X-Forwarded-Host`; that is what the
-        // page's `Origin` will name.
+        // page's `Origin` will name. Its port is dropped and the host alone
+        // is compared: a proxy that writes its own listener's port into the
+        // header would otherwise fail every page it serves. `Host` keeps
+        // its port, so a page on another port of the same host is refused.
         let compared = req
             .headers()
             .get("x-forwarded-host")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(',').next().unwrap_or("").trim().to_string())
+            .map(|v| host_of(v.split(',').next().unwrap_or("")).to_string())
             .filter(|v| !v.is_empty())
             .or(authority);
         if let Some(origin) = req.headers().get(header::ORIGIN) {

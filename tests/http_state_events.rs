@@ -168,22 +168,35 @@ async fn a_tick_reaches_the_streams_of_its_user_and_no_other() {
 }
 
 #[tokio::test]
-async fn a_lagged_receiver_skips_ahead_and_keeps_streaming() {
+async fn a_lagged_receiver_is_sent_one_event_for_the_ticks_it_missed() {
     // Capacity 2 with 8 ticks queued before the first poll drops the
-    // receiver behind, and `recv` reports `Lagged`. The handler swallows it
-    // and delivers the next retained tick. A browser that fell behind
-    // still refetches, which is all the event means.
+    // receiver behind, and `recv` reports `Lagged`. The ring is shared by
+    // every user, so the ticks this stream missed may have been its own
+    // user's, and they are gone; the handler sends one `state_changed` in
+    // their place, and the browser refetches, which is all the event
+    // means. Every tick here is bob's, so the frame alice sees can only
+    // be the one the lag produced: skipping ahead would deliver nothing.
     let state = test_state(2);
     let mut stream = open_stream(state.clone()).await;
-    let alice = user_id(&state, "alice").await;
+    state.login_for_test("bob", "correct horse battery").await;
+    let bob = user_id(&state, "bob").await;
 
     for _ in 0..8 {
         state
             .state_changes
-            .send(alice.clone())
+            .send(bob.clone())
             .expect("receiver attached");
     }
 
+    let frame = next_frame(&mut stream).await;
+    assert!(
+        frame.contains("event: state_changed"),
+        "frame was `{frame}`"
+    );
+
+    // The stream goes on after the lag: alice's own tick is delivered.
+    let alice = user_id(&state, "alice").await;
+    state.state_changes.send(alice).expect("receiver attached");
     let frame = next_frame(&mut stream).await;
     assert!(
         frame.contains("event: state_changed"),

@@ -173,6 +173,40 @@ fn missing_config_reports_and_attempts_setup() {
     );
 }
 
+#[test]
+fn a_start_with_no_config_beside_a_keyless_datastore_refuses_and_writes_nothing() {
+    // Requirement 4 criterion 1: with no config the start would fall into
+    // the setup, and the setup writes a new key and drops every sealed
+    // row. A datastore whose key is gone is refused first, with the line
+    // the served start uses, and nothing under the home changes.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join(".mezame");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("mezame.db");
+    let key_path = dir.join("master.key");
+    std::fs::write(&db_path, b"whatever the datastore holds").unwrap();
+
+    let out = run_with_home(&[], tmp.path());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&key_path.display().to_string()), "{stderr}");
+    assert!(stderr.contains(&db_path.display().to_string()), "{stderr}");
+    assert!(stderr.contains("backup"), "{stderr}");
+    assert!(stderr.contains("mezame init"), "{stderr}");
+    assert_eq!(
+        stderr.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "one line, before the setup is offered: {stderr}"
+    );
+    assert!(!key_path.exists(), "no key is written");
+    assert!(!dir.join("config.json").exists(), "no config is written");
+    assert_eq!(
+        std::fs::read(&db_path).unwrap(),
+        b"whatever the datastore holds",
+        "the datastore is untouched"
+    );
+}
+
 // ---------- phase 2: startup over the datastore ----------
 
 /// Run `init` with `flags` and the admin `alice` under `home`, the

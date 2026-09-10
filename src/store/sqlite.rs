@@ -5,9 +5,10 @@
 //! bounded channel and awaits a one-shot reply. No tokio worker ever holds
 //! the connection, and SQLite's one-writer rule is kept by the one thread.
 //! Each job runs under `catch_unwind`, so a panicking statement answers its
-//! caller with an error and the thread survives; when the store is dropped
-//! the last sender goes, the loop drains what is queued and the connection
-//! closes with it.
+//! caller with an error and the thread survives. Dropping the store closes
+//! the queue and then joins the thread, so the loop runs what is queued
+//! and the connection closes before the drop returns; a job whose caller
+//! stopped waiting for its answer still runs.
 //!
 //! Migrations are numbered SQL files embedded with `include_str!` and
 //! applied forward-only against `PRAGMA user_version`, each inside one
@@ -45,7 +46,11 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
 /// The store over one SQLite database, on its own thread.
 pub struct SqliteStore {
-    jobs: mpsc::Sender<Job>,
+    /// The queue's one sender. `None` only while `Drop` runs, which takes
+    /// it so the thread sees the queue close before the join waits for it.
+    jobs: Option<mpsc::Sender<Job>>,
+    /// The thread, joined by `Drop`.
+    thread: Option<std::thread::JoinHandle<()>>,
     keys: Keys,
     /// The file, or `None` for an in-memory database.
     path: Option<PathBuf>,
@@ -111,7 +116,7 @@ impl SqliteStore {
             .map_err(|e| StoreError::Internal(format!("configuring {at}: {e}")))?;
         migrate_with(&conn, MIGRATIONS, &at)?;
         let (jobs, mut rx) = mpsc::channel::<Job>(QUEUE_CAPACITY);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("mezame-store".to_string())
             .spawn(move || {
                 let mut conn = conn;
@@ -122,7 +127,12 @@ impl SqliteStore {
                 }
             })
             .map_err(|e| StoreError::Internal(format!("spawning the store thread: {e}")))?;
-        Ok(Self { jobs, keys, path })
+        Ok(Self {
+            jobs: Some(jobs),
+            thread: Some(thread),
+            keys,
+            path,
+        })
     }
 
     /// Run `f` on the store thread and await its answer.
@@ -135,7 +145,8 @@ impl SqliteStore {
         let job: Job = Box::new(move |conn| {
             let _ = reply_tx.send(f(conn));
         });
-        self.jobs.send(job).await.map_err(|_| StoreError::Closed)?;
+        let jobs = self.jobs.as_ref().ok_or(StoreError::Closed)?;
+        jobs.send(job).await.map_err(|_| StoreError::Closed)?;
         reply_rx
             .await
             .map_err(|_| StoreError::Internal(format!("{name}: the store thread panicked")))?
@@ -152,6 +163,24 @@ impl SqliteStore {
             job(conn);
             Ok(())
         }))
+    }
+}
+
+/// Close the queue, then wait for the thread to run what is queued and
+/// close the connection. The store holds the only sender, so once it is
+/// gone `blocking_recv` hands out the remaining jobs and then `None`, and
+/// the loop ends. A drop running on the store thread itself would wait for
+/// its own exit, so that one only closes the queue.
+impl Drop for SqliteStore {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        if let Some(thread) = self.thread.take() {
+            if thread.thread().id() != std::thread::current().id() {
+                // The loop catches every job's panic, so this only fails
+                // when the thread is already gone.
+                let _ = thread.join();
+            }
+        }
     }
 }
 
@@ -477,6 +506,19 @@ impl Store for SqliteStore {
             )
             .optional()
             .map_err(sql("password_hash_of"))
+        }))
+    }
+
+    fn login_user(&self, name: &str) -> StoreFuture<'_, Option<(UserRow, String)>> {
+        let name = name.to_string();
+        Box::pin(self.run("login_user", move |conn| {
+            conn.query_row(
+                &format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE name = ?1"),
+                params![name],
+                |row| Ok((user_row(row)?, row.get("password_hash")?)),
+            )
+            .optional()
+            .map_err(sql("login_user"))
         }))
     }
 

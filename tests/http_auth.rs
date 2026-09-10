@@ -3,9 +3,12 @@
 //! endpoints, the sliding renewal, the `Secure` rule, the limiter, and the
 //! guard's `Sec-Fetch-Site` rule.
 
+#[macro_use]
 mod support;
 
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use axum::body::{to_bytes, Body};
@@ -15,17 +18,62 @@ use mezame::auth::{
     LOGIN_LIMIT,
 };
 use mezame::config::{Config, TransportConfig};
+use mezame::conversation::Block;
 use mezame::http::{build_router, AppState, Clock, LOGIN_BODY_LIMIT, LOGIN_REQUIRED};
 use mezame::hub::HubRegistry;
+use mezame::provider::Usage;
 use mezame::store::crypto::{MasterKey, KEY_LEN};
 use mezame::store::sqlite::SqliteStore;
-use mezame::store::{Role, Store, USER_NAME_MAX_CHARS};
+// The row and window types beyond `Role`, `Store` and the name cap are the
+// ones the `forward_store!` expansion below names.
+use mezame::store::{
+    CredentialRow, MessageStats, MessageWindow, NewProfile, ProfileRow, Role, SessionList,
+    SessionRow, Store, StoreError, StoreFuture, UserRow, WorkspaceRow, USER_NAME_MAX_CHARS,
+};
 use serde_json::{json, Value};
 use support::FailingStore;
 use tokio::sync::{broadcast, Notify};
 use tower::ServiceExt;
 
 const NOW: i64 = 1_800_000_000;
+
+/// A Store that records the name of every method called on it and forwards
+/// the call, so a test can say which reads a login performed.
+struct RecordingStore {
+    inner: Arc<dyn Store>,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl RecordingStore {
+    fn new(inner: Arc<dyn Store>) -> Self {
+        Self {
+            inner,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// How many times `method` was called since the last `reset`.
+    fn calls_of(&self, method: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|called| **called == method)
+            .count()
+    }
+
+    fn reset(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
+    fn on_load(&self) {}
+    fn on_title_write(&self) {}
+}
+
+forward_store!(RecordingStore, by method |s: &RecordingStore, method: &'static str| {
+    s.calls.lock().unwrap().push(method);
+    Ok::<(), StoreError>(())
+});
 
 fn config(public_url: Option<&str>) -> Config {
     Config {
@@ -351,12 +399,14 @@ async fn secure_follows_the_forwarded_proto_or_the_public_url_and_never_the_bind
 async fn the_eleventh_attempt_in_a_minute_is_429_with_retry_after() {
     let state = state_at(NOW, None);
     create_alice(&state).await;
+    let started = Instant::now();
     for i in 0..LOGIN_LIMIT {
         let (status, _, _) = send(&state, login_request("alice", "wrong")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {i}");
     }
     let before = verify_calls_for_test();
     let (status, headers, _) = send(&state, login_request("alice", "correct horse battery")).await;
+    let taken = started.elapsed();
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     let retry: u64 = headers
         .get(header::RETRY_AFTER)
@@ -365,7 +415,17 @@ async fn the_eleventh_attempt_in_a_minute_is_429_with_retry_after() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!((1..=60).contains(&retry), "{retry}");
+    // The handler reads `Instant::now()` for the limiter, which this test
+    // cannot set, so the exact value is pinned where the clock is injected
+    // (`tests/auth.rs` and the limiter property) and bounded here: the
+    // seconds left are sixty less the time the eleven requests took,
+    // which is 59 or 60 when the ten verifications finish inside a second
+    // and one less for each further second they take.
+    let ceiling = taken.as_secs() + u64::from(taken.subsec_nanos() > 0);
+    assert!(
+        (60 - ceiling..=60).contains(&retry),
+        "Retry-After {retry} for attempts that took {taken:?}"
+    );
     assert_eq!(
         verify_calls_for_test(),
         before,
@@ -543,6 +603,83 @@ async fn a_name_no_account_can_have_is_refused_without_a_limiter_key_and_the_bod
         1,
         "the refused body reached no handler"
     );
+}
+
+#[tokio::test]
+async fn a_login_reads_the_row_and_its_hash_once_and_stamps_the_epoch_of_that_read() {
+    // A password change replaces the hash and bumps the epoch in one
+    // statement. Read as two, the old hash could verify the old password
+    // while the row already carried the new epoch, and the cookie minted
+    // would outlive the change meant to refuse it. One read is one
+    // snapshot: the hash verified and the epoch stamped are the same row's.
+    let keys = MasterKey::from_bytes_for_test([9u8; KEY_LEN]).keys();
+    let recording = Arc::new(RecordingStore::new(Arc::new(
+        SqliteStore::open_in_memory(keys).unwrap(),
+    )));
+    let state = state_over(NOW, None, recording.clone() as Arc<dyn Store>);
+    let id = create_alice(&state).await;
+    let new_hash = hash_password("a new password").unwrap();
+    state.store.set_password_hash(&id, &new_hash).await.unwrap();
+    recording.reset();
+
+    let (status, headers, _) = send(&state, login_request("alice", "a new password")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recording.calls_of("login_user"), 1, "one read");
+    assert_eq!(recording.calls_of("user_by_name"), 0);
+    assert_eq!(recording.calls_of("password_hash_of"), 0);
+    let value = cookie_value_of(&set_cookie_of(&headers).expect("a cookie"));
+    let cookie = auth::verify(&value, &state.keys.cookie, NOW).expect("a valid cookie");
+    assert_eq!(cookie.user_id, id);
+    assert_eq!(
+        cookie.epoch, 1,
+        "the epoch of the row the verified hash came from"
+    );
+
+    // An unknown name is the same one read, against the dummy hash.
+    recording.reset();
+    let (status, headers, _) = send(&state, login_request("nobody", "a new password")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(set_cookie_of(&headers).is_none());
+    assert_eq!(recording.calls_of("login_user"), 1);
+    assert_eq!(recording.calls_of("user_by_name"), 0);
+    assert_eq!(recording.calls_of("password_hash_of"), 0);
+}
+
+#[tokio::test]
+async fn a_login_carrying_neither_origin_nor_sec_fetch_site_is_refused() {
+    // Requirement 6 criterion 3, `POST /login` included: the login is
+    // public, but it is a write, and a request that says nothing about
+    // where it came from is no browser's. It is refused ahead of the
+    // handler, so the limiter opens no window and no hash is checked.
+    let state = state_at(NOW, None);
+    create_alice(&state).await;
+    let before = verify_calls_for_test();
+    let body = json!({ "username": "alice", "password": "correct horse battery" });
+    let bare = Request::post("/login")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, headers, out) = send(&state, bare).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        String::from_utf8_lossy(&out).contains("Sec-Fetch-Site"),
+        "the body names the way out: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(set_cookie_of(&headers).is_none());
+    assert_eq!(state.limiter.len(), 0, "the request reached no handler");
+    assert_eq!(verify_calls_for_test(), before, "no hash was checked");
+
+    // The same body saying where it came from, either way, logs in.
+    let (status, _, _) = send(&state, post_json("/login", &body)).await;
+    assert_eq!(status, StatusCode::OK, "Sec-Fetch-Site: same-origin");
+    let with_origin = Request::post("/login")
+        .header("origin", "https://mezame.example.com")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let (status, _, _) = send(&state, with_origin).await;
+    assert_eq!(status, StatusCode::OK, "a listed Origin");
 }
 
 #[tokio::test]

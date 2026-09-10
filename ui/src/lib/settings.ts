@@ -74,6 +74,12 @@ let current: Settings = { ...DEFAULTS };
 // `resetSettings` both re-arm it.
 let initInFlight: Promise<void> | null = null;
 
+// The fields set here since the current `initSettings` run began. The
+// run's answer leaves them alone: the user's value is on its way to the
+// server through the debounced write, and the document the answer holds
+// was read before that write landed. Cleared when a run begins.
+let setSinceInit = new Set<keyof Settings>();
+
 const listeners = new Set<() => void>();
 
 const notify = () => {
@@ -99,6 +105,7 @@ export const setNotificationPreference = (next: NotificationPreference): void =>
     return;
   }
   current = { ...current, notifications: next };
+  setSinceInit.add('notifications');
   notify();
   void persist();
 };
@@ -110,6 +117,7 @@ export const setThemePreference = (next: ThemePreference): void => {
     return;
   }
   current = { ...current, theme: next };
+  setSinceInit.add('theme');
   writeThemeToStorage(next);
   notify();
   void persist();
@@ -122,6 +130,7 @@ export const setSendOnEnter = (next: boolean): void => {
     return;
   }
   current = { ...current, sendOnEnter: next };
+  setSinceInit.add('sendOnEnter');
   notify();
   void persist();
 };
@@ -134,6 +143,7 @@ export const setIdleSuspendMinutes = (next: number): void => {
     return;
   }
   current = { ...current, idleSuspendMinutes: clamped };
+  setSinceInit.add('idleSuspendMinutes');
   notify();
   void persist();
 };
@@ -172,6 +182,7 @@ const doInitSettings = async (): Promise<void> => {
   // in-memory snapshot agrees with what `bootTheme` already painted,
   // before the (slower, authoritative) /state read below.
   current = { ...current, theme: readThemeFromStorage() };
+  setSinceInit = new Set();
   try {
     const res = await apiFetch(STATE_URL);
     if (!res.ok) {
@@ -179,29 +190,37 @@ const doInitSettings = async (): Promise<void> => {
     }
     const body = (await res.json()) as { settings?: Partial<Settings> };
     if (body.settings && typeof body.settings === 'object') {
+      // A field the user set while the read was out keeps the user's
+      // value: the server's is older than the write that carries it.
       const pref = body.settings.notifications;
       if (
-        pref === 'unset' ||
-        pref === 'pending' ||
-        pref === 'on' ||
-        pref === 'off'
+        (pref === 'unset' || pref === 'pending' || pref === 'on' || pref === 'off') &&
+        !setSinceInit.has('notifications')
       ) {
         current = { ...current, notifications: pref };
         notify();
       }
       const theme = body.settings.theme;
-      if (isThemePreference(theme) && theme !== current.theme) {
+      if (isThemePreference(theme) && theme !== current.theme && !setSinceInit.has('theme')) {
         current = { ...current, theme };
         writeThemeToStorage(theme);
         notify();
       }
       const sendOnEnter = body.settings.sendOnEnter;
-      if (typeof sendOnEnter === 'boolean' && sendOnEnter !== current.sendOnEnter) {
+      if (
+        typeof sendOnEnter === 'boolean' &&
+        sendOnEnter !== current.sendOnEnter &&
+        !setSinceInit.has('sendOnEnter')
+      ) {
         current = { ...current, sendOnEnter };
         notify();
       }
       const idleMins = body.settings.idleSuspendMinutes;
-      if (typeof idleMins === 'number' && Number.isFinite(idleMins)) {
+      if (
+        typeof idleMins === 'number' &&
+        Number.isFinite(idleMins) &&
+        !setSinceInit.has('idleSuspendMinutes')
+      ) {
         const clamped = clampIdleMinutes(idleMins);
         if (clamped !== current.idleSuspendMinutes) {
           current = { ...current, idleSuspendMinutes: clamped };
@@ -251,6 +270,7 @@ export const resetSettings = (): void => {
   }
   current = { ...DEFAULTS, theme: readThemeFromStorage() };
   initInFlight = null;
+  setSinceInit = new Set();
   notify();
 };
 
@@ -259,6 +279,7 @@ export const resetSettings = (): void => {
 export const __resetSettingsForTests = (): void => {
   current = { ...DEFAULTS };
   initInFlight = null;
+  setSinceInit = new Set();
   if (persistTimer !== null) {
     clearTimeout(persistTimer);
     persistTimer = null;

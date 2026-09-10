@@ -157,6 +157,36 @@ fn the_last_mac_character_verifies_in_one_spelling_only() {
 }
 
 #[test]
+fn the_expiry_and_the_epoch_verify_in_one_spelling_only() {
+    // The integer parsers take a leading plus sign and leading zeros, and
+    // the MAC is recomputed over the parsed numbers, so without a check on
+    // the spelling every one of these strings would carry the genuine MAC.
+    // Exactly one string verifies for a given key and payload.
+    let key = key();
+    let now = 1_700_000_000;
+    let cookie = Cookie::issue(USER, 3, now);
+    let value = sign(&cookie, &key);
+    assert_eq!(verify(&value, &key, now), Some(cookie.clone()));
+    let parts: Vec<&str> = value.split('.').collect();
+    let [user, expiry, epoch, mac] = parts.as_slice() else {
+        panic!("four parts: {value}");
+    };
+    for (spelled_expiry, spelled_epoch) in [
+        (format!("+{expiry}"), epoch.to_string()),
+        (format!("0{expiry}"), epoch.to_string()),
+        (expiry.to_string(), format!("+{epoch}")),
+        (expiry.to_string(), format!("0{epoch}")),
+        (format!("00{expiry}"), format!("+0{epoch}")),
+    ] {
+        let altered = format!("{user}.{spelled_expiry}.{spelled_epoch}.{mac}");
+        assert_ne!(altered, value);
+        assert_eq!(verify(&altered, &key, now), None, "{altered}");
+    }
+    // The genuine spelling still verifies after the others were refused.
+    assert_eq!(verify(&value, &key, now), Some(cookie));
+}
+
+#[test]
 fn renewal_is_due_under_thirty_days() {
     let now = 1_700_000_000;
     let cookie = Cookie::issue(USER, 0, now);
@@ -204,11 +234,22 @@ fn the_limiter_admits_ten_then_refuses_until_the_window_turns() {
     for i in 0..LOGIN_LIMIT {
         assert!(limiter.check("u:alice", start).is_ok(), "attempt {i}");
     }
+    // The eleventh attempt, ten seconds into a sixty-second window, is
+    // told the fifty seconds left in it: the value, not a bound on it.
     let left = limiter
         .check("u:alice", start + Duration::from_secs(10))
         .unwrap_err();
-    assert!(left <= LOGIN_WINDOW - Duration::from_secs(10), "{left:?}");
-    assert!(left >= Duration::from_secs(1));
+    assert_eq!(left, Duration::from_secs(50));
+    // Later in the same window, less is left; in its last moments the wait
+    // is floored at one second so the header never reads zero.
+    let left = limiter
+        .check("u:alice", start + Duration::from_secs(59))
+        .unwrap_err();
+    assert_eq!(left, Duration::from_secs(1));
+    let left = limiter
+        .check("u:alice", start + Duration::from_millis(59_500))
+        .unwrap_err();
+    assert_eq!(left, Duration::from_secs(1));
     // Another name is another bucket.
     assert!(limiter.check("u:bob", start).is_ok());
     // The window turns and the count starts over.

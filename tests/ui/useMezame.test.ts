@@ -992,4 +992,293 @@ describe('the session list is the server_s', () => {
     expect(ids()).toEqual(['aaa1']);
     expect(requests.some((r) => r.method === 'GET' && r.url === '/state')).toBe(true);
   });
+
+  it('a_socket_that_drops_before_its_first_ready_is_not_reopened_without_an_id_and_the_list_is_fetched', async () => {
+    // A reconnect with no `session` parameter would mint a second row.
+    // The tab goes and `/state` is fetched instead; the row the mint
+    // created comes back once, as a tab with its id.
+    vi.useFakeTimers();
+    try {
+      await mezameActions.init(); // the empty list mints one pending tab
+      const pending = FakeSocket.instances.at(-1)!;
+      expect(pending.url.endsWith('/ws')).toBe(true);
+      requests = [];
+      const opened = FakeSocket.instances.length;
+      // The mint landed before the socket dropped: the server holds the row.
+      stateDoc = { sessions: [{ id: 'mint1', title: null }], closed: [] };
+      pending.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(31_000); // past the longest back-off
+      const mints = FakeSocket.instances.slice(opened).filter((w) => w.url.endsWith('/ws'));
+      expect(mints, 'no second socket without a session parameter').toHaveLength(0);
+      expect(requests.some((r) => r.method === 'GET' && r.url === '/state')).toBe(true);
+      expect(ids()).toEqual(['mint1']);
+      expect(socketFor('mint1')).toHaveLength(1);
+      // The dropped tab was the active one; the row that stands for it
+      // takes its place, so the composer is not left disabled.
+      expect(__testState().activeId, 'the active pointer follows the row').toBe('mint1');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a_saved_active_tab_is_restored_over_the_list_s_first', async () => {
+    localStorage.setItem('mezame.activeSession', 'aaa1');
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'bbb2', title: 'Beta' }], closed: [] };
+    await mezameActions.init();
+    expect(ids()).toEqual(['bbb2', 'aaa1']);
+    expect(__testState().activeId).toBe('aaa1');
+    expect(localStorage.getItem('mezame.activeSession')).toBe('aaa1');
+  });
+
+  it('a_tab_closed_before_its_first_ready_archives_its_row_once_the_id_arrives_and_no_document_puts_it_back', async () => {
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    await mezameActions.init();
+    mezameActions.newSession();
+    const pending = FakeSocket.instances.at(-1)!;
+    expect(pending.url.endsWith('/ws')).toBe(true);
+    const placeholder = ids()[0];
+    // The archive's answer is held back, so the documents requested
+    // while it is out can be told from the one requested after it landed.
+    const base = fetch;
+    let release: (() => void) | null = null;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const res = await base(input, init);
+        if (init?.method === 'PATCH') {
+          await held;
+        }
+        return res;
+      })
+    );
+    requests = [];
+    mezameActions.closeSession(placeholder);
+    expect(ids()).toEqual(['aaa1']);
+    expect(pending.closeCalls, 'the socket waits for the id').toBe(0);
+    expect(requests.filter((r) => r.method === 'PATCH')).toHaveLength(0);
+    // The mint's row and its tick land before the socket's ready.
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'mint1', title: null }], closed: [] };
+    await tick();
+    expect(ids(), 'the closing tab_s row gets no tab of its own').toEqual(['aaa1']);
+    pending.ready('mint1');
+    await flush();
+    expect(requests).toContainEqual({
+      url: '/sessions/mint1',
+      method: 'PATCH',
+      body: { archived: true }
+    });
+    expect(pending.closeCalls).toBeGreaterThan(0);
+    expect(__testState().closed).toEqual([expect.objectContaining({ id: 'mint1' })]);
+    // While the archive is out, a document read before the mint lists
+    // no such row, and one read before the archive lists it active.
+    // Neither gives it a tab: the first is no confirmation, the second
+    // is older than the archive.
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    await tick();
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'mint1', title: null }], closed: [] };
+    await tick();
+    expect(ids(), 'a document requested before the archive landed does not put the row back').toEqual(['aaa1']);
+    expect(socketFor('mint1')).toHaveLength(0);
+    release!();
+    await flush();
+    // The archive's own tick confirms it.
+    stateDoc = {
+      sessions: [{ id: 'aaa1', title: 'Alpha' }],
+      closed: [{ id: 'mint1', title: null, closedAt: 9 }]
+    };
+    await tick();
+    expect(ids()).toEqual(['aaa1']);
+    expect(__testState().closed).toEqual([{ id: 'mint1', label: 'New session', closedAt: 9 }]);
+  });
+
+  it('a_row_archived_here_and_restored_elsewhere_gets_its_tab_back_from_the_first_document_requested_after_the_archive_landed', async () => {
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }, { id: 'bbb2', title: 'Beta' }], closed: [] };
+    await mezameActions.init();
+    mezameActions.closeSession('bbb2');
+    await flush(); // the archive's 204 has landed; its tick never reaches this browser
+    expect(ids()).toEqual(['aaa1']);
+    expect(__testState().closed).toEqual([expect.objectContaining({ id: 'bbb2' })]);
+    // Another device restores the row. The next document requested here
+    // lists it active again and was read after the archive committed,
+    // so it is believed: the row gets its tab back and a socket.
+    await tick();
+    expect(ids(), 'the restored row gets its tab back').toEqual(['bbb2', 'aaa1']);
+    expect(socketFor('bbb2').filter((w) => w.closeCalls === 0)).toHaveLength(1);
+    expect(__testState().closed).toEqual([]);
+  });
+
+  it('a_refetch_answered_after_a_newer_one_was_applied_is_dropped', async () => {
+    stateDoc = { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] };
+    await mezameActions.init();
+    // Two refetches go out; the first was read before a rename landed,
+    // the second after it. Their answers arrive in the reverse order.
+    const docs: unknown[] = [
+      { sessions: [{ id: 'aaa1', title: 'Alpha' }], closed: [] },
+      { sessions: [{ id: 'aaa1', title: 'Renamed' }], closed: [] }
+    ];
+    const holds: Array<() => void> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).startsWith('/state')) {
+          const doc = docs.shift();
+          await new Promise<void>((resolve) => holds.push(resolve));
+          return jsonResponse(doc);
+        }
+        return jsonResponse({});
+      })
+    );
+    const es = FakeEventSource.instances.at(-1)!;
+    es.emit('state_changed');
+    es.emit('state_changed');
+    expect(holds).toHaveLength(2);
+    holds[1]();
+    await flush();
+    expect(labels()).toEqual(['Renamed']);
+    holds[0]();
+    await flush();
+    expect(labels(), 'the older answer is dropped').toEqual(['Renamed']);
+  });
+
+  it('a_restore_whose_tab_a_refetch_removed_while_the_request_was_out_opens_no_socket', async () => {
+    stateDoc = {
+      sessions: [{ id: 'aaa1', title: 'Alpha' }],
+      closed: [{ id: 'ccc3', title: 'Gone', closedAt: 5 }]
+    };
+    await mezameActions.init();
+    const base = fetch;
+    let release: (() => void) | null = null;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'PATCH') {
+          await held;
+          return new Response(null, { status: 204 });
+        }
+        return base(input, init);
+      })
+    );
+    mezameActions.restoreFromHistory('ccc3');
+    expect(ids()).toEqual(['ccc3', 'aaa1']);
+    // A document read before the restore landed still lists the row as
+    // closed, and its application removes the optimistic tab.
+    await tick();
+    expect(ids()).toEqual(['aaa1']);
+    requests = [];
+    release!();
+    await flush();
+    expect(socketFor('ccc3'), 'no socket for a tab that is in no list').toHaveLength(0);
+    expect(requests.some((r) => r.method === 'GET' && r.url === '/state')).toBe(true);
+  });
+
+  it('a_first_visit_tab_that_drops_before_its_first_ready_with_no_row_behind_it_is_minted_again', async () => {
+    // The mint never reached the server (it restarted during the
+    // handshake, or a proxy refused the upgrade): the refetch lists
+    // nothing, and the user would be left with no tab and the composer
+    // disabled until `+`. One session is minted in the dropped tab's
+    // place, and it is the active one.
+    vi.useFakeTimers();
+    try {
+      await mezameActions.init(); // the empty list mints one pending tab
+      const pending = FakeSocket.instances.at(-1)!;
+      expect(pending.url.endsWith('/ws')).toBe(true);
+      const opened = FakeSocket.instances.length;
+      requests = [];
+      pending.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(31_000); // past the longest back-off
+      expect(requests.some((r) => r.method === 'GET' && r.url === '/state')).toBe(true);
+      const after = FakeSocket.instances.slice(opened);
+      expect(after.map((w) => w.url.endsWith('/ws')), 'one new socket, without a session parameter').toEqual([true]);
+      expect(__testState().sessions.map((s) => s.sessionId), 'one pending tab').toEqual([null]);
+      expect(__testState().activeId, 'the minted tab is the active one').toBe(ids()[0]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a_recovery_mint_that_drops_before_its_first_ready_is_not_minted_again', async () => {
+    // A proxy that refuses every upgrade: the original mint and the one
+    // made in its place both drop. No third socket is opened, and the
+    // list is left empty rather than minting without end.
+    vi.useFakeTimers();
+    try {
+      await mezameActions.init();
+      FakeSocket.instances.at(-1)!.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(31_000);
+      const recovery = FakeSocket.instances.at(-1)!;
+      expect(FakeSocket.instances).toHaveLength(2);
+      expect(recovery.url.endsWith('/ws')).toBe(true);
+      requests = [];
+      recovery.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(requests.some((r) => r.method === 'GET' && r.url === '/state'), 'the list is still fetched').toBe(true);
+      expect(FakeSocket.instances, 'no third socket').toHaveLength(2);
+      expect(ids()).toEqual([]);
+      expect(__testState().activeId).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a_ready_answers_the_want_a_pre_ready_drop_left_and_a_later_drop_raises_it_again', async () => {
+    // The want lives from a pending tab's drop to the next applied
+    // document or `ready`, whichever comes first, and a later drop
+    // raises it anew: the bound is per drop, not per page load.
+    vi.useFakeTimers();
+    try {
+      await mezameActions.init();
+      FakeSocket.instances.at(-1)!.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(31_000);
+      const recovery = FakeSocket.instances.at(-1)!;
+      expect(FakeSocket.instances).toHaveLength(2);
+      // A second tab is opened while the recovery mint is still pending,
+      // and its socket drops before its `ready`. The drop's refetch is
+      // held so the recovery mint's `ready` lands first.
+      mezameActions.newSession();
+      const second = FakeSocket.instances.at(-1)!;
+      expect(FakeSocket.instances).toHaveLength(3);
+      const base = fetch;
+      let release: (() => void) | null = null;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).startsWith('/state')) {
+            await held;
+          }
+          return base(input, init);
+        })
+      );
+      second.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ids()).toHaveLength(1);
+      recovery.ready('rec1');
+      expect(ids()).toEqual(['rec1']);
+      // The document lists nothing: the row went elsewhere, and its tab
+      // goes with it. The `ready` answered the want, so nothing is minted
+      // and the list is empty.
+      release!();
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(FakeSocket.instances, 'no mint: a ready arrived since the drop').toHaveLength(3);
+      expect(ids()).toEqual([]);
+      // A third tab's drop is a new want, and it is answered by a mint.
+      mezameActions.newSession();
+      expect(FakeSocket.instances).toHaveLength(4);
+      FakeSocket.instances.at(-1)!.onclose?.({ code: 1006 });
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(FakeSocket.instances, 'a later drop mints again').toHaveLength(5);
+      expect(FakeSocket.instances.at(-1)!.url.endsWith('/ws')).toBe(true);
+      expect(__testState().sessions.map((s) => s.sessionId)).toEqual([null]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

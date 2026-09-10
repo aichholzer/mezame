@@ -4,8 +4,11 @@
 //! open the provider's stream, apply its events to an accumulator while
 //! forwarding text as `append` frames and reasoning as `thought` frames,
 //! then persist what the stream produced and resolve. The loop owns the
-//! two stores, the conversation the next request is built from and the
-//! transcript `GET /history` serves, and writes them together.
+//! conversation the next request is built from, with the transcript
+//! recorded beside it, and writes the store's rows after each transition.
+//! A persisting deployment serves `GET /history` from those rows, rebuilt
+//! through `Conversation::restore`; the transcript held here answers
+//! `Backend::history`, which the route reads only in the echo fallback.
 //!
 //! Sessions must not brick. Every way a turn can end resolves it: a stream
 //! that stalls is cut after [`IDLE_TIMEOUT`], a cancel interrupts the
@@ -323,13 +326,19 @@ impl LoopBackend {
                 timestamp,
             )
         };
+        //    A user row that could not be written holds back the turn's
+        //    reply, see `persist`.
+        let mut user_written = true;
         if let (Some(store), Some(user_blocks)) = (&self.store, user_blocks) {
             match store
                 .append_user(&self.session_id, &user_blocks, &text, timestamp)
                 .await
             {
                 Ok(id) => lock(&self.state).conversation.set_user_row(id),
-                Err(e) => self.store_failure("append_user", &e),
+                Err(e) => {
+                    user_written = false;
+                    self.store_failure("append_user", &e);
+                }
             }
         }
 
@@ -352,7 +361,9 @@ impl LoopBackend {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    return self.resolve(Ended::Cancelled, accumulator, &events, &model, started).await;
+                    return self
+                        .resolve(Ended::Cancelled, accumulator, &events, &model, started, user_written)
+                        .await;
                 }
                 opened = self.provider.stream(attempt) => match opened {
                     Ok(stream) => break stream,
@@ -373,7 +384,14 @@ impl LoopBackend {
                     }
                     Err(error) => {
                         return self
-                            .resolve(Ended::BeforeStream(error), accumulator, &events, &model, started)
+                            .resolve(
+                                Ended::BeforeStream(error),
+                                accumulator,
+                                &events,
+                                &model,
+                                started,
+                                user_written,
+                            )
                             .await;
                     }
                 }
@@ -401,7 +419,7 @@ impl LoopBackend {
         drop(stream);
 
         // 5. Record, write and resolve.
-        self.resolve(ended, accumulator, &events, &model, started)
+        self.resolve(ended, accumulator, &events, &model, started, user_written)
             .await
     }
 }
@@ -441,6 +459,7 @@ impl LoopBackend {
     /// resolve. The record and the log line are synchronous under the
     /// lock; the writes follow with the lock released and the turn still
     /// open, so a browser learns of `prompt_done` after the rows exist.
+    /// `user_written` says whether the turn's user row landed.
     async fn resolve(
         &self,
         ended: Ended,
@@ -448,9 +467,10 @@ impl LoopBackend {
         events: &mpsc::UnboundedSender<Value>,
         model: &str,
         started: Instant,
+        user_written: bool,
     ) -> Result<TurnOutcome> {
         let (outcome, writes) = self.finish(ended, accumulator, events, model, started);
-        self.persist(writes).await;
+        self.persist(writes, user_written).await;
         // A hub torn down while this turn ran (an archive, a delete, the
         // grace timer) left the conversation to us so the reply could be
         // recorded and written; it is ours to clear now.
@@ -591,12 +611,27 @@ impl LoopBackend {
     /// A failure is counted, reported once per session, and otherwise
     /// ignored: the conversation in memory is the one the session runs
     /// on.
-    async fn persist(&self, writes: Vec<StoreWrite>) {
+    ///
+    /// A turn whose user row was not written holds its reply back and
+    /// counts it as a failed write. A rebuild pairs the rows by position,
+    /// a user row with the assistant row after it, so a reply whose
+    /// question is missing would be read as the answer to the question
+    /// before it; held back, that question stays with no reply, which is
+    /// what the rows say. A rejection's flags go through regardless: with
+    /// no row of its own, the turn's ids name only the earlier unanswered
+    /// rows the refused request merged in, which exist, and left unflagged
+    /// they would be replayed as questions after a rebuild.
+    async fn persist(&self, writes: Vec<StoreWrite>, user_written: bool) {
         let Some(store) = &self.store else {
             return;
         };
         for write in writes {
             match write {
+                StoreWrite::Assistant { .. } if !user_written => {
+                    // The user row's failure wrote the session's line, so
+                    // the held-back reply is counted and not reported.
+                    self.store_failures.fetch_add(1, Ordering::SeqCst);
+                }
                 StoreWrite::Assistant {
                     blocks,
                     usage,

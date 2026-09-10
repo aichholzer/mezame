@@ -201,6 +201,28 @@ async fn connect_as(
     }
 }
 
+/// A logged-in handshake attempt that says nothing about where it came
+/// from: no `Origin` and no `Sec-Fetch-Site`, which is what tungstenite
+/// sends on its own. The socket, or the HTTP status the server refused
+/// the handshake with.
+async fn connect_saying_nothing(server: &Server, path: &str) -> Result<Socket, u16> {
+    use tokio_tungstenite::tungstenite::http::header::COOKIE;
+    let cookie = cookie_for(server).await;
+    let url = format!("ws://{}{path}", server.addr);
+    let mut request = url.into_client_request().expect("a client request");
+    request
+        .headers_mut()
+        .insert(COOKIE, cookie.parse().expect("a header value"));
+    match timeout(Duration::from_secs(5), connect_async(request))
+        .await
+        .expect("the attempt settles within 5s")
+    {
+        Ok((socket, _response)) => Ok(socket),
+        Err(WsError::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("expected a socket or an HTTP refusal, got {other:?}"),
+    }
+}
+
 /// The next text frame on `socket` as JSON, within five seconds.
 async fn next_text(socket: &mut Socket) -> Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -461,6 +483,39 @@ async fn next_close(socket: &mut Socket) -> (u16, String) {
         }
     }
     panic!("no close frame arrived");
+}
+
+#[tokio::test]
+async fn an_upgrade_carrying_neither_origin_nor_sec_fetch_site_is_refused_403() {
+    // Phase 2 Requirement 6 criterion 3 over a real socket: a handshake
+    // that says nothing about where it came from is no browser's, and is
+    // refused with a status ahead of the handshake and the login layer
+    // alike. The cookie is valid, so the refusal is the guard's; the same
+    // handshake with the script's marker completes.
+    let server = serve().await;
+    let refused = connect_saying_nothing(&server, "/ws")
+        .await
+        .expect_err("refused ahead of the handshake");
+    assert_eq!(refused, 403);
+    let alice = user_id(&server, "alice").await;
+    let rows = server.state.store.list_sessions(&alice).await.unwrap();
+    assert!(
+        rows.active.is_empty(),
+        "no session was minted for the refused upgrade"
+    );
+
+    let cookie = cookie_for(&server).await;
+    let sec_fetch_site: tokio_tungstenite::tungstenite::http::HeaderName =
+        "sec-fetch-site".parse().unwrap();
+    let mut socket = connect_as(
+        &server,
+        "/ws",
+        Some(&cookie),
+        Some((sec_fetch_site, "none")),
+    )
+    .await
+    .expect("the marked handshake is accepted");
+    assert_eq!(next_text(&mut socket).await["type"], "ready");
 }
 
 #[tokio::test]

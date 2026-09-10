@@ -147,6 +147,15 @@ async fn turn(backend: &LoopBackend, blocks: Vec<Value>) -> anyhow::Result<TurnO
     backend.prompt(blocks, tx).await
 }
 
+/// Wait until `provider` has received `count` requests.
+async fn wait_for_requests(provider: &ScriptedProvider, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while provider.request_count() < count && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(provider.request_count(), count, "the request arrived");
+}
+
 fn entry_texts(entries: &[HistoryEntry]) -> Vec<String> {
     entries
         .iter()
@@ -488,6 +497,192 @@ async fn a_failing_store_is_reported_once_and_every_turn_still_resolves() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].text.as_deref(), Some("c"));
     assert_eq!(rows[1].blocks, vec![text_block("three")]);
+}
+
+#[tokio::test]
+async fn a_turn_whose_question_was_not_written_writes_no_reply_so_a_rebuild_pairs_nothing_wrongly()
+{
+    // A rebuild pairs the rows by position. Were turn one's reply and turn
+    // two's question both lost, the rows would read [question one, reply
+    // two] and the rebuild would answer question one with reply two. So a
+    // turn whose user row was not written holds its reply back, counted
+    // as a failed write, and the rows read as a question with no reply
+    // followed by the next turn's pair.
+    let inner = memory_store();
+    seed(inner.as_ref(), "alice", "s1").await;
+    let failing = Arc::new(FailingStore::new(inner.clone()));
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        ScriptedStream::Pending { first: vec![] },
+        ScriptedStream::Pending { first: vec![] },
+        plain_reply("three"),
+    ]));
+    let backend = Arc::new(backend(
+        &provider,
+        Some(failing.clone() as Arc<dyn Store>),
+        "s1",
+    ));
+    let spawn_turn = |prompt: &'static str| {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move { turn(&backend, text(prompt)).await })
+    };
+    let reply = |text: &str| {
+        vec![
+            TurnEvent::TextDelta(text.into()),
+            end_turn(),
+            TurnEvent::Usage(usage()),
+        ]
+    };
+
+    // Turn one: the question lands, the store fails before the reply.
+    let first = spawn_turn("a");
+    wait_for_requests(&provider, 1).await;
+    failing.fail();
+    provider.release_stream(reply("one"));
+    assert!(first.await.unwrap().is_ok());
+    assert_eq!(backend.store_failures_for_test(), 1, "the reply");
+
+    // Turn two: the question is lost, the store answers again before the
+    // reply arrives.
+    let second = spawn_turn("b");
+    wait_for_requests(&provider, 2).await;
+    failing.recover();
+    provider.release_stream(reply("two"));
+    assert!(second.await.unwrap().is_ok());
+    assert_eq!(
+        backend.store_failures_for_test(),
+        3,
+        "the question, and the reply held back"
+    );
+
+    // Turn three: both rows land.
+    assert!(turn(&backend, text("c")).await.is_ok());
+    assert_eq!(backend.store_failures_for_test(), 3);
+    assert_eq!(
+        entry_texts(&backend.history().await),
+        vec![
+            "user:a",
+            "agent:one",
+            "user:b",
+            "agent:two",
+            "user:c",
+            "agent:three"
+        ],
+        "the session in memory holds every exchange"
+    );
+
+    let written = rows(inner.as_ref(), "s1").await;
+    let shape: Vec<(MessageRole, Option<&str>)> = written
+        .iter()
+        .map(|row| (row.role, row.text.as_deref()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (MessageRole::User, Some("a")),
+            (MessageRole::User, Some("c")),
+            (MessageRole::Assistant, None),
+        ],
+        "no reply row without its question"
+    );
+
+    let mut rebuilt = Conversation::new();
+    rebuilt.restore(inner.load_window("s1", 1_000, 1 << 24).await.unwrap());
+    assert_eq!(
+        entry_texts(&rebuilt.history()),
+        vec!["user:a", "user:c", "agent:three"]
+    );
+    let exchanges: Vec<_> = rebuilt.exchanges().collect();
+    assert_eq!(exchanges.len(), 2);
+    assert_eq!(exchanges[0].status, ExchangeStatus::Closed);
+    assert!(exchanges[0].assistant.is_none(), "question a has no reply");
+    assert_eq!(
+        exchanges[1].assistant.as_ref().map(|m| m.blocks.clone()),
+        Some(vec![text_block("three")]),
+        "question c has its own reply"
+    );
+}
+
+#[tokio::test]
+async fn a_rejection_on_a_turn_whose_question_was_not_written_still_flags_the_earlier_rows() {
+    // The refused request merged question one, unanswered, into the
+    // question whose row was lost. The flag names only rows that exist,
+    // so it goes through even though the turn's reply is held back:
+    // left unflagged, question one would be replayed after a rebuild.
+    let inner = memory_store();
+    seed(inner.as_ref(), "alice", "s1").await;
+    let failing = Arc::new(FailingStore::new(inner.clone()));
+    let provider = Arc::new(ScriptedProvider::with_streams(vec![
+        ScriptedStream::BeforeStream {
+            retryable: false,
+            rejected: false,
+            message: "no credentials".into(),
+        },
+        ScriptedStream::PendingSend,
+        plain_reply("three"),
+    ]));
+    let backend = Arc::new(backend(
+        &provider,
+        Some(failing.clone() as Arc<dyn Store>),
+        "s1",
+    ));
+
+    // Turn one: the question lands, the request fails before any output.
+    assert!(turn(&backend, text("a")).await.is_err());
+    assert_eq!(backend.store_failures_for_test(), 0);
+
+    // Turn two: the question is lost; the store answers again before the
+    // service refuses the request.
+    failing.fail();
+    let second = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move { turn(&backend, text("b")).await })
+    };
+    wait_for_requests(&provider, 2).await;
+    failing.recover();
+    provider.release_send(ScriptedStream::BeforeStream {
+        retryable: false,
+        rejected: true,
+        message: "refused".into(),
+    });
+    assert!(second.await.unwrap().is_err());
+    assert_eq!(backend.store_failures_for_test(), 1, "the question alone");
+
+    let written = rows(inner.as_ref(), "s1").await;
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].text.as_deref(), Some("a"));
+    assert!(written[0].rejected, "question one is flagged");
+
+    // Turn three carries neither question, and both its rows land.
+    assert!(turn(&backend, text("c")).await.is_ok());
+    let request = &provider.requests()[2];
+    assert_eq!(request.roles, vec![Role::User]);
+    assert_eq!(request.messages[0].text(), "c");
+    assert_eq!(backend.store_failures_for_test(), 1);
+
+    let mut rebuilt = Conversation::new();
+    rebuilt.restore(inner.load_window("s1", 1_000, 1 << 24).await.unwrap());
+    let exchanges: Vec<_> = rebuilt.exchanges().collect();
+    assert_eq!(exchanges.len(), 2);
+    assert_eq!(exchanges[0].status, ExchangeStatus::Rejected);
+    assert_eq!(exchanges[0].user.text(), "a");
+    assert_eq!(exchanges[1].status, ExchangeStatus::Closed);
+    assert_eq!(
+        exchanges[1].assistant.as_ref().map(|m| m.blocks.clone()),
+        Some(vec![text_block("three")])
+    );
+    assert_eq!(
+        entry_texts(&rebuilt.history()),
+        vec!["user:a", "user:c", "agent:three"]
+    );
+    assert_eq!(
+        rebuilt
+            .messages()
+            .iter()
+            .map(|m| m.text())
+            .collect::<Vec<_>>(),
+        vec!["c", "three"],
+        "the rejected question leaves every later request"
+    );
 }
 
 // ---------- the rebuild ----------

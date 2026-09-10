@@ -494,6 +494,123 @@ fn init_with_admin_but_without_password_stdin_is_refused_naming_both_flags() {
 }
 
 #[test]
+fn init_with_password_stdin_but_without_admin_is_refused_naming_both_flags() {
+    // The reverse of the case above. The flag used to be consumed with
+    // nothing said, so a script could believe the password had been read;
+    // now it is refused before anything is created, whether or not the
+    // datastore holds an admin.
+    let tmp = TempDir::new().unwrap();
+    let out = run_with_home(
+        &[
+            "init",
+            "--password-stdin",
+            "--model",
+            "anthropic.claude-sonnet-5",
+        ],
+        tmp.path(),
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("`--password-stdin`"), "{err}");
+    assert!(err.contains("`--admin`"), "{err}");
+    assert!(
+        !tmp.path().join(".mezame").exists(),
+        "nothing is created: {err}"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let first = run_with_stdin(
+        &["init", "--admin", "alice", "--password-stdin"],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert_success(&first);
+    let out = run_with_home(&["init", "--password-stdin"], tmp.path());
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(stderr(&out).contains("`--admin`"), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("Wrote"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_carried_forward_value_the_loader_refuses_stops_init_before_the_datastore_is_written() {
+    // A version 2 file with a padded `models` entry parses, so `init`
+    // starts from it and carries the entry forward, and the loader refuses
+    // it. The run fails on that line before any row is written: no admin
+    // is created, an existing credential keeps its id and payload, and the
+    // file is left as it was for the hand edit the line asks for.
+    const PADDED: &str = r#"{"version":2,"transports":[{"kind":"cloudflared","bind":"127.0.0.1:9510"}],"models":[" padded "]}"#;
+    let tmp = home_with(PADDED);
+    let out = run_with_stdin(
+        &[
+            "init",
+            "--admin",
+            "alice",
+            "--password-stdin",
+            "--model",
+            "anthropic.claude-sonnet-5",
+        ],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("`models` entry ` padded ` has leading or trailing whitespace"),
+        "{err}"
+    );
+    let rows = bedrock_rows(tmp.path());
+    assert!(
+        rows.users.is_empty(),
+        "no admin was created: {:?}",
+        rows.users
+    );
+    assert!(rows.credentials.is_empty(), "no credential was written");
+    assert!(rows.model.is_none(), "no profile was written");
+    assert_eq!(
+        std::fs::read_to_string(config_at(tmp.path())).unwrap(),
+        PADDED,
+        "the file is left as it was"
+    );
+
+    // With rows in place, the same file stops a re-run before the
+    // credential is replaced.
+    let tmp = TempDir::new().unwrap();
+    let first = run_with_stdin(
+        &[
+            "init",
+            "--admin",
+            "alice",
+            "--password-stdin",
+            "--model",
+            "anthropic.claude-sonnet-5",
+            "--region",
+            "us-east-1",
+        ],
+        tmp.path(),
+        PASSWORD,
+    );
+    assert_success(&first);
+    let before = bedrock_rows(tmp.path());
+    assert_eq!(before.credentials.len(), 1);
+    std::fs::write(config_at(tmp.path()), PADDED).unwrap();
+    let out = run_with_home(&["init", "--profile", "new-profile"], tmp.path());
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(stderr(&out).contains("` padded `"), "{}", stderr(&out));
+    let after = bedrock_rows(tmp.path());
+    assert_eq!(
+        after.credentials, before.credentials,
+        "the credential row keeps its id"
+    );
+    assert_eq!(after.payload, before.payload, "and its payload");
+    assert_eq!(after.users, before.users);
+    assert_eq!(after.model, before.model);
+    assert_eq!(
+        std::fs::read_to_string(config_at(tmp.path())).unwrap(),
+        PADDED
+    );
+}
+
+#[test]
 fn init_with_password_stdin_and_an_empty_first_line_is_refused() {
     let tmp = TempDir::new().unwrap();
     let out = run_with_stdin(
@@ -1002,11 +1119,16 @@ fn init_beside_a_datastore_with_no_key_drops_its_credentials_and_says_how_many()
 
 #[test]
 fn a_datastore_holding_only_plain_users_still_gets_its_admin_from_init() {
-    // `mezame user add` runs before any `init` and creates the datastore
-    // itself. The admin question is settled by an admin row, not by any
-    // user row, so `--admin` still creates one here and the credential has
-    // an owner to be granted to.
+    // An `init` that names no admin leaves the datastore with no user, and
+    // `mezame user add` can then fill it with plain users. The admin
+    // question is settled by an admin row, not by any user row, so
+    // `--admin` still creates one here and the credential has an owner to
+    // be granted to.
     let tmp = TempDir::new().unwrap();
+    assert_success(&run_with_home(
+        &["init", "--bind", "127.0.0.1:9510"],
+        tmp.path(),
+    ));
     let out = run_with_stdin(
         &["user", "add", "bob", "--password-stdin"],
         tmp.path(),
@@ -1060,6 +1182,10 @@ fn a_datastore_holding_only_plain_users_still_gets_its_admin_from_init() {
 
     // Without one, `--model` alone names both ways to get an admin.
     let tmp = TempDir::new().unwrap();
+    assert_success(&run_with_home(
+        &["init", "--bind", "127.0.0.1:9510"],
+        tmp.path(),
+    ));
     let out = run_with_stdin(
         &["user", "add", "bob", "--password-stdin"],
         tmp.path(),

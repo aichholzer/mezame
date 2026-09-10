@@ -6,6 +6,7 @@
 //! process-wide lock; the binary case spawns `mezame` with its own `HOME`.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use mezame::config::{
@@ -85,25 +86,35 @@ fn a_file_of_another_or_no_version_is_refused_with_the_pointer_line() {
 }
 
 #[test]
-fn the_binary_exits_with_one_pointer_line_on_a_versionless_file() {
-    let tmp = TempDir::new().unwrap();
-    let dir = tmp.path().join(".mezame");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("config.json"), format!("{{{TRANSPORT}}}")).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mezame"))
-        .env("HOME", tmp.path())
-        .output()
-        .expect("spawn mezame");
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("version none"), "{stderr}");
-    assert!(stderr.contains("`mezame init`"), "{stderr}");
-    assert!(!stderr.contains("missing field"), "{stderr}");
-    assert_eq!(
-        stderr.lines().filter(|l| !l.trim().is_empty()).count(),
-        1,
-        "one line, no parse error: {stderr}"
-    );
+fn the_binary_exits_with_one_pointer_line_on_a_file_of_no_version_or_of_version_1_or_3() {
+    // Requirement 9 criterion 7: each of the three shapes through the
+    // spawned binary, not only through the loader.
+    for (body, found) in [
+        (format!("{{{TRANSPORT}}}"), "version none"),
+        (format!("{{\"version\":1,{TRANSPORT}}}"), "version 1"),
+        (format!("{{\"version\":3,{TRANSPORT}}}"), "version 3"),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".mezame");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), &body).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_mezame"))
+            .env("HOME", tmp.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn mezame");
+        assert!(!out.status.success(), "{body}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(found), "{body}: {stderr}");
+        assert!(stderr.contains("reads version 2"), "{body}: {stderr}");
+        assert!(stderr.contains("`mezame init`"), "{body}: {stderr}");
+        assert!(!stderr.contains("missing field"), "{body}: {stderr}");
+        assert_eq!(
+            stderr.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "one line, no parse error: {body}: {stderr}"
+        );
+    }
 }
 
 #[test]
